@@ -1,0 +1,27 @@
+# Build artifacts
+/build/
+/target/
+/enclave/target/
+/sysroot/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# SGX signing key (generate locally, never commit)
+config/enclave_private.pem
+*.signed.so
+*.token
+
+# KV store data
+/kvdata/
+
+# OS-specific
+Thumbs.db
+.DS_Store
+
+# Test certificate private keys
+/tests/certificates/*.key
