@@ -1,0 +1,35 @@
+# Copyright (c) Privasys. All rights reserved.
+# Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
+
+[package]
+name = "enclave-os-host"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Host-side application for enclave-os-mini"
+
+[dependencies]
+enclave-os-common = { workspace = true }
+anyhow = "1"
+log = "0.4"
+env_logger = "0.11"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+hex = "0.4"
+base64 = "0.22"
+rocksdb = "0.22"
+
+# SGX untrusted runtime bindings
+sgx_types = { git = "https://github.com/Privasys/teaclave-sgx-sdk", branch = "main" }
+sgx_urts  = { git = "https://github.com/Privasys/teaclave-sgx-sdk", branch = "main" }
+
+[features]
+mock = []
+
+[build-dependencies]
+cc = "1"
+
+[[bin]]
+name = "enclave-os-host"
+path = "src/main.rs"

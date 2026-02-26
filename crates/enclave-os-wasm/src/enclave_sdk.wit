@@ -1,0 +1,173 @@
+// Copyright (c) Privasys. All rights reserved.
+// Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Enclave OS WIT — Platform SDK for WASM apps running inside SGX
+// ═══════════════════════════════════════════════════════════════════════
+//
+//  This WIT-style interface is the "right way" for WASM apps to access
+//  enclave capabilities.  Unlike raw WASI sockets (which pass plaintext
+//  through the host), these APIs ensure:
+//
+//    • HTTPS egress: TLS terminates inside the enclave (rustls/ring)
+//    • Crypto: routed to native ring primitives inside SGX
+//    • Key management: keys sealed with MRENCLAVE, never leave enclave
+//
+//  Design inspired by W3C SubtleCrypto but adapted for SGX constraints.
+//
+//  ┌─────────────────────────────────────────────────────────────────┐
+//  │  WASM App                                                      │
+//  │    │                                                           │
+//  │    ├── privasys:enclave-os/crypto    → ring inside SGX         │
+//  │    ├── privasys:enclave-os/https     → rustls + OCALL          │
+//  │    └── privasys:enclave-os/keystore  → sealed KV store         │
+//  │                                                                │
+//  │  Host NEVER sees plaintext, keys, or TLS session material.     │
+//  └─────────────────────────────────────────────────────────────────┘
+//
+// ═══════════════════════════════════════════════════════════════════════
+
+// This file documents the interface contract. The actual registration
+// happens in `enclave_sdk.rs` via wasmtime's dynamic `func_new` API
+// (same pattern as our WASI implementation).
+//
+// Package: privasys:enclave-os@0.1.0
+//
+// ─── privasys:enclave-os/crypto@0.1.0 ─────────────────────────────
+//
+// ## Digest
+//
+//   digest: func(algorithm: digest-algorithm, data: list<u8>)
+//           -> result<list<u8>, string>
+//
+//   enum digest-algorithm {
+//       sha256,       // SHA-256  (32 bytes)
+//       sha384,       // SHA-384  (48 bytes)
+//       sha512,       // SHA-512  (64 bytes)
+//   }
+//
+// ## Symmetric encryption (AES-GCM)
+//
+//   encrypt: func(key-name: string, iv: list<u8>, aad: list<u8>,
+//                 plaintext: list<u8>)
+//            -> result<list<u8>, string>
+//
+//   decrypt: func(key-name: string, iv: list<u8>, aad: list<u8>,
+//                 ciphertext: list<u8>)
+//            -> result<list<u8>, string>
+//
+//   AES-256-GCM only.  The key is referenced by name (stored in the
+//   enclave keystore).  IV must be 12 bytes.  Returns ciphertext+tag
+//   concatenated (encrypt) or plaintext (decrypt).
+//
+// ## ECDSA signing / verification
+//
+//   sign: func(key-name: string, algorithm: sign-algorithm,
+//              data: list<u8>)
+//         -> result<list<u8>, string>
+//
+//   verify: func(key-name: string, algorithm: sign-algorithm,
+//                data: list<u8>, signature: list<u8>)
+//           -> result<bool, string>
+//
+//   enum sign-algorithm {
+//       ecdsa-p256-sha256,   // NIST P-256 + SHA-256 (ASN.1 DER sig)
+//       ecdsa-p384-sha384,   // NIST P-384 + SHA-384
+//   }
+//
+// ## HMAC
+//
+//   hmac-sign: func(key-name: string, algorithm: hmac-algorithm,
+//                   data: list<u8>)
+//              -> result<list<u8>, string>
+//
+//   hmac-verify: func(key-name: string, algorithm: hmac-algorithm,
+//                     data: list<u8>, tag: list<u8>)
+//                -> result<bool, string>
+//
+//   enum hmac-algorithm {
+//       hmac-sha256,
+//       hmac-sha384,
+//       hmac-sha512,
+//   }
+//
+// ## Random
+//
+//   get-random-bytes: func(len: u32) -> result<list<u8>, string>
+//
+//   Uses RDRAND (hardware RNG on SGX).
+//
+// ─── privasys:enclave-os/keystore@0.1.0 ───────────────────────────
+//
+//   generate-symmetric-key: func(key-name: string)
+//                           -> result<_, string>
+//
+//   generate-signing-key: func(key-name: string,
+//                              algorithm: sign-algorithm)
+//                         -> result<_, string>
+//
+//   generate-hmac-key: func(key-name: string,
+//                           algorithm: hmac-algorithm)
+//                      -> result<_, string>
+//
+//   import-symmetric-key: func(key-name: string, raw-key: list<u8>)
+//                         -> result<_, string>
+//
+//   export-public-key: func(key-name: string)
+//                      -> result<list<u8>, string>
+//
+//   delete-key: func(key-name: string) -> result<_, string>
+//
+//   key-exists: func(key-name: string) -> result<bool, string>
+//
+//   persist-key: func(key-name: string) -> result<_, string>
+//
+//     Seals the key material with MRENCLAVE policy and stores the
+//     ciphertext in the host KV store under the app's namespace
+//     (`app:<app-name>/key:<key-name>`).  Survives enclave restarts
+//     (same MRENCLAVE required to unseal).
+//
+//   load-key: func(key-name: string) -> result<_, string>
+//
+//     Reads a previously persisted key from the host KV store,
+//     unseals it, and inserts it into the in-memory KeyStore.
+//     Fails if a key with that name already exists in memory.
+//
+//   Keys are:
+//     - Generated inside SGX using ring's SystemRandom (RDRAND)
+//     - Stored in-memory keyed by name
+//     - Optionally persisted via MRENCLAVE-sealed KV store
+//     - NEVER leave the enclave in plaintext
+//
+//   KV namespace isolation:
+//     - Every app gets its own prefix: `app:<app-name>/`
+//     - Filesystem entries: `app:<app-name>/fs:<path>`
+//     - Persisted keys: `app:<app-name>/key:<key-name>`
+//     - Apps cannot read or write each other's data
+//
+// ─── privasys:enclave-os/https@0.1.0 ──────────────────────────────
+//
+//   fetch: func(request: http-request)
+//          -> result<http-response, string>
+//
+//   record http-request {
+//       method: http-method,
+//       url: string,
+//       headers: list<tuple<string, string>>,
+//       body: option<list<u8>>,
+//   }
+//
+//   record http-response {
+//       status: u16,
+//       headers: list<tuple<string, string>>,
+//       body: list<u8>,
+//   }
+//
+//   enum http-method {
+//       get, post, put, delete, patch, head, options,
+//   }
+//
+//   TLS terminates INSIDE the enclave using rustls + Mozilla CA bundle.
+//   The host only transports encrypted bytes via OCALLs.
+//
+// ═══════════════════════════════════════════════════════════════════════

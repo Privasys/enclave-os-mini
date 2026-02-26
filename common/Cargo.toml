@@ -1,0 +1,30 @@
+# Copyright (c) Privasys. All rights reserved.
+# Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
+
+[package]
+name = "enclave-os-common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared types and protocol definitions for enclave-os-mini"
+
+[features]
+default = ["std"]
+std = []
+# When building for the enclave (no_std), disable std
+sgx = []
+# JWT verification & encoding (ECDSA P-256 / ES256)
+jwt = ["dep:ring", "dep:base64", "dep:serde_json"]
+
+[dependencies]
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+
+# Optional: only pulled in when the `jwt` feature is enabled
+ring       = { version = "0.17", optional = true }
+base64     = { version = "0.21", default-features = false, features = ["alloc"], optional = true }
+serde_json = { version = "1", default-features = false, features = ["alloc"], optional = true }
+
+[dev-dependencies]
+serde_json = "1"
+ring = "0.17"
+base64 = "0.21"

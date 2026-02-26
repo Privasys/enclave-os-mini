@@ -1,0 +1,27 @@
+# Copyright (c) Privasys. All rights reserved.
+# Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
+
+[package]
+name = "enclave-os-tests"
+version = "0.1.0"
+edition = "2021"
+license.workspace = true
+
+[[test]]
+name = "integration"
+path = "src/integration.rs"
+
+[[test]]
+name = "config_merkle"
+path = "src/config_merkle.rs"
+
+[dependencies]
+enclave-os-common = { path = "../../common" }
+serde_json = "1"
+
+[dev-dependencies]
+tokio = { version = "1", features = ["full"] }
+ring = "0.17"
+rcgen = { version = "0.13", default-features = false, features = ["ring", "x509-parser"] }
+x509-parser = "0.16"
+rustls-pki-types = "1"

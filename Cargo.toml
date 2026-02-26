@@ -1,0 +1,31 @@
+# Copyright (c) Privasys. All rights reserved.
+# Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
+
+[workspace]
+members = [
+    "common",
+    "host",
+    "tests/integration",
+]
+exclude = [
+    "enclave",
+]
+# The enclave crate is built separately with a different target;
+# it is NOT part of this workspace (cargo cannot mix targets in one build).
+# See enclave/Cargo.toml for its standalone configuration.
+resolver = "2"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+
+[workspace.dependencies]
+enclave-os-common = { path = "common" }
+
+[profile.release]
+opt-level = "s"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = "symbols"

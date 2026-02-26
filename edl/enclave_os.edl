@@ -1,0 +1,95 @@
+// Copyright (c) Privasys. All rights reserved.
+// Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
+
+/* enclave_os.edl – Enclave Definition Language for enclave-os-mini
+ *
+ * SIMPLIFIED DESIGN: Instead of many individual OCALLs/ECALLs, we use
+ * shared-memory SPSC queues for all communication. The EDL only defines:
+ *
+ *   1. ecall_init_channel  – host passes shared queue pointers to enclave
+ *   2. ecall_run           – main enclave entry point (runs the event loop)
+ *   3. ecall_shutdown      – graceful stop
+ *   4. ocall_notify        – enclave nudges host when a message is enqueued
+ *
+ * All actual RPC (network I/O, KV store, logging, etc.) flows through the
+ * lock-free SPSC ring buffers in host memory. The enclave writes requests,
+ * the host reads and writes responses — no context switches per operation.
+ */
+
+enclave {
+    from "sgx_tstd.edl"   import *;
+    from "sgx_stdio.edl"  import *;
+    from "sgx_net.edl"    import *;
+    from "sgx_time.edl"   import *;
+    from "sgx_env.edl"    import *;
+    from "sgx_thread.edl" import *;
+    from "sgx_pipe.edl"   import *;
+    from "sgx_backtrace.edl" import *;
+    from "sgx_cpuid.edl"  import *;
+    from "sgx_process.edl" import *;
+
+    trusted {
+        /* ================================================================
+         *  Channel Initialisation (called once per enclave thread)
+         * ================================================================
+         *
+         * The host allocates two SPSC ring buffers in untrusted memory and
+         * passes their pointers to the enclave. The enclave then uses them
+         * for all subsequent communication — no further OCALLs needed for
+         * data transfer.
+         *
+         * enc_to_host_header / enc_to_host_buf : enclave → host queue
+         * host_to_enc_header / host_to_enc_buf : host → enclave queue
+         * capacity : size of each ring buffer (must be power of 2)
+         */
+        public int ecall_init_channel(
+            [user_check] void* enc_to_host_header,
+            [user_check] void* enc_to_host_buf,
+            [user_check] void* host_to_enc_header,
+            [user_check] void* host_to_enc_buf,
+            uint64_t capacity
+        );
+
+        /* ================================================================
+         *  Main Entry Point
+         * ================================================================
+         *
+         * Starts the enclave's main event loop. The enclave will:
+         *   - Initialise crypto, sealed KV store, RA-TLS server
+         *   - Enter a loop reading RPC responses / events from host_to_enc
+         *   - Process ingress connections, egress requests, KV ops
+         *
+         * config_json : JSON-encoded startup configuration (port, etc.)
+         *               [user_check] so the enclave reads it directly.
+         * config_len  : length of the config buffer
+         */
+        public int ecall_run(
+            [user_check] const void* config_json,
+            uint64_t config_len
+        );
+
+        /* ================================================================
+         *  Shutdown
+         * ================================================================
+         *
+         * Signals the enclave to stop its event loop and clean up.
+         */
+        public int ecall_shutdown();
+    };
+
+    untrusted {
+        /* ================================================================
+         *  Notify (the ONLY OCALL)
+         * ================================================================
+         *
+         * A lightweight signal from enclave to host: "I put something in
+         * the enc_to_host queue, please process it."
+         *
+         * This is optional — the host can spin-poll the queue instead.
+         * Using it lets the host sleep when idle, saving CPU.
+         *
+         * The OCALL carries no data; all data flows through the queue.
+         */
+        void ocall_notify();
+    };
+};

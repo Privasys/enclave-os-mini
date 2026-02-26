@@ -1,0 +1,20 @@
+# Copyright (c) Privasys. All rights reserved.
+# Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
+
+[package]
+name = "enclave-os-kvstore"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+description = "Sealed KV store module for enclave-os — AES-256-GCM encrypted storage inside SGX."
+
+[lib]
+name = "enclave_os_kvstore"
+
+[dependencies]
+# Core enclave library (without default-ecall — adopter provides their own)
+enclave-os-enclave = { path = "../../enclave", default-features = false, features = ["sgx"] }
+enclave-os-common = { path = "../../common" }
+
+# Crypto (HMAC for deterministic key name obfuscation)
+ring = "0.17"

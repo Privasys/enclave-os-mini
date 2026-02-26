@@ -1,0 +1,13 @@
+<!-- Debug configuration: debug enabled, generous stack/heap for development -->
+<EnclaveConfiguration>
+    <ProdID>0</ProdID>
+    <ISVSVN>0</ISVSVN>
+    <StackMaxSize>0x400000</StackMaxSize>
+    <HeapMaxSize>0x4000000</HeapMaxSize>
+    <TCSNum>10</TCSNum>
+    <TCSPolicy>1</TCSPolicy>
+    <!-- 0 = debug enabled, 1 = debug disabled -->
+    <DisableDebug>0</DisableDebug>
+    <MiscSelect>0</MiscSelect>
+    <MiscMask>0xFFFFFFFF</MiscMask>
+</EnclaveConfiguration>

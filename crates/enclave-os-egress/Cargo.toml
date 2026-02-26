@@ -1,0 +1,24 @@
+# Copyright (c) Privasys. All rights reserved.
+# Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
+
+[package]
+name = "enclave-os-egress"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+description = "HTTPS egress module for enclave-os — outbound TLS from inside SGX."
+
+[lib]
+name = "enclave_os_egress"
+
+[dependencies]
+# Core enclave library (without default-ecall — adopter provides their own)
+enclave-os-enclave = { path = "../../enclave", default-features = false, features = ["sgx"] }
+enclave-os-common = { path = "../../common" }
+
+# TLS
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
+rustls-pemfile = "2"
+
+# Crypto (for CA bundle hashing)
+ring = "0.17"

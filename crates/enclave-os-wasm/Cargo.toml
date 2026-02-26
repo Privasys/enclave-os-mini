@@ -1,0 +1,65 @@
+# Copyright (c) Privasys. All rights reserved.
+# Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
+
+[package]
+name = "enclave-os-wasm"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+description = "WASM module for enclave-os — WebAssembly Component runtime inside SGX."
+
+[lib]
+name = "enclave_os_wasm"
+
+[dependencies]
+# Core enclave library (without default-ecall — adopter provides their own)
+enclave-os-enclave = { path = "../../enclave", default-features = false, features = ["sgx"] }
+enclave-os-common = { path = "../../common" }
+enclave-os-kvstore = { path = "../enclave-os-kvstore" }
+
+# Wasmtime with SGX support (Privasys fork, `sgx` branch).
+#
+# The fork adds a `target_vendor = "teaclave"` check in `sys/mod.rs`
+# to route to `sys::custom` instead of `sys::unix`, and an `sgx` feature
+# that enables `custom-virtual-memory` + `custom-native-signals`.
+#
+# Our `sgx_platform.rs` then provides the `#[no_mangle] extern "C"`
+# symbols that wasmtime's `sys::custom::capi` declares:
+#   - Memory: sgx_mm_alloc / sgx_mm_modify_permissions (SGX2 EDMM)
+#   - Traps: sgx_register_exception_handler (VEH)
+#   - TLS: std::thread_local!  (→ sgx_tstd)
+#
+# Reference: https://github.com/bytecodealliance/wasmtime/commit/fbbcd2ac
+#
+# Features:
+#   cranelift        — Cranelift code generator (required)
+#   component-model  — Component Model / WIT support for typed interfaces
+#   runtime          — the core execution engine
+#   sgx              — routes to sys::custom + enables EDMM/VEH C API
+#
+# Excluded features:
+#   async            — not needed; synchronous dispatch only
+#   pooling-allocator— complex SGX memory constraints
+#   cache            — no filesystem in SGX
+#   wat              — text format parsing not needed at runtime
+wasmtime = { git = "https://github.com/Privasys/wasmtime", branch = "sgx", default-features = false, features = [
+    "cranelift",
+    "component-model",
+    "runtime",
+    "std",
+    "sgx",
+] }
+
+# Crypto (SHA-256 for WASM code hashing, RNG for WASI random)
+ring = "0.17"
+
+# TLS inside enclave for Enclave OS SDK HTTPS egress
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
+webpki-roots = "0.26"
+
+# Serialization for WasmCall / WasmResult protocol
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Hardware RNG for wasi:random (RDRAND on SGX)
+getrandom = { version = "0.2", features = ["rdrand"] }
