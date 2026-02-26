@@ -1,9 +1,4 @@
-﻿# enclave-os
-
-> **Copyright (c) Privasys. All rights reserved.**
->
-> This project is licensed under the [GNU Affero General Public License v3.0](LICENSE).
-> For commercial or closed-source use, a commercial license must be purchased  contact **legal@privasys.org**.
+﻿# Enclave OS (Mini)
 
 A minimal OS layer for Intel SGX enclaves, written in Rust. Provides:
 
@@ -93,42 +88,43 @@ impl EnclaveModule for HelloWorldModule {
 
 ## Architecture
 
-All hostenclave communication flows through **shared-memory SPSC queues**
+All host↔enclave communication flows through **shared-memory SPSC queues**
 with a **single OCALL** (`ocall_notify`) for wake-up signalling. The enclave
 writes directly to host memory without context-switching.
 
 ```
-
-                     Host (Untrusted)                          
-                                                               
-             
-   TCP Socket       KV Store        RPC Dispatcher      
-   Table            Backend         (spin-polls         
-   (net/)           (kvstore/)       enc_to_host)       
-             
-                                                            
-      
-              Shared Memory SPSC Queues                     
-    enc_to_host: [ring buf]   enclave writes requests      
-    host_to_enc: [ring buf]   host writes responses        
-      
-                                                              
-
-                                 SGX boundary                
-                                  (3 ECALLs + 1 OCALL)        
-      
-                  RPC Client                                
-    (encodes requests  enc_to_host, reads responses)       
-      
-                                                            
-                
-   RA-TLS       HTTPS           Sealed KV              
-   Server       Egress          Store                  
-   (rustls)     (rustls)        (AES-GCM)             
-                
-                  Enclave (Trusted)                            
-
+┌────────────────────────────────────────────────────────────┐
+│                     Host (Untrusted)                       │
+│                                                            │
+│  ┌──────────────┐   ┌─────────────┐   ┌────────────────┐   │
+│  │ TCP Socket   │   │ KV Store    │   │ RPC Dispatcher │   │
+│  │ Table        │   │ Backend     │   │ (spin-polls    │   │
+│  │ (net/)       │   │ (kvstore/)  │   │  enc_to_host)  │   │
+│  └──────┬───────┘   └──────┬──────┘   └────────┬───────┘   │
+│         │                  │                   │           │
+│  ┌──────┴──────────────────┴───────────────────┴────────┐  │
+│  │            Shared Memory SPSC Queues                 │  │
+│  │  enc_to_host: [ring buf]  ← enclave writes requests  │  │
+│  │  host_to_enc: [ring buf]  → host writes responses    │  │
+│  └──────────────────────────────────────────────────────┘  │
+│                           │                                │
+├───────────────────────────┼────────────────────────────────┤
+│                           │     ← SGX boundary             │
+│                           │       (3 ECALLs + 1 OCALL)     │
+│  ┌────────────────────────┴────────────────────────────┐   │
+│  │                RPC Client                           │   │
+│  │  (encodes requests → enc_to_host, reads responses)  │   │
+│  └───┬──────────────┬──────────────┬───────────────────┘   │
+│      │              │              │                       │
+│  ┌───┴──────┐  ┌────┴───────┐  ┌───┴────────┐              │
+│  │ RA-TLS   │  │ HTTPS      │  │ Sealed KV  │              │
+│  │ Server   │  │ Egress     │  │ Store      │              │
+│  │ (rustls) │  │ (rustls)   │  │ (AES-GCM)  │              │
+│  └──────────┘  └────────────┘  └────────────┘              │
+│                  Enclave (Trusted)                         │
+└────────────────────────────────────────────────────────────┘
 ```
+
 
 ### SPSC Queue Design
 
@@ -170,84 +166,13 @@ untrusted {
 };
 ```
 
-## Directory Structure
-
-```
-enclave-os/
- CMakeLists.txt              # Top-level CMake (orchestrates Rust + SGX)
- Cargo.toml                  # Rust workspace (host + common)
- cmake/
-    SgxConfig.cmake         # SGX SDK detection & flags
-    RustBuild.cmake         # Cargo build helpers
- config/
-    enclave.config.xml      # SGX enclave configuration
- edl/
-    CMakeLists.txt          # EDL code generation
-    enclave_os.edl          # Simplified EDL (3 ECALLs + 1 OCALL)
- common/                     # Shared types (no_std compatible)
-    Cargo.toml
-    src/
-        lib.rs
-        types.rs            # Error codes, constants
-        protocol.rs         # Wire protocol (length-delimited frames)
-        queue.rs            # Lock-free SPSC ring buffer
-        rpc.rs              # RPC message encoding/decoding
-        jwt.rs              # ES256 JWT verification (feature-gated)
- host/                       # Untrusted host application
-    Cargo.toml
-    build.rs
-    CMakeLists.txt
-    src/
-        main.rs             # CLI: allocates queues, starts dispatcher + enclave
-        enclave.rs          # Enclave lifecycle + shared channel allocation
-        dispatcher.rs       # RPC dispatcher (polls enc_to_host queue)
-        ocall_impl.rs       # Single OCALL: ocall_notify()
-        net/                # Host-side TCP socket management
-        kvstore/            # Host-side file-backed KV storage
- enclave/                    # Trusted enclave code
-    Cargo.toml
-    build.rs
-    CMakeLists.txt
-    src/
-        lib.rs              # Enclave state + RPC client global
-        ecall.rs            # 3 ECALLs: init_channel, run, shutdown
-        rpc_client.rs       # Typed RPC client over SPSC queues
-        ocall.rs            # Thin wrappers  RPC client calls
-        sealed_config.rs    # Unified sealed config (CA + egress + KV key)
-        config_merkle.rs    # Auditable config Merkle tree + manifest
-        modules/
-           mod.rs          # EnclaveModule trait, ModuleOid, registry
-           helloworld.rs   # Smoke-test module (inline, default-ecall feature)
-        crypto/
-           aead.rs         # AES-256-GCM encryption
-           sealing.rs      # SGX MRENCLAVE sealing primitives
-        ratls/
-            attestation.rs  # SGX quote generation + OID extensions
-            server.rs       # RA-TLS TCP server
-            session.rs      # TLS session management
- crates/                     # Pluggable module crates
-    enclave-os-egress/      # HTTPS egress (rustls + host TCP via OCALLs)
-    enclave-os-kvstore/     # Sealed KV store (AES-256-GCM, HMAC keys)
-    enclave-os-vault/       # JWT-authenticated secret store (ES256)
-    enclave-os-wasm/        # WASM runtime (wasmtime + WASI)
- tests/                      # Integration tests
-    certificates/           # Test CA certs (.key files git-ignored)
-        privasys.root-ca.dev.crt
-        privasys.root-ca.dev.key
-        privasys.intermadiate-ca.dev.crt
-        privasys.intermadiate-ca.dev.key
- vendor/
-     getrandom/              # Vendored getrandom for SGX RDRAND support
-```
-
-
 ## Dependencies
 
-- **Intel SGX SDK** (Linux)  for `sgx_edger8r`, `sgx_sign`, and SGX runtime libraries
-- **[teaclave-sgx-sdk](https://github.com/privasys/teaclave-sgx-sdk)** (branch `main`)  Privasys fork of the Teaclave SGX SDK with Rust 1.84 + SGX 2.25 patches
-- **[rustls](https://github.com/rustls/rustls)**  Lightweight, pure-Rust TLS 1.3 library (no OpenSSL dependency)
-- **[ring](https://github.com/briansmith/ring)**  Cryptographic primitives (AES-GCM, ECDSA, SHA-256, HMAC)
-- **[rcgen](https://github.com/rustls/rcgen)**  X.509 certificate generation for RA-TLS
+- **Intel SGX SDK** (Linux) — for `sgx_edger8r`, `sgx_sign`, and SGX runtime libraries
+- **[teaclave-sgx-sdk](https://github.com/privasys/teaclave-sgx-sdk)** (branch `main`) — Privasys fork of the Teaclave SGX SDK with Rust 1.84 + SGX 2.25 patches
+- **[rustls](https://github.com/rustls/rustls)** — Lightweight, pure-Rust TLS 1.3 library (no OpenSSL dependency)
+- **[ring](https://github.com/briansmith/ring)** — Cryptographic primitives (AES-GCM, ECDSA, SHA-256, HMAC)
+- **[rcgen](https://github.com/rustls/rcgen)** — X.509 certificate generation for RA-TLS
 
 ## Randomness and AEAD
 
@@ -345,12 +270,12 @@ Use the root CA from `tests/certificates/privasys.root-ca.dev.crt` when running 
 
 ```
 Root CA (privasys.root-ca.dev.crt)
-  Intermediary CA (privasys.intermadiate-ca.dev.crt + .key)   sealed inside enclave
-       Leaf RA-TLS certificate (generated per-connection inside enclave)
-                Extension: SGX Quote             (OID 1.2.840.113741.1.13.1.0)
-                Extension: Config Merkle Root    (OID 1.3.6.1.4.1.1337.1.1)
-                Extension: Egress CA Hash        (OID 1.3.6.1.4.1.1337.2.1)   module
-                Extension: WASM Code Hash       (OID 1.3.6.1.4.1.1337.2.3)   module
+ └── Intermediary CA (privasys.intermadiate-ca.dev.crt + .key)  ← sealed inside enclave
+      └── Leaf RA-TLS certificate (generated per-connection inside enclave)
+               ├── Extension: SGX Quote             (OID 1.2.840.113741.1.13.1.0)
+               ├── Extension: Config Merkle Root    (OID 1.3.6.1.4.1.1337.1.1)
+               ├── Extension: Egress CA Hash        (OID 1.3.6.1.4.1.1337.2.1)  ← module
+               └── Extension: WASM Code Hash       (OID 1.3.6.1.4.1.1337.2.3)  ← module
 ```
 
 - The **intermediary CA** cert + key are passed to the enclave at init time,
@@ -359,7 +284,7 @@ Root CA (privasys.root-ca.dev.crt)
 - The **leaf certificate** is generated per-connection with an embedded SGX
   quote and signed by the intermediary CA.
 - **Module OIDs** are registered by each module via `custom_oids()` and
-  embedded as non-critical extensions. Clients can verify specific module
+  embedded as non-critical extensions. Clients can verify specific ← module
   properties (e.g. "the egress CA bundle hash matches my expectation")
   with a single OID check  no Merkle tree computation needed.
 
@@ -410,14 +335,14 @@ Root CA (privasys.root-ca.dev.crt)
 
 ### Client Verification
 
-The enclave is an **honest reporter**  it computes and publishes the config
+The enclave is an **honest reporter** — it computes and publishes the config
 Merkle root in every RA-TLS certificate. There is no owner key or authorization
 gate. Clients verify:
 
-1. **MRENCLAVE** (via SGX quote)  correct enclave code
+1. **MRENCLAVE** (via SGX quote) → correct enclave code
 2. **Config Merkle root** (via X.509 OID `1.3.6.1.4.1.1337.1.1`)  correct operator-chosen inputs
 3. **Module OIDs** (e.g. `1.3.6.1.4.1.1337.2.1`)  fast-path verification of individual module properties without Merkle audit
-4. **Config manifest** (optional)  request the full `(name, leaf_hash)` list from the enclave and recompute the root to audit individual inputs
+4. **Config manifest** (optional) → request the full `(name, leaf_hash)` list from the enclave and recompute the root to audit individual inputs
 
 Anyone with host access can change the config, but the Merkle root in the
 certificate will change accordingly, and clients pinning a known-good value
