@@ -6,6 +6,15 @@
 //! Provides outbound HTTPS from inside the SGX enclave. The TLS termination
 //! happens inside the enclave; the host never sees plaintext.
 //!
+//! ## RA-TLS verification
+//!
+//! When connecting to a server that serves RA-TLS certificates (e.g. another
+//! enclave-os instance or a Caddy RA-TLS reverse proxy), callers can pass an
+//! [`RaTlsPolicy`] to [`client::https_get`] / [`client::https_post`]. The
+//! policy specifies the expected TEE type and measurement registers; the
+//! egress client will verify the attestation quote during the TLS handshake
+//! and reject the connection if any check fails.
+//!
 //! ## Responsibilities
 //!
 //! - Owns the egress root CA store (loaded from operator-provided PEM bundle)
@@ -38,6 +47,12 @@
 
 pub mod client;
 
+// Re-export RA-TLS verification types for convenience.
+pub use client::{
+    ExpectedOid, RaTlsPolicy, ReportDataBinding, TeeType,
+    OID_CONFIG_MERKLE_ROOT, OID_EGRESS_CA_HASH, OID_WASM_APPS_HASH,
+};
+
 use std::sync::OnceLock;
 use std::vec::Vec;
 
@@ -46,17 +61,11 @@ use rustls::RootCertStore;
 
 use enclave_os_enclave::config_merkle::ConfigLeaf;
 use enclave_os_enclave::modules::{EnclaveModule, ModuleOid};
+use enclave_os_common::oids;
 use enclave_os_common::protocol::{Request, Response};
 
-/// OID for the egress CA bundle hash.
-///
-/// `1.3.6.1.4.1.1337.2.1` — Privasys / enclave-os / egress-ca-bundle-hash
-///
-/// The extension value is a 32-byte SHA-256 hash of the PEM-encoded CA
-/// bundle. Clients can compare this against a known-good hash to verify
-/// which root CAs the enclave trusts for outbound HTTPS — without
-/// recomputing the full config Merkle tree.
-pub const EGRESS_CA_HASH_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 1337, 2, 1];
+/// OID for the egress CA bundle hash — imported from common.
+pub use enclave_os_common::oids::EGRESS_CA_HASH_OID;
 
 // ---------------------------------------------------------------------------
 //  Global root CA store

@@ -24,11 +24,8 @@ use rcgen::{
 };
 use x509_parser::prelude::*;
 
-// Privasys OID: 1.3.6.1.4.1.1337.1.1
-const CONFIG_MERKLE_ROOT_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 1337, 1, 1];
-
-// The OID encoded as a dotted string for x509-parser lookup.
-const CONFIG_MERKLE_ROOT_OID_STR: &str = "1.3.6.1.4.1.1337.1.1";
+// OIDs imported from common — single source of truth.
+use enclave_os_common::oids::{CONFIG_MERKLE_ROOT_OID, CONFIG_MERKLE_ROOT_OID_STR};
 
 // ---------------------------------------------------------------------------
 //  Helpers — mirror the enclave ConfigMerkleTree logic

@@ -20,5 +20,8 @@ enclave-os-common = { path = "../../common" }
 rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
 rustls-pemfile = "2"
 
-# Crypto (for CA bundle hashing)
+# Crypto (for CA bundle hashing + ReportData verification)
 ring = "0.17"
+
+# Certificate parsing (for RA-TLS quote extraction + ReportData verification)
+x509-parser = "0.16"

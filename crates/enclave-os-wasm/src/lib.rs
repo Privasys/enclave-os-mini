@@ -88,16 +88,10 @@ use crate::protocol::{WasmCall, WasmEnvelope, WasmResult};
 use crate::registry::AppRegistry;
 
 // ---------------------------------------------------------------------------
-//  OID for WASM apps combined code hash
+//  OID for WASM apps combined code hash — imported from common
 // ---------------------------------------------------------------------------
 
-/// X.509 OID for the combined WASM apps code hash.
-///
-/// Arc: `1.3.6.1.4.1.1337.2.3`
-///   - `1.3.6.1.4.1.1337`   = Privasys placeholder (pending IANA PEN)
-///   - `.2`                 = enclave-os module OIDs
-///   - `.3`                 = WASM combined apps hash
-pub const WASM_APPS_HASH_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 1337, 2, 3];
+pub use enclave_os_common::oids::WASM_APPS_HASH_OID;
 
 
 // ---------------------------------------------------------------------------

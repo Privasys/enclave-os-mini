@@ -10,7 +10,7 @@
 
 #[cfg(feature = "sgx")]
 extern crate alloc;
-
+pub mod oids;
 pub mod protocol;
 pub mod queue;
 pub mod rpc;

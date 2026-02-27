@@ -22,21 +22,8 @@ use ring::digest;
 use ring::rand::SystemRandom;
 use ring::signature::{self, EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 
-/// OID for the SGX quote extension in X.509 certificates.
-/// 1.2.840.113741.1.13.1.0  (Intel SGX Quote)
-pub const SGX_QUOTE_OID: &[u64] = &[1, 2, 840, 113741, 1, 13, 1, 0];
-
-/// OID for the configuration Merkle root extension in X.509 certificates.
-///
-/// 1.3.6.1.4.1.1337.1.1  (Privasys / enclave-os / config-merkle-root)
-///
-/// The extension value is a 32-byte SHA-256 hash covering all operator-chosen
-/// configuration inputs (egress CA bundle, etc.). Clients can compare this
-/// against a known-good value to verify the enclave's runtime configuration.
-///
-/// Note: 1337 is a placeholder PEN. Replace with the actual Privasys PEN
-/// once assigned by IANA.
-pub const CONFIG_MERKLE_ROOT_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 1337, 1, 1];
+// OIDs imported from common — single source of truth.
+use enclave_os_common::oids::{SGX_QUOTE_OID, CONFIG_MERKLE_ROOT_OID};
 
 /// Certificate validity for challenge-response mode (5 minutes).
 pub const CHALLENGE_VALIDITY_SECS: u64 = 300;
