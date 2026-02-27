@@ -34,7 +34,7 @@ struct Cli {
     enclave_path: String,
 
     /// Port for the RA-TLS ingress server
-    #[arg(short, long, default_value_t = 8443)]
+    #[arg(short, long, default_value_t = 443)]
     port: u16,
 
     /// TCP listen backlog

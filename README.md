@@ -234,7 +234,7 @@ an egress CA bundle) so the enclave can seal everything to disk:
 ```bash
 ./enclave-os-host \
     --enclave-path ./build/bin/enclave.signed.so \
-    --port 8443 \
+    --port 443 \
     --kv-path ./kvdata \
     --ca-cert tests/certificates/privasys.intermadiate-ca.dev.crt \
     --ca-key  tests/certificates/privasys.intermadiate-ca.dev.key \
@@ -248,7 +248,7 @@ unified `SealedConfig` blob from disk automatically:
 ```bash
 ./enclave-os-host \
     --enclave-path ./build/bin/enclave.signed.so \
-    --port 8443 \
+    --port 443 \
     --kv-path ./kvdata \
     --debug
 ```

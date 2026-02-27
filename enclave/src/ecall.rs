@@ -329,7 +329,7 @@ pub struct EnclaveConfig {
     pub extra: serde_json::Map<String, serde_json::Value>,
 }
 
-fn default_port() -> u16 { 8443 }
+fn default_port() -> u16 { 443 }
 fn default_backlog() -> i32 { 128 }
 
 /// Minimal hex decoder (no external dependency).

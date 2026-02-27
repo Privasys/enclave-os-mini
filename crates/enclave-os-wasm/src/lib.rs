@@ -94,7 +94,7 @@ use crate::registry::AppRegistry;
 /// X.509 OID for the combined WASM apps code hash.
 ///
 /// Arc: `1.3.6.1.4.1.1337.2.3`
-///   - `1.3.6.1.4.1.1337` = Privasys IANA PEN
+///   - `1.3.6.1.4.1.1337`   = Privasys placeholder (pending IANA PEN)
 ///   - `.2`                 = enclave-os module OIDs
 ///   - `.3`                 = WASM combined apps hash
 pub const WASM_APPS_HASH_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 1337, 2, 3];

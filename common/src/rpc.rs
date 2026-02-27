@@ -503,9 +503,9 @@ mod tests {
 
     #[test]
     fn test_net_tcp_listen_payload() {
-        let encoded = encode_net_tcp_listen_req(8443, 128);
+        let encoded = encode_net_tcp_listen_req(443, 128);
         let (port, backlog) = decode_net_tcp_listen_req(&encoded).unwrap();
-        assert_eq!(port, 8443);
+        assert_eq!(port, 443);
         assert_eq!(backlog, 128);
     }
 
@@ -740,7 +740,7 @@ mod tests {
 
         // Enclave: send NetTcpListen request
         let req_id = 1u64;
-        let payload = encode_net_tcp_listen_req(8443, 128);
+        let payload = encode_net_tcp_listen_req(443, 128);
         let msg = encode_request(req_id, RpcMethod::NetTcpListen, &payload);
         enc_tx.send(&msg);
 
@@ -750,7 +750,7 @@ mod tests {
         assert_eq!(rid, req_id);
         assert_eq!(method, RpcMethod::NetTcpListen);
         let (port, backlog) = decode_net_tcp_listen_req(p).unwrap();
-        assert_eq!(port, 8443);
+        assert_eq!(port, 443);
         assert_eq!(backlog, 128);
 
         // Host responds with fd=100
