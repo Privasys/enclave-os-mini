@@ -9,7 +9,7 @@
 //!      intermediary CA certificate).
 //!   2. Compute the Merkle root.
 //!   3. Embed the root as a custom X.509 extension at the Privasys
-//!      Config Merkle Root OID (`1.3.6.1.4.1.1337.1.1`).
+//!      Config Merkle Root OID (`1.3.6.1.4.1.65230.1.1`).
 //!   4. Parse the extension back from the DER certificate and verify
 //!      it matches.
 //!

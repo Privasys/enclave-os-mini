@@ -34,7 +34,7 @@ use crate::config_merkle::ConfigLeaf;
 /// certificate, allowing clients to verify individual module properties
 /// without computing the full config Merkle tree.
 pub struct ModuleOid {
-    /// OID arc sequence (e.g. `&[1, 3, 6, 1, 4, 1, 1337, 2, 1]`).
+    /// OID arc sequence (e.g. `&[1, 3, 6, 1, 4, 1, 65230, 2, 1]`).
     pub oid: &'static [u64],
     /// Raw extension value bytes.
     pub value: Vec<u8>,

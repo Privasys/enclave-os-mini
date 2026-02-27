@@ -49,7 +49,7 @@
 //! Each loaded app's WASM bytecode hash (SHA-256) is:
 //! 1. Included as a config Merkle leaf (`wasm.<app_name>.code_hash`)
 //! 2. Aggregated into a combined hash exposed as X.509 OID
-//!    `1.3.6.1.4.1.1337.2.3` in RA-TLS certificates.
+//!    `1.3.6.1.4.1.65230.2.3` in RA-TLS certificates.
 //!
 //! This allows clients to verify exactly which WASM apps are running
 //! inside the enclave without trusting the host.
@@ -262,7 +262,7 @@ impl EnclaveModule for WasmModule {
 
     /// Custom X.509 OIDs for RA-TLS certificates.
     ///
-    /// Embeds the combined apps hash as OID `1.3.6.1.4.1.1337.2.3`.
+    /// Embeds the combined apps hash as OID `1.3.6.1.4.1.65230.2.3`.
     fn custom_oids(&self) -> Vec<ModuleOid> {
         let combined = self.combined_apps_hash();
 

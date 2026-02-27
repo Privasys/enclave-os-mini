@@ -19,7 +19,7 @@
 //!
 //! - Owns the egress root CA store (loaded from operator-provided PEM bundle)
 //! - Registers a config Merkle leaf: `egress.ca_bundle`
-//! - Registers a custom X.509 OID: `1.3.6.1.4.1.1337.2.1` (CA bundle
+//! - Registers a custom X.509 OID: `1.3.6.1.4.1.65230.2.1` (CA bundle
 //!   SHA-256 hash) so clients can verify the egress trust anchors without
 //!   a full Merkle audit.
 //!

@@ -44,9 +44,9 @@ pub trait EnclaveModule: Send + Sync {
 
 | Module | Crate | Description |
 |--------|-------|-------------|
-| **egress** | `crates/enclave-os-egress` | HTTPS egress client; owns egress root CA store; registers `egress.ca_bundle` leaf + OID `1.3.6.1.4.1.1337.2.1` |
+| **egress** | `crates/enclave-os-egress` | HTTPS egress client; owns egress root CA store; registers `egress.ca_bundle` leaf + OID `1.3.6.1.4.1.65230.2.1` |
 | **kvstore** | `crates/enclave-os-kvstore` | Sealed (AES-256-GCM) KV store; owns master key from sealed config |
-| **wasm** | `crates/enclave-os-wasm` | WASM runtime; registers `wasm.code_hash` leaf + OID `1.3.6.1.4.1.1337.2.3` |
+| **wasm** | `crates/enclave-os-wasm` | WASM runtime; registers `wasm.code_hash` leaf + OID `1.3.6.1.4.1.65230.2.3` |
 | **vault** | `crates/enclave-os-vault` | JWT-authenticated (ES256) secret store/retrieval |
 | **helloworld** | `enclave/src/modules/helloworld.rs` | Smoke-test module: responds `"world"` to `"hello"` (inline, used by `default-ecall` feature) |
 
@@ -273,9 +273,9 @@ Root CA (privasys.root-ca.dev.crt)
  └── Intermediary CA (privasys.intermadiate-ca.dev.crt + .key)  ← sealed inside enclave
       └── Leaf RA-TLS certificate (generated per-connection inside enclave)
                ├── Extension: SGX Quote             (OID 1.2.840.113741.1.13.1.0)
-               ├── Extension: Config Merkle Root    (OID 1.3.6.1.4.1.1337.1.1)
-               ├── Extension: Egress CA Hash        (OID 1.3.6.1.4.1.1337.2.1)  ← module
-               └── Extension: WASM Code Hash       (OID 1.3.6.1.4.1.1337.2.3)  ← module
+               ├── Extension: Config Merkle Root    (OID 1.3.6.1.4.1.65230.1.1)
+               ├── Extension: Egress CA Hash        (OID 1.3.6.1.4.1.65230.2.1)  ← module
+               └── Extension: WASM Code Hash       (OID 1.3.6.1.4.1.65230.2.3)  ← module
 ```
 
 - The **intermediary CA** cert + key are passed to the enclave at init time,
@@ -290,9 +290,9 @@ Root CA (privasys.root-ca.dev.crt)
 
   | OID | Module | Value |
   |-----|--------|-------|
-  | `1.3.6.1.4.1.1337.1.1` | core | Config Merkle root (32 bytes) |
-  | `1.3.6.1.4.1.1337.2.1` | egress | SHA-256 of egress CA bundle (32 bytes) |
-  | `1.3.6.1.4.1.1337.2.3` | wasm | SHA-256 of WASM bytecode (32 bytes) |
+  | `1.3.6.1.4.1.65230.1.1` | core | Config Merkle root (32 bytes) |
+  | `1.3.6.1.4.1.65230.2.1` | egress | SHA-256 of egress CA bundle (32 bytes) |
+  | `1.3.6.1.4.1.65230.2.3` | wasm | SHA-256 of WASM bytecode (32 bytes) |
 
 - The **Config Merkle Root** extension is a 32-byte SHA-256 hash tree over
   all operator-chosen and module-contributed configuration inputs. The leaf
@@ -340,8 +340,8 @@ Merkle root in every RA-TLS certificate. There is no owner key or authorization
 gate. Clients verify:
 
 1. **MRENCLAVE** (via SGX quote) → correct enclave code
-2. **Config Merkle root** (via X.509 OID `1.3.6.1.4.1.1337.1.1`)  correct operator-chosen inputs
-3. **Module OIDs** (e.g. `1.3.6.1.4.1.1337.2.1`)  fast-path verification of individual module properties without Merkle audit
+2. **Config Merkle root** (via X.509 OID `1.3.6.1.4.1.65230.1.1`)  correct operator-chosen inputs
+3. **Module OIDs** (e.g. `1.3.6.1.4.1.65230.2.1`)  fast-path verification of individual module properties without Merkle audit
 4. **Config manifest** (optional) → request the full `(name, leaf_hash)` list from the enclave and recompute the root to audit individual inputs
 
 Anyone with host access can change the config, but the Merkle root in the
