@@ -80,7 +80,7 @@ use std::vec::Vec;
 use ring::digest;
 use enclave_os_common::protocol::{Request, Response};
 use enclave_os_enclave::config_merkle::ConfigLeaf;
-use enclave_os_enclave::ecall::{hex_decode, hex_encode};
+use enclave_os_enclave::ecall::hex_decode;
 use enclave_os_enclave::modules::{AppIdentity, ConfigEntry, EnclaveModule, ModuleOid};
 use enclave_os_enclave::ratls::cert_store;
 use enclave_os_common::types::AEAD_KEY_SIZE;

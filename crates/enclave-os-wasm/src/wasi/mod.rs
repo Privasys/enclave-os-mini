@@ -29,7 +29,7 @@ use std::collections::BTreeMap;
 use std::string::String;
 use std::vec::Vec;
 
-use wasmtime::component::{Linker, Resource};
+use wasmtime::component::Linker;
 
 use crate::enclave_sdk::KeyStore;
 use enclave_os_kvstore::SealedKvStore;

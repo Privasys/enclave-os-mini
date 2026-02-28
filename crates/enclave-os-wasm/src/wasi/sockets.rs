@@ -26,7 +26,7 @@ use std::string::String;
 use std::vec::Vec;
 
 use wasmtime::component::{Linker, Resource, ResourceType, Val};
-use wasmtime::StoreContextMut;
+use wasmtime::{AsContextMut, StoreContextMut};
 
 use super::{
     AppContext, InputStreamKind, InputStreamRes, NetworkRes,
@@ -85,6 +85,7 @@ fn add_tcp_create_socket(linker: &mut Linker<AppContext>) -> Result<(), wasmtime
     inst.func_new(
         "create-tcp-socket",
         |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          _params: &[Val],
          results: &mut [Val]| {
             let rep = store.data_mut().alloc_rep();
@@ -132,16 +133,17 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
     inst.func_new(
         "[method]tcp-socket.start-bind",
         |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let sock_rep = io_rep(&params[0])?;
+            let sock_rep = io_rep(&params[0], store.as_context_mut())?;
             // params[1] = network (ignored — we have one implicit network)
             let port = extract_port_from_address(&params[2]);
 
             let fd = match enclave_os_enclave::ocall::net_tcp_listen(port, 128) {
                 Ok(fd) => fd,
                 Err(_) => {
-                    results[0] = error_code_result(7); // address-in-use
+                    results[0] = error_code_result("address-in-use");
                     return Ok(());
                 }
             };
@@ -161,6 +163,7 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
     inst.func_new(
         "[method]tcp-socket.finish-bind",
         |_store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          _params: &[Val],
          results: &mut [Val]| {
             results[0] = Val::Result(Ok(None));
@@ -173,16 +176,17 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
     inst.func_new(
         "[method]tcp-socket.start-connect",
         |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let sock_rep = io_rep(&params[0])?;
+            let sock_rep = io_rep(&params[0], store.as_context_mut())?;
             // params[1] = network
             let (host, port) = extract_host_port_from_address(&params[2]);
 
             let fd = match enclave_os_enclave::ocall::net_tcp_connect(&host, port) {
                 Ok(fd) => fd,
                 Err(_) => {
-                    results[0] = error_code_result(13); // connection-refused
+                    results[0] = error_code_result("connection-refused");
                     return Ok(());
                 }
             };
@@ -204,19 +208,20 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
     inst.func_new(
         "[method]tcp-socket.finish-connect",
         |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let sock_rep = io_rep(&params[0])?;
+            let sock_rep = io_rep(&params[0], store.as_context_mut())?;
             let fd = match store.data().tcp_sockets.get(&sock_rep) {
                 Some(s) if s.connected => match s.fd {
                     Some(fd) => fd,
                     None => {
-                        results[0] = error_code_result(0); // unknown
+                        results[0] = error_code_result("unknown");
                         return Ok(());
                     }
                 },
                 _ => {
-                    results[0] = error_code_result(14); // not-connected
+                    results[0] = error_code_result("invalid-state");
                     return Ok(());
                 }
             };
@@ -252,9 +257,10 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
     inst.func_new(
         "[method]tcp-socket.start-listen",
         |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let sock_rep = io_rep(&params[0])?;
+            let sock_rep = io_rep(&params[0], store.as_context_mut())?;
             if let Some(sock) = store.data_mut().tcp_sockets.get_mut(&sock_rep) {
                 sock.listening = true;
             }
@@ -267,6 +273,7 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
     inst.func_new(
         "[method]tcp-socket.finish-listen",
         |_store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          _params: &[Val],
          results: &mut [Val]| {
             results[0] = Val::Result(Ok(None));
@@ -279,19 +286,20 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
     inst.func_new(
         "[method]tcp-socket.accept",
         |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let sock_rep = io_rep(&params[0])?;
+            let sock_rep = io_rep(&params[0], store.as_context_mut())?;
             let listener_fd = match store.data().tcp_sockets.get(&sock_rep) {
                 Some(s) if s.listening => match s.fd {
                     Some(fd) => fd,
                     None => {
-                        results[0] = error_code_result(0);
+                        results[0] = error_code_result("unknown");
                         return Ok(());
                     }
                 },
                 _ => {
-                    results[0] = error_code_result(14);
+                    results[0] = error_code_result("invalid-state");
                     return Ok(());
                 }
             };
@@ -300,7 +308,7 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
                 match enclave_os_enclave::ocall::net_tcp_accept(listener_fd) {
                     Ok(pair) => pair,
                     Err(_) => {
-                        results[0] = error_code_result(0);
+                        results[0] = error_code_result("unknown");
                         return Ok(());
                     }
                 };
@@ -354,9 +362,10 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
     inst.func_new(
         "[method]tcp-socket.shutdown",
         |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let sock_rep = io_rep(&params[0])?;
+            let sock_rep = io_rep(&params[0], store.as_context_mut())?;
             if let Some(sock) = store.data_mut().tcp_sockets.get_mut(&sock_rep) {
                 if let Some(fd) = sock.fd.take() {
                     enclave_os_enclave::ocall::net_close(fd);
@@ -372,10 +381,11 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
     // func(self) -> result<ip-socket-address, error-code>
     inst.func_new(
         "[method]tcp-socket.local-address",
-        |store: StoreContextMut<'_, AppContext>,
+        |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let sock_rep = io_rep(&params[0])?;
+            let sock_rep = io_rep(&params[0], store.as_context_mut())?;
             let port = store
                 .data()
                 .tcp_sockets
@@ -391,10 +401,11 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
     // ── remote-address ─────────────────────────────────────────────
     inst.func_new(
         "[method]tcp-socket.remote-address",
-        |store: StoreContextMut<'_, AppContext>,
+        |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let sock_rep = io_rep(&params[0])?;
+            let sock_rep = io_rep(&params[0], store.as_context_mut())?;
             let port = store
                 .data()
                 .tcp_sockets
@@ -441,13 +452,14 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
         inst.func_new(
             &name,
             |_store: StoreContextMut<'_, AppContext>,
+             _func_type: wasmtime::component::types::ComponentFunc,
              _params: &[Val],
              results: &mut [Val]| {
                 // Return a reasonable default or ok(()).
                 // Most of these return result<T, error-code>.
                 if !results.is_empty() {
                     results[0] = Val::Result(Err(Some(Box::new(
-                        Val::Enum(0), // error-code::unknown
+                        Val::Enum("unknown".to_string()), // error-code::unknown
                     ))));
                 }
                 Ok(())
@@ -476,19 +488,22 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
 // =========================================================================
 
 /// Extract resource rep from a Val.
-fn io_rep(val: &Val) -> Result<u32, wasmtime::Error> {
+fn io_rep(val: &Val, store: impl wasmtime::AsContextMut) -> Result<u32, wasmtime::Error> {
     match val {
-        Val::Resource(any) => Ok(any.rep()),
+        Val::Resource(any) => {
+            let dyn_res = wasmtime::component::ResourceDynamic::try_from_resource_any(*any, store)?;
+            Ok(dyn_res.rep())
+        }
         _ => Err(wasmtime::Error::msg("expected resource")),
     }
 }
 
 /// Build a `result<_, error-code>` error value.
 ///
-/// `error-code` is an enum with many cases; the discriminant maps to
-/// the case index (0 = unknown, 7 = address-in-use, 13 = connection-refused, etc.).
-fn error_code_result(code: u32) -> Val {
-    Val::Result(Err(Some(Box::new(Val::Enum(code)))))
+/// `error-code` is an enum with many cases; the name maps to
+/// the case (e.g. "unknown", "address-in-use", "connection-refused", etc.).
+fn error_code_result(name: &str) -> Val {
+    Val::Result(Err(Some(Box::new(Val::Enum(name.to_string())))))
 }
 
 /// Extract port from a `Val` representing `ip-socket-address`.
@@ -502,7 +517,7 @@ fn extract_port_from_address(val: &Val) -> u16 {
     if let Val::Variant(_disc, Some(inner)) = val {
         if let Val::Record(fields) = inner.as_ref() {
             for (name, field_val) in fields.iter() {
-                if name.as_ref() == "port" {
+                if name.as_str() == "port" {
                     if let Val::U16(p) = field_val {
                         return *p;
                     }
@@ -521,13 +536,13 @@ fn extract_host_port_from_address(val: &Val) -> (String, u16) {
     if let Val::Variant(disc, Some(inner)) = val {
         if let Val::Record(fields) = inner.as_ref() {
             for (name, field_val) in fields.iter() {
-                if name.as_ref() == "port" {
+                if name.as_str() == "port" {
                     if let Val::U16(p) = field_val {
                         port = *p;
                     }
                 }
-                if name.as_ref() == "address" {
-                    if *disc == 0 {
+                if name.as_str() == "address" {
+                    if disc == "ipv4" {
                         // ipv4 — tuple<u8,u8,u8,u8>
                         if let Val::Tuple(parts) = field_val {
                             let octets: Vec<u8> = parts
@@ -555,9 +570,9 @@ fn extract_host_port_from_address(val: &Val) -> (String, u16) {
 
 /// Construct an `ip-socket-address` variant for ipv4.
 fn make_ipv4_address(a: u8, b: u8, c: u8, d: u8, port: u16) -> Val {
-    // variant case 0 = ipv4
+    // variant case "ipv4"
     Val::Variant(
-        0,
+        "ipv4".to_string(),
         Some(Box::new(Val::Record(
             vec![
                 (

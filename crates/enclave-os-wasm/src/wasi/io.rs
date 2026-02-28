@@ -15,7 +15,7 @@
 //!   streams backed by AppContext I/O buffers, sockets, or the KV store.
 
 use wasmtime::component::{Linker, Resource, ResourceType};
-use wasmtime::StoreContextMut;
+use wasmtime::{AsContextMut, StoreContextMut};
 
 use super::{
     AppContext, InputStreamRes, IoErrorRes, OutputStreamKind,
@@ -138,10 +138,11 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
     inst.func_new(
         "[method]input-stream.read",
         |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            let rep = resource_rep(&params[0])?;
+            let rep = resource_rep(&params[0], store.as_context_mut())?;
             let len = val_u64(&params[1])? as usize;
 
             let data = store.data_mut().read_stream(rep, len);
@@ -152,13 +153,13 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
                 }
                 Err("closed") => {
                     results[0] = Val::Result(Err(Some(Box::new(
-                        Val::Variant(1, None), // stream-error::closed
+                        Val::Variant("closed".to_string(), None), // stream-error::closed
                     ))));
                 }
                 Err(_) => {
                     // last-operation-failed — we skip the error resource for simplicity
                     results[0] = Val::Result(Err(Some(Box::new(
-                        Val::Variant(1, None), // fallback to closed
+                        Val::Variant("closed".to_string(), None), // fallback to closed
                     ))));
                 }
             }
@@ -170,10 +171,11 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
     inst.func_new(
         "[method]input-stream.blocking-read",
         |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            let rep = resource_rep(&params[0])?;
+            let rep = resource_rep(&params[0], store.as_context_mut())?;
             let len = val_u64(&params[1])? as usize;
 
             match store.data_mut().read_stream(rep, len) {
@@ -182,7 +184,7 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
                     results[0] = Val::Result(Ok(Some(Box::new(Val::List(list.into())))));
                 }
                 Err(_) => {
-                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant(1, None)))));
+                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
                 }
             }
             Ok(())
@@ -193,10 +195,11 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
     inst.func_new(
         "[method]input-stream.skip",
         |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            let rep = resource_rep(&params[0])?;
+            let rep = resource_rep(&params[0], store.as_context_mut())?;
             let len = val_u64(&params[1])? as usize;
 
             match store.data_mut().read_stream(rep, len) {
@@ -205,7 +208,7 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
                         Val::Result(Ok(Some(Box::new(Val::U64(bytes.len() as u64)))));
                 }
                 Err(_) => {
-                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant(1, None)))));
+                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
                 }
             }
             Ok(())
@@ -216,10 +219,11 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
     inst.func_new(
         "[method]input-stream.blocking-skip",
         |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            let rep = resource_rep(&params[0])?;
+            let rep = resource_rep(&params[0], store.as_context_mut())?;
             let len = val_u64(&params[1])? as usize;
 
             match store.data_mut().read_stream(rep, len) {
@@ -228,7 +232,7 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
                         Val::Result(Ok(Some(Box::new(Val::U64(bytes.len() as u64)))));
                 }
                 Err(_) => {
-                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant(1, None)))));
+                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
                 }
             }
             Ok(())
@@ -252,17 +256,18 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
     // [method]output-stream.check-write: func() -> result<u64, stream-error>
     inst.func_new(
         "[method]output-stream.check-write",
-        |store: StoreContextMut<'_, AppContext>,
+        |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            let rep = resource_rep(&params[0])?;
+            let rep = resource_rep(&params[0], store.as_context_mut())?;
 
             if store.data().output_streams.contains_key(&rep) {
                 // Report 64 KiB writable (generous buffer).
                 results[0] = Val::Result(Ok(Some(Box::new(Val::U64(65536)))));
             } else {
-                results[0] = Val::Result(Err(Some(Box::new(Val::Variant(1, None)))));
+                results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
             }
             Ok(())
         },
@@ -272,10 +277,11 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
     inst.func_new(
         "[method]output-stream.write",
         |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            let rep = resource_rep(&params[0])?;
+            let rep = resource_rep(&params[0], store.as_context_mut())?;
             let data = val_list_u8(&params[1])?;
 
             match store.data_mut().write_stream(rep, &data) {
@@ -283,7 +289,7 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
                     results[0] = Val::Result(Ok(None)); // result<_, _>::ok(())
                 }
                 Err(_) => {
-                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant(1, None)))));
+                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
                 }
             }
             Ok(())
@@ -294,10 +300,11 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
     inst.func_new(
         "[method]output-stream.blocking-write-and-flush",
         |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            let rep = resource_rep(&params[0])?;
+            let rep = resource_rep(&params[0], store.as_context_mut())?;
             let data = val_list_u8(&params[1])?;
 
             match store.data_mut().write_stream(rep, &data) {
@@ -305,7 +312,7 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
                     results[0] = Val::Result(Ok(None));
                 }
                 Err(_) => {
-                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant(1, None)))));
+                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
                 }
             }
             Ok(())
@@ -315,10 +322,11 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
     // [method]output-stream.flush: func() -> result<_, stream-error>
     inst.func_new(
         "[method]output-stream.flush",
-        |_store: StoreContextMut<'_, AppContext>,
+        |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
-            let _rep = resource_rep(&params[0])?;
+            let _rep = resource_rep(&params[0], store.as_context_mut())?;
             // Flush is a no-op for memory buffers and OCALLs (already delivered).
             results[0] = wasmtime::component::Val::Result(Ok(None));
             Ok(())
@@ -328,10 +336,11 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
     // [method]output-stream.blocking-flush: func() -> result<_, stream-error>
     inst.func_new(
         "[method]output-stream.blocking-flush",
-        |_store: StoreContextMut<'_, AppContext>,
+        |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
-            let _rep = resource_rep(&params[0])?;
+            let _rep = resource_rep(&params[0], store.as_context_mut())?;
             results[0] = wasmtime::component::Val::Result(Ok(None));
             Ok(())
         },
@@ -351,17 +360,18 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
     inst.func_new(
         "[method]output-stream.write-zeroes",
         |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            let rep = resource_rep(&params[0])?;
+            let rep = resource_rep(&params[0], store.as_context_mut())?;
             let len = val_u64(&params[1])? as usize;
             let zeroes = vec![0u8; len.min(65536)];
 
             match store.data_mut().write_stream(rep, &zeroes) {
                 Ok(()) => results[0] = Val::Result(Ok(None)),
                 Err(_) => {
-                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant(1, None)))));
+                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
                 }
             }
             Ok(())
@@ -372,17 +382,18 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
     inst.func_new(
         "[method]output-stream.blocking-write-zeroes-and-flush",
         |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            let rep = resource_rep(&params[0])?;
+            let rep = resource_rep(&params[0], store.as_context_mut())?;
             let len = val_u64(&params[1])? as usize;
             let zeroes = vec![0u8; len.min(65536)];
 
             match store.data_mut().write_stream(rep, &zeroes) {
                 Ok(()) => results[0] = Val::Result(Ok(None)),
                 Err(_) => {
-                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant(1, None)))));
+                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
                 }
             }
             Ok(())
@@ -393,18 +404,19 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
     inst.func_new(
         "[method]output-stream.splice",
         |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            let out_rep = resource_rep(&params[0])?;
-            let in_rep = resource_rep(&params[1])?;
+            let out_rep = resource_rep(&params[0], store.as_context_mut())?;
+            let in_rep = resource_rep(&params[1], store.as_context_mut())?;
             let len = val_u64(&params[2])? as usize;
 
             // Read from input, write to output
             let data = match store.data_mut().read_stream(in_rep, len) {
                 Ok(d) => d,
                 Err(_) => {
-                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant(1, None)))));
+                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
                     return Ok(());
                 }
             };
@@ -415,7 +427,7 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
                         Val::Result(Ok(Some(Box::new(Val::U64(written as u64)))));
                 }
                 Err(_) => {
-                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant(1, None)))));
+                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
                 }
             }
             Ok(())
@@ -426,17 +438,18 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
     inst.func_new(
         "[method]output-stream.blocking-splice",
         |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            let out_rep = resource_rep(&params[0])?;
-            let in_rep = resource_rep(&params[1])?;
+            let out_rep = resource_rep(&params[0], store.as_context_mut())?;
+            let in_rep = resource_rep(&params[1], store.as_context_mut())?;
             let len = val_u64(&params[2])? as usize;
 
             let data = match store.data_mut().read_stream(in_rep, len) {
                 Ok(d) => d,
                 Err(_) => {
-                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant(1, None)))));
+                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
                     return Ok(());
                 }
             };
@@ -447,7 +460,7 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
                         Val::Result(Ok(Some(Box::new(Val::U64(written as u64)))));
                 }
                 Err(_) => {
-                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant(1, None)))));
+                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
                 }
             }
             Ok(())
@@ -474,9 +487,12 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
 // =========================================================================
 
 /// Extract the resource representation (u32) from a `Val::Resource`.
-fn resource_rep(val: &wasmtime::component::Val) -> Result<u32, wasmtime::Error> {
+fn resource_rep(val: &wasmtime::component::Val, store: impl wasmtime::AsContextMut) -> Result<u32, wasmtime::Error> {
     match val {
-        wasmtime::component::Val::Resource(any) => Ok(any.rep()),
+        wasmtime::component::Val::Resource(any) => {
+            let dyn_res = wasmtime::component::ResourceDynamic::try_from_resource_any(*any, store)?;
+            Ok(dyn_res.rep())
+        }
         _ => Err(wasmtime::Error::msg("expected resource value")),
     }
 }

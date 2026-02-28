@@ -180,6 +180,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     inst.func_new(
         "generate-symmetric-key",
         |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
             let name = val_to_string(&params[0]);
@@ -216,12 +217,12 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     inst.func_new(
         "generate-signing-key",
         |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
             let name = val_to_string(&params[0]);
             let algo = match &params[1] {
                 Val::U32(v) => *v,
-                Val::Enum(v) => *v,
                 _ => {
                     results[0] = err_result("invalid algorithm parameter");
                     return Ok(());
@@ -270,12 +271,12 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     inst.func_new(
         "generate-hmac-key",
         |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
             let name = val_to_string(&params[0]);
             let algo = match &params[1] {
                 Val::U32(v) => *v,
-                Val::Enum(v) => *v,
                 _ => {
                     results[0] = err_result("invalid algorithm parameter");
                     return Ok(());
@@ -321,6 +322,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     inst.func_new(
         "import-symmetric-key",
         |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
             let name = val_to_string(&params[0]);
@@ -349,8 +351,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     // func(key-name: string) -> result<list<u8>, string>
     inst.func_new(
         "export-public-key",
-        |store: StoreContextMut<'_, AppContext>,
-         params: &[Val],
+        |store: StoreContextMut<'_, AppContext>,         _func_type: wasmtime::component::types::ComponentFunc,         params: &[Val],
          results: &mut [Val]| {
             let name = val_to_string(&params[0]);
 
@@ -391,6 +392,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     inst.func_new(
         "delete-key",
         |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
             let name = val_to_string(&params[0]);
@@ -407,8 +409,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     // func(key-name: string) -> result<bool, string>
     inst.func_new(
         "key-exists",
-        |store: StoreContextMut<'_, AppContext>,
-         params: &[Val],
+        |store: StoreContextMut<'_, AppContext>,         _func_type: wasmtime::component::types::ComponentFunc,         params: &[Val],
          results: &mut [Val]| {
             let name = val_to_string(&params[0]);
             let exists = store.data().keystore.exists(&name);
@@ -424,8 +425,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     // ciphertext in the host KV store under the app's namespace.
     inst.func_new(
         "persist-key",
-        |store: StoreContextMut<'_, AppContext>,
-         params: &[Val],
+        |store: StoreContextMut<'_, AppContext>,         _func_type: wasmtime::component::types::ComponentFunc,         params: &[Val],
          results: &mut [Val]| {
             let name = val_to_string(&params[0]);
 
@@ -460,6 +460,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     inst.func_new(
         "load-key",
         |mut store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
             let name = val_to_string(&params[0]);

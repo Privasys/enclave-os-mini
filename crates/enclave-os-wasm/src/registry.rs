@@ -431,13 +431,13 @@ fn param_to_val(p: &WasmParam) -> Val {
         WasmParam::S64(v) => Val::S64(*v),
         WasmParam::U32(v) => Val::U32(*v),
         WasmParam::U64(v) => Val::U64(*v),
-        WasmParam::F32(v) => Val::Float32(v.to_bits()),
-        WasmParam::F64(v) => Val::Float64(v.to_bits()),
+        WasmParam::F32(v) => Val::Float32(*v),
+        WasmParam::F64(v) => Val::Float64(*v),
         WasmParam::String(v) => Val::String(v.clone().into()),
         WasmParam::Bytes(v) => {
             // Component model doesn't have a native "bytes" type;
             // map to list<u8>.
-            Val::List(v.iter().map(|&b| Val::U8(b)).collect())
+            Val::List(v.iter().map(|&b| Val::U8(b)).collect::<Vec<_>>().into())
         }
     }
 }
@@ -454,8 +454,8 @@ fn val_to_wasm_value(v: &Val) -> WasmValue {
         Val::U32(n) => WasmValue::U32(*n),
         Val::S64(n) => WasmValue::S64(*n),
         Val::U64(n) => WasmValue::U64(*n),
-        Val::Float32(bits) => WasmValue::F32(f32::from_bits(*bits)),
-        Val::Float64(bits) => WasmValue::F64(f64::from_bits(*bits)),
+        Val::Float32(v) => WasmValue::F32(*v),
+        Val::Float64(v) => WasmValue::F64(*v),
         Val::String(s) => WasmValue::String(s.to_string()),
         Val::List(items) => {
             // Heuristic: if all items are U8, marshal as Bytes.

@@ -4,15 +4,25 @@
 # enclave/CMakeLists.txt
 # Build the enclave crate → link enclave.so → sign it.
 #
-# The enclave-os-enclave crate (this directory) provides the default
-# ecall_run with the HelloWorld module. Adopters who need additional
-# modules (e.g. WASM) create a separate project with a custom ecall_run
-# and point CMake at it instead.
+# By default this builds enclave-os-enclave (HelloWorld only).
+# Set -DENABLE_WASM=ON to build the wasm-enclave composition crate
+# which registers the WASM runtime module alongside HelloWorld.
 
 # -- Step 2: Build enclave crate (staticlib) --
-rust_build_enclave("${CMAKE_CURRENT_SOURCE_DIR}" enclave_os_enclave)
-add_dependencies(enclave_os_enclave sgx_sysroot)
-set(ENCLAVE_STATIC_LIB "${enclave_os_enclave_STATIC_LIB}")
+option(ENABLE_WASM "Build with WASM runtime module (examples/wasm-enclave)" OFF)
+
+if(ENABLE_WASM)
+    set(_ENCLAVE_CRATE_DIR "${CMAKE_SOURCE_DIR}/examples/wasm-enclave")
+    set(_ENCLAVE_CRATE_NAME "enclave_os_wasm_app")
+    message(STATUS "WASM runtime enabled — building ${_ENCLAVE_CRATE_DIR}")
+else()
+    set(_ENCLAVE_CRATE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    set(_ENCLAVE_CRATE_NAME "enclave_os_enclave")
+endif()
+
+rust_build_enclave("${_ENCLAVE_CRATE_DIR}" ${_ENCLAVE_CRATE_NAME})
+add_dependencies(${_ENCLAVE_CRATE_NAME} sgx_sysroot)
+set(ENCLAVE_STATIC_LIB "${${_ENCLAVE_CRATE_NAME}_STATIC_LIB}")
 
 # -- Step 3+4: EDL stubs are built in edl/ --
 # EDL_TRUSTED_OBJ is set by edl/CMakeLists.txt
@@ -32,7 +42,7 @@ sgx_link_enclave(
 add_custom_target(enclave_so ALL
     DEPENDS "${ENCLAVE_SO}"
 )
-add_dependencies(enclave_so enclave_os_enclave edl_trusted_obj)
+add_dependencies(enclave_so ${_ENCLAVE_CRATE_NAME} edl_trusted_obj)
 
 # -- Step 6: Sign enclave --
 # Pick debug vs release enclave config

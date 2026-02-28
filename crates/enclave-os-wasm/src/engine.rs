@@ -71,15 +71,15 @@ impl WasmEngine {
         // SGX Enclave Page Cache (EPC) is limited.  Conservative defaults
         // prevent a single WASM app from exhausting enclave memory.
         //
-        // static_memory_maximum_size:
+        // memory_reservation:
         //   Max size of a single linear memory.  4 MiB is generous for
         //   most apps and avoids over-committing EPC.
-        config.static_memory_maximum_size(4 * 1024 * 1024);
+        config.memory_reservation(4 * 1024 * 1024);
 
-        // static_memory_guard_size:
+        // memory_guard_size:
         //   Guard pages after each memory.  Reduced from the default 2 GiB
         //   because SGX doesn't have virtual memory overcommit.
-        config.static_memory_guard_size(64 * 1024);
+        config.memory_guard_size(64 * 1024);
 
         // ── No CoW / no disk-backed images ─────────────────────────
         config.memory_init_cow(false);

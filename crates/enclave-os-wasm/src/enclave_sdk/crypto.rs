@@ -45,11 +45,11 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     inst.func_new(
         "digest",
         |_store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
             let algo = match &params[0] {
                 Val::U32(v) => *v,
-                Val::Enum(v) => *v,
                 _ => {
                     results[0] = err_result("invalid algorithm parameter");
                     return Ok(());
@@ -79,6 +79,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     inst.func_new(
         "encrypt",
         |store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
             let key_name = val_to_string(&params[0]);
@@ -131,6 +132,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     inst.func_new(
         "decrypt",
         |store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
             let key_name = val_to_string(&params[0]);
@@ -184,12 +186,12 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     inst.func_new(
         "sign",
         |store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
             let key_name = val_to_string(&params[0]);
             let algo = match &params[1] {
                 Val::U32(v) => *v,
-                Val::Enum(v) => *v,
                 _ => {
                     results[0] = err_result("invalid algorithm parameter");
                     return Ok(());
@@ -241,12 +243,12 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     inst.func_new(
         "verify",
         |store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
             let key_name = val_to_string(&params[0]);
             let algo = match &params[1] {
                 Val::U32(v) => *v,
-                Val::Enum(v) => *v,
                 _ => {
                     results[0] = err_result("invalid algorithm parameter");
                     return Ok(());
@@ -308,12 +310,12 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     inst.func_new(
         "hmac-sign",
         |store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
             let key_name = val_to_string(&params[0]);
             let algo = match &params[1] {
                 Val::U32(v) => *v,
-                Val::Enum(v) => *v,
                 _ => {
                     results[0] = err_result("invalid algorithm parameter");
                     return Ok(());
@@ -352,12 +354,12 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     inst.func_new(
         "hmac-verify",
         |store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
             let key_name = val_to_string(&params[0]);
             let algo = match &params[1] {
                 Val::U32(v) => *v,
-                Val::Enum(v) => *v,
                 _ => {
                     results[0] = err_result("invalid algorithm parameter");
                     return Ok(());
@@ -396,6 +398,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     inst.func_new(
         "get-random-bytes",
         |_store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
             let len = match &params[0] {

@@ -47,11 +47,11 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     inst.func_new(
         "fetch",
         |_store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
             let method = match &params[0] {
                 Val::U32(v) => *v,
-                Val::Enum(v) => *v,
                 _ => {
                     results[0] = err_result("invalid method parameter");
                     return Ok(());

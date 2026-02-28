@@ -124,6 +124,7 @@ fn add_wall_clock(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error
     inst.func_new(
         "now",
         |_store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          _params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
@@ -144,6 +145,7 @@ fn add_wall_clock(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error
     inst.func_new(
         "resolution",
         |_store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          _params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
@@ -327,6 +329,7 @@ fn add_cli_exit(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> 
     inst.func_new(
         "exit",
         |_store: StoreContextMut<'_, AppContext>,
+         _func_type: wasmtime::component::types::ComponentFunc,
          _params: &[wasmtime::component::Val],
          _results: &mut [wasmtime::component::Val]| {
             // Trap the WASM execution — the enclave manages its own lifecycle.
