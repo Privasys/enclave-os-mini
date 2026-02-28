@@ -97,9 +97,9 @@ impl RaTlsServer {
         // Process existing sessions
         let mut to_remove = Vec::new();
         for (&fd, session) in self.sessions.iter_mut() {
-            match session.read() {
-                Ok(data) if data.is_empty() => { /* no data yet */ }
-                Ok(data) => match handle_request(&data) {
+            match session.recv_frame() {
+                Ok(None) => { /* incomplete frame or no data yet */ }
+                Ok(Some(payload)) => match handle_frame(&payload) {
                     HandleResult::Response(resp) => {
                         if let Err(e) = session.send_frame(&resp) {
                             enclave_log_error!(
@@ -363,34 +363,32 @@ enum HandleResult {
     Close,
 }
 
-/// Handle an incoming request from a client.
-fn handle_request(data: &[u8]) -> HandleResult {
+/// Handle a complete, already-decoded frame payload from a client.
+fn handle_frame(payload: &[u8]) -> HandleResult {
     use enclave_os_common::protocol::{Request, Response};
     use crate::modules;
-    match enclave_os_common::protocol::decode_frame(data) {
-        Some((payload, _consumed)) => {
-            match serde_json::from_slice::<Request>(&payload) {
-                Ok(Request::Ping) => {
-                    let resp = serde_json::to_vec(&Response::Pong).unwrap_or_default();
-                    HandleResult::Response(resp)
-                }
-                Ok(Request::Shutdown) => HandleResult::Shutdown,
-                Ok(req) => {
-                    // Try all registered modules first
-                    if let Some(resp) = modules::dispatch(&req) {
-                        HandleResult::Response(serde_json::to_vec(&resp).unwrap_or_default())
-                    } else if let Request::Data(payload) = req {
-                        // Fallback: echo Data back if no module handled it
-                        let resp = serde_json::to_vec(&Response::Data(payload)).unwrap_or_default();
-                        HandleResult::Response(resp)
-                    } else {
-                        let err = Response::Error(b"unhandled request".to_vec());
-                        HandleResult::Response(serde_json::to_vec(&err).unwrap_or_default())
-                    }
-                }
-                Err(_) => HandleResult::Response(data.to_vec()),
+    match serde_json::from_slice::<Request>(payload) {
+        Ok(Request::Ping) => {
+            let resp = serde_json::to_vec(&Response::Pong).unwrap_or_default();
+            HandleResult::Response(resp)
+        }
+        Ok(Request::Shutdown) => HandleResult::Shutdown,
+        Ok(req) => {
+            // Try all registered modules first
+            if let Some(resp) = modules::dispatch(&req) {
+                HandleResult::Response(serde_json::to_vec(&resp).unwrap_or_default())
+            } else if let Request::Data(payload) = req {
+                // Fallback: echo Data back if no module handled it
+                let resp = serde_json::to_vec(&Response::Data(payload)).unwrap_or_default();
+                HandleResult::Response(resp)
+            } else {
+                let err = Response::Error(b"unhandled request".to_vec());
+                HandleResult::Response(serde_json::to_vec(&err).unwrap_or_default())
             }
         }
-        None => HandleResult::Response(data.to_vec()),
+        Err(_) => {
+            let err = Response::Error(b"invalid JSON request".to_vec());
+            HandleResult::Response(serde_json::to_vec(&err).unwrap_or_default())
+        }
     }
 }
