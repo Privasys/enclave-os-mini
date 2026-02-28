@@ -82,6 +82,18 @@ pub struct WasmLoad {
     /// the app's config Merkle root and any declared OID extensions.
     #[serde(default)]
     pub hostname: Option<String>,
+    /// Bring-Your-Own-Key: hex-encoded 32-byte AES-256 encryption key
+    /// for this app's KV store data.
+    ///
+    /// If absent, a random key is generated inside the enclave via
+    /// RDRAND. The generated key exists only in enclave memory and is
+    /// destroyed when the app is unloaded — making any on-disk data
+    /// permanently unrecoverable.
+    ///
+    /// If present, the caller supplies the key so the same data can be
+    /// read across app reloads.
+    #[serde(default)]
+    pub encryption_key: Option<String>,
 }
 
 /// Unload a WASM app by name.
@@ -256,6 +268,11 @@ pub struct AppInfo {
     pub hostname: String,
     /// SHA-256 of the WASM component bytecode (hex-encoded).
     pub code_hash: String,
+    /// How the app's KV store encryption key was provisioned.
+    ///
+    /// - `"byok"`: Bring-Your-Own-Key — caller supplied the key.
+    /// - `"generated"`: Key was generated inside the enclave via RDRAND.
+    pub key_source: String,
     /// Exported function signatures discovered from the component.
     pub exports: Vec<ExportedFunc>,
 }

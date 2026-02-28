@@ -258,7 +258,7 @@ The protocol uses a `WasmEnvelope` JSON payload inside the core
 
 | Command | Envelope field | Payload | Response |
 |---------|---------------|---------|----------|
-| **Load app** | `wasm_load` | `{ name, bytes, hostname? }` | `WasmManagementResult::Loaded { app }` |
+| **Load app** | `wasm_load` | `{ name, bytes, hostname?, encryption_key? }` | `WasmManagementResult::Loaded { app }` |
 | **Unload app** | `wasm_unload` | `{ name }` | `Unloaded { name }` or `NotFound { name }` |
 | **List apps** | `wasm_list` | `{}` | `Apps { apps: [...] }` |
 | **Call function** | `wasm_call` | `{ app, function, params }` | `WasmResult { values }` or `{ error }` |
@@ -269,18 +269,46 @@ Only one field should be set per envelope. The module dispatches in order:
 ### Example: load and call
 
 ```json
-// 1. Upload the WASM component (with optional SNI hostname)
+// 1. Upload the WASM component (with optional SNI hostname and BYOK key)
 {"wasm_load": {"name": "my-app", "hostname": "my-app.enclave.local", "bytes": [0, 97, 115, 109, ...]}}
+
+// Or with Bring-Your-Own-Key (hex-encoded 32-byte AES-256 key):
+{"wasm_load": {"name": "my-app", "hostname": "my-app.enclave.local", "bytes": [...], "encryption_key": "a1b2c3...64hex..."}}
 
 // 2. Call a function
 {"wasm_call": {"app": "my-app", "function": "hello", "params": [{"type": "string", "value": "world"}]}}
 
-// 3. List loaded apps
+// 3. List loaded apps (response includes key_source: "byok" or "generated")
 {"wasm_list": {}}
 
-// 4. Unload when done
+// 4. Unload when done (destroys per-app encryption key — on-disk data becomes unrecoverable)
 {"wasm_unload": {"name": "my-app"}}
 ```
+
+### Per-app KV store encryption
+
+Each loaded app gets its own AES-256-GCM encryption key for KV store
+data, providing cryptographic isolation between apps:
+
+- **Generated key** (default): A 32-byte key is generated inside the
+  enclave via RDRAND (`ring::rand::SystemRandom`). The key exists only
+  in enclave memory and is destroyed when the app is unloaded — making
+  any on-disk data permanently unrecoverable.
+- **BYOK** (Bring-Your-Own-Key): The caller supplies a hex-encoded
+  32-byte key in the `encryption_key` field of `wasm_load`. This allows
+  the same data to be read across app reloads.
+
+The key source (`"byok"` or `"generated"`) is:
+- Included in the app's `AppInfo` response (`key_source` field)
+- Attested as a config Merkle leaf (`wasm.<name>.key_source`)
+- Part of the per-app X.509 certificate's config Merkle root
+
+This design ensures:
+1. Apps cannot read each other's encrypted data
+2. Unloading an app with a generated key permanently destroys access
+3. The encryption key never leaves the enclave
+4. Clients can verify via attestation whether BYOK or enclave-generated
+   keys are in use
 
 ### Attestation
 
@@ -288,6 +316,10 @@ Each loaded app's SHA-256 code hash is automatically included in subsequent
 RA-TLS certificate renewals (combined hash OID `1.3.6.1.4.1.65230.2.3`).
 Clients can verify exactly which WASM code is running without trusting the
 operator.
+
+Each app also contributes a `key_source` Merkle leaf
+(`wasm.<name>.key_source`) indicating whether the KV encryption key was
+BYOK-supplied or enclave-generated.
 
 ### Per-app X.509 certificates
 
@@ -298,8 +330,12 @@ routing. When a client connects with a hostname matching a loaded app's
 | Extension | OID | Content |
 |-----------|-----|---------|
 | SGX Quote | `1.2.840.113741.1.13.1.0` | SGX DCAP quote proving enclave genuineness |
-| Per-app Config Merkle Root | `1.3.6.1.4.1.65230.3.1` | SHA-256 root of the app's config entries |
+| Per-app Config Merkle Root | `1.3.6.1.4.1.65230.3.1` | SHA-256 root of the app's config entries (code hash + key source) |
 | Per-app Code Hash | `1.3.6.1.4.1.65230.3.2` | SHA-256 of the WASM component bytecode |
+
+The per-app config Merkle tree includes these leaves:
+- `wasm.<name>.code_hash` — SHA-256 of the WASM bytecode
+- `wasm.<name>.key_source` — `"byok"` or `"generated"`
 
 If no SNI match is found, the default enclave-wide certificate is used
 (containing the enclave-wide Merkle root + module OIDs).

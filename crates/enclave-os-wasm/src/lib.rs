@@ -80,7 +80,7 @@ use std::vec::Vec;
 use ring::digest;
 use enclave_os_common::protocol::{Request, Response};
 use enclave_os_enclave::config_merkle::ConfigLeaf;
-use enclave_os_enclave::ecall::hex_encode;
+use enclave_os_enclave::ecall::{hex_decode, hex_encode};
 use enclave_os_enclave::modules::{AppIdentity, ConfigEntry, EnclaveModule, ModuleOid};
 use enclave_os_enclave::ratls::cert_store;
 use enclave_os_common::types::AEAD_KEY_SIZE;
@@ -110,15 +110,14 @@ pub struct WasmModule {
 impl WasmModule {
     /// Create a new WASM module.
     ///
-    /// Takes the enclave-wide master encryption key from [`SealedConfig`].
     /// Initialises wasmtime with SGX-appropriate settings and WASI
     /// host function bindings.
     ///
     /// Call [`load_app()`](Self::load_app) to add WASM apps before
     /// the enclave enters its event loop.
-    pub fn new(master_key: [u8; AEAD_KEY_SIZE]) -> Result<Self, String> {
+    pub fn new() -> Result<Self, String> {
         let engine = crate::engine::WasmEngine::new()?;
-        let registry = AppRegistry::new(engine, master_key);
+        let registry = AppRegistry::new(engine);
         Ok(Self {
             registry: Mutex::new(registry),
         })
@@ -133,21 +132,33 @@ impl WasmModule {
     /// A per-app X.509 certificate identity is registered with the
     /// global [`CertStore`](cert_store::CertStore) so that clients
     /// connecting via the `hostname` SNI receive an app-specific cert.
-    pub fn load_app(&self, name: &str, hostname: &str, wasm_bytes: &[u8]) -> Result<(), String> {
-        // Load into the registry (compile + introspect)
-        let code_hash = {
+    ///
+    /// Each app gets its own AES-256 encryption key for KV store data.
+    /// If `encryption_key` is `Some`, the caller supplies the key
+    /// (BYOK). Otherwise a random key is generated inside the enclave.
+    pub fn load_app(
+        &self,
+        name: &str,
+        hostname: &str,
+        wasm_bytes: &[u8],
+        encryption_key: Option<[u8; AEAD_KEY_SIZE]>,
+    ) -> Result<(), String> {
+        // Load into the registry (compile + introspect + per-app key)
+        let (code_hash, byok) = {
             let mut reg = self.registry
                 .lock()
                 .map_err(|_| String::from("registry lock poisoned"))?;
-            reg.load_app(name, hostname, wasm_bytes)?;
+            reg.load_app(name, hostname, wasm_bytes, encryption_key)?;
 
-            // Copy code hash while we hold the lock
-            reg.app_code_hash(name)
+            let hash = reg.app_code_hash(name)
                 .copied()
-                .ok_or_else(|| String::from("app loaded but hash not found"))?
+                .ok_or_else(|| String::from("app loaded but hash not found"))?;
+            let byok = reg.app_byok(name).unwrap_or(false);
+            (hash, byok)
         };
 
         // Register per-app identity with the global CertStore
+        let key_source_str = if byok { "byok" } else { "generated" };
         let identity = AppIdentity {
             hostname: hostname.to_string(),
             config: vec![
@@ -155,6 +166,11 @@ impl WasmModule {
                     key: format!("wasm.{}.code_hash", name),
                     value: code_hash.to_vec(),
                     oid: Some(enclave_os_common::oids::APP_CODE_HASH_OID),
+                },
+                ConfigEntry {
+                    key: format!("wasm.{}.key_source", name),
+                    value: key_source_str.as_bytes().to_vec(),
+                    oid: None,
                 },
             ],
         };
@@ -268,7 +284,37 @@ impl EnclaveModule for WasmModule {
         // 2. wasm_load — load (or replace) an app
         if let Some(load) = envelope.wasm_load {
             let hostname = load.hostname.unwrap_or_else(|| load.name.clone());
-            let mgmt_result = match self.load_app(&load.name, &hostname, &load.bytes) {
+
+            // Decode optional BYOK encryption key (hex → [u8; 32])
+            let encryption_key = match load.encryption_key {
+                Some(hex) => {
+                    let bytes = match hex_decode(&hex) {
+                        Some(b) => b,
+                        None => {
+                            let mgmt_result = WasmManagementResult::Error {
+                                message: String::from("encryption_key: invalid hex encoding"),
+                            };
+                            return Some(Response::Data(serialize_or_error(&mgmt_result)));
+                        }
+                    };
+                    if bytes.len() != AEAD_KEY_SIZE {
+                        let mgmt_result = WasmManagementResult::Error {
+                            message: format!(
+                                "encryption_key: expected {} bytes, got {}",
+                                AEAD_KEY_SIZE,
+                                bytes.len(),
+                            ),
+                        };
+                        return Some(Response::Data(serialize_or_error(&mgmt_result)));
+                    }
+                    let mut key = [0u8; AEAD_KEY_SIZE];
+                    key.copy_from_slice(&bytes);
+                    Some(key)
+                }
+                None => None,
+            };
+
+            let mgmt_result = match self.load_app(&load.name, &hostname, &load.bytes, encryption_key) {
                 Ok(()) => {
                     // Return the loaded app's info
                     let apps = self.list_apps();
@@ -305,24 +351,26 @@ impl EnclaveModule for WasmModule {
         None
     }
 
-    /// Config Merkle leaves for attestation.
-    ///
-    /// Each loaded app contributes a leaf:
-    ///   `wasm.<app_name>.code_hash` = SHA-256 of the WASM bytecode
+    /// Config Merkle leaves for attestation.\n    ///\n    /// Each loaded app contributes two leaves:\n    ///   - `wasm.<app_name>.code_hash` = SHA-256 of the WASM bytecode\n    ///   - `wasm.<app_name>.key_source` = `\"byok\"` or `\"generated\"`
     fn config_leaves(&self) -> Vec<ConfigLeaf> {
         let registry = match self.registry.lock() {
             Ok(r) => r,
             Err(_) => return Vec::new(),
         };
 
-        registry
-            .all_code_hashes()
-            .into_iter()
-            .map(|(name, hash)| ConfigLeaf {
+        let mut leaves = Vec::new();
+        for (name, hash, byok) in registry.all_app_metadata() {
+            leaves.push(ConfigLeaf {
                 name: format!("wasm.{}.code_hash", name),
                 data: Some(hash.to_vec()),
-            })
-            .collect()
+            });
+            let source = if byok { "byok" } else { "generated" };
+            leaves.push(ConfigLeaf {
+                name: format!("wasm.{}.key_source", name),
+                data: Some(source.as_bytes().to_vec()),
+            });
+        }
+        leaves
     }
 
     /// Custom X.509 OIDs for RA-TLS certificates.

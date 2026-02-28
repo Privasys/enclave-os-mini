@@ -45,6 +45,7 @@ use std::string::String;
 use std::vec::Vec;
 
 use ring::digest;
+use ring::rand::{SecureRandom, SystemRandom};
 use wasmtime::component::{Component, Func, Val};
 
 use crate::engine::WasmEngine;
@@ -64,6 +65,16 @@ pub struct LoadedApp {
     pub hostname: String,
     /// SHA-256 of the original WASM component bytecode.
     pub code_hash: [u8; 32],
+    /// Per-app AES-256 encryption key for KV store data.
+    ///
+    /// Each app gets its own key so that data isolation is
+    /// cryptographically enforced.  When the app is unloaded this key
+    /// is dropped from memory, making any on-disk data permanently
+    /// unrecoverable.
+    encryption_key: [u8; AEAD_KEY_SIZE],
+    /// Whether the encryption key was supplied by the caller (BYOK)
+    /// or generated inside the enclave.
+    pub byok: bool,
     /// Compiled component (cheap to clone — refcounted internally).
     component: Component,
     /// Exported functions discovered from the component's WIT.
@@ -98,17 +109,14 @@ impl LoadedApp {
 pub struct AppRegistry {
     engine: WasmEngine,
     apps: BTreeMap<String, LoadedApp>,
-    /// AES-256 master key for sealed KV store (WASI FS + key persistence).
-    master_key: [u8; AEAD_KEY_SIZE],
 }
 
 impl AppRegistry {
     /// Create a new empty registry backed by the given engine.
-    pub fn new(engine: WasmEngine, master_key: [u8; AEAD_KEY_SIZE]) -> Self {
+    pub fn new(engine: WasmEngine) -> Self {
         Self {
             engine,
             apps: BTreeMap::new(),
-            master_key,
         }
     }
 
@@ -119,8 +127,17 @@ impl AppRegistry {
     /// 3. Introspects exports (root functions + interface members).
     /// 4. Registers under `name` with the given `hostname`.
     ///
+    /// If `encryption_key` is `Some`, the caller supplies the AES-256 key
+    /// (BYOK). Otherwise a random key is generated via RDRAND.
+    ///
     /// Returns an error if `name` is already taken or compilation fails.
-    pub fn load_app(&mut self, name: &str, hostname: &str, wasm_bytes: &[u8]) -> Result<(), String> {
+    pub fn load_app(
+        &mut self,
+        name: &str,
+        hostname: &str,
+        wasm_bytes: &[u8],
+        encryption_key: Option<[u8; AEAD_KEY_SIZE]>,
+    ) -> Result<(), String> {
         if self.apps.contains_key(name) {
             return Err(format!("app '{}' is already loaded", name));
         }
@@ -132,7 +149,17 @@ impl AppRegistry {
 
         // ── Compile ────────────────────────────────────────────────
         let component = self.engine.compile(wasm_bytes)?;
-
+        // ── Per-app encryption key ─────────────────────────────────
+        let (app_key, byok) = match encryption_key {
+            Some(k) => (k, true),
+            None => {
+                let rng = SystemRandom::new();
+                let mut k = [0u8; AEAD_KEY_SIZE];
+                rng.fill(&mut k)
+                    .map_err(|_| String::from("RDRAND failed generating app encryption key"))?;
+                (k, false)
+            }
+        };
         // ── Introspect exports ─────────────────────────────────────
         let discovered = self.engine.discover_exports(&component);
         let mut exports = BTreeMap::new();
@@ -153,6 +180,8 @@ impl AppRegistry {
                 name: name.to_string(),
                 hostname: hostname.to_string(),
                 code_hash,
+                encryption_key: app_key,
+                byok,
                 component,
                 exports,
             },
@@ -174,6 +203,7 @@ impl AppRegistry {
                 name: app.name.clone(),
                 hostname: app.hostname.clone(),
                 code_hash: enclave_os_enclave::ecall::hex_encode(&app.code_hash),
+                key_source: if app.byok { "byok".into() } else { "generated".into() },
                 exports: app.exported_funcs(),
             })
             .collect()
@@ -184,11 +214,26 @@ impl AppRegistry {
         self.apps.get(name).map(|app| &app.code_hash)
     }
 
+    /// Check whether an app uses Bring-Your-Own-Key for KV encryption.
+    pub fn app_byok(&self, name: &str) -> Option<bool> {
+        self.apps.get(name).map(|app| app.byok)
+    }
+
     /// Get all loaded apps' code hashes (sorted by name).
     pub fn all_code_hashes(&self) -> Vec<(&str, &[u8; 32])> {
         self.apps
             .iter()
             .map(|(name, app)| (name.as_str(), &app.code_hash))
+            .collect()
+    }
+
+    /// Get all loaded apps' attestation metadata (sorted by name).
+    ///
+    /// Returns `(name, code_hash, byok)` for each loaded app.
+    pub fn all_app_metadata(&self) -> Vec<(&str, &[u8; 32], bool)> {
+        self.apps
+            .iter()
+            .map(|(name, app)| (name.as_str(), &app.code_hash, app.byok))
             .collect()
     }
 
@@ -229,7 +274,7 @@ impl AppRegistry {
         }
 
         // ── Instantiate ────────────────────────────────────────────
-        let (mut store, instance) = match self.engine.instantiate(app_name, self.master_key, &app.component) {
+        let (mut store, instance) = match self.engine.instantiate(app_name, app.encryption_key, &app.component) {
             Ok(pair) => pair,
             Err(e) => {
                 return WasmResult::Error {

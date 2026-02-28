@@ -49,7 +49,11 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
     ));
 
     // Phase 2b: register the WASM runtime (dynamic loading over RA-TLS)
-    match enclave_os_wasm::WasmModule::new(sealed_cfg.master_key()) {
+    //
+    // Each WASM app gets its own AES-256 encryption key for KV store
+    // data, generated inside the enclave or supplied by the caller (BYOK).
+    // The enclave-wide master_key is no longer used for app data.
+    match enclave_os_wasm::WasmModule::new() {
         Ok(wasm) => {
             enclave_log_info!("WASM runtime initialised (dynamic loading enabled)");
             register_module(Box::new(wasm));
