@@ -42,7 +42,9 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "tls1
 webpki = { package = "rustls-webpki", version = "0.102", default-features = false, features = ["ring", "alloc", "std"] }
 # ring for low-level crypto (AEAD, key generation)
 ring = "0.17"
-# Force getrandom to use RDRAND (the same path as target_env="sgx")
+# getrandom 0.2 (pulled by ring) selects its Linux backend on the Teaclave
+# target (target_os="linux").  Our C shim (src/getrandom_shim.c) intercepts
+# syscall(SYS_getrandom) and routes it to sgx_read_rand.
 getrandom = { version = "0.2", features = ["rdrand"] }
 # For RA-TLS certificate generation
 rcgen = { version = "0.13", default-features = false, features = ["ring", "x509-parser"] }
@@ -64,9 +66,4 @@ strip = "symbols"       # strip debug symbols from .a
 
 [build-dependencies]
 cc = "1"
-
-# Override crates.io getrandom with our vendored copy that checks
-# target_vendor="teaclave" (our target JSON) and uses RDRAND via sgx_rand.rs.
-[patch.crates-io]
-getrandom = { path = "../vendor/getrandom" }
 

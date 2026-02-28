@@ -43,8 +43,33 @@ fn main() {
         eprintln!("cargo:warning=EDL trusted stubs not found at {:?}, skipping", edl_t_c);
     }
 
+    // Compile the getrandom shim — provides syscall(SYS_getrandom) via
+    // sgx_read_rand() plus dead-code stubs for symbols the getrandom crate's
+    // Linux backend pulls in but never reaches inside SGX.
+    let shim_c = PathBuf::from("src/getrandom_shim.c");
+    if shim_c.exists() {
+        let mut build = cc::Build::new();
+        build
+            .file(&shim_c)
+            // Same enclave flags used for EDL stubs — tlibc replaces the
+            // system C library inside SGX.
+            .flag("-ffreestanding")
+            .flag("-nostdinc")
+            .flag("-fvisibility=hidden")
+            .flag("-fno-strict-overflow")
+            .include(format!("{}/include", sgx_sdk))
+            .include(format!("{}/include/tlibc", sgx_sdk));
+
+        if !teaclave.is_empty() {
+            build.include(format!("{}/common/inc", teaclave));
+        }
+
+        build.compile("getrandom_shim");
+    }
+
     println!("cargo:rustc-link-search=native={}/lib64", sgx_sdk);
     println!("cargo:rerun-if-changed=build.rs");
+    println!("cargo:rerun-if-changed=src/getrandom_shim.c");
     println!("cargo:rerun-if-env-changed=ENCLAVE_EDL_DIR");
     println!("cargo:rerun-if-env-changed=SGX_SDK_PATH");
     println!("cargo:rerun-if-env-changed=TEACLAVE_SGX_SDK");
