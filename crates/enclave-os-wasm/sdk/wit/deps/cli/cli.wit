@@ -1,0 +1,45 @@
+// WASI CLI — as implemented by Enclave OS (Mini).
+//
+// Environment variables and arguments are controlled by the enclave
+// operator at startup. stdin/stdout/stderr are captured in-memory
+// and routed to the enclave log via OCALL.
+
+package wasi:cli@0.2.0;
+
+/// Controlled environment variables set by the enclave operator.
+interface environment {
+    /// Returns operator-configured environment variables.
+    get-environment: func() -> list<tuple<string, string>>;
+
+    /// Returns operator-configured command-line arguments. 
+    get-arguments: func() -> list<string>;
+
+    /// Always returns `none` (no filesystem concept of CWD in SGX).
+    initial-cwd: func() -> option<string>;
+}
+
+/// Standard input (backed by in-memory buffer).
+interface stdin {
+    use wasi:io/streams@0.2.0.{input-stream};
+    get-stdin: func() -> input-stream;
+}
+
+/// Standard output (captured to enclave log via OCALL).
+interface stdout {
+    use wasi:io/streams@0.2.0.{output-stream};
+    get-stdout: func() -> output-stream;
+}
+
+/// Standard error (captured to enclave log via OCALL).
+interface stderr {
+    use wasi:io/streams@0.2.0.{output-stream};
+    get-stderr: func() -> output-stream;
+}
+
+/// Process exit — always traps.
+///
+/// The enclave manages its own lifecycle. Calling `exit` from a WASM
+/// app terminates that call with an error, not the enclave.
+interface exit {
+    exit: func(status: result);
+}

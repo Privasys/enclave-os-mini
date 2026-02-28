@@ -1,0 +1,26 @@
+# Copyright (c) Privasys. All rights reserved.
+# Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
+
+[package]
+name = "enclave-os-wasm-compile"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+description = "AOT compiler for WASM components targeting enclave-os."
+
+[[bin]]
+name = "enclave-os-wasm-compile"
+path = "src/main.rs"
+
+[dependencies]
+# Same wasmtime fork + branch as enclave-os-wasm.
+# The precompiled artefact format is strongly tied to the wasmtime version
+# and the Engine configuration, so both MUST stay in sync.
+wasmtime = { git = "https://github.com/Privasys/wasmtime", branch = "sgx", default-features = false, features = [
+    "cranelift",
+    "component-model",
+    "runtime",
+    "std",
+] }
+
+clap = { version = "4", features = ["derive"] }

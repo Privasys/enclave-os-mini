@@ -359,7 +359,7 @@ impl AppContext {
 /// Register all WASI host function implementations in the given [`Linker`].
 ///
 /// This populates the standard WASI namespaces so that WASM components
-/// targeting `wasi:cli/run@0.2.0` (wasip2) can be instantiated.
+/// targeting `wasi:cli/run@0.2.3` (wasip2) can be instantiated.
 pub fn add_wasi_to_linker(
     linker: &mut Linker<AppContext>,
 ) -> Result<(), wasmtime::Error> {

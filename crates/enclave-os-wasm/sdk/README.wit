@@ -1,0 +1,40 @@
+// ═══════════════════════════════════════════════════════════════════════
+//  Enclave OS (Mini) — WASM SDK
+// ═══════════════════════════════════════════════════════════════════════
+//
+//  This is the **complete** API surface available to WASM Components
+//  running inside an Enclave OS SGX enclave.
+//
+//  WASM apps are sandboxed guests. They can ONLY call the host functions
+//  defined in this SDK. There is no direct access to the hardware, the
+//  operating system, or the network — everything goes through the
+//  enclave OS runtime.
+//
+//  ┌────────────────────────────────────────────────────────────────┐
+//  │                     WASM Component (guest)                     │
+//  │                                                                │
+//  │  Imports from this SDK:                                        │
+//  │                                                                │
+//  │   Platform APIs          WASI subset (enclave-backed)          │
+//  │   ──────────────         ────────────────────────────          │
+//  │   crypto (ring/SGX)      random      (RDRAND)                  │
+//  │   keystore (sealed)      clocks      (OCALL)                   │
+//  │   https    (rustls)      filesystem  (sealed KV store)         │
+//  │                          io          (in-memory streams)       │
+//  │                          cli         (controlled env)          │
+//  │                          sockets/tcp (OCALL tunnelling)        │
+//  │                                                                │
+//  │  Security invariants:                                          │
+//  │   • All crypto runs inside SGX (ring + RDRAND)                 │
+//  │   • Key material never leaves the enclave                      │
+//  │   • HTTPS terminates TLS inside the enclave                    │
+//  │   • Filesystem is AES-256-GCM encrypted (MRENCLAVE-sealed)     │
+//  │   • Host only sees ciphertext                                  │
+//  │   • Each app is namespace-isolated (app:<name>/*)              │
+//  │   • 10M instruction fuel budget per call                       │
+//  └────────────────────────────────────────────────────────────────┘
+//
+//  Version: 0.1.0
+//  Compatibility: WASI Preview 2 (wasi:*@0.2.0)
+//
+// ═══════════════════════════════════════════════════════════════════════

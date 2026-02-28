@@ -1,0 +1,28 @@
+// WASI Random — as implemented by Enclave OS (Mini).
+//
+// ALL random sources use RDRAND (Intel hardware RNG inside SGX).
+// There is no difference between "secure" and "insecure" — all
+// random bytes come from the CPU's hardware entropy source.
+
+package wasi:random@0.2.0;
+
+/// Cryptographically secure random bytes (RDRAND).
+interface random {
+    /// Generate `len` cryptographically secure random bytes.
+    /// Maximum 65,536 bytes per call.
+    get-random-bytes: func(len: u64) -> list<u8>;
+
+    /// Generate a random 64-bit unsigned integer.
+    get-random-u64: func() -> u64;
+}
+
+/// "Insecure" random — identical to `random` in SGX (RDRAND).
+interface insecure {
+    get-insecure-random-bytes: func(len: u64) -> list<u8>;
+    get-insecure-random-u64: func() -> u64;
+}
+
+/// Seed for insecure PRNG — returns 128 bits from RDRAND.
+interface insecure-seed {
+    insecure-seed: func() -> tuple<u64, u64>;
+}

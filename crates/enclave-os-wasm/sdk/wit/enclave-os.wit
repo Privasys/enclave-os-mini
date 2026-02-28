@@ -1,0 +1,173 @@
+// Enclave OS (Mini) — Platform SDK
+//
+// Custom host functions that go beyond WASI. These APIs leverage
+// the SGX enclave's unique security properties (hardware RNG,
+// sealed storage, in-enclave TLS).
+//
+// Package: privasys:enclave-os@0.1.0
+
+package privasys:enclave-os@0.1.0;
+
+// ─── Cryptographic primitives ──────────────────────────────────────
+
+/// Hardware-backed cryptographic operations powered by `ring` inside SGX.
+///
+/// All operations execute inside the enclave. Key material is referenced
+/// by name from the keystore — raw keys are never passed over the wire.
+interface crypto {
+    /// Hash algorithm for digest operations.
+    enum digest-algorithm {
+        /// SHA-256 (32 bytes)
+        sha256,
+        /// SHA-384 (48 bytes)
+        sha384,
+        /// SHA-512 (64 bytes)
+        sha512,
+    }
+
+    /// Signing algorithm for ECDSA operations.
+    enum sign-algorithm {
+        /// ECDSA with NIST P-256 + SHA-256 (ASN.1 DER signatures)
+        ecdsa-p256-sha256,
+        /// ECDSA with NIST P-384 + SHA-384
+        ecdsa-p384-sha384,
+    }
+
+    /// HMAC algorithm.
+    enum hmac-algorithm {
+        /// HMAC-SHA-256
+        hmac-sha256,
+        /// HMAC-SHA-384
+        hmac-sha384,
+        /// HMAC-SHA-512
+        hmac-sha512,
+    }
+
+    /// Compute a cryptographic hash digest.
+    digest: func(algorithm: digest-algorithm, data: list<u8>) -> result<list<u8>, string>;
+
+    /// Encrypt with AES-256-GCM.
+    ///
+    /// `key-name`: name of a symmetric key in the keystore.
+    /// `iv`: 12-byte initialisation vector (caller must ensure uniqueness).
+    /// `aad`: additional authenticated data (can be empty).
+    /// Returns ciphertext || 16-byte authentication tag.
+    encrypt: func(key-name: string, iv: list<u8>, aad: list<u8>, plaintext: list<u8>) -> result<list<u8>, string>;
+
+    /// Decrypt with AES-256-GCM.
+    ///
+    /// `ciphertext` must include the 16-byte tag appended by `encrypt`.
+    decrypt: func(key-name: string, iv: list<u8>, aad: list<u8>, ciphertext: list<u8>) -> result<list<u8>, string>;
+
+    /// Sign data with an ECDSA key from the keystore.
+    ///
+    /// Returns ASN.1 DER-encoded signature.
+    sign: func(key-name: string, algorithm: sign-algorithm, data: list<u8>) -> result<list<u8>, string>;
+
+    /// Verify an ECDSA signature against a key from the keystore.
+    verify: func(key-name: string, algorithm: sign-algorithm, data: list<u8>, signature: list<u8>) -> result<bool, string>;
+
+    /// Generate an HMAC tag.
+    hmac-sign: func(key-name: string, algorithm: hmac-algorithm, data: list<u8>) -> result<list<u8>, string>;
+
+    /// Verify an HMAC tag.
+    hmac-verify: func(key-name: string, algorithm: hmac-algorithm, data: list<u8>, tag: list<u8>) -> result<bool, string>;
+
+    /// Generate cryptographically secure random bytes (RDRAND).
+    get-random-bytes: func(len: u32) -> result<list<u8>, string>;
+}
+
+// ─── Key management ────────────────────────────────────────────────
+
+/// Enclave-sealed key lifecycle management.
+///
+/// Keys are generated inside SGX using hardware RNG, stored in enclave
+/// memory by name, and optionally persisted via MRENCLAVE-sealed KV store.
+/// Keys NEVER leave the enclave in plaintext.
+///
+/// Namespace isolation: persisted keys are stored under `app:<name>/key:<key-name>`.
+/// One app cannot access another app's keys.
+interface keystore {
+    use crypto.{sign-algorithm, hmac-algorithm};
+
+    /// Generate a 256-bit symmetric key (AES-256) for encrypt/decrypt.
+    generate-symmetric-key: func(key-name: string) -> result<_, string>;
+
+    /// Generate an ECDSA signing key pair.
+    generate-signing-key: func(key-name: string, algorithm: sign-algorithm) -> result<_, string>;
+
+    /// Generate an HMAC key (32/48/64 bytes depending on algorithm).
+    generate-hmac-key: func(key-name: string, algorithm: hmac-algorithm) -> result<_, string>;
+
+    /// Import a raw 256-bit symmetric key.
+    import-symmetric-key: func(key-name: string, raw-key: list<u8>) -> result<_, string>;
+
+    /// Export the public key component of a signing key (DER-encoded).
+    export-public-key: func(key-name: string) -> result<list<u8>, string>;
+
+    /// Delete a key from in-memory storage.
+    delete-key: func(key-name: string) -> result<_, string>;
+
+    /// Check if a key exists in the in-memory keystore.
+    key-exists: func(key-name: string) -> result<bool, string>;
+
+    /// Seal and persist a key to the host KV store (MRENCLAVE-bound).
+    ///
+    /// The key is encrypted with the enclave master key and stored
+    /// under `app:<app-name>/key:<key-name>`. It survives enclave
+    /// restarts as long as MRENCLAVE is unchanged.
+    persist-key: func(key-name: string) -> result<_, string>;
+
+    /// Load a previously persisted key from the host KV store.
+    ///
+    /// Unseals with the enclave master key and inserts into the
+    /// in-memory keystore. Fails if a key with that name already exists.
+    load-key: func(key-name: string) -> result<_, string>;
+}
+
+// ─── Secure HTTPS egress ───────────────────────────────────────────
+
+/// HTTPS-only client with TLS termination inside the SGX enclave.
+///
+/// The host only transports encrypted TLS bytes via OCALLs —
+/// it never sees request URLs, headers, bodies, or responses in plaintext.
+///
+/// Trust anchors: Mozilla root CA bundle (webpki-roots).
+/// Protocol: TLS 1.3 (preferred) or TLS 1.2.
+///
+/// **Plain HTTP is not supported.** Only `https://` URLs are accepted.
+/// Requests to `http://` URLs will be rejected with an error.
+interface https {
+    /// Request method (HTTPS only — plain HTTP is not supported).
+    enum method {
+        get,
+        post,
+        put,
+        delete,
+        patch,
+        head,
+        options,
+    }
+
+    /// An outgoing HTTPS request.
+    record request {
+        method: method,
+        url: string,
+        headers: list<tuple<string, string>>,
+        body: option<list<u8>>,
+    }
+
+    /// An HTTPS response received from the remote server.
+    record response {
+        status: u16,
+        headers: list<tuple<string, string>>,
+        body: list<u8>,
+    }
+
+    /// Perform an HTTPS request.
+    ///
+    /// TLS handshake + data transfer happen entirely inside the enclave.
+    /// The host only sees encrypted bytes on the wire.
+    /// Plain HTTP (`http://`) is rejected — only `https://` is allowed.
+    fetch: func(request: request) -> result<response, string>;
+}

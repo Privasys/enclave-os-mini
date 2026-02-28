@@ -1,0 +1,80 @@
+// WASI I/O interfaces — as implemented by Enclave OS (Mini).
+//
+// Synchronous model: all pollables are always ready,
+// streams are backed by in-memory buffers or OCALL tunnels.
+
+package wasi:io@0.2.0;
+
+/// Contextual error information for I/O operations.
+interface error {
+    /// An I/O error.
+    resource error {
+        /// Human-readable debug representation.
+        to-debug-string: func() -> string;
+    }
+}
+
+/// Readiness polling (synchronous in SGX — always ready).
+interface poll {
+    /// A pollable handle. In the enclave, all pollables report ready
+    /// immediately (no async I/O).
+    resource pollable {
+        /// Returns `true` (always ready in synchronous model).
+        ready: func() -> bool;
+        /// No-op in synchronous model.
+        block: func();
+    }
+
+    /// Returns all indices (everything is always ready).
+    poll: func(%in: list<borrow<pollable>>) -> list<u32>;
+}
+
+/// Byte streams for reading and writing.
+interface streams {
+    use error.{error};
+    use poll.{pollable};
+
+    /// Stream error — either a wrapped I/O error or end-of-stream.
+    variant stream-error {
+        last-operation-failed(error),
+        closed,
+    }
+
+    /// A readable byte stream.
+    resource input-stream {
+        /// Read up to `len` bytes.
+        read: func(len: u64) -> result<list<u8>, stream-error>;
+        /// Blocking read (same as `read` in synchronous model).
+        blocking-read: func(len: u64) -> result<list<u8>, stream-error>;
+        /// Skip up to `len` bytes.
+        skip: func(len: u64) -> result<u64, stream-error>;
+        /// Blocking skip.
+        blocking-skip: func(len: u64) -> result<u64, stream-error>;
+        /// Returns an always-ready pollable.
+        subscribe: func() -> pollable;
+    }
+
+    /// A writable byte stream.
+    resource output-stream {
+        /// Returns available write capacity (64 KiB).
+        check-write: func() -> result<u64, stream-error>;
+        /// Write bytes.
+        write: func(contents: list<u8>) -> result<_, stream-error>;
+        /// Write + flush (same as `write` in synchronous model).
+        blocking-write-and-flush: func(contents: list<u8>) -> result<_, stream-error>;
+        /// Flush buffered data.
+        flush: func() -> result<_, stream-error>;
+        /// Blocking flush.
+        blocking-flush: func() -> result<_, stream-error>;
+        /// Returns an always-ready pollable.
+        subscribe: func() -> pollable;
+        /// Write `len` zero bytes.
+        write-zeroes: func(len: u64) -> result<_, stream-error>;
+        /// Write zeroes + flush.
+        blocking-write-zeroes-and-flush: func(len: u64) -> result<_, stream-error>;
+        /// Copy `len` bytes from `src`.
+        splice: func(src: borrow<input-stream>, len: u64) -> result<u64, stream-error>;
+        /// Blocking splice.
+        blocking-splice: func(src: borrow<input-stream>, len: u64) -> result<u64, stream-error>;
+    }
+}

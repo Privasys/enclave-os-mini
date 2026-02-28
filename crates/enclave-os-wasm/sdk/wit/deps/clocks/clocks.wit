@@ -1,0 +1,44 @@
+// WASI Clocks — as implemented by Enclave OS (Mini).
+//
+// Wall clock: backed by OCALL get_current_time() (1-second resolution).
+// Monotonic clock: derived from wall clock × 1e9 nanoseconds.
+
+package wasi:clocks@0.2.0;
+
+/// Wall-clock time (real-world calendar time).
+///
+/// Backed by a host OCALL returning UNIX timestamp.
+/// Resolution: 1 second. Nanoseconds are always 0.
+interface wall-clock {
+    /// A point in time.
+    record datetime {
+        seconds: u64,
+        nanoseconds: u32,
+    }
+
+    /// Current wall-clock time as UNIX timestamp.
+    now: func() -> datetime;
+
+    /// Clock resolution: 1 second.
+    resolution: func() -> datetime;
+}
+
+/// Monotonic clock (for measuring elapsed time).
+///
+/// Best-effort: derived from wall-clock × 1,000,000,000.
+/// Resolution: 1 second (1,000,000,000 nanoseconds).
+interface monotonic-clock {
+    use wasi:io/poll@0.2.0.{pollable};
+
+    /// Current time in nanoseconds.
+    now: func() -> u64;
+
+    /// Resolution in nanoseconds (1,000,000,000 = 1 second).
+    resolution: func() -> u64;
+
+    /// Returns an always-ready pollable (synchronous model).
+    subscribe-instant: func(when: u64) -> pollable;
+
+    /// Returns an always-ready pollable.
+    subscribe-duration: func(when: u64) -> pollable;
+}

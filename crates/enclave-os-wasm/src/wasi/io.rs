@@ -1,7 +1,7 @@
 // Copyright (c) Privasys. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
-//! `wasi:io/{error,poll,streams}@0.2.0` — resource-based I/O primitives.
+//! `wasi:io/{error,poll,streams}@0.2.3` — resource-based I/O primitives.
 //!
 //! This is the foundation of the WASI I/O model.  All other WASI
 //! interfaces that perform I/O (cli, sockets, filesystem) build on top
@@ -23,11 +23,11 @@ use super::{
 };
 
 // =========================================================================
-//  wasi:io/error@0.2.0
+//  wasi:io/error@0.2.3
 // =========================================================================
 
 pub fn add_io_error(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:io/error@0.2.0")?;
+    let mut inst = linker.instance("wasi:io/error@0.2.3")?;
 
     // ── resource: error ────────────────────────────────────────────
     inst.resource("error", ResourceType::host::<IoErrorRes>(), |mut store, rep| {
@@ -53,11 +53,11 @@ pub fn add_io_error(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Err
 }
 
 // =========================================================================
-//  wasi:io/poll@0.2.0
+//  wasi:io/poll@0.2.3
 // =========================================================================
 
 pub fn add_io_poll(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:io/poll@0.2.0")?;
+    let mut inst = linker.instance("wasi:io/poll@0.2.3")?;
 
     // ── resource: pollable ─────────────────────────────────────────
     inst.resource(
@@ -99,11 +99,11 @@ pub fn add_io_poll(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Erro
 }
 
 // =========================================================================
-//  wasi:io/streams@0.2.0
+//  wasi:io/streams@0.2.3
 // =========================================================================
 
 pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:io/streams@0.2.0")?;
+    let mut inst = linker.instance("wasi:io/streams@0.2.3")?;
 
     // ── resource: input-stream ─────────────────────────────────────
     inst.resource(

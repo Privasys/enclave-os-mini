@@ -1,0 +1,133 @@
+// WASI Sockets — as implemented by Enclave OS (Mini).
+//
+// TCP connections are tunnelled through OCALLs. The host executes
+// the actual syscalls; the enclave sends/receives raw bytes.
+//
+// Synchronous model: `start-*` does the real work, `finish-*` returns
+// success immediately.
+//
+// NOTE: For HTTPS, prefer `privasys:enclave-os/https` which terminates
+// TLS inside the enclave. Raw TCP sockets expose plaintext to the host.
+
+package wasi:sockets@0.2.0;
+
+/// Network handle.
+interface network {
+    /// Opaque network resource.
+    resource network;
+}
+
+/// Returns the instance's network handle.
+interface instance-network {
+    use network.{network};
+    instance-network: func() -> network;
+}
+
+/// Create new TCP sockets.
+interface tcp-create-socket {
+    use network.{network};
+    use tcp.{tcp-socket};
+
+    /// IP address family.
+    enum ip-address-family {
+        ipv4,
+        ipv6,
+    }
+
+    /// Error codes for socket operations.
+    enum error-code {
+        unknown,
+        access-denied,
+        not-supported,
+        invalid-argument,
+        out-of-memory,
+        timeout,
+        concurrency-conflict,
+        not-in-progress,
+        would-block,
+        invalid-state,
+        new-socket-limit,
+        address-not-bindable,
+        address-in-use,
+        remote-unreachable,
+        connection-refused,
+        connection-reset,
+        connection-aborted,
+        datagram-too-large,
+        name-unresolvable,
+        temporary-resolver-failure,
+        permanent-resolver-failure,
+    }
+
+    /// Create a new TCP socket.
+    create-tcp-socket: func(address-family: ip-address-family) -> result<tcp-socket, error-code>;
+}
+
+/// TCP socket operations.
+interface tcp {
+    use wasi:io/streams@0.2.0.{input-stream, output-stream};
+    use wasi:io/poll@0.2.0.{pollable};
+    use tcp-create-socket.{error-code};
+
+    /// IP v4 socket address.
+    record ipv4-socket-address {
+        port: u16,
+        address: tuple<u8, u8, u8, u8>,
+    }
+
+    /// IP v6 socket address.
+    record ipv6-socket-address {
+        port: u16,
+        flow-info: u32,
+        address: tuple<u16, u16, u16, u16, u16, u16, u16, u16>,
+        scope-id: u32,
+    }
+
+    /// IP socket address (v4 or v6).
+    variant ip-socket-address {
+        ipv4(ipv4-socket-address),
+        ipv6(ipv6-socket-address),
+    }
+
+    /// Shutdown direction.
+    enum shutdown-type {
+        receive,
+        send,
+        both,
+    }
+
+    /// A TCP socket backed by host OCALLs.
+    ///
+    /// **Warning**: Raw TCP exposes plaintext to the host. For secure
+    /// communication, use `privasys:enclave-os/https` instead.
+    resource tcp-socket {
+        /// Bind to a local address. Calls `net_tcp_listen(port)` on the host.
+        start-bind: func(network: borrow<network>, local-address: ip-socket-address) -> result<_, error-code>;
+        finish-bind: func() -> result<_, error-code>;
+
+        /// Connect to a remote address. Calls `net_tcp_connect(host, port)` on the host.
+        start-connect: func(network: borrow<network>, remote-address: ip-socket-address) -> result<_, error-code>;
+        /// Returns `(input-stream, output-stream)` for the connection.
+        finish-connect: func() -> result<tuple<input-stream, output-stream>, error-code>;
+
+        /// Start listening for incoming connections.
+        start-listen: func() -> result<_, error-code>;
+        finish-listen: func() -> result<_, error-code>;
+
+        /// Accept an incoming connection.
+        /// Returns `(client-socket, input-stream, output-stream)`.
+        accept: func() -> result<tuple<tcp-socket, input-stream, output-stream>, error-code>;
+
+        /// Shut down the socket. Calls `net_close(fd)` on the host.
+        shutdown: func(shutdown-type: shutdown-type) -> result<_, error-code>;
+
+        /// Get the local address.
+        local-address: func() -> result<ip-socket-address, error-code>;
+
+        /// Get the remote address.
+        remote-address: func() -> result<ip-socket-address, error-code>;
+
+        /// Returns an always-ready pollable.
+        subscribe: func() -> pollable;
+    }
+}

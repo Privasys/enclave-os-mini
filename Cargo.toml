@@ -9,6 +9,7 @@ members = [
 ]
 exclude = [
     "enclave",
+    "app",
 ]
 # The enclave crate is built separately with a different target;
 # it is NOT part of this workspace (cargo cannot mix targets in one build).

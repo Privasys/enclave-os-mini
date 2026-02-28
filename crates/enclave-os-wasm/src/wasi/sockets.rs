@@ -1,7 +1,7 @@
 // Copyright (c) Privasys. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
-//! `wasi:sockets/{network,instance-network,tcp,tcp-create-socket}@0.2.0`
+//! `wasi:sockets/{network,instance-network,tcp,tcp-create-socket}@0.2.3`
 //!
 //! TCP sockets backed by enclave OS OCALLs.  The host performs the actual
 //! `socket()` / `bind()` / `listen()` / `accept()` / `connect()` kernel
@@ -34,11 +34,11 @@ use super::{
 };
 
 // =========================================================================
-//  wasi:sockets/network@0.2.0
+//  wasi:sockets/network@0.2.3
 // =========================================================================
 
 fn add_network(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:sockets/network@0.2.0")?;
+    let mut inst = linker.instance("wasi:sockets/network@0.2.3")?;
 
     // resource: network
     inst.resource(
@@ -51,11 +51,11 @@ fn add_network(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
 }
 
 // =========================================================================
-//  wasi:sockets/instance-network@0.2.0
+//  wasi:sockets/instance-network@0.2.3
 // =========================================================================
 
 fn add_instance_network(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:sockets/instance-network@0.2.0")?;
+    let mut inst = linker.instance("wasi:sockets/instance-network@0.2.3")?;
 
     // instance-network: func() -> network
     inst.func_wrap(
@@ -70,11 +70,11 @@ fn add_instance_network(linker: &mut Linker<AppContext>) -> Result<(), wasmtime:
 }
 
 // =========================================================================
-//  wasi:sockets/tcp-create-socket@0.2.0
+//  wasi:sockets/tcp-create-socket@0.2.3
 // =========================================================================
 
 fn add_tcp_create_socket(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:sockets/tcp-create-socket@0.2.0")?;
+    let mut inst = linker.instance("wasi:sockets/tcp-create-socket@0.2.3")?;
 
     // create-tcp-socket: func(address-family: ip-address-family) -> result<tcp-socket, error-code>
     //
@@ -106,11 +106,11 @@ fn add_tcp_create_socket(linker: &mut Linker<AppContext>) -> Result<(), wasmtime
 }
 
 // =========================================================================
-//  wasi:sockets/tcp@0.2.0
+//  wasi:sockets/tcp@0.2.3
 // =========================================================================
 
 fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:sockets/tcp@0.2.0")?;
+    let mut inst = linker.instance("wasi:sockets/tcp@0.2.3")?;
 
     // ── resource: tcp-socket ───────────────────────────────────────
     inst.resource(

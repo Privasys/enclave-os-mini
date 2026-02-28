@@ -1,0 +1,75 @@
+// ═══════════════════════════════════════════════════════════════════════
+//  Enclave OS (Mini) — WASM SDK World
+// ═══════════════════════════════════════════════════════════════════════
+//
+//  This world defines EVERYTHING a WASM Component can import when
+//  running inside an Enclave OS SGX enclave.
+//
+//  To build a WASM app for Enclave OS:
+//    1. Copy the `sdk/wit/` directory into your project as `wit/deps/`
+//    2. Create your own `wit/world.wit` that imports from these packages
+//    3. Build with `cargo component build` (Rust) or any other
+//       Component Model toolchain
+//
+//  See `wasm-apps/wasm-test-app/` for a complete example.
+//
+// ═══════════════════════════════════════════════════════════════════════
+
+package privasys:enclave-os-sdk@0.1.0;
+
+/// The full Enclave OS capability set.
+///
+/// A WASM app does NOT need to import everything listed here.
+/// Import only the interfaces you actually use — the enclave will
+/// satisfy them all.
+world enclave-app {
+    // ── Platform APIs (Enclave OS exclusive) ──────────────────────
+    //
+    // These are the "crown jewels" — capabilities that only exist
+    // because the code runs inside an SGX enclave.
+
+    /// Cryptographic primitives (ring + RDRAND inside SGX).
+    import privasys:enclave-os/crypto@0.1.0;
+
+    /// Key management with MRENCLAVE-sealed persistence.
+    import privasys:enclave-os/keystore@0.1.0;
+
+    /// HTTPS egress with TLS termination inside the enclave.
+    import privasys:enclave-os/https@0.1.0;
+
+    // ── WASI (enclave-implemented subset) ─────────────────────────
+    //
+    // Standard WASI interfaces, re-implemented by the enclave OS.
+    // Not backed by the host OS — backed by enclave internals.
+
+    /// I/O primitives (streams, poll, errors).
+    import wasi:io/error@0.2.0;
+    import wasi:io/poll@0.2.0;
+    import wasi:io/streams@0.2.0;
+
+    /// Cryptographic random (RDRAND hardware RNG).
+    import wasi:random/random@0.2.0;
+    import wasi:random/insecure@0.2.0;
+    import wasi:random/insecure-seed@0.2.0;
+
+    /// Wall and monotonic clocks (via host OCALL).
+    import wasi:clocks/wall-clock@0.2.0;
+    import wasi:clocks/monotonic-clock@0.2.0;
+
+    /// Sealed encrypted filesystem (KV store backed).
+    import wasi:filesystem/types@0.2.0;
+    import wasi:filesystem/preopens@0.2.0;
+
+    /// CLI environment (operator-controlled).
+    import wasi:cli/environment@0.2.0;
+    import wasi:cli/stdin@0.2.0;
+    import wasi:cli/stdout@0.2.0;
+    import wasi:cli/stderr@0.2.0;
+    import wasi:cli/exit@0.2.0;
+
+    /// TCP sockets (OCALL-tunnelled — plaintext visible to host).
+    import wasi:sockets/network@0.2.0;
+    import wasi:sockets/instance-network@0.2.0;
+    import wasi:sockets/tcp-create-socket@0.2.0;
+    import wasi:sockets/tcp@0.2.0;
+}

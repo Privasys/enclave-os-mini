@@ -385,7 +385,7 @@ Enclave OS (Mini) uses the following third-party Rust crates:
 | log / env_logger | Apache 2.0 / MIT | Logging |
 | hex | Apache 2.0 / MIT | Hex encoding |
 | cc | Apache 2.0 / MIT | C compiler build helper |
-| getrandom | Apache 2.0 / MIT | OS random number generation |
+| getrandom | Apache 2.0 / MIT | RDRAND hardware RNG (WASM module) |
 | tokio | MIT | Async runtime (tests only) |
 
 Full license texts are available in [THIRD-PARTY-LICENSES](THIRD-PARTY-LICENSES).

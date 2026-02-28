@@ -1,7 +1,7 @@
 // Copyright (c) Privasys. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
-//! `wasi:filesystem/{types,preopens}@0.2.0`
+//! `wasi:filesystem/{types,preopens}@0.2.3`
 //!
 //! Lightweight filesystem implementation backed by the enclave OS sealed KV store.
 //!
@@ -44,11 +44,11 @@ use super::{
 const FS_DOMAIN: &str = "fs:";
 
 // =========================================================================
-//  wasi:filesystem/types@0.2.0
+//  wasi:filesystem/types@0.2.3
 // =========================================================================
 
 fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:filesystem/types@0.2.0")?;
+    let mut inst = linker.instance("wasi:filesystem/types@0.2.3")?;
 
     // ── resource: descriptor ───────────────────────────────────────
     inst.resource(
@@ -639,15 +639,28 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
         )?;
     }
 
+    // ── filesystem-error-code ──────────────────────────────────────
+    // func(err: borrow<error>) -> option<error-code>
+    inst.func_new(
+        "filesystem-error-code",
+        |_store: StoreContextMut<'_, AppContext>,
+         _params: &[Val],
+         results: &mut [Val]| {
+            // We don't use io/error for filesystem errors, so always return None.
+            results[0] = Val::Option(None);
+            Ok(())
+        },
+    )?;
+
     Ok(())
 }
 
 // =========================================================================
-//  wasi:filesystem/preopens@0.2.0
+//  wasi:filesystem/preopens@0.2.3
 // =========================================================================
 
 fn add_preopens(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:filesystem/preopens@0.2.0")?;
+    let mut inst = linker.instance("wasi:filesystem/preopens@0.2.3")?;
 
     // get-directories: func() -> list<tuple<own<descriptor>, string>>
     //
