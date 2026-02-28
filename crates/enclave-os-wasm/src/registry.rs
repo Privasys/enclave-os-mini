@@ -60,6 +60,8 @@ use crate::wasi::AppContext;
 pub struct LoadedApp {
     /// User-chosen name for this app.
     pub name: String,
+    /// SNI hostname for this app's dedicated TLS certificate.
+    pub hostname: String,
     /// SHA-256 of the original WASM component bytecode.
     pub code_hash: [u8; 32],
     /// Compiled component (cheap to clone — refcounted internally).
@@ -115,10 +117,10 @@ impl AppRegistry {
     /// 1. Computes the SHA-256 code hash.
     /// 2. Compiles via Cranelift.
     /// 3. Introspects exports (root functions + interface members).
-    /// 4. Registers under `name`.
+    /// 4. Registers under `name` with the given `hostname`.
     ///
     /// Returns an error if `name` is already taken or compilation fails.
-    pub fn load_app(&mut self, name: &str, wasm_bytes: &[u8]) -> Result<(), String> {
+    pub fn load_app(&mut self, name: &str, hostname: &str, wasm_bytes: &[u8]) -> Result<(), String> {
         if self.apps.contains_key(name) {
             return Err(format!("app '{}' is already loaded", name));
         }
@@ -149,6 +151,7 @@ impl AppRegistry {
             name.to_string(),
             LoadedApp {
                 name: name.to_string(),
+                hostname: hostname.to_string(),
                 code_hash,
                 component,
                 exports,
@@ -158,9 +161,9 @@ impl AppRegistry {
         Ok(())
     }
 
-    /// Unload an app by name.
-    pub fn unload_app(&mut self, name: &str) -> bool {
-        self.apps.remove(name).is_some()
+    /// Unload an app by name. Returns the hostname if found.
+    pub fn unload_app(&mut self, name: &str) -> Option<String> {
+        self.apps.remove(name).map(|app| app.hostname)
     }
 
     /// List all loaded apps with their metadata.
@@ -169,6 +172,7 @@ impl AppRegistry {
             .values()
             .map(|app| crate::protocol::AppInfo {
                 name: app.name.clone(),
+                hostname: app.hostname.clone(),
                 code_hash: enclave_os_enclave::ecall::hex_encode(&app.code_hash),
                 exports: app.exported_funcs(),
             })

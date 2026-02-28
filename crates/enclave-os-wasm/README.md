@@ -258,7 +258,7 @@ The protocol uses a `WasmEnvelope` JSON payload inside the core
 
 | Command | Envelope field | Payload | Response |
 |---------|---------------|---------|----------|
-| **Load app** | `wasm_load` | `{ name, bytes }` | `WasmManagementResult::Loaded { app }` |
+| **Load app** | `wasm_load` | `{ name, bytes, hostname? }` | `WasmManagementResult::Loaded { app }` |
 | **Unload app** | `wasm_unload` | `{ name }` | `Unloaded { name }` or `NotFound { name }` |
 | **List apps** | `wasm_list` | `{}` | `Apps { apps: [...] }` |
 | **Call function** | `wasm_call` | `{ app, function, params }` | `WasmResult { values }` or `{ error }` |
@@ -269,8 +269,8 @@ Only one field should be set per envelope. The module dispatches in order:
 ### Example: load and call
 
 ```json
-// 1. Upload the WASM component
-{"wasm_load": {"name": "my-app", "bytes": [0, 97, 115, 109, ...]}}
+// 1. Upload the WASM component (with optional SNI hostname)
+{"wasm_load": {"name": "my-app", "hostname": "my-app.enclave.local", "bytes": [0, 97, 115, 109, ...]}}
 
 // 2. Call a function
 {"wasm_call": {"app": "my-app", "function": "hello", "params": [{"type": "string", "value": "world"}]}}
@@ -285,8 +285,27 @@ Only one field should be set per envelope. The module dispatches in order:
 ### Attestation
 
 Each loaded app's SHA-256 code hash is automatically included in subsequent
-RA-TLS certificate renewals (OID `1.3.6.1.4.1.65230.2.3`). Clients can
-verify exactly which WASM code is running without trusting the operator.
+RA-TLS certificate renewals (combined hash OID `1.3.6.1.4.1.65230.2.3`).
+Clients can verify exactly which WASM code is running without trusting the
+operator.
+
+### Per-app X.509 certificates
+
+Each loaded WASM app gets its own leaf X.509 certificate, served via SNI
+routing. When a client connects with a hostname matching a loaded app's
+`hostname`, the RA-TLS server generates a cert containing:
+
+| Extension | OID | Content |
+|-----------|-----|---------|
+| SGX Quote | `1.2.840.113741.1.13.1.0` | SGX DCAP quote proving enclave genuineness |
+| Per-app Config Merkle Root | `1.3.6.1.4.1.65230.3.1` | SHA-256 root of the app's config entries |
+| Per-app Code Hash | `1.3.6.1.4.1.65230.3.2` | SHA-256 of the WASM component bytecode |
+
+If no SNI match is found, the default enclave-wide certificate is used
+(containing the enclave-wide Merkle root + module OIDs).
+
+The `hostname` field in `wasm_load` is optional — if omitted, the app
+`name` is used as the SNI hostname.
 
 ## Directory structure
 

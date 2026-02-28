@@ -34,11 +34,14 @@ pub trait EnclaveModule: Send + Sync {
     fn config_leaves(&self) -> Vec<ConfigLeaf> { Vec::new() }
     /// Custom X.509 OIDs for RA-TLS certificates (default: none).
     fn custom_oids(&self) -> Vec<ModuleOid> { Vec::new() }
+    /// Per-app identities for SNI-routed X.509 certificates (default: none).
+    fn app_identities(&self) -> Vec<AppIdentity> { Vec::new() }
 }
 ```
 
 - `config_leaves()`  named inputs hashed into the config Merkle root OID.
 - `custom_oids()`  individual X.509 OID extensions embedded in every RA-TLS certificate, allowing clients to verify specific module properties without full Merkle audit.
+- `app_identities()`  per-app identities, each getting its own leaf cert (signed by the Enclave CA) with a dedicated Merkle tree and OID extensions, served via SNI routing.
 
 ### Module Crates
 

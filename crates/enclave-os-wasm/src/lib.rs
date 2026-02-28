@@ -81,7 +81,8 @@ use ring::digest;
 use enclave_os_common::protocol::{Request, Response};
 use enclave_os_enclave::config_merkle::ConfigLeaf;
 use enclave_os_enclave::ecall::hex_encode;
-use enclave_os_enclave::modules::{EnclaveModule, ModuleOid};
+use enclave_os_enclave::modules::{AppIdentity, ConfigEntry, EnclaveModule, ModuleOid};
+use enclave_os_enclave::ratls::cert_store;
 use enclave_os_common::types::AEAD_KEY_SIZE;
 
 use crate::protocol::{WasmCall, WasmEnvelope, WasmManagementResult, WasmResult};
@@ -128,19 +129,55 @@ impl WasmModule {
     /// The app will be compiled, introspected, and registered under
     /// the given name.  Its code hash is automatically included in
     /// attestation (config Merkle leaves + X.509 OID).
-    pub fn load_app(&self, name: &str, wasm_bytes: &[u8]) -> Result<(), String> {
-        self.registry
-            .lock()
-            .map_err(|_| String::from("registry lock poisoned"))?
-            .load_app(name, wasm_bytes)
+    ///
+    /// A per-app X.509 certificate identity is registered with the
+    /// global [`CertStore`](cert_store::CertStore) so that clients
+    /// connecting via the `hostname` SNI receive an app-specific cert.
+    pub fn load_app(&self, name: &str, hostname: &str, wasm_bytes: &[u8]) -> Result<(), String> {
+        // Load into the registry (compile + introspect)
+        let code_hash = {
+            let mut reg = self.registry
+                .lock()
+                .map_err(|_| String::from("registry lock poisoned"))?;
+            reg.load_app(name, hostname, wasm_bytes)?;
+
+            // Copy code hash while we hold the lock
+            reg.app_code_hash(name)
+                .copied()
+                .ok_or_else(|| String::from("app loaded but hash not found"))?
+        };
+
+        // Register per-app identity with the global CertStore
+        let identity = AppIdentity {
+            hostname: hostname.to_string(),
+            config: vec![
+                ConfigEntry {
+                    key: format!("wasm.{}.code_hash", name),
+                    value: code_hash.to_vec(),
+                    oid: Some(enclave_os_common::oids::APP_CODE_HASH_OID),
+                },
+            ],
+        };
+        cert_store::cert_store().register(identity);
+
+        Ok(())
     }
 
     /// Unload a WASM app by name.
+    ///
+    /// Removes the app from the registry and unregisters its identity
+    /// from the global [`CertStore`](cert_store::CertStore).
     pub fn unload_app(&self, name: &str) -> bool {
-        self.registry
+        let hostname = self.registry
             .lock()
-            .map(|mut r| r.unload_app(name))
-            .unwrap_or(false)
+            .ok()
+            .and_then(|mut r| r.unload_app(name));
+
+        if let Some(ref h) = hostname {
+            cert_store::cert_store().unregister(h);
+        }
+
+        hostname.is_some()
     }
 
     /// List all loaded apps with metadata.
@@ -230,7 +267,8 @@ impl EnclaveModule for WasmModule {
 
         // 2. wasm_load — load (or replace) an app
         if let Some(load) = envelope.wasm_load {
-            let mgmt_result = match self.load_app(&load.name, &load.bytes) {
+            let hostname = load.hostname.unwrap_or_else(|| load.name.clone());
+            let mgmt_result = match self.load_app(&load.name, &hostname, &load.bytes) {
                 Ok(()) => {
                     // Return the loaded app's info
                     let apps = self.list_apps();

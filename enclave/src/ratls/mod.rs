@@ -7,5 +7,6 @@
 //! in X.509 certificates.
 
 pub mod attestation;
+pub mod cert_store;
 pub mod server;
 pub mod session;

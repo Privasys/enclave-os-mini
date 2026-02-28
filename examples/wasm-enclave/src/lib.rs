@@ -18,11 +18,18 @@
 //! ## Wire protocol
 //!
 //! ```json
-//! {"wasm_load": {"name": "my-app", "bytes": [0, 97, 115, 109, ...]}}
+//! {"wasm_load": {"name": "my-app", "hostname": "my-app.enclave.local", "bytes": [0, 97, 115, 109, ...]}}
 //! {"wasm_call": {"app": "my-app", "function": "hello", "params": []}}
 //! {"wasm_list": {}}
 //! {"wasm_unload": {"name": "my-app"}}
 //! ```
+//!
+//! ## Per-app certificates
+//!
+//! Each loaded WASM app gets its own X.509 leaf certificate routed via
+//! SNI. Clients connecting with `hostname` as the SNI receive a cert
+//! containing the app's config Merkle root and code hash OID, signed by
+//! the Enclave CA.
 
 use enclave_os_enclave::ecall::{init_enclave, finalize_and_run};
 use enclave_os_enclave::modules::register_module;

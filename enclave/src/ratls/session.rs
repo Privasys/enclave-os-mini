@@ -17,14 +17,6 @@ pub struct RaTlsSession {
 }
 
 impl RaTlsSession {
-    /// Create a new session from an accepted connection (legacy path).
-    pub fn new(client_fd: i32, tls_config: std::sync::Arc<rustls::ServerConfig>) -> Result<Self, &'static str> {
-        let tls_conn = rustls::ServerConnection::new(tls_config)
-            .map_err(|_| "Failed to create TLS server connection")?;
-
-        Ok(Self { client_fd, tls_conn })
-    }
-
     /// Create a session from a pre-built `ServerConnection`.
     ///
     /// Used by the Acceptor-based flow in [`super::server::RaTlsServer`]

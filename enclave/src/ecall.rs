@@ -220,6 +220,28 @@ pub fn finalize_and_run(config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i3
             return -20;
         }
     };
+
+    // ── Per-app certificate store ──────────────────────────────────
+    // Initialise the global CertStore and register initial app
+    // identities collected from all modules. Modules that load apps
+    // dynamically (e.g. WASM) will call cert_store().register()
+    // at runtime.
+    {
+        let store = crate::ratls::cert_store::CertStore::new(ca.clone());
+        let identities = crate::modules::collect_app_identities();
+        let count = identities.len();
+        for identity in identities {
+            enclave_log_info!("Registering app identity: {}", identity.hostname);
+            store.register(identity);
+        }
+        crate::ratls::cert_store::init_cert_store(store);
+        if count > 0 {
+            enclave_log_info!("CertStore initialised with {} app identities", count);
+        } else {
+            enclave_log_info!("CertStore initialised (no initial app identities)");
+        }
+    }
+
     let server = match RaTlsServer::new(config.port, config.backlog, ca) {
         Ok(s) => s,
         Err(e) => {

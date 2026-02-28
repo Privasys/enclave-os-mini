@@ -73,8 +73,15 @@ pub struct WasmEnvelope {
 pub struct WasmLoad {
     /// App identifier — used in subsequent `wasm_call` requests.
     pub name: String,
-    /// Raw WASM component bytecode.
+    /// Raw WASM component bytecode (AOT-compiled).
     pub bytes: Vec<u8>,
+    /// SNI hostname for this app's dedicated TLS certificate.
+    ///
+    /// If absent, defaults to the app `name`. Clients connecting via
+    /// this hostname will receive a per-app X.509 certificate containing
+    /// the app's config Merkle root and any declared OID extensions.
+    #[serde(default)]
+    pub hostname: Option<String>,
 }
 
 /// Unload a WASM app by name.
@@ -245,6 +252,8 @@ pub enum WasmValue {
 pub struct AppInfo {
     /// App identifier.
     pub name: String,
+    /// SNI hostname for this app's dedicated TLS certificate.
+    pub hostname: String,
     /// SHA-256 of the WASM component bytecode (hex-encoded).
     pub code_hash: String,
     /// Exported function signatures discovered from the component.

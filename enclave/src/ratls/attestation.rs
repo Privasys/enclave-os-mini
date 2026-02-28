@@ -22,8 +22,9 @@ use ring::digest;
 use ring::rand::SystemRandom;
 use ring::signature::{self, EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 
-// OIDs imported from common — single source of truth.
-use enclave_os_common::oids::{SGX_QUOTE_OID, CONFIG_MERKLE_ROOT_OID};
+use enclave_os_common::oids::{SGX_QUOTE_OID, CONFIG_MERKLE_ROOT_OID, APP_CONFIG_MERKLE_ROOT_OID};
+
+use crate::ratls::cert_store::AppCertData;
 
 /// Certificate validity for challenge-response mode (5 minutes).
 pub const CHALLENGE_VALIDITY_SECS: u64 = 300;
@@ -114,50 +115,57 @@ pub fn generate_ratls_certificate(
     ca: &CaContext,
     mode: CertMode,
 ) -> Result<(Vec<Vec<u8>>, Vec<u8>), String> {
-    // 1. Generate a fresh ECDSA P-256 key pair for the leaf cert
-    let rng = SystemRandom::new();
-    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
-        .map_err(|_| String::from("Key generation failed"))?;
-    let pkcs8_bytes = pkcs8.as_ref().to_vec();
+    let ctx = prepare_attestation(&mode)?;
 
-    // 2. Extract the public key DER
-    let key_pair = EcdsaKeyPair::from_pkcs8(
-        &ECDSA_P256_SHA256_ASN1_SIGNING,
-        &pkcs8_bytes,
-        &rng,
-    )
-    .map_err(|_| String::from("Failed to parse generated key"))?;
-    let pubkey_der = signature::KeyPair::public_key(&key_pair).as_ref();
+    // Collect enclave-wide extensions
+    let mut extensions: Vec<(&'static [u64], Vec<u8>)> = Vec::new();
+    if let Some(root) = crate::config_merkle_root() {
+        extensions.push((CONFIG_MERKLE_ROOT_OID, root.to_vec()));
+    }
+    for oid in &crate::modules::collect_module_oids() {
+        extensions.push((oid.oid, oid.value.clone()));
+    }
 
-    // 3. Compute report_data = SHA-512(SHA-256(pubkey) || binding)
-    let (report_data, validity_secs) = match &mode {
-        CertMode::Challenge { nonce } => (
-            compute_report_data(pubkey_der, nonce),
-            CHALLENGE_VALIDITY_SECS,
-        ),
-        CertMode::Deterministic { creation_time } => (
-            compute_report_data(pubkey_der, &creation_time.to_le_bytes()),
-            DETERMINISTIC_VALIDITY_SECS,
-        ),
-    };
-
-    // 4. Generate SGX quote over report_data
-    let quote = generate_sgx_quote(&report_data)?;
-
-    // 5. Read the config Merkle root (if computed)
-    let config_merkle = crate::config_merkle_root().copied();
-
-    // 6. Collect module-registered custom OIDs
-    let module_oids = crate::modules::collect_module_oids();
-
-    // 7. Build the leaf X.509 certificate signed by the CA
     let leaf_der = build_leaf_cert(
-        &pkcs8_bytes, &quote, validity_secs, ca,
-        config_merkle.as_ref(), &module_oids,
+        &ctx.pkcs8_bytes, &ctx.quote, ctx.validity_secs, ca,
+        "Enclave OS RA-TLS", &extensions,
     )?;
 
-    // 8. Return cert chain [leaf, ca_cert] and private key
-    Ok((vec![leaf_der, ca.ca_cert_der.clone()], pkcs8_bytes))
+    Ok((vec![leaf_der, ca.ca_cert_der.clone()], ctx.pkcs8_bytes))
+}
+
+/// Generate a per-app RA-TLS leaf certificate signed by the CA.
+///
+/// Like [`generate_ratls_certificate()`] but the leaf cert contains
+/// per-app data instead of enclave-wide module OIDs:
+/// - Per-app config Merkle root (OID `1.3.6.1.4.1.65230.3.1`)
+/// - Per-app OID extensions flagged by config entries
+/// - SGX quote (same as the enclave-wide cert)
+/// - Subject CN = app hostname (for SNI matching)
+///
+/// Returns `(cert_chain_der, pkcs8_private_key)`.
+pub fn generate_app_certificate(
+    ca: &CaContext,
+    mode: CertMode,
+    app: &AppCertData,
+) -> Result<(Vec<Vec<u8>>, Vec<u8>), String> {
+    let ctx = prepare_attestation(&mode)?;
+
+    // Collect per-app extensions
+    let mut extensions: Vec<(&'static [u64], Vec<u8>)> = Vec::new();
+    if app.merkle_root != [0u8; 32] {
+        extensions.push((APP_CONFIG_MERKLE_ROOT_OID, app.merkle_root.to_vec()));
+    }
+    for (oid, value) in &app.oid_extensions {
+        extensions.push((*oid, value.clone()));
+    }
+
+    let leaf_der = build_leaf_cert(
+        &ctx.pkcs8_bytes, &ctx.quote, ctx.validity_secs, ca,
+        &app.hostname, &extensions,
+    )?;
+
+    Ok((vec![leaf_der, ca.ca_cert_der.clone()], ctx.pkcs8_bytes))
 }
 
 /// Generate an ECDSA P-256 key pair and return `(pkcs8_bytes, key_pair)`.
@@ -173,6 +181,49 @@ pub fn generate_keypair() -> Result<(Vec<u8>, EcdsaKeyPair), &'static str> {
     )
     .map_err(|_| "Failed to parse generated key")?;
     Ok((pkcs8_bytes, key_pair))
+}
+
+// ---------------------------------------------------------------------------
+//  Attestation preparation (key gen + quote)
+// ---------------------------------------------------------------------------
+
+/// Internal context produced by [`prepare_attestation()`].
+struct AttestationContext {
+    pkcs8_bytes: Vec<u8>,
+    quote: Vec<u8>,
+    validity_secs: u64,
+}
+
+/// Generate a fresh ECDSA key pair, compute report_data from the mode,
+/// and obtain an SGX quote.  Shared by enclave-wide and per-app cert
+/// generation.
+fn prepare_attestation(mode: &CertMode) -> Result<AttestationContext, String> {
+    let rng = SystemRandom::new();
+    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
+        .map_err(|_| String::from("Key generation failed"))?;
+    let pkcs8_bytes = pkcs8.as_ref().to_vec();
+
+    let key_pair = EcdsaKeyPair::from_pkcs8(
+        &ECDSA_P256_SHA256_ASN1_SIGNING,
+        &pkcs8_bytes,
+        &rng,
+    )
+    .map_err(|_| String::from("Failed to parse generated key"))?;
+    let pubkey_der = signature::KeyPair::public_key(&key_pair).as_ref();
+
+    let (report_data, validity_secs) = match mode {
+        CertMode::Challenge { nonce } => (
+            compute_report_data(pubkey_der, nonce),
+            CHALLENGE_VALIDITY_SECS,
+        ),
+        CertMode::Deterministic { creation_time } => (
+            compute_report_data(pubkey_der, &creation_time.to_le_bytes()),
+            DETERMINISTIC_VALIDITY_SECS,
+        ),
+    };
+
+    let quote = generate_sgx_quote(&report_data)?;
+    Ok(AttestationContext { pkcs8_bytes, quote, validity_secs })
 }
 
 // ---------------------------------------------------------------------------
@@ -220,16 +271,16 @@ fn generate_sgx_quote(report_data: &[u8; 64]) -> Result<Vec<u8>, String> {
 
 /// Build a leaf certificate signed by the intermediary CA.
 ///
-/// The SGX quote is embedded as a non-critical custom X.509 extension at
-/// [`SGX_QUOTE_OID`]. The optional config Merkle root is embedded at
-/// [`CONFIG_MERKLE_ROOT_OID`]. Module-registered OIDs are also embedded.
+/// The SGX quote goes into [`SGX_QUOTE_OID`]. Additional X.509 extensions
+/// (config Merkle roots, module OIDs, per-app OIDs) are passed via
+/// `extensions`. The `common_name` is set as the Subject CN.
 fn build_leaf_cert(
     leaf_pkcs8: &[u8],
     quote: &[u8],
     _validity_secs: u64,
     ca: &CaContext,
-    config_merkle_root: Option<&[u8; 32]>,
-    module_oids: &[crate::modules::ModuleOid],
+    common_name: &str,
+    extensions: &[(&'static [u64], Vec<u8>)],
 ) -> Result<Vec<u8>, String> {
     use rcgen::{
         CertificateParams, CustomExtension, DnType, DnValue, IsCa, KeyPair,
@@ -251,7 +302,7 @@ fn build_leaf_cert(
 
     leaf_params.distinguished_name.push(
         DnType::CommonName,
-        DnValue::Utf8String("Enclave OS RA-TLS".into()),
+        DnValue::Utf8String(common_name.into()),
     );
     leaf_params.distinguished_name.push(
         DnType::OrganizationName,
@@ -259,26 +310,16 @@ fn build_leaf_cert(
     );
 
     // Validity: wide window; actual freshness is proved by the quote.
-    // In production, derive from OCALL get_current_time + validity_secs.
     leaf_params.not_before = rcgen::date_time_ymd(2024, 1, 1);
     leaf_params.not_after = rcgen::date_time_ymd(2030, 12, 31);
 
-    // Embed the SGX quote as a non-critical custom extension.
+    // SGX quote
     let quote_ext = CustomExtension::from_oid_content(SGX_QUOTE_OID, quote.to_vec());
     leaf_params.custom_extensions.push(quote_ext);
 
-    // Embed the config Merkle root as a non-critical custom extension (if computed).
-    if let Some(root) = config_merkle_root {
-        let merkle_ext = CustomExtension::from_oid_content(
-            CONFIG_MERKLE_ROOT_OID,
-            root.to_vec(),
-        );
-        leaf_params.custom_extensions.push(merkle_ext);
-    }
-
-    // Embed module-registered custom OIDs.
-    for oid in module_oids {
-        let ext = CustomExtension::from_oid_content(oid.oid, oid.value.clone());
+    // Caller-supplied extensions (Merkle roots, module OIDs, per-app OIDs)
+    for (oid, value) in extensions {
+        let ext = CustomExtension::from_oid_content(*oid, value.clone());
         leaf_params.custom_extensions.push(ext);
     }
 
@@ -307,101 +348,100 @@ fn build_leaf_cert(
 }
 
 // ---------------------------------------------------------------------------
-//  ClientHello extension 0xFFBB parser
+//  ClientHello parser — combined SNI + challenge nonce extraction
 // ---------------------------------------------------------------------------
 
-/// Try to extract the challenge nonce from TLS extension 0xFFBB in a raw
-/// ClientHello message.
+/// Information extracted from a TLS ClientHello message.
+pub struct ClientHelloInfo {
+    /// Challenge nonce from extension 0xFFBB (if present).
+    pub challenge_nonce: Option<Vec<u8>>,
+    /// Server Name Indication hostname (from extension 0x0000).
+    pub sni: Option<String>,
+}
+
+/// Parse a raw TLS ClientHello to extract extension data.
 ///
-/// The `raw` bytes may start at the TLS record layer (content-type 0x16)
-/// or at the Handshake layer (type 0x01). Returns `None` if the extension
-/// is not found or the message is malformed.
-pub fn extract_challenge_nonce(raw: &[u8]) -> Option<Vec<u8>> {
-    // Minimum sizes: TLS record header(5) + Handshake header(4) +
-    //   ClientHello fields(2+32+1) = 44 bytes absolute minimum.
+/// Extracts both the challenge nonce (extension 0xFFBB) and the SNI
+/// hostname (extension 0x0000) in a single pass. The `raw` bytes may
+/// start at the TLS record layer or the Handshake layer.
+pub fn parse_client_hello(raw: &[u8]) -> ClientHelloInfo {
+    let mut info = ClientHelloInfo {
+        challenge_nonce: None,
+        sni: None,
+    };
+
     if raw.len() < 44 {
-        return None;
+        return info;
     }
 
     let mut pos: usize = 0;
 
     // --- TLS record layer (optional) ---
     if raw[0] == 0x16 {
-        // ContentType::Handshake
-        // Skip version(2) + length(2) = 4 bytes
         pos += 5;
     }
 
     // --- Handshake header ---
     if pos >= raw.len() || raw[pos] != 0x01 {
-        return None; // Not a ClientHello
+        return info;
     }
     pos += 1;
-    // 3-byte handshake length
     if pos + 3 > raw.len() {
-        return None;
+        return info;
     }
-    let _hs_len = (raw[pos] as usize) << 16
-        | (raw[pos + 1] as usize) << 8
-        | raw[pos + 2] as usize;
-    pos += 3;
+    pos += 3; // 3-byte handshake length
 
     // --- ClientHello body ---
-    // client_version (2)
     if pos + 2 > raw.len() {
-        return None;
+        return info;
     }
-    pos += 2;
+    pos += 2; // client_version
 
-    // random (32)
     if pos + 32 > raw.len() {
-        return None;
+        return info;
     }
-    pos += 32;
+    pos += 32; // random
 
-    // session_id_length (1) + session_id
     if pos >= raw.len() {
-        return None;
+        return info;
     }
     let sid_len = raw[pos] as usize;
     pos += 1;
     if pos + sid_len > raw.len() {
-        return None;
+        return info;
     }
     pos += sid_len;
 
-    // cipher_suites_length (2) + cipher_suites
     if pos + 2 > raw.len() {
-        return None;
+        return info;
     }
     let cs_len = u16::from_be_bytes([raw[pos], raw[pos + 1]]) as usize;
     pos += 2;
     if pos + cs_len > raw.len() {
-        return None;
+        return info;
     }
     pos += cs_len;
 
-    // compression_methods_length (1) + compression_methods
     if pos >= raw.len() {
-        return None;
+        return info;
     }
     let cm_len = raw[pos] as usize;
     pos += 1;
     if pos + cm_len > raw.len() {
-        return None;
+        return info;
     }
     pos += cm_len;
 
     // --- Extensions ---
     if pos + 2 > raw.len() {
-        return None;
+        return info;
     }
     let ext_total_len = u16::from_be_bytes([raw[pos], raw[pos + 1]]) as usize;
     pos += 2;
 
     let ext_end = pos + ext_total_len;
     if ext_end > raw.len() {
-        return None;
+        return info;
     }
 
     while pos + 4 <= ext_end {
@@ -410,17 +450,50 @@ pub fn extract_challenge_nonce(raw: &[u8]) -> Option<Vec<u8>> {
         pos += 4;
 
         if pos + ext_len > ext_end {
-            return None;
+            break;
         }
 
-        if ext_type == enclave_os_common::types::RATLS_CLIENT_HELLO_EXTENSION_TYPE {
-            return Some(raw[pos..pos + ext_len].to_vec());
+        match ext_type {
+            // Challenge nonce — Privasys RA-TLS extension
+            ext if ext == enclave_os_common::types::RATLS_CLIENT_HELLO_EXTENSION_TYPE => {
+                info.challenge_nonce = Some(raw[pos..pos + ext_len].to_vec());
+            }
+            // SNI — Server Name Indication (RFC 6066)
+            0x0000 => {
+                info.sni = parse_sni_extension(&raw[pos..pos + ext_len]);
+            }
+            _ => {}
         }
 
         pos += ext_len;
     }
 
-    None
+    info
+}
+
+/// Parse the SNI extension value to extract the host_name.
+///
+/// Format (RFC 6066 §3):
+/// ```text
+/// [2 bytes: ServerNameList length]
+/// [1 byte:  name_type (0x00 = host_name)]
+/// [2 bytes: HostName length]
+/// [N bytes: hostname (UTF-8)]
+/// ```
+fn parse_sni_extension(data: &[u8]) -> Option<String> {
+    if data.len() < 5 {
+        return None;
+    }
+    // Skip list length (2 bytes)
+    let name_type = data[2];
+    if name_type != 0x00 {
+        return None; // Only host_name type is supported
+    }
+    let name_len = u16::from_be_bytes([data[3], data[4]]) as usize;
+    if 5 + name_len > data.len() {
+        return None;
+    }
+    String::from_utf8(data[5..5 + name_len].to_vec()).ok()
 }
 
 // ===========================================================================
@@ -491,7 +564,7 @@ mod tests {
         assert_ne!(rd, rd2);
     }
 
-    // ----- extract_challenge_nonce (ClientHello parser) -------------------
+    // ----- parse_client_hello (ClientHello parser) ------------------------
 
     /// Build a minimal TLS 1.2 ClientHello with the given extensions.
     ///
@@ -548,23 +621,26 @@ mod tests {
     }
 
     #[test]
-    fn extract_nonce_present() {
+    fn parse_nonce_present() {
         let nonce = b"challenge_nonce_32_bytes_padding!";
         let ch = build_client_hello(&[(0xFFBB, nonce)]);
-        let result = extract_challenge_nonce(&ch);
-        assert_eq!(result, Some(nonce.to_vec()));
+        let info = parse_client_hello(&ch);
+        assert_eq!(info.challenge_nonce, Some(nonce.to_vec()));
+        assert_eq!(info.sni, None);
     }
 
     #[test]
-    fn extract_nonce_absent() {
-        // ClientHello with SNI extension but no 0xFFBB
-        let ch = build_client_hello(&[(0x0000, b"example.com")]); // SNI
-        let result = extract_challenge_nonce(&ch);
-        assert_eq!(result, None);
+    fn parse_nonce_absent() {
+        // Valid SNI extension but no 0xFFBB
+        let sni = b"\x00\x0e\x00\x00\x0bexample.com";
+        let ch = build_client_hello(&[(0x0000, sni)]);
+        let info = parse_client_hello(&ch);
+        assert_eq!(info.challenge_nonce, None);
+        assert_eq!(info.sni, Some("example.com".into()));
     }
 
     #[test]
-    fn extract_nonce_multiple_extensions() {
+    fn parse_nonce_and_sni_together() {
         let nonce = b"my_nonce";
         let exts: &[(u16, &[u8])] = &[
             (0x0000, b"\x00\x0e\x00\x00\x0bexample.com"), // SNI
@@ -572,19 +648,20 @@ mod tests {
             (0xFFBB, nonce),                                 // our extension
         ];
         let ch = build_client_hello(exts);
-        let result = extract_challenge_nonce(&ch);
-        assert_eq!(result, Some(nonce.to_vec()));
+        let info = parse_client_hello(&ch);
+        assert_eq!(info.challenge_nonce, Some(nonce.to_vec()));
+        assert_eq!(info.sni, Some("example.com".into()));
     }
 
     #[test]
-    fn extract_nonce_empty_extension_data() {
+    fn parse_nonce_empty_extension_data() {
         let ch = build_client_hello(&[(0xFFBB, b"")]);
-        let result = extract_challenge_nonce(&ch);
-        assert_eq!(result, Some(vec![]));
+        let info = parse_client_hello(&ch);
+        assert_eq!(info.challenge_nonce, Some(vec![]));
     }
 
     #[test]
-    fn extract_nonce_no_record_layer() {
+    fn parse_nonce_no_record_layer() {
         // Feed just the handshake message (no TLS record header)
         let nonce = b"nonce123";
 
@@ -609,32 +686,37 @@ mod tests {
         hs.push((len & 0xFF) as u8);
         hs.extend_from_slice(&ch_body);
 
-        let result = extract_challenge_nonce(&hs);
-        assert_eq!(result, Some(nonce.to_vec()));
+        let info = parse_client_hello(&hs);
+        assert_eq!(info.challenge_nonce, Some(nonce.to_vec()));
     }
 
     #[test]
-    fn extract_nonce_too_short() {
-        assert_eq!(extract_challenge_nonce(&[]), None);
-        assert_eq!(extract_challenge_nonce(&[0x16, 0x03, 0x01]), None);
-        assert_eq!(extract_challenge_nonce(&[0u8; 10]), None);
+    fn parse_too_short() {
+        let info = parse_client_hello(&[]);
+        assert!(info.challenge_nonce.is_none() && info.sni.is_none());
+        let info = parse_client_hello(&[0x16, 0x03, 0x01]);
+        assert!(info.challenge_nonce.is_none());
+        let info = parse_client_hello(&[0u8; 10]);
+        assert!(info.challenge_nonce.is_none());
     }
 
     #[test]
-    fn extract_nonce_not_handshake() {
+    fn parse_not_handshake() {
         // Content type 0x17 = Application Data (not Handshake)
         let mut bad = build_client_hello(&[(0xFFBB, b"nonce")]);
         bad[0] = 0x17;
-        assert_eq!(extract_challenge_nonce(&bad), None);
+        let info = parse_client_hello(&bad);
+        assert!(info.challenge_nonce.is_none());
     }
 
     #[test]
-    fn extract_nonce_not_client_hello() {
+    fn parse_not_client_hello() {
         // Handshake type 0x02 = ServerHello (not ClientHello)
         let mut bad = build_client_hello(&[(0xFFBB, b"nonce")]);
         // Record header is 5 bytes, then handshake type is at offset 5
         bad[5] = 0x02;
-        assert_eq!(extract_challenge_nonce(&bad), None);
+        let info = parse_client_hello(&bad);
+        assert!(info.challenge_nonce.is_none());
     }
 
     // ----- Mock-mode certificate generation (feature = "mock") -----------

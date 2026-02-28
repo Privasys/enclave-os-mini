@@ -30,6 +30,7 @@ use std::vec::Vec;
 
 use crate::ocall;
 use crate::ratls::attestation::{self, CaContext, CertMode};
+use crate::ratls::cert_store;
 use crate::ratls::session::RaTlsSession;
 use crate::{enclave_log_info, enclave_log_error};
 
@@ -44,8 +45,11 @@ pub struct RaTlsServer {
     sessions: BTreeMap<i32, RaTlsSession>,
     ca: Arc<CaContext>,
     shutdown: bool,
-    /// Cached deterministic TLS config (reused when 0xFFBB is absent).
-    cached_config: Option<CachedConfig>,
+    /// Per-hostname cached deterministic TLS configs.
+    ///
+    /// Key: SNI hostname (empty string = default/no-SNI).
+    /// Caches are invalidated after `DETERMINISTIC_VALIDITY_SECS`.
+    cached_configs: BTreeMap<String, CachedConfig>,
 }
 
 /// A cached ServerConfig for deterministic (non-challenge) connections.
@@ -65,7 +69,7 @@ impl RaTlsServer {
             sessions: BTreeMap::new(),
             ca,
             shutdown: false,
-            cached_config: None,
+            cached_configs: BTreeMap::new(),
         })
     }
 
@@ -184,11 +188,14 @@ impl RaTlsServer {
         };
         let raw = &raw_buf[..raw_len];
 
-        // Parse extension 0xFFBB for challenge nonce
-        let nonce = attestation::extract_challenge_nonce(raw);
+        // Parse ClientHello for challenge nonce (0xFFBB) and SNI (0x0000)
+        let hello = attestation::parse_client_hello(raw);
+        if let Some(ref sni) = hello.sni {
+            enclave_log_info!("SNI: {} (fd={})", sni, client_fd);
+        }
 
-        // Build the per-connection TLS config
-        let tls_config = match self.tls_config_for(&nonce) {
+        // Build the per-connection TLS config (per-app if SNI matches)
+        let tls_config = match self.tls_config_for(&hello.challenge_nonce, &hello.sni) {
             Ok(cfg) => cfg,
             Err(e) => {
                 enclave_log_error!("Cert generation failed for fd={}: {}", client_fd, e);
@@ -254,37 +261,46 @@ impl RaTlsServer {
 
     /// Obtain a `ServerConfig` for this connection.
     ///
-    /// - If `nonce` is `Some`, generate a fresh challenge-response cert.
-    /// - Otherwise, return a cached deterministic config (or generate one).
+    /// 1. If `nonce` is present → challenge mode (fresh cert, per-app if SNI matches).
+    /// 2. Otherwise → deterministic mode (cached by hostname, per-app if SNI matches).
     fn tls_config_for(
         &mut self,
         nonce: &Option<Vec<u8>>,
+        sni: &Option<String>,
     ) -> Result<Arc<ServerConfig>, String> {
+        // Resolve per-app identity from the global CertStore
+        let app_data = sni.as_deref()
+            .and_then(|h| cert_store::cert_store().resolve(h));
+
         if let Some(n) = nonce {
             // Challenge-response: always generate a fresh cert
-            let mode = CertMode::Challenge {
-                nonce: n.clone(),
-            };
-            return build_tls_config_from_cert(&self.ca, mode);
+            let mode = CertMode::Challenge { nonce: n.clone() };
+            return build_tls_config(&self.ca, mode, app_data.as_ref());
         }
 
-        // Deterministic: check cache
+        // Deterministic: check per-hostname cache
+        let cache_key = sni.clone().unwrap_or_default();
         let now = ocall::get_current_time().unwrap_or(0);
-        if let Some(ref cached) = self.cached_config {
+
+        if let Some(cached) = self.cached_configs.get(&cache_key) {
             if now < cached.expires_at {
                 return Ok(cached.config.clone());
             }
         }
 
-        let mode = CertMode::Deterministic {
-            creation_time: now,
-        };
-        let config = build_tls_config_from_cert(&self.ca, mode)?;
-        self.cached_config = Some(CachedConfig {
+        let mode = CertMode::Deterministic { creation_time: now };
+        let config = build_tls_config(&self.ca, mode, app_data.as_ref())?;
+
+        self.cached_configs.insert(cache_key, CachedConfig {
             config: config.clone(),
             expires_at: now + attestation::DETERMINISTIC_VALIDITY_SECS,
         });
         Ok(config)
+    }
+
+    /// Invalidate cached cert for a hostname (called when an app is loaded/unloaded).
+    pub fn invalidate_cached_config(&mut self, hostname: &str) {
+        self.cached_configs.remove(hostname);
     }
 }
 
@@ -304,12 +320,20 @@ impl Drop for RaTlsServer {
 //  TLS configuration helpers
 // ---------------------------------------------------------------------------
 
-/// Build a `ServerConfig` from a freshly generated RA-TLS certificate.
-fn build_tls_config_from_cert(
+/// Build a `ServerConfig` from an RA-TLS certificate.
+///
+/// When `app` is `Some`, generates a per-app leaf cert (with app-specific
+/// Merkle root + OIDs and CN = hostname).  Otherwise generates the
+/// enclave-wide cert.
+fn build_tls_config(
     ca: &CaContext,
     mode: CertMode,
+    app: Option<&cert_store::AppCertData>,
 ) -> Result<Arc<ServerConfig>, String> {
-    let (cert_chain_der, pkcs8_key) = attestation::generate_ratls_certificate(ca, mode)?;
+    let (cert_chain_der, pkcs8_key) = match app {
+        Some(a) => attestation::generate_app_certificate(ca, mode, a)?,
+        None => attestation::generate_ratls_certificate(ca, mode)?,
+    };
 
     let certs: Vec<CertificateDer<'static>> = cert_chain_der
         .into_iter()

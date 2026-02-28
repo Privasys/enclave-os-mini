@@ -7,6 +7,7 @@
 //! - Handle client requests via [`handle()`](EnclaveModule::handle)
 //! - Register config inputs for the Merkle tree via [`config_leaves()`](EnclaveModule::config_leaves)
 //! - Register custom X.509 OIDs for RA-TLS certs via [`custom_oids()`](EnclaveModule::custom_oids)
+//! - Declare per-app identities for SNI-routed certs via [`app_identities()`](EnclaveModule::app_identities)
 
 // ---------------------------------------------------------------------------
 //  Built-in modules
@@ -42,6 +43,44 @@ pub struct ModuleOid {
 }
 
 // ---------------------------------------------------------------------------
+//  Per-app identity types
+// ---------------------------------------------------------------------------
+
+/// A configuration entry declared by a module or app at init time.
+///
+/// Each entry is SHA-256 hashed and included in the app's per-identity
+/// Merkle tree. Entries flagged with an [`oid`](Self::oid) are also
+/// embedded as direct X.509 extensions in the app's certificate for
+/// fast-path verification (clients can check the OID without
+/// recomputing the full Merkle tree).
+pub struct ConfigEntry {
+    /// Human-readable key (e.g. `"code_hash"`, `"policy_version"`).
+    pub key: String,
+    /// Raw value bytes (SHA-256 hashed into the Merkle tree).
+    pub value: Vec<u8>,
+    /// If `Some`, also embed this entry as a direct X.509 OID extension
+    /// in the app's leaf certificate.
+    pub oid: Option<&'static [u64]>,
+}
+
+/// Identity of an app endpoint that gets its own X.509 certificate.
+///
+/// Each identity is served via SNI-based TLS routing. The app's leaf
+/// certificate (signed by the Enclave CA) contains:
+/// - A per-app Merkle tree root computed from [`config`](Self::config)
+/// - Any OID-flagged config entries as direct extensions
+/// - The SGX quote (proving the enclave is genuine)
+pub struct AppIdentity {
+    /// SNI hostname this app responds to (e.g. `"payments.example.com"`).
+    pub hostname: String,
+    /// Configuration entries for this app's Merkle tree.
+    ///
+    /// The tree is computed as:
+    /// `root = SHA-256( SHA-256(entry_0.value) || SHA-256(entry_1.value) || … )`
+    pub config: Vec<ConfigEntry>,
+}
+
+// ---------------------------------------------------------------------------
 //  EnclaveModule trait
 // ---------------------------------------------------------------------------
 
@@ -67,6 +106,20 @@ pub trait EnclaveModule: Send + Sync {
     /// properties (e.g. egress CA bundle hash) without recomputing the
     /// full Merkle tree.
     fn custom_oids(&self) -> Vec<ModuleOid> {
+        Vec::new()
+    }
+
+    /// App identities for per-app X.509 certificates.
+    ///
+    /// Each returned [`AppIdentity`] gets its own leaf cert (signed by
+    /// the Enclave CA) with a dedicated Merkle tree and OID extensions.
+    /// Connections are routed to the correct cert via SNI.
+    ///
+    /// Called once during init to collect initial identities. For
+    /// dynamically loaded apps (e.g. WASM), modules should also call
+    /// [`crate::ratls::cert_store::cert_store()`] directly to
+    /// register/unregister identities at runtime.
+    fn app_identities(&self) -> Vec<AppIdentity> {
         Vec::new()
     }
 }
@@ -99,6 +152,15 @@ pub fn collect_module_oids() -> Vec<ModuleOid> {
         oids.extend(module.custom_oids());
     }
     oids
+}
+
+/// Collect app identities from all registered modules.
+pub fn collect_app_identities() -> Vec<AppIdentity> {
+    let mut identities = Vec::new();
+    for module in MODULES.lock().unwrap().iter() {
+        identities.extend(module.app_identities());
+    }
+    identities
 }
 
 /// Dispatch a request to the first module that handles it.

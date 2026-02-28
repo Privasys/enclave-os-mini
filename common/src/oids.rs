@@ -54,3 +54,24 @@ pub const EGRESS_CA_HASH_OID_STR: &str = "1.3.6.1.4.1.65230.2.1";
 pub const WASM_APPS_HASH_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 2, 3];
 /// WASM Apps Combined Code Hash (dotted-string).
 pub const WASM_APPS_HASH_OID_STR: &str = "1.3.6.1.4.1.65230.2.3";
+
+// =========================================================================
+//  Per-app certificate OIDs
+// =========================================================================
+
+/// Per-app Config Merkle Root — `1.3.6.1.4.1.65230.3.1`
+///
+/// 32-byte SHA-256 hash covering the configuration entries declared by
+/// a single app. Each app gets its own cert with its own Merkle root.
+pub const APP_CONFIG_MERKLE_ROOT_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 3, 1];
+/// Per-app Config Merkle Root (dotted-string).
+pub const APP_CONFIG_MERKLE_ROOT_OID_STR: &str = "1.3.6.1.4.1.65230.3.1";
+
+/// Per-app Code Hash — `1.3.6.1.4.1.65230.3.2`
+///
+/// 32-byte SHA-256 hash of the app's code (e.g. WASM component bytecode).
+/// Embedded directly in the app's leaf certificate for fast-path
+/// verification without recomputing the per-app Merkle tree.
+pub const APP_CODE_HASH_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 3, 2];
+/// Per-app Code Hash (dotted-string).
+pub const APP_CODE_HASH_OID_STR: &str = "1.3.6.1.4.1.65230.3.2";
