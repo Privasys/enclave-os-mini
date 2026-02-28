@@ -128,10 +128,10 @@ capable CPU onto a less capable one. In our case:
 1. **Same physical CPU** — the compiler and enclave always run on the
    same machine (or at least the same CPU model, verified by
    MRENCLAVE/MRSIGNER attestation).
-2. **MRENCLAVE integrity** — the `.cwasm` is `include_bytes!`'d into the
-   enclave binary. Its hash is part of the MRENCLAVE measurement. Nobody
-   can substitute a differently-compiled module without changing the
-   measurement.
+2. **MRENCLAVE integrity** — the `.cwasm` is compiled from WASM bytecode
+   whose SHA-256 hash is attested in the RA-TLS certificate. Nobody
+   can substitute a differently-compiled module without the hash
+   changing.
 3. **Feature flags are additive** — if Cranelift emitted AVX2
    instructions, the CPU supports them. The issue is purely a reporting
    discrepancy.
@@ -247,6 +247,46 @@ Key design choices:
 
 - **Disabled memory images**: CoW / memfd-based memory images are not
   available in SGX (no `/proc`, no `memfd_create`).
+
+## Wire protocol — dynamic WASM loading
+
+WASM apps are loaded, unloaded, and called over the RA-TLS wire protocol.
+The protocol uses a `WasmEnvelope` JSON payload inside the core
+`Request::Data` / `Response::Data` framing.
+
+### Management commands
+
+| Command | Envelope field | Payload | Response |
+|---------|---------------|---------|----------|
+| **Load app** | `wasm_load` | `{ name, bytes }` | `WasmManagementResult::Loaded { app }` |
+| **Unload app** | `wasm_unload` | `{ name }` | `Unloaded { name }` or `NotFound { name }` |
+| **List apps** | `wasm_list` | `{}` | `Apps { apps: [...] }` |
+| **Call function** | `wasm_call` | `{ app, function, params }` | `WasmResult { values }` or `{ error }` |
+
+Only one field should be set per envelope. The module dispatches in order:
+`wasm_call` → `wasm_load` → `wasm_unload` → `wasm_list`.
+
+### Example: load and call
+
+```json
+// 1. Upload the WASM component
+{"wasm_load": {"name": "my-app", "bytes": [0, 97, 115, 109, ...]}}
+
+// 2. Call a function
+{"wasm_call": {"app": "my-app", "function": "hello", "params": [{"type": "string", "value": "world"}]}}
+
+// 3. List loaded apps
+{"wasm_list": {}}
+
+// 4. Unload when done
+{"wasm_unload": {"name": "my-app"}}
+```
+
+### Attestation
+
+Each loaded app's SHA-256 code hash is automatically included in subsequent
+RA-TLS certificate renewals (OID `1.3.6.1.4.1.65230.2.3`). Clients can
+verify exactly which WASM code is running without trusting the operator.
 
 ## Directory structure
 

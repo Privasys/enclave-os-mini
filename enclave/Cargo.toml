@@ -9,8 +9,8 @@ license = "AGPL-3.0"
 description = "Enclave-side trusted code for enclave-os"
 
 # This crate builds as a static library that gets linked into the enclave .so.
-# The rlib target is also needed so that dependent Rust crates (app/, kvstore,
-# wasm) can link against it during compilation.
+# The rlib target is also needed so that dependent Rust crates (kvstore,
+# wasm, adopter projects) can link against it during compilation.
 [lib]
 name = "enclave_os_enclave"
 crate-type = ["staticlib", "rlib"]

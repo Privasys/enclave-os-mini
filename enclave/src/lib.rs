@@ -15,13 +15,20 @@
 //! separate crates and register themselves via
 //! [`modules::register_module()`].
 //!
-//! ## Adopter integration
+//! ## Composition
 //!
 //! By default, the `default-ecall` feature provides a minimal `ecall_run`
-//! that registers only the HelloWorld example module. Adopters disable
-//! this feature and provide their own `ecall_run`, using
-//! [`ecall::init_enclave()`] and [`ecall::finalize_and_run()`] as
-//! building blocks.
+//! that registers only the HelloWorld diagnostic module, keeping the
+//! enclave binary small.
+//!
+//! To add modules (e.g. WASM runtime), create a separate crate that:
+//! 1. Depends on `enclave-os-enclave` with `default-features = false`
+//!    and `features = ["sgx"]` (disabling `default-ecall`).
+//! 2. Provides its own `#[no_mangle] pub extern "C" fn ecall_run(…)`.
+//! 3. Calls [`ecall::init_enclave()`] → registers modules →
+//!    [`ecall::finalize_and_run()`].
+//!
+//! See `examples/wasm-enclave/` for a complete example.
 //!
 //! **Build mode**: sysroot replacement.
 //! `sgx_tstd` is compiled as `std` in a custom sysroot, so all crates

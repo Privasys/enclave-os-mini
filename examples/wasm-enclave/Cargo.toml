@@ -1,0 +1,40 @@
+# Example: Enclave OS with WASM runtime
+#
+# This shows how to create a custom enclave that registers the WASM
+# module alongside the built-in HelloWorld module.
+#
+# To build, point CMake at this directory instead of enclave/:
+#
+#   cmake -DENCLAVE_CRATE_DIR=examples/wasm-enclave ..
+#
+# Or modify enclave/CMakeLists.txt to call:
+#
+#   rust_build_enclave("${CMAKE_SOURCE_DIR}/examples/wasm-enclave" enclave_os_wasm_app)
+
+[package]
+name = "enclave-os-wasm-app"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+description = "Enclave OS with WASM runtime — example composition."
+publish = false
+
+# Static library linked into enclave.so by CMake.
+[lib]
+name = "enclave_os_wasm_app"
+crate-type = ["staticlib"]
+
+[features]
+default = ["sgx"]
+sgx = []
+
+[dependencies]
+# Enclave core — WITHOUT default-ecall (we provide our own ecall_run)
+enclave-os-enclave = { path = "../../enclave", default-features = false, features = ["sgx"] }
+enclave-os-common = { path = "../../common" }
+
+# WASM runtime
+enclave-os-wasm = { path = "../../crates/enclave-os-wasm" }
+
+[profile.release]
+opt-level = "s"

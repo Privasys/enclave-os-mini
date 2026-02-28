@@ -2,23 +2,17 @@
 # Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
 # enclave/CMakeLists.txt
-# Build the enclave app crate → link enclave.so → sign it.
+# Build the enclave crate → link enclave.so → sign it.
 #
-# The app/ crate provides the custom ecall_run that loads WASM apps.
-# It depends on both enclave-os-enclave (core) and enclave-os-wasm (runtime).
+# The enclave-os-enclave crate (this directory) provides the default
+# ecall_run with the HelloWorld module. Adopters who need additional
+# modules (e.g. WASM) create a separate project with a custom ecall_run
+# and point CMake at it instead.
 
-# -- Step 2: Build enclave app crate (staticlib) --
-# If app/ exists, use it (custom ecall_run with WASM support).
-# Otherwise fall back to enclave/ (default-ecall: HelloWorld only).
-if(EXISTS "${CMAKE_SOURCE_DIR}/app/Cargo.toml")
-    rust_build_enclave("${CMAKE_SOURCE_DIR}/app" enclave_os_app)
-    add_dependencies(enclave_os_app sgx_sysroot)
-    set(ENCLAVE_STATIC_LIB "${enclave_os_app_STATIC_LIB}")
-else()
-    rust_build_enclave("${CMAKE_CURRENT_SOURCE_DIR}" enclave_os_enclave)
-    add_dependencies(enclave_os_enclave sgx_sysroot)
-    set(ENCLAVE_STATIC_LIB "${enclave_os_enclave_STATIC_LIB}")
-endif()
+# -- Step 2: Build enclave crate (staticlib) --
+rust_build_enclave("${CMAKE_CURRENT_SOURCE_DIR}" enclave_os_enclave)
+add_dependencies(enclave_os_enclave sgx_sysroot)
+set(ENCLAVE_STATIC_LIB "${enclave_os_enclave_STATIC_LIB}")
 
 # -- Step 3+4: EDL stubs are built in edl/ --
 # EDL_TRUSTED_OBJ is set by edl/CMakeLists.txt
@@ -38,11 +32,7 @@ sgx_link_enclave(
 add_custom_target(enclave_so ALL
     DEPENDS "${ENCLAVE_SO}"
 )
-if(EXISTS "${CMAKE_SOURCE_DIR}/app/Cargo.toml")
-    add_dependencies(enclave_so enclave_os_app edl_trusted_obj)
-else()
-    add_dependencies(enclave_so enclave_os_enclave edl_trusted_obj)
-endif()
+add_dependencies(enclave_so enclave_os_enclave edl_trusted_obj)
 
 # -- Step 6: Sign enclave --
 # Pick debug vs release enclave config

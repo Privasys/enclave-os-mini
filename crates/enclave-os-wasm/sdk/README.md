@@ -216,15 +216,18 @@ Output: `target/wasm32-wasip1/release/your_app.wasm`
 
 ### 4. Load into the enclave
 
-The WASM component is loaded at enclave startup via a custom `ecall_run`:
+Connect to the running enclave over RA-TLS and upload the compiled WASM component:
 
-```rust
-const MY_APP: &[u8] = include_bytes!("path/to/your_app.wasm");
-
-let wasm = WasmModule::new(sealed_cfg.master_key()).unwrap();
-wasm.load_app("my-app", MY_APP).unwrap();
-register_module(Box::new(wasm));
+```json
+{
+    "wasm_load": {
+        "name": "my-app",
+        "bytes": [0, 97, 115, 109, ...]
+    }
+}
 ```
+
+The `bytes` field contains the raw WASM component bytecode as a JSON array of integers. The enclave compiles the component, registers it, and returns the app's metadata (including its SHA-256 code hash).
 
 ### 5. Call over RA-TLS
 

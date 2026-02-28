@@ -84,7 +84,7 @@ use enclave_os_enclave::ecall::hex_encode;
 use enclave_os_enclave::modules::{EnclaveModule, ModuleOid};
 use enclave_os_common::types::AEAD_KEY_SIZE;
 
-use crate::protocol::{WasmCall, WasmEnvelope, WasmResult};
+use crate::protocol::{WasmCall, WasmEnvelope, WasmManagementResult, WasmResult};
 use crate::registry::AppRegistry;
 
 // ---------------------------------------------------------------------------
@@ -202,9 +202,13 @@ impl EnclaveModule for WasmModule {
 
     /// Handle a client request.
     ///
-    /// Expects the `Request::Data` payload to be JSON containing a
-    /// `wasm_call` field.  If present, dispatches to the target app.
-    /// Returns `None` if the payload doesn't contain a `wasm_call`
+    /// Expects the `Request::Data` payload to be JSON containing one of:
+    /// - `wasm_call`   — call an exported function on a loaded app
+    /// - `wasm_load`   — load (or replace) a WASM app from raw bytes
+    /// - `wasm_unload` — unload an app by name
+    /// - `wasm_list`   — list all loaded apps
+    ///
+    /// Returns `None` if the payload doesn't match any WASM envelope
     /// (letting other modules handle the request).
     fn handle(&self, req: &Request) -> Option<Response> {
         let data = match req {
@@ -218,26 +222,49 @@ impl EnclaveModule for WasmModule {
             Err(_) => return None, // Not a WASM request — decline.
         };
 
-        let call = match envelope.wasm_call {
-            Some(c) => c,
-            None => return None, // No wasm_call field — decline.
-        };
+        // 1. wasm_call — execute a function
+        if let Some(call) = envelope.wasm_call {
+            let result = self.dispatch_call(&call);
+            return Some(Response::Data(serialize_or_error(&result)));
+        }
 
-        // Dispatch the call.
-        let result = self.dispatch_call(&call);
+        // 2. wasm_load — load (or replace) an app
+        if let Some(load) = envelope.wasm_load {
+            let mgmt_result = match self.load_app(&load.name, &load.bytes) {
+                Ok(()) => {
+                    // Return the loaded app's info
+                    let apps = self.list_apps();
+                    match apps.into_iter().find(|a| a.name == load.name) {
+                        Some(info) => WasmManagementResult::Loaded { app: info },
+                        None => WasmManagementResult::Error {
+                            message: String::from("app loaded but not found in registry"),
+                        },
+                    }
+                }
+                Err(e) => WasmManagementResult::Error { message: e },
+            };
+            return Some(Response::Data(serialize_or_error(&mgmt_result)));
+        }
 
-        // Serialize the result.
-        let result_json = match serde_json::to_vec(&result) {
-            Ok(j) => j,
-            Err(e) => {
-                let err = WasmResult::Error {
-                    message: format!("result serialization failed: {}", e),
-                };
-                serde_json::to_vec(&err).unwrap_or_default()
-            }
-        };
+        // 3. wasm_unload — remove an app
+        if let Some(unload) = envelope.wasm_unload {
+            let mgmt_result = if self.unload_app(&unload.name) {
+                WasmManagementResult::Unloaded { name: unload.name }
+            } else {
+                WasmManagementResult::NotFound { name: unload.name }
+            };
+            return Some(Response::Data(serialize_or_error(&mgmt_result)));
+        }
 
-        Some(Response::Data(result_json))
+        // 4. wasm_list — enumerate loaded apps
+        if envelope.wasm_list.is_some() {
+            let apps = self.list_apps();
+            let mgmt_result = WasmManagementResult::Apps { apps };
+            return Some(Response::Data(serialize_or_error(&mgmt_result)));
+        }
+
+        // No recognised field — decline so other modules can try.
+        None
     }
 
     /// Config Merkle leaves for attestation.
@@ -275,5 +302,23 @@ impl EnclaveModule for WasmModule {
             oid: WASM_APPS_HASH_OID,
             value: combined.to_vec(),
         }]
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Helpers
+// ---------------------------------------------------------------------------
+
+/// Serialize any `Serialize` value to JSON bytes, falling back to an error
+/// JSON blob if serialization itself fails.
+fn serialize_or_error<T: serde::Serialize>(value: &T) -> Vec<u8> {
+    match serde_json::to_vec(value) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            let fallback = WasmResult::Error {
+                message: format!("result serialization failed: {}", e),
+            };
+            serde_json::to_vec(&fallback).unwrap_or_default()
+        }
     }
 }

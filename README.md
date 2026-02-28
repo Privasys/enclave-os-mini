@@ -81,8 +81,10 @@ impl EnclaveModule for HelloWorldModule {
 
 1. Create a new crate: `crates/enclave-os-mymodule/` with a `Cargo.toml` depending on `enclave-os-enclave` and `enclave-os-common`.
 2. Implement the `EnclaveModule` trait (including `name()`, `handle()`, and optionally `config_leaves()` + `custom_oids()`).
-3. Add your crate as a dependency in `enclave/Cargo.toml`.
-4. Register your module in `ecall_run()` in `ecall.rs`.
+3. Create a composition crate that depends on `enclave-os-enclave` (with `default-features = false, features = ["sgx"]`) and your module crate. Provide a custom `ecall_run` that registers your module.
+4. Point CMake at your composition crate instead of `enclave/`.
+
+See `examples/wasm-enclave/` for a complete example.
 
 ---
 

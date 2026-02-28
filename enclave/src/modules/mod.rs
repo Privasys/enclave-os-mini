@@ -11,10 +11,11 @@
 // ---------------------------------------------------------------------------
 //  Built-in modules
 // ---------------------------------------------------------------------------
-// HelloWorld is the only built-in module -- it exists as a minimal smoke-test
-// for the `default-ecall` feature.  All production modules (egress, kvstore,
-// vault, wasm, ...) live in `crates/enclave-os-*` and are registered by the
-// adopter's custom `ecall_run`.
+// HelloWorld is the only built-in module — it exists as a minimal smoke-test
+// for the `default-ecall` feature. Additional modules (egress, kvstore,
+// vault, wasm, etc.) live in `crates/enclave-os-*` and are registered by a
+// custom `ecall_run` in a separate composition crate.
+// See `examples/wasm-enclave/` for a complete example.
 
 pub mod helloworld;
 

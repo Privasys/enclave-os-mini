@@ -8,21 +8,23 @@
 //! - `ecall_run`: main enclave entry – init subsystems, run event loop
 //! - `ecall_shutdown`: signal graceful stop
 //!
-//! ## Adopter integration
+//! ## Composition
 //!
 //! When the `default-ecall` feature is enabled (the default), this module
-//! provides a vanilla `ecall_run` that registers only the HelloWorld
-//! example module.
+//! provides a minimal `ecall_run` that registers only the HelloWorld
+//! diagnostic module.
 //!
-//! Adopters that need custom modules should:
+//! To add modules (e.g. WASM runtime), create a separate crate:
 //! 1. Depend on `enclave-os-enclave` with `default-features = false` and
 //!    `features = ["sgx"]` (excluding `default-ecall`).
-//! 2. Provide their own `#[no_mangle] pub extern "C" fn ecall_run(…)`.
+//! 2. Provide your own `#[no_mangle] pub extern "C" fn ecall_run(…)`.
 //! 3. Call [`init_enclave()`] to get the parsed config and sealed state.
 //! 4. Construct modules using `sealed_cfg.master_key()` and
 //!    [`register_module()`](crate::modules::register_module) them.
 //! 5. Call [`finalize_and_run()`] to build the Merkle tree, start the
 //!    RA-TLS server, and enter the event loop.
+//!
+//! See `examples/wasm-enclave/` for a complete example.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -267,10 +269,10 @@ pub fn finalize_and_run(config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i3
 // ==========================================================================
 
 /// Default `ecall_run` implementation that registers only the HelloWorld
-/// example module.
+/// diagnostic module.
 ///
-/// Adopters should disable the `default-ecall` feature and provide their
-/// own `ecall_run` that calls [`init_enclave()`] and [`finalize_and_run()`].
+/// To add modules, create a separate composition crate that disables the
+/// `default-ecall` feature. See `examples/wasm-enclave/` for a full example.
 #[cfg(feature = "default-ecall")]
 #[no_mangle]
 pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {

@@ -9,11 +9,13 @@ members = [
 ]
 exclude = [
     "enclave",
-    "app",
+    "examples",
 ]
 # The enclave crate is built separately with a different target;
 # it is NOT part of this workspace (cargo cannot mix targets in one build).
 # See enclave/Cargo.toml for its standalone configuration.
+# Examples (e.g. wasm-enclave) are also excluded — they are composition
+# crates that depend on enclave-os-enclave and build with the SGX target.
 resolver = "2"
 
 [workspace.package]

@@ -27,12 +27,109 @@ use std::vec::Vec;
 
 /// Top-level request envelope.
 ///
-/// The `Request::Data` payload is deserialized into this.  The `wasm_call`
-/// field acts as a discriminator so the WASM module knows the request is
-/// for it (other modules get `None` and decline).
+/// The `Request::Data` payload is deserialized into this.  Exactly one of
+/// the fields should be `Some` — the WASM module checks them in order:
+/// `wasm_call`, `wasm_load`, `wasm_unload`, `wasm_list`.
+///
+/// If all fields are `None`, the WASM module declines the request
+/// (returning `None` so other modules can handle it).
 #[derive(Debug, Serialize, Deserialize)]
 pub struct WasmEnvelope {
+    /// Call an exported function on a loaded WASM app.
+    #[serde(default)]
     pub wasm_call: Option<WasmCall>,
+
+    /// Load (or replace) a WASM app from raw component bytes.
+    #[serde(default)]
+    pub wasm_load: Option<WasmLoad>,
+
+    /// Unload a WASM app by name.
+    #[serde(default)]
+    pub wasm_unload: Option<WasmUnload>,
+
+    /// List all loaded WASM apps (no payload needed, just `"wasm_list": {}`).
+    #[serde(default)]
+    pub wasm_list: Option<WasmList>,
+}
+
+// ---------------------------------------------------------------------------
+//  Management commands — load / unload / list
+// ---------------------------------------------------------------------------
+
+/// Load a WASM component into the enclave at runtime.
+///
+/// ```json
+/// {
+///   "wasm_load": {
+///     "name": "my-app",
+///     "bytes": [0, 97, 115, 109, ...]
+///   }
+/// }
+/// ```
+///
+/// The `bytes` field contains the raw WASM component bytecode.
+/// If an app with the same name is already loaded, it will be replaced.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WasmLoad {
+    /// App identifier — used in subsequent `wasm_call` requests.
+    pub name: String,
+    /// Raw WASM component bytecode.
+    pub bytes: Vec<u8>,
+}
+
+/// Unload a WASM app by name.
+///
+/// ```json
+/// { "wasm_unload": { "name": "my-app" } }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WasmUnload {
+    /// App identifier to remove.
+    pub name: String,
+}
+
+/// List all loaded WASM apps.
+///
+/// ```json
+/// { "wasm_list": {} }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WasmList {}
+
+/// Result of a management operation (load / unload / list).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "status")]
+pub enum WasmManagementResult {
+    /// App loaded successfully.
+    #[serde(rename = "loaded")]
+    Loaded {
+        /// The loaded app's metadata.
+        app: AppInfo,
+    },
+    /// App unloaded successfully.
+    #[serde(rename = "unloaded")]
+    Unloaded {
+        /// Name of the removed app.
+        name: String,
+    },
+    /// App not found (unload of non-existent app).
+    #[serde(rename = "not_found")]
+    NotFound {
+        /// Name that was requested.
+        name: String,
+    },
+    /// List of all loaded apps.
+    #[serde(rename = "apps")]
+    Apps {
+        /// All currently loaded apps with metadata.
+        apps: Vec<AppInfo>,
+    },
+    /// Management operation failed.
+    #[serde(rename = "error")]
+    Error {
+        /// Human-readable error message.
+        message: String,
+    },
 }
 
 // ---------------------------------------------------------------------------
