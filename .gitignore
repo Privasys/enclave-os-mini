@@ -25,4 +25,6 @@ Thumbs.db
 .DS_Store
 
 # Test certificate private keys
-/tests/certificates/*.key
+*.key
+*.crt
+*.csr

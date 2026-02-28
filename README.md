@@ -236,8 +236,8 @@ an egress CA bundle) so the enclave can seal everything to disk:
     --enclave-path ./build/bin/enclave.signed.so \
     --port 443 \
     --kv-path ./kvdata \
-    --ca-cert tests/certificates/privasys.intermadiate-ca.dev.crt \
-    --ca-key  tests/certificates/privasys.intermadiate-ca.dev.key \
+    --ca-cert tests/certificates/privasys.intermediate-ca.dev.crt \
+    --ca-key  tests/certificates/privasys.intermediate-ca.dev.key \
     --egress-ca-bundle /etc/ssl/certs/ca-certificates.crt \
     --debug
 ```
@@ -270,7 +270,7 @@ Use the root CA from `tests/certificates/privasys.root-ca.dev.crt` when running 
 
 ```
 Root CA (privasys.root-ca.dev.crt)
- └── Intermediary CA (privasys.intermadiate-ca.dev.crt + .key)  ← sealed inside enclave
+ └── Intermediary CA (privasys.intermediate-ca.dev.crt + .key)  ← sealed inside enclave
       └── Leaf RA-TLS certificate (generated per-connection inside enclave)
                ├── Extension: SGX Quote             (OID 1.2.840.113741.1.13.1.0)
                ├── Extension: Config Merkle Root    (OID 1.3.6.1.4.1.65230.1.1)
