@@ -362,6 +362,34 @@ without modifying core code.
 8. **RocksDB host KV store**: Host stores opaque encrypted blobs in RocksDB, tuned for point lookups
 9. **Crate-per-module**: Each module is an independent crate under `crates/`, keeping the core enclave TCB small and enabling independent compilation/testing
 
+## Third-party dependencies
+
+Enclave OS (Mini) uses the following third-party Rust crates:
+
+| Dependency | License | Usage |
+|---|---|---|
+| Teaclave SGX SDK (sgx_types, sgx_urts, sgx_tseal, sgx_tse) | Apache 2.0 | Intel SGX enclave SDK bindings (Privasys fork) |
+| wasmtime | Apache 2.0 WITH LLVM-exception | WebAssembly runtime inside SGX (Privasys fork) |
+| rocksdb | Apache 2.0 | Host-side key-value store |
+| rustls | Apache 2.0 / MIT / ISC | TLS 1.3 implementation |
+| rustls-pemfile | Apache 2.0 / MIT / ISC | PEM file parsing |
+| ring | ISC | Cryptographic primitives |
+| rustls-webpki (webpki) | ISC | WebPKI certificate validation |
+| webpki-roots | MPL 2.0 | Mozilla root CA certificates |
+| serde / serde_json | Apache 2.0 / MIT | Serialization |
+| base64 | Apache 2.0 / MIT | Base64 encoding |
+| rcgen | Apache 2.0 / MIT | X.509 certificate generation |
+| x509-parser | Apache 2.0 / MIT | X.509 certificate parsing |
+| anyhow | Apache 2.0 / MIT | Error handling |
+| clap | Apache 2.0 / MIT | CLI argument parsing |
+| log / env_logger | Apache 2.0 / MIT | Logging |
+| hex | Apache 2.0 / MIT | Hex encoding |
+| cc | Apache 2.0 / MIT | C compiler build helper |
+| getrandom | Apache 2.0 / MIT | OS random number generation |
+| tokio | MIT | Async runtime (tests only) |
+
+Full license texts are available in [THIRD-PARTY-LICENSES](THIRD-PARTY-LICENSES).
+
 ## License
 
 This project is licensed under the **GNU Affero General Public License v3.0** (AGPL-3.0).
