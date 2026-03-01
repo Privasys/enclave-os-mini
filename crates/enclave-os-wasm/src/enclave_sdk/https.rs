@@ -189,16 +189,31 @@ fn do_https_fetch(
         match enclave_os_enclave::ocall::net_recv(fd, &mut net_buf) {
             Ok(0) => break,
             Ok(n) => {
+                // Feed ALL received bytes to rustls.  read_tls may only
+                // consume part of the cursor (its internal deframer buffer
+                // is ~4 KiB), so we loop until every byte is ingested.
                 let mut cursor = std::io::Cursor::new(&net_buf[..n]);
-                tls_conn.read_tls(&mut cursor).map_err(|_| "read_tls failed")?;
-                tls_conn.process_new_packets().map_err(|_| "TLS error")?;
+                while (cursor.position() as usize) < n {
+                    match tls_conn.read_tls(&mut cursor) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            tls_conn
+                                .process_new_packets()
+                                .map_err(|e| format!("TLS error: {:?}", e))?;
+                        }
+                        Err(e) => return Err(format!("read_tls error: {:?}", e)),
+                    }
+                }
 
-                let mut app_buf = vec![0u8; 16384];
-                match tls_conn.reader().read(&mut app_buf) {
-                    Ok(0) => break,
-                    Ok(n) => response_data.extend_from_slice(&app_buf[..n]),
-                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-                    Err(_) => break,
+                // Drain all available application data.
+                loop {
+                    let mut app_buf = vec![0u8; 16384];
+                    match tls_conn.reader().read(&mut app_buf) {
+                        Ok(0) => break,
+                        Ok(m) => response_data.extend_from_slice(&app_buf[..m]),
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(_) => break,
+                    }
                 }
             }
             Err(_) => break,
@@ -220,21 +235,39 @@ fn do_https_fetch(
 
 fn tls_handshake(fd: i32, tls_conn: &mut ClientConnection) -> Result<(), i32> {
     loop {
+        // Flush any pending outbound TLS data (e.g. ClientHello, Finished).
+        flush_tls(fd, tls_conn)?;
+
+        // In TLS 1.3 the handshake completes as soon as the client Finished
+        // is flushed — there is nothing more to receive.  Checking *after*
+        // flush avoids a blocking recv on an idle socket.
         if !tls_conn.is_handshaking() {
-            flush_tls(fd, tls_conn)?;
             return Ok(());
         }
 
-        flush_tls(fd, tls_conn)?;
-
+        // Read the next chunk of TLS handshake data from the server.
         let mut buf = vec![0u8; 16384];
         match enclave_os_enclave::ocall::net_recv(fd, &mut buf) {
             Ok(n) if n > 0 => {
                 let mut cursor = std::io::Cursor::new(&buf[..n]);
-                tls_conn.read_tls(&mut cursor).map_err(|_| -1i32)?;
-                tls_conn.process_new_packets().map_err(|_| -1i32)?;
+                while (cursor.position() as usize) < n {
+                    match tls_conn.read_tls(&mut cursor) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            tls_conn.process_new_packets().map_err(|_| -1i32)?;
+                        }
+                        Err(_) => return Err(-1i32),
+                    }
+                }
             }
-            _ => continue,
+            Ok(_) => {
+                // EOF — server closed before handshake completed.
+                return Err(-1i32);
+            }
+            Err(_) => {
+                // Read error.
+                return Err(-1i32);
+            }
         }
     }
 }

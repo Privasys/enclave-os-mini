@@ -11,6 +11,7 @@ use std::collections::HashMap;
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream, SocketAddr};
 use std::sync::Mutex;
+use std::time::Duration;
 
 // ---------------------------------------------------------------------------
 //  Global socket table
@@ -82,6 +83,10 @@ pub fn tcp_connect(host: &str, port: u16) -> Result<i32> {
     let addr = format!("{}:{}", host, port);
     let stream = TcpStream::connect(&addr)
         .with_context(|| format!("Failed to connect to {}", addr))?;
+
+    // Set a read timeout so the enclave's net_recv OCALL cannot block
+    // the host dispatcher indefinitely (e.g. server is slow or gone).
+    let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
 
     let mut table = SOCKET_TABLE.lock().unwrap();
     let fd = table.alloc_fd();
