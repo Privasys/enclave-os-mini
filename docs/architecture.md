@@ -147,35 +147,66 @@ All communication between the host (untrusted) and enclave (trusted) flows
 through **shared-memory SPSC (Single Producer, Single Consumer) queues** with
 a single OCALL for wake-up signalling.
 
+There are **two independent channel pairs**:
+
+| Channel | Direction | Purpose |
+|---------|-----------|---------|
+| **Data Channel** | host ↔ enclave | Raw TCP bytes. The host TCP Proxy writes inbound socket data and reads enclave TLS output. |
+| **RPC Channel** | enclave ↔ host | Control-plane requests: KV reads/writes, HTTPS egress, etc. |
+
+Separating data and control planes means network I/O never contends with
+KV or egress RPC.
+
 ```
-┌─────────────────────────────────────────────────────────┐
-│                    Host (Untrusted)                     │
-│                                                         │
-│  ┌──────────────┐  ┌──────────────┐  ┌───────────────┐  │
-│  │  TCP Sockets │  │  KV Backend  │  │  RPC Dispatch │  │
-│  └──────┬───────┘  └──────┬───────┘  └──────┬────────┘  │
-│         └─────────────────┴─────────────────┘           │
-│                           │                             │
-│  ┌────────────────────────┴──────────────────────────┐  │
-│  │          Shared Memory SPSC Queues                │  │
-│  │  enc_to_host: [ring buf] ← enclave requests       │  │
-│  │  host_to_enc: [ring buf] → host responses         │  │
-│  └────────────────────────┬──────────────────────────┘  │
-│                           │                             │
-├───────────────────────────┼─────────────────────────────┤
-│                           │  SGX boundary               │
-│                           │  (4 ECALLs + 1 OCALL)       │
-│  ┌────────────────────────┴──────────────────────────┐  │
-│  │                    RPC Client                     │  │
-│  └──┬──────────────┬──────────────┬──────────────────┘  │
-│     │              │              │                     │
-│  ┌──┴──────┐  ┌────┴──────┐  ┌────┴───────┐             │
-│  │ RA-TLS  │  │  HTTPS    │  │ Sealed KV  │             │
-│  │ Server  │  │  Egress   │  │ Store      │             │
-│  └─────────┘  └───────────┘  └────────────┘             │
-│              Enclave (Trusted)                          │
-└─────────────────────────────────────────────────────────┘
+┌──────────────────────────────────────────────────────────────────┐
+│                        Host (Untrusted)                          │
+│                                                                  │
+│  ┌──────────────┐   ┌─────────────┐   ┌────────────────┐         │
+│  │ TCP Proxy    │   │ KV Backend  │   │ RPC Dispatcher │         │
+│  │ (tcp_proxy/) │   │ (kvstore/)  │   │ (spin-polls    │         │
+│  │ :443         │   │             │   │  enc_to_host)  │         │
+│  └──────┬───────┘   └──────┬──────┘   └────────┬───────┘         │
+│         │                  │                   │                 │
+│         │                  └───────┬───────────┘                 │
+│         │                          │                             │
+│  ┌──────┴───────────┐   ┌──────────┴──────────────────────────┐  │
+│  │  Data Channel    │   │  RPC Channel                        │  │
+│  │  (TCP bytes)     │   │  (KV ops, egress, module dispatch)  │  │
+│  │  host↔enc [SPSC] │   │  enc↔host [SPSC]                    │  │
+│  └──────┬───────────┘   └──────────┬──────────────────────────┘  │
+│         │                          │                             │
+├─────────┼──────────────────────────┼─────────────────────────────┤
+│         │                          │    SGX boundary             │
+│         │                          │    (4 ECALLs + 1 OCALL)     │
+│  ┌──────┴──────────┐   ┌───────────┴─────────────────────┐       │
+│  │  TLS Engine     │   │  RPC Client                     │       │
+│  │  (rustls)       │   │  (encodes req → enc_to_host,    │       │
+│  │  TCP bytes in,  │   │   reads responses)              │       │
+│  │  HTTP out       │   └───┬──────────────┬──────────────┘       │
+│  └──────┬──────────┘       │              │                      │
+│         │             ┌────┴──────┐  ┌────┴───────┐              │
+│         │             │ HTTPS     │  │ Sealed KV  │              │
+│         │             │ Egress    │  │ Store      │              │
+│         │             │ (rustls)  │  │ (AES-GCM)  │              │
+│         │             └───────────┘  └────────────┘              │
+│  ┌──────┴───────────────────────────────────────────────┐        │
+│  │         Pluggable Modules (EnclaveModule)            │        │
+│  │  ┌────────┐  ┌────────┐  ┌──────┐  ┌──────────────┐  │        │
+│  │  │ Egress │  │ WASM   │  │Vault │  │ HelloWorld   │  │        │
+│  │  └────────┘  └────────┘  └──────┘  └──────────────┘  │        │
+│  └──────────────────────────────────────────────────────┘        │
+│                    Enclave (Trusted)                             │
+└──────────────────────────────────────────────────────────────────┘
 ```
+
+The host runs **two dedicated threads** alongside the enclave:
+
+- **TCP Proxy** — non-blocking TCP listener that accepts connections, assigns
+  `conn_id`s, and shuttles raw bytes to/from the enclave over the Data Channel.
+  The enclave terminates TLS internally, so the host never sees plaintext.
+- **RPC Dispatcher** — spin-polls the RPC Channel for enclave requests
+  (KV reads/writes, HTTPS egress, etc.) and dispatches them to the appropriate
+  host-side handler.
 
 **Why SPSC queues instead of traditional OCALLs?**
 
@@ -279,3 +310,16 @@ No PRNG seeds, no `/dev/urandom`, no OCALLs for randomness.
 7. **Per-connection RA-TLS certificates** — fresh key pair + SGX quote per connection
 8. **RocksDB host KV store** — opaque encrypted blobs, tuned for point lookups
 9. **Crate-per-module** — independent compilation and testing, minimal core TCB
+
+---
+
+## Production Deployment
+
+Because TLS terminates **inside** the enclave, any front-end load balancer
+must operate at **Layer 4 (TCP passthrough)** — it must not terminate TLS
+itself.  The load balancer forwards opaque TCP to the host's TCP Proxy port,
+which relays into the enclave.
+
+See [Layer-4 TCP Proxy Setup](layer4-proxy.md) for Caddy (caddy-l4) and
+HAProxy configurations, including SNI-based routing for multiple enclave
+instances.
