@@ -51,6 +51,25 @@ enclave {
         );
 
         /* ================================================================
+         *  Data Channel Initialisation (TCP proxy ↔ enclave)
+         * ================================================================
+         *
+         * A second pair of SPSC ring buffers for the inbound TCP data
+         * channel. The host TCP proxy writes raw TCP bytes into
+         * host_to_enc and reads TLS output from enc_to_host.
+         *
+         * Separated from the RPC channel to avoid multiplexing
+         * complexity and RPC client blocking issues.
+         */
+        public int ecall_init_data_channel(
+            [user_check] void* enc_to_host_header,
+            [user_check] void* enc_to_host_buf,
+            [user_check] void* host_to_enc_header,
+            [user_check] void* host_to_enc_buf,
+            uint64_t capacity
+        );
+
+        /* ================================================================
          *  Main Entry Point
          * ================================================================
          *

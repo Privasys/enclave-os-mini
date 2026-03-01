@@ -72,4 +72,5 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
 
 // Re-export symbols that must be visible in the final staticlib.
 pub use enclave_os_enclave::ecall::ecall_init_channel;
+pub use enclave_os_enclave::ecall::ecall_init_data_channel;
 pub use enclave_os_enclave::ecall::ecall_shutdown;

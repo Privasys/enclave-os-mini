@@ -115,6 +115,16 @@ mod sgx {
             capacity: u64,
         ) -> SgxStatus;
 
+        fn ecall_init_data_channel(
+            eid: EnclaveId,
+            retval: *mut i32,
+            enc_to_host_header: *mut u8,
+            enc_to_host_buf: *mut u8,
+            host_to_enc_header: *mut u8,
+            host_to_enc_buf: *mut u8,
+            capacity: u64,
+        ) -> SgxStatus;
+
         fn ecall_run(
             eid: EnclaveId,
             retval: *mut i32,
@@ -160,6 +170,30 @@ mod sgx {
         };
         if status != SgxStatus::Success {
             log::error!("ecall_init_channel SGX status: {:?}", status);
+            return -1;
+        }
+        retval
+    }
+
+    pub fn call_ecall_init_data_channel(
+        eid: u64,
+        enc_to_host_header: *mut u8,
+        enc_to_host_buf: *mut u8,
+        host_to_enc_header: *mut u8,
+        host_to_enc_buf: *mut u8,
+        capacity: u64,
+    ) -> i32 {
+        let mut retval: i32 = -1;
+        let status = unsafe {
+            ecall_init_data_channel(
+                eid, &mut retval,
+                enc_to_host_header, enc_to_host_buf,
+                host_to_enc_header, host_to_enc_buf,
+                capacity,
+            )
+        };
+        if status != SgxStatus::Success {
+            log::error!("ecall_init_data_channel SGX status: {:?}", status);
             return -1;
         }
         retval
@@ -221,6 +255,18 @@ mod sgx {
         _capacity: u64,
     ) -> i32 {
         info!("[MOCK] ecall_init_channel");
+        0
+    }
+
+    pub fn call_ecall_init_data_channel(
+        _eid: u64,
+        _enc_to_host_header: *mut u8,
+        _enc_to_host_buf: *mut u8,
+        _host_to_enc_header: *mut u8,
+        _host_to_enc_buf: *mut u8,
+        _capacity: u64,
+    ) -> i32 {
+        info!("[MOCK] ecall_init_data_channel");
         0
     }
 

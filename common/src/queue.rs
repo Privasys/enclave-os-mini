@@ -139,6 +139,7 @@ pub struct SpscProducer {
 }
 
 unsafe impl Send for SpscProducer {}
+unsafe impl Sync for SpscProducer {}
 
 impl SpscProducer {
     /// Create a producer from raw pointers to the shared header and buffer.
@@ -239,6 +240,7 @@ pub struct SpscConsumer {
 }
 
 unsafe impl Send for SpscConsumer {}
+unsafe impl Sync for SpscConsumer {}
 
 impl SpscConsumer {
     /// Create a consumer from raw pointers.

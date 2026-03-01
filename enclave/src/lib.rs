@@ -55,8 +55,10 @@ use std::sync::OnceLock;
 
 use std::sync::Mutex;
 
-use crate::ratls::server::RaTlsServer;
+use crate::ratls::server::IngressServer;
 use crate::rpc_client::RpcClient;
+
+use enclave_os_common::queue::{SpscProducer, SpscConsumer};
 
 // ---------------------------------------------------------------------------
 //  Global state
@@ -68,6 +70,12 @@ static RPC_CLIENT: OnceLock<RpcClient> = OnceLock::new();
 /// Shutdown flag – set when `ecall_shutdown` is called.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
 
+/// Data channel: enclave → host TCP proxy (set by `ecall_init_data_channel`).
+static DATA_TX: OnceLock<SpscProducer> = OnceLock::new();
+
+/// Data channel: host TCP proxy → enclave (set by `ecall_init_data_channel`).
+static DATA_RX: OnceLock<SpscConsumer> = OnceLock::new();
+
 /// Configuration Merkle root – delegates to the [`config_merkle`] manifest.
 ///
 /// Returns `None` before the tree is finalized during init.
@@ -77,7 +85,7 @@ pub fn config_merkle_root() -> Option<&'static [u8; 32]> {
 
 /// Global enclave application state, initialised by `ecall_run`.
 pub struct EnclaveState {
-    pub ratls_server: Option<RaTlsServer>,
+    pub ingress_server: Option<IngressServer>,
 }
 
 static ENCLAVE_STATE: OnceLock<Mutex<EnclaveState>> = OnceLock::new();
@@ -92,6 +100,16 @@ pub fn rpc_client_ref() -> &'static RpcClient {
     RPC_CLIENT.get().expect("RPC channel not initialised")
 }
 
+/// Get a reference to the data channel producer (enclave → host).
+pub fn data_tx() -> &'static SpscProducer {
+    DATA_TX.get().expect("Data channel not initialised")
+}
+
+/// Get a reference to the data channel consumer (host → enclave).
+pub fn data_rx() -> &'static SpscConsumer {
+    DATA_RX.get().expect("Data channel not initialised")
+}
+
 /// Check if shutdown has been requested.
 pub fn is_shutdown() -> bool {
     SHUTDOWN.load(Ordering::Relaxed)
@@ -100,7 +118,7 @@ pub fn is_shutdown() -> bool {
 /// Initialise the enclave state.
 pub fn init_state() -> Result<(), i32> {
     let st = EnclaveState {
-        ratls_server: None,
+        ingress_server: None,
     };
     ENCLAVE_STATE
         .set(Mutex::new(st))
@@ -111,6 +129,13 @@ pub fn init_state() -> Result<(), i32> {
 /// Store the RPC client. Called once from `ecall_init_channel`.
 pub fn set_rpc_client(client: RpcClient) -> Result<(), i32> {
     RPC_CLIENT.set(client).map_err(|_| -1)
+}
+
+/// Store the data channel endpoints. Called once from `ecall_init_data_channel`.
+pub fn set_data_channel(tx: SpscProducer, rx: SpscConsumer) -> Result<(), i32> {
+    DATA_TX.set(tx).map_err(|_| -1)?;
+    DATA_RX.set(rx).map_err(|_| -1)?;
+    Ok(())
 }
 
 /// Signal shutdown.

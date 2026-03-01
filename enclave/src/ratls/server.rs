@@ -1,27 +1,28 @@
 // Copyright (c) Privasys. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
-//! RA-TLS ingress server.
+//! RA-TLS ingress server — data-channel driven.
 //!
-//! Accepts incoming TCP connections (via OCALLs to the host), performs
-//! TLS 1.3 handshake with per-session RA-TLS certificate generation,
-//! and handles client requests.
+//! The host TCP proxy accepts TCP connections, assigns a `conn_id`, and
+//! shuttles raw encrypted bytes through the SPSC data channel. This
+//! server processes those messages:
 //!
-//! Certificate generation follows the challenge-response pattern:
+//!   1. `TcpNew(conn_id, peer_addr)` — record a pending connection.
+//!   2. `TcpData(conn_id, bytes)` — feed raw TLS bytes into the session.
+//!      On first data for a new connection, parse the ClientHello,
+//!      generate the RA-TLS certificate, create the TLS session.
+//!   3. `TcpClose(conn_id)` — tear down the session.
 //!
-//!   1. Host listens on a TCP port (via OCALLs).
-//!   2. On accept, read raw ClientHello; parse extension 0xFFBB for nonce.
-//!   3. Generate a fresh ECDSA key pair.
-//!   4. Compute `report_data = SHA-512(SHA-256(DER pubkey) || binding)`.
-//!   5. Obtain an SGX quote over `report_data`.
-//!   6. Build a leaf X.509 cert (quote in extension @ Intel OID) signed
-//!      by the intermediary CA.
-//!   7. Create a per-connection `ServerConfig` and resume the handshake.
-//!   8. Bidirectional TLS communication.
+//! Outgoing TLS bytes (handshake responses, encrypted app data) are
+//! written to the `data_enc_to_host` SPSC queue for the TCP proxy to
+//! send on the wire.
 //!
-//! If the client does **not** send extension 0xFFBB, the server generates
-//! a deterministic certificate (binding = creation_time) and caches it
-//! for 24 h.
+//! ## No OCALLs for I/O
+//!
+//! All network I/O is mediated by the data channel. The enclave never
+//! calls `net_recv`/`net_send` for inbound connections. OCALLs are still
+//! used for non-network operations (KV store, time, logging) via the
+//! separate RPC channel.
 
 use std::collections::BTreeMap;
 use std::string::String;
@@ -34,21 +35,46 @@ use crate::ratls::cert_store;
 use crate::ratls::session::RaTlsSession;
 use crate::{enclave_log_info, enclave_log_error};
 
+use enclave_os_common::channel::{self, ChannelMsgType};
+use enclave_os_common::queue::SpscProducer;
+
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::server::Acceptor;
 use rustls::ServerConfig;
 
-/// RA-TLS TCP server running inside the enclave.
-pub struct RaTlsServer {
-    listener_fd: i32,
-    sessions: BTreeMap<i32, RaTlsSession>,
+// ========================================================================
+//  Session states
+// ========================================================================
+
+/// Per-connection state. A connection progresses through:
+///   `Pending` → `Handshaking` → `Established`
+enum SessionState {
+    /// TCP connection accepted but no TLS data received yet.
+    Pending {
+        peer_addr: String,
+    },
+    /// TLS handshake is in progress.
+    Handshaking(RaTlsSession),
+    /// TLS handshake complete, processing application data.
+    Established(RaTlsSession),
+}
+
+// ========================================================================
+//  IngressServer
+// ========================================================================
+
+/// RA-TLS ingress server driven by data channel messages.
+pub struct IngressServer {
+    /// Per-connection state, keyed by conn_id from the TCP proxy.
+    sessions: BTreeMap<u32, SessionState>,
+    /// Intermediary CA for certificate generation.
     ca: Arc<CaContext>,
+    /// Producer for `data_enc_to_host` — sends TLS bytes to the TCP proxy.
+    data_tx: &'static SpscProducer,
+    /// Shutdown flag.
     shutdown: bool,
     /// Per-hostname cached deterministic TLS configs.
-    ///
-    /// Key: SNI hostname (empty string = default/no-SNI).
-    /// Caches are invalidated after `DETERMINISTIC_VALIDITY_SECS`.
     cached_configs: BTreeMap<String, CachedConfig>,
 }
 
@@ -58,160 +84,270 @@ struct CachedConfig {
     expires_at: u64,
 }
 
-impl RaTlsServer {
-    /// Create a new RA-TLS server bound to the given port.
-    pub fn new(port: u16, backlog: i32, ca: Arc<CaContext>) -> Result<Self, String> {
-        let listener_fd = ocall::net_tcp_listen(port, backlog)
-            .map_err(|e| format!("TCP listen failed: {}", e))?;
-
-        Ok(Self {
-            listener_fd,
+impl IngressServer {
+    /// Create a new ingress server.
+    ///
+    /// `data_tx` is the producer for the `data_enc_to_host` SPSC queue.
+    /// The host TCP proxy reads from the other end and sends bytes on
+    /// the wire.
+    pub fn new(ca: Arc<CaContext>, data_tx: &'static SpscProducer) -> Self {
+        Self {
             sessions: BTreeMap::new(),
             ca,
+            data_tx,
             shutdown: false,
             cached_configs: BTreeMap::new(),
-        })
+        }
     }
 
-    /// Poll for events: accept new connections and handle existing sessions.
-    pub fn poll(&mut self) -> Result<(), String> {
-        if self.shutdown {
-            return Err("Server is shut down".into());
-        }
-
-        // Try to accept a new connection
-        match ocall::net_tcp_accept(self.listener_fd) {
-            Ok((client_fd, peer_addr)) => {
+    /// Process a single data channel message.
+    ///
+    /// Called from the enclave event loop for each message received on
+    /// the `data_host_to_enc` queue.
+    pub fn handle_message(
+        &mut self,
+        msg_type: ChannelMsgType,
+        conn_id: u32,
+        payload: &[u8],
+    ) {
+        match msg_type {
+            ChannelMsgType::TcpNew => {
+                let peer_addr = core::str::from_utf8(payload)
+                    .unwrap_or("<invalid>")
+                    .to_string();
                 enclave_log_info!(
-                    "Accepted connection from {} (fd={})",
-                    peer_addr,
-                    client_fd
+                    "New connection conn_id={} from {}", conn_id, peer_addr
                 );
-                self.handle_new_connection(client_fd);
+                self.sessions.insert(conn_id, SessionState::Pending {
+                    peer_addr,
+                });
             }
-            Err(_) => {
-                // No pending connections (non-blocking) – normal
-            }
-        }
 
-        // Process existing sessions
-        let mut to_remove = Vec::new();
-        for (&fd, session) in self.sessions.iter_mut() {
-            match session.recv_frame() {
-                Ok(None) => { /* incomplete frame or no data yet */ }
-                Ok(Some(payload)) => match handle_frame(&payload) {
-                    HandleResult::Response(resp) => {
-                        if let Err(e) = session.send_frame(&resp) {
-                            enclave_log_error!(
-                                "Failed to send response to fd={}: {}",
-                                fd,
-                                e
-                            );
-                            to_remove.push(fd);
+            ChannelMsgType::TcpData => {
+                self.handle_tcp_data(conn_id, payload);
+            }
+
+            ChannelMsgType::TcpClose => {
+                if let Some(state) = self.sessions.remove(&conn_id) {
+                    if let SessionState::Established(mut session)
+                        | SessionState::Handshaking(mut session) = state
+                    {
+                        let close_bytes = session.close_notify();
+                        if !close_bytes.is_empty() {
+                            self.send_to_proxy(conn_id, &close_bytes);
                         }
                     }
-                    HandleResult::Shutdown => {
-                        enclave_log_info!("Shutdown requested by fd={}", fd);
-                        self.shutdown = true;
-                        to_remove.push(fd);
-                    }
-                    HandleResult::Close => {
-                        to_remove.push(fd);
-                    }
-                },
-                Err(e) => {
-                    enclave_log_error!("Read error on fd={}: {}", fd, e);
-                    to_remove.push(fd);
+                    enclave_log_info!("Connection closed conn_id={}", conn_id);
                 }
             }
         }
-
-        for fd in to_remove {
-            if let Some(session) = self.sessions.remove(&fd) {
-                session.close();
-            }
-        }
-
-        Ok(())
     }
 
-    // ---- Connection setup with Acceptor ---------------------------------
+    /// Are we shutting down?
+    pub fn is_shutdown(&self) -> bool {
+        self.shutdown
+    }
 
-    /// Handle a freshly accepted TCP connection.
-    ///
-    /// 1. Read raw ClientHello from the socket.
-    /// 2. Parse extension 0xFFBB to detect a challenge nonce.
-    /// 3. Generate an appropriate certificate.
-    /// 4. Use `rustls::server::Acceptor` to build a `ServerConnection`.
-    /// 5. Complete the handshake and register the session.
-    fn handle_new_connection(&mut self, client_fd: i32) {
-        // Read initial TLS data (ClientHello is typically < 1 KB).
-        //
-        // The accepted socket is non-blocking, so the ClientHello may not
-        // be available yet — especially for remote clients with higher
-        // network latency.  Retry on EAGAIN (-11) with a spin-wait.
-        let mut raw_buf = vec![0u8; 16384];
-        let raw_len = {
-            let mut attempts = 0u32;
-            const MAX_ATTEMPTS: u32 = 2000; // ~1-2 s total wall time
-            loop {
-                match ocall::net_recv(client_fd, &mut raw_buf) {
-                    Ok(n) if n > 0 => break n,
-                    Ok(_) => {
-                        // Ok(0) = genuine EOF – peer closed before sending data
-                        enclave_log_error!(
-                            "Peer closed before ClientHello on fd={}",
-                            client_fd
-                        );
-                        ocall::net_close(client_fd);
-                        return;
-                    }
-                    Err(-11) if attempts < MAX_ATTEMPTS => {
-                        // EAGAIN / WOULDBLOCK – data not yet available
-                        attempts += 1;
-                        // Brief spin (~150-500 µs per iteration depending on clock)
-                        for _ in 0..500_000 {
-                            core::hint::spin_loop();
+    /// Invalidate cached cert for a hostname (called when an app is
+    /// loaded/unloaded).
+    pub fn invalidate_cached_config(&mut self, hostname: &str) {
+        self.cached_configs.remove(hostname);
+    }
+
+    // ====================================================================
+    //  TCP data handling
+    // ====================================================================
+
+    /// Handle incoming TLS bytes for a connection.
+    fn handle_tcp_data(&mut self, conn_id: u32, data: &[u8]) {
+        // Take ownership of the session state to avoid borrow issues
+        let state = match self.sessions.remove(&conn_id) {
+            Some(s) => s,
+            None => {
+                enclave_log_error!(
+                    "TcpData for unknown conn_id={}", conn_id
+                );
+                return;
+            }
+        };
+
+        match state {
+            SessionState::Pending { peer_addr } => {
+                // First TLS data — should contain the ClientHello.
+                // Parse it, generate cert, create the TLS session.
+                match self.create_session(conn_id, &peer_addr, data) {
+                    Ok(session) => {
+                        if session.is_handshaking() {
+                            self.sessions.insert(
+                                conn_id,
+                                SessionState::Handshaking(session),
+                            );
+                        } else {
+                            self.sessions.insert(
+                                conn_id,
+                                SessionState::Established(session),
+                            );
                         }
                     }
                     Err(e) => {
                         enclave_log_error!(
-                            "Failed to read ClientHello from fd={}: err={}",
-                            client_fd,
-                            e
+                            "Session creation failed for conn_id={}: {}",
+                            conn_id, e
                         );
-                        ocall::net_close(client_fd);
-                        return;
+                        self.send_close(conn_id);
                     }
                 }
             }
-        };
-        let raw = &raw_buf[..raw_len];
 
-        // Parse ClientHello for challenge nonce (0xFFBB) and SNI (0x0000)
+            SessionState::Handshaking(mut session) => {
+                match self.process_session_data(conn_id, &mut session, data) {
+                    Ok(()) => {
+                        if session.is_handshaking() {
+                            self.sessions.insert(
+                                conn_id,
+                                SessionState::Handshaking(session),
+                            );
+                        } else {
+                            enclave_log_info!(
+                                "TLS handshake complete for conn_id={}",
+                                conn_id
+                            );
+                            self.sessions.insert(
+                                conn_id,
+                                SessionState::Established(session),
+                            );
+                        }
+                    }
+                    Err(e) => {
+                        enclave_log_error!(
+                            "Handshake error conn_id={}: {}", conn_id, e
+                        );
+                        self.send_close(conn_id);
+                    }
+                }
+            }
+
+            SessionState::Established(mut session) => {
+                match self.process_session_data(conn_id, &mut session, data) {
+                    Ok(()) => {
+                        // Dispatch any complete application frames
+                        self.dispatch_frames(conn_id, &mut session);
+                        self.sessions.insert(
+                            conn_id,
+                            SessionState::Established(session),
+                        );
+                    }
+                    Err(e) => {
+                        enclave_log_error!(
+                            "Session error conn_id={}: {}", conn_id, e
+                        );
+                        self.send_close(conn_id);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Feed TLS bytes into a session and send any output back.
+    fn process_session_data(
+        &mut self,
+        conn_id: u32,
+        session: &mut RaTlsSession,
+        data: &[u8],
+    ) -> Result<(), &'static str> {
+        session.feed_tls_bytes(data)?;
+        let output = session.collect_tls_output()?;
+        if !output.is_empty() {
+            self.send_to_proxy(conn_id, &output);
+        }
+        Ok(())
+    }
+
+    /// Process all complete application-level frames from a session.
+    fn dispatch_frames(&mut self, conn_id: u32, session: &mut RaTlsSession) {
+        loop {
+            match session.recv_frame() {
+                Ok(Some(payload)) => {
+                    match handle_frame(&payload) {
+                        HandleResult::Response(resp) => {
+                            match session.send_frame(&resp) {
+                                Ok(tls_bytes) => {
+                                    if !tls_bytes.is_empty() {
+                                        self.send_to_proxy(conn_id, &tls_bytes);
+                                    }
+                                }
+                                Err(e) => {
+                                    enclave_log_error!(
+                                        "send_frame failed conn_id={}: {}",
+                                        conn_id, e
+                                    );
+                                    self.send_close(conn_id);
+                                    return;
+                                }
+                            }
+                        }
+                        HandleResult::Shutdown => {
+                            enclave_log_info!(
+                                "Shutdown requested by conn_id={}", conn_id
+                            );
+                            self.shutdown = true;
+                            self.send_close(conn_id);
+                            return;
+                        }
+                        HandleResult::Close => {
+                            self.send_close(conn_id);
+                            return;
+                        }
+                    }
+                }
+                Ok(None) => break, // no more complete frames
+                Err(e) => {
+                    enclave_log_error!(
+                        "recv_frame error conn_id={}: {}", conn_id, e
+                    );
+                    self.send_close(conn_id);
+                    return;
+                }
+            }
+        }
+    }
+
+    // ====================================================================
+    //  Connection setup (ClientHello → TLS session)
+    // ====================================================================
+
+    /// Create a TLS session from the first TCP data (ClientHello).
+    ///
+    /// 1. Parse ClientHello for nonce (0xFFBB) and SNI (0x0000).
+    /// 2. Generate appropriate certificate.
+    /// 3. Feed the data into `rustls::server::Acceptor`.
+    /// 4. Build the `ServerConnection` and wrap in `RaTlsSession`.
+    /// 5. Collect and send any handshake output (ServerHello etc.).
+    fn create_session(
+        &mut self,
+        conn_id: u32,
+        _peer_addr: &str,
+        raw: &[u8],
+    ) -> Result<RaTlsSession, String> {
+        // Parse ClientHello for challenge nonce and SNI
         let hello = attestation::parse_client_hello(raw);
         if let Some(ref sni) = hello.sni {
-            enclave_log_info!("SNI: {} (fd={})", sni, client_fd);
+            enclave_log_info!("SNI: {} (conn_id={})", sni, conn_id);
         }
 
-        // Build the per-connection TLS config (per-app if SNI matches)
-        let tls_config = match self.tls_config_for(&hello.challenge_nonce, &hello.sni) {
-            Ok(cfg) => cfg,
-            Err(e) => {
-                enclave_log_error!("Cert generation failed for fd={}: {}", client_fd, e);
-                ocall::net_close(client_fd);
-                return;
-            }
-        };
+        // Build per-connection TLS config
+        let tls_config = self.tls_config_for(
+            &hello.challenge_nonce, &hello.sni,
+        )?;
 
         // Feed the raw ClientHello into a rustls Acceptor
         let mut acceptor = Acceptor::default();
         {
             let mut cursor = std::io::Cursor::new(raw);
             if acceptor.read_tls(&mut cursor).is_err() {
-                enclave_log_error!("Acceptor read_tls failed for fd={}", client_fd);
-                ocall::net_close(client_fd);
-                return;
+                return Err(format!(
+                    "Acceptor read_tls failed for conn_id={}", conn_id
+                ));
             }
         }
 
@@ -219,50 +355,51 @@ impl RaTlsServer {
         let accepted = match acceptor.accept() {
             Ok(Some(a)) => a,
             Ok(None) => {
-                // Need more data – unusual for a single ClientHello read
-                enclave_log_error!("Incomplete ClientHello for fd={}", client_fd);
-                ocall::net_close(client_fd);
-                return;
+                return Err(format!(
+                    "Incomplete ClientHello for conn_id={}", conn_id
+                ));
             }
             Err(e) => {
-                enclave_log_error!("Acceptor error for fd={}: {:?}", client_fd, e);
-                ocall::net_close(client_fd);
-                return;
+                return Err(format!(
+                    "Acceptor error for conn_id={}: {:?}", conn_id, e
+                ));
             }
         };
 
-        // Create the ServerConnection from the accepted state
+        // Create the ServerConnection
         let server_conn = match accepted.into_connection(tls_config) {
             Ok(conn) => conn,
             Err(e) => {
-                enclave_log_error!("into_connection failed for fd={}: {:?}", client_fd, e);
-                ocall::net_close(client_fd);
-                return;
+                return Err(format!(
+                    "into_connection failed for conn_id={}: {:?}",
+                    conn_id, e
+                ));
             }
         };
 
-        // Wrap in our session type and complete the handshake
-        let mut session = RaTlsSession::from_connection(client_fd, server_conn);
-        match session.handshake() {
-            Ok(()) => {
-                enclave_log_info!("TLS handshake complete for fd={}", client_fd);
-                self.sessions.insert(client_fd, session);
-            }
-            Err(e) => {
-                enclave_log_error!(
-                    "TLS handshake failed for fd={}: {}",
-                    client_fd,
-                    e
-                );
-                ocall::net_close(client_fd);
-            }
+        // Wrap in our session type
+        let mut session = RaTlsSession::new(server_conn);
+
+        // Collect any initial handshake output (ServerHello, etc.)
+        let output = session.collect_tls_output()
+            .map_err(|e| format!("collect_tls_output: {}", e))?;
+        if !output.is_empty() {
+            self.send_to_proxy(conn_id, &output);
         }
+
+        Ok(session)
     }
+
+    // ====================================================================
+    //  TLS config resolution (same logic as before)
+    // ====================================================================
 
     /// Obtain a `ServerConfig` for this connection.
     ///
-    /// 1. If `nonce` is present → challenge mode (fresh cert, per-app if SNI matches).
-    /// 2. Otherwise → deterministic mode (cached by hostname, per-app if SNI matches).
+    /// - If `nonce` is present → challenge mode (fresh cert, per-app if
+    ///   SNI matches).
+    /// - Otherwise → deterministic mode (cached by hostname, per-app if
+    ///   SNI matches).
     fn tls_config_for(
         &mut self,
         nonce: &Option<Vec<u8>>,
@@ -273,7 +410,6 @@ impl RaTlsServer {
             .and_then(|h| cert_store::cert_store().resolve(h));
 
         if let Some(n) = nonce {
-            // Challenge-response: always generate a fresh cert
             let mode = CertMode::Challenge { nonce: n.clone() };
             return build_tls_config(&self.ca, mode, app_data.as_ref());
         }
@@ -298,21 +434,40 @@ impl RaTlsServer {
         Ok(config)
     }
 
-    /// Invalidate cached cert for a hostname (called when an app is loaded/unloaded).
-    pub fn invalidate_cached_config(&mut self, hostname: &str) {
-        self.cached_configs.remove(hostname);
+    // ====================================================================
+    //  Data channel output helpers
+    // ====================================================================
+
+    /// Send TLS bytes to the TCP proxy via the data channel.
+    fn send_to_proxy(&self, conn_id: u32, tls_bytes: &[u8]) {
+        let msg = channel::encode_tcp_data(conn_id, tls_bytes);
+        self.data_tx.send(&msg);
+    }
+
+    /// Send a TcpClose to the TCP proxy.
+    fn send_close(&self, conn_id: u32) {
+        let msg = channel::encode_tcp_close(conn_id);
+        self.data_tx.send(&msg);
     }
 }
 
-impl Drop for RaTlsServer {
+impl Drop for IngressServer {
     fn drop(&mut self) {
-        let keys: Vec<i32> = self.sessions.keys().copied().collect();
-        for fd in keys {
-            if let Some(session) = self.sessions.remove(&fd) {
-                session.close();
+        // Close all active sessions
+        let conn_ids: Vec<u32> = self.sessions.keys().copied().collect();
+        for conn_id in conn_ids {
+            if let Some(state) = self.sessions.remove(&conn_id) {
+                if let SessionState::Established(mut session)
+                    | SessionState::Handshaking(mut session) = state
+                {
+                    let close_bytes = session.close_notify();
+                    if !close_bytes.is_empty() {
+                        self.send_to_proxy(conn_id, &close_bytes);
+                    }
+                }
+                self.send_close(conn_id);
             }
         }
-        ocall::net_close(self.listener_fd);
     }
 }
 
@@ -321,10 +476,6 @@ impl Drop for RaTlsServer {
 // ---------------------------------------------------------------------------
 
 /// Build a `ServerConfig` from an RA-TLS certificate.
-///
-/// When `app` is `Some`, generates a per-app leaf cert (with app-specific
-/// Merkle root + OIDs and CN = hostname).  Otherwise generates the
-/// enclave-wide cert.
 fn build_tls_config(
     ca: &CaContext,
     mode: CertMode,
@@ -353,7 +504,7 @@ fn build_tls_config(
 }
 
 // ---------------------------------------------------------------------------
-//  Request handling
+//  Request handling (unchanged)
 // ---------------------------------------------------------------------------
 
 enum HandleResult {

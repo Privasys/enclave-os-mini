@@ -15,6 +15,7 @@ mod enclave;
 mod ocall_impl;
 mod net;
 mod kvstore;
+mod tcp_proxy;
 
 use anyhow::Result;
 use clap::Parser;
@@ -86,11 +87,15 @@ fn main() -> Result<()> {
     let enclave_id = enclave::create_enclave(&cli.enclave_path)?;
     info!("Enclave created, id = {}", enclave_id);
 
-    // Allocate shared-memory SPSC queues
+    // Allocate shared-memory SPSC queues for RPC channel
     let channel = SharedChannel::new(DEFAULT_QUEUE_CAPACITY);
-    info!("Shared channel allocated (capacity = {} bytes per queue)", DEFAULT_QUEUE_CAPACITY);
+    info!("RPC channel allocated (capacity = {} bytes per queue)", DEFAULT_QUEUE_CAPACITY);
 
-    // Pass queue pointers to the enclave
+    // Allocate shared-memory SPSC queues for data channel (TCP proxy ↔ enclave)
+    let data_channel = SharedChannel::new(DEFAULT_QUEUE_CAPACITY);
+    info!("Data channel allocated (capacity = {} bytes per queue)", DEFAULT_QUEUE_CAPACITY);
+
+    // Pass RPC queue pointers to the enclave
     let ret = enclave::call_ecall_init_channel(
         enclave_id,
         channel.enc_to_host_header as *mut u8,
@@ -102,12 +107,33 @@ fn main() -> Result<()> {
     if ret != 0 {
         error!("ecall_init_channel failed: {}", ret);
         enclave::destroy_enclave(enclave_id);
-        anyhow::bail!("Failed to initialise enclave channel");
+        anyhow::bail!("Failed to initialise enclave RPC channel");
     }
-    info!("Enclave channel initialised");
+    info!("Enclave RPC channel initialised");
+
+    // Pass data channel queue pointers to the enclave
+    let ret = enclave::call_ecall_init_data_channel(
+        enclave_id,
+        data_channel.enc_to_host_header as *mut u8,
+        data_channel.enc_to_host_buf,
+        data_channel.host_to_enc_header as *mut u8,
+        data_channel.host_to_enc_buf,
+        data_channel.capacity,
+    );
+    if ret != 0 {
+        error!("ecall_init_data_channel failed: {}", ret);
+        enclave::destroy_enclave(enclave_id);
+        anyhow::bail!("Failed to initialise enclave data channel");
+    }
+    info!("Enclave data channel initialised");
 
     // Create host-side queue endpoints (consumer for requests, producer for responses)
     let (request_rx, response_tx) = unsafe { channel.host_endpoints() };
+
+    // Create host-side data channel endpoints
+    // For data channel: host writes to host_to_enc (raw TCP → enclave),
+    // host reads from enc_to_host (TLS output from enclave)
+    let (data_from_enc_rx, data_to_enc_tx) = unsafe { data_channel.host_endpoints() };
 
     // Set up shared shutdown flag
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -128,6 +154,28 @@ fn main() -> Result<()> {
             dispatcher.run();
         })?;
     info!("RPC dispatcher thread started");
+
+    // Spawn the TCP proxy thread
+    let proxy_port = cli.port;
+    let proxy_backlog = cli.backlog;
+    let shutdown_clone = shutdown.clone();
+    let proxy_handle = thread::Builder::new()
+        .name("tcp-proxy".into())
+        .spawn(move || {
+            match tcp_proxy::TcpProxy::new(
+                proxy_port,
+                proxy_backlog,
+                data_to_enc_tx,
+                data_from_enc_rx,
+                shutdown_clone,
+            ) {
+                Ok(mut proxy) => proxy.run(),
+                Err(e) => {
+                    error!("TCP proxy failed to start: {}", e);
+                }
+            }
+        })?;
+    info!("TCP proxy thread started on port {}", cli.port);
 
     // Build config JSON for the enclave
     let mut config = serde_json::json!({
@@ -165,18 +213,21 @@ fn main() -> Result<()> {
         error!("ecall_run returned: {}", ret);
     }
 
-    // Signal dispatcher to stop
+    // Signal dispatcher and proxy to stop
     shutdown.store(true, Ordering::Relaxed);
 
     // Graceful shutdown
     let _ = enclave::call_ecall_shutdown(enclave_id);
     info!("Waiting for dispatcher thread...");
     let _ = dispatcher_handle.join();
+    info!("Waiting for TCP proxy thread...");
+    let _ = proxy_handle.join();
     enclave::destroy_enclave(enclave_id);
     info!("Enclave destroyed. Goodbye.");
 
-    // Keep channel alive until after enclave is destroyed
+    // Keep channels alive until after enclave is destroyed
     drop(channel);
+    drop(data_channel);
 
     Ok(())
 }

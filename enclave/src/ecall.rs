@@ -31,11 +31,12 @@ use std::sync::Arc;
 
 use crate::rpc_client::RpcClient;
 use crate::ratls::attestation::CaContext;
-use crate::ratls::server::RaTlsServer;
+use crate::ratls::server::IngressServer;
 use crate::sealed_config::SealedConfig;
 use crate::{enclave_log_info, enclave_log_error};
 use enclave_os_common::types::AEAD_KEY_SIZE;
 use enclave_os_common::queue::{SpscProducer, SpscConsumer, SpscQueueHeader};
+use enclave_os_common::channel;
 
 // ==========================================================================
 //  ecall_init_channel – set up the shared-memory RPC channel
@@ -88,6 +89,54 @@ pub extern "C" fn ecall_init_channel(
             // Use raw ocall_notify briefly to confirm init – or just return 0.
             0
         }
+        Err(_) => -1,
+    }
+}
+
+// ==========================================================================
+//  ecall_init_data_channel – set up the data channel for TCP proxy
+// ==========================================================================
+
+/// Called by the host to pass the second pair of SPSC queue pointers for
+/// the data channel (TCP proxy ↔ enclave).
+///
+/// # Parameters
+/// - `enc_to_host_header`/`enc_to_host_buf`: enclave → host (TLS output)
+/// - `host_to_enc_header`/`host_to_enc_buf`: host → enclave (raw TCP data)
+/// - `capacity`: ring buffer size
+#[no_mangle]
+pub extern "C" fn ecall_init_data_channel(
+    enc_to_host_header: *mut u8,
+    enc_to_host_buf: *mut u8,
+    host_to_enc_header: *mut u8,
+    host_to_enc_buf: *mut u8,
+    _capacity: u64,
+) -> i32 {
+    if enc_to_host_header.is_null()
+        || enc_to_host_buf.is_null()
+        || host_to_enc_header.is_null()
+        || host_to_enc_buf.is_null()
+    {
+        return -1;
+    }
+
+    // The enclave is the **producer** for enc_to_host (TLS output to proxy)
+    // and the **consumer** for host_to_enc (raw TCP data from proxy).
+    let data_tx = unsafe {
+        SpscProducer::from_raw(
+            enc_to_host_header as *const SpscQueueHeader,
+            enc_to_host_buf,
+        )
+    };
+    let data_rx = unsafe {
+        SpscConsumer::from_raw(
+            host_to_enc_header as *const SpscQueueHeader,
+            host_to_enc_buf as *const u8,
+        )
+    };
+
+    match crate::set_data_channel(data_tx, data_rx) {
+        Ok(()) => 0,
         Err(_) => -1,
     }
 }
@@ -170,7 +219,7 @@ pub fn init_enclave(
 /// This function **blocks** until shutdown is signalled. It re-seals the
 /// config to disk before starting the server (persisting any module data
 /// written during init).
-pub fn finalize_and_run(config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i32 {
+pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i32 {
     // Persist the (possibly updated) sealed config
     if let Err(e) = sealed_cfg.seal_to_disk() {
         enclave_log_error!("Failed to seal config: {}", e);
@@ -242,44 +291,49 @@ pub fn finalize_and_run(config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i3
         }
     }
 
-    let server = match RaTlsServer::new(config.port, config.backlog, ca) {
-        Ok(s) => s,
-        Err(e) => {
-            enclave_log_error!("RA-TLS server init failed: {}", e);
-            return -21;
-        }
-    };
+    let server = IngressServer::new(ca, crate::data_tx());
     {
         let mut st = match crate::state().lock() {
             Ok(st) => st,
             Err(_) => return -22,
         };
-        st.ratls_server = Some(server);
+        st.ingress_server = Some(server);
     }
-    enclave_log_info!("RA-TLS server listening on port {}", config.port);
+    enclave_log_info!("RA-TLS ingress server initialised (data channel mode)");
 
-    // Main event loop: poll RA-TLS server until shutdown
+    // Main event loop: read from data channel, dispatch to IngressServer
+    let data_rx = crate::data_rx();
     while !crate::is_shutdown() {
-        let poll_result = {
-            let mut st = match crate::state().lock() {
-                Ok(st) => st,
-                Err(_) => break,
-            };
-            if let Some(ref mut srv) = st.ratls_server {
-                srv.poll()
-            } else {
-                break;
+        // Try to receive a data channel message
+        match data_rx.try_recv() {
+            Some(msg) => {
+                // Decode the channel message
+                match channel::decode_channel_msg(&msg) {
+                    Some((msg_type, conn_id, payload)) => {
+                        let mut st = match crate::state().lock() {
+                            Ok(st) => st,
+                            Err(_) => break,
+                        };
+                        if let Some(ref mut srv) = st.ingress_server {
+                            srv.handle_message(msg_type, conn_id, payload);
+                            if srv.is_shutdown() {
+                                crate::signal_shutdown();
+                            }
+                        }
+                    }
+                    None => {
+                        enclave_log_error!(
+                            "Failed to decode data channel message ({} bytes)",
+                            msg.len()
+                        );
+                    }
+                }
             }
-        };
-        if let Err(e) = poll_result {
-            if crate::is_shutdown() {
-                break;
+            None => {
+                // No message available — yield
+                core::hint::spin_loop();
             }
-            enclave_log_error!("Poll error: {}", e);
-            break;
         }
-        // Yield to avoid busy-spinning too aggressively
-        core::hint::spin_loop();
     }
 
     enclave_log_info!("Event loop exited");
@@ -323,7 +377,7 @@ pub extern "C" fn ecall_shutdown() -> i32 {
 
     // Clean up subsystems
     if let Ok(mut st) = crate::state().lock() {
-        st.ratls_server = None;
+        st.ingress_server = None;
     }
     0
 }
