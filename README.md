@@ -87,7 +87,7 @@ impl EnclaveModule for HelloWorldModule {
 3. Create a composition crate that depends on `enclave-os-enclave` (with `default-features = false, features = ["sgx"]`) and your module crate. Provide a custom `ecall_run` that registers your module.
 4. Point CMake at your composition crate instead of `enclave/`.
 
-See `examples/wasm-enclave/` for a complete example.
+See [wasm-app-example](https://github.com/Privasys/wasm-app-example) for a complete example.
 
 ---
 

@@ -16,7 +16,7 @@
 // for the `default-ecall` feature. Additional modules (egress, kvstore,
 // vault, wasm, etc.) live in `crates/enclave-os-*` and are registered by a
 // custom `ecall_run` in a separate composition crate.
-// See `examples/wasm-enclave/` for a complete example.
+// See https://github.com/Privasys/wasm-app-example for a complete example.
 
 pub mod helloworld;
 

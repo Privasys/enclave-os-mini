@@ -9,10 +9,17 @@
 # which registers the WASM runtime module alongside HelloWorld.
 
 # -- Step 2: Build enclave crate (staticlib) --
-option(ENABLE_WASM "Build with WASM runtime module (examples/wasm-enclave)" OFF)
+option(ENABLE_WASM "Build with WASM runtime module" OFF)
+set(WASM_ENCLAVE_DIR "" CACHE PATH "Path to the wasm-enclave composition crate (required when ENABLE_WASM=ON)")
 
 if(ENABLE_WASM)
-    set(_ENCLAVE_CRATE_DIR "${CMAKE_SOURCE_DIR}/examples/wasm-enclave")
+    if(WASM_ENCLAVE_DIR STREQUAL "")
+        message(FATAL_ERROR
+            "ENABLE_WASM=ON requires WASM_ENCLAVE_DIR to be set.\n"
+            "Point it at your composition crate, e.g.:\n"
+            "  cmake -DENABLE_WASM=ON -DWASM_ENCLAVE_DIR=/path/to/wasm-app-example/enclave ..")
+    endif()
+    set(_ENCLAVE_CRATE_DIR "${WASM_ENCLAVE_DIR}")
     set(_ENCLAVE_CRATE_NAME "enclave_os_wasm_app")
     message(STATUS "WASM runtime enabled — building ${_ENCLAVE_CRATE_DIR}")
 else()

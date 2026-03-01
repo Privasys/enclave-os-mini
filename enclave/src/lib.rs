@@ -28,7 +28,7 @@
 //! 3. Calls [`ecall::init_enclave()`] → registers modules →
 //!    [`ecall::finalize_and_run()`].
 //!
-//! See `examples/wasm-enclave/` for a complete example.
+//! See https://github.com/Privasys/wasm-app-example for a complete example.
 //!
 //! **Build mode**: sysroot replacement.
 //! `sgx_tstd` is compiled as `std` in a custom sysroot, so all crates

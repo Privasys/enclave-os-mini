@@ -24,7 +24,7 @@
 //! 5. Call [`finalize_and_run()`] to build the Merkle tree, start the
 //!    RA-TLS server, and enter the event loop.
 //!
-//! See `examples/wasm-enclave/` for a complete example.
+//! See https://github.com/Privasys/wasm-app-example for a complete example.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -348,7 +348,7 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
 /// diagnostic module.
 ///
 /// To add modules, create a separate composition crate that disables the
-/// `default-ecall` feature. See `examples/wasm-enclave/` for a full example.
+/// `default-ecall` feature. See https://github.com/Privasys/wasm-app-example for a full example.
 #[cfg(feature = "default-ecall")]
 #[no_mangle]
 pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
