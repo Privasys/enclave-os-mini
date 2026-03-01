@@ -644,7 +644,6 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
         "[method]descriptor.metadata-hash",
         "[method]descriptor.metadata-hash-at",
     ] {
-        let _name = method.to_string();
         inst.func_new(
             method,
             |_store: StoreContextMut<'_, AppContext>,
@@ -749,14 +748,6 @@ fn resource_rep<T: 'static>(val: &Val, store: impl wasmtime::AsContextMut) -> Re
 fn val_u64(val: &Val) -> u64 {
     match val {
         Val::U64(v) => *v,
-        _ => 0,
-    }
-}
-
-/// Extract a u32 from a Val.
-fn val_u32(val: &Val) -> u32 {
-    match val {
-        Val::U32(v) => *v,
         _ => 0,
     }
 }

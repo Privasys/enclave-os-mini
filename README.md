@@ -5,7 +5,7 @@ A minimal OS layer for Intel SGX enclaves, written in Rust. Provides:
 1. **RA-TLS Ingress**  Accept incoming TCP connections authenticated via Remote Attestation TLS (TLS 1.3 with SGX quotes embedded in X.509 certificates)
 2. **HTTPS Egress**  Make outbound HTTPS requests from inside the enclave (TLS termination inside the enclave, network I/O via host RPC)  *egress module*
 3. **Sealed Key-Value Store**  Encrypted KV database stored on the host, with both keys and values encrypted using a master key that is sealed to `MRENCLAVE`  *kvstore module*
-4. **WASM Runtime**  Execute third-party WebAssembly bytecode inside SGX with WASI support (random, sockets, KV)  *wasm module*
+4. **WASM Runtime**  Execute third-party WebAssembly bytecode inside SGX with WASI support (random, clocks, filesystem, sockets, IO/streams, CLI)  *wasm module*
 5. **JWT-Authenticated Vault**  Store and retrieve secrets gated by ES256 JWT verification  *vault module*
 6. **Sealed Config**  All persistent state (CA material, egress CA bundle, KV master key) stored as a single MRENCLAVE-bound blob
 7. **Config Attestation**  A Merkle root and per-module OIDs over all config inputs are embedded as custom X.509 extensions in every RA-TLS certificate
@@ -115,7 +115,7 @@ writes directly to host memory without context-switching.
 │                           │                                │
 ├───────────────────────────┼────────────────────────────────┤
 │                           │     ← SGX boundary             │
-│                           │       (3 ECALLs + 1 OCALL)     │
+│                           │       (4 ECALLs + 1 OCALL)     │
 │  ┌────────────────────────┴────────────────────────────┐   │
 │  │                RPC Client                           │   │
 │  │  (encodes requests → enc_to_host, reads responses)  │   │
@@ -163,7 +163,14 @@ trusted {
         [user_check] void* host_to_enc_buf,
         uint64_t capacity
     );
-    public int ecall_run([user_check] const void* config, uint64_t len);
+    public int ecall_init_data_channel(
+        [user_check] void* enc_to_host_header,
+        [user_check] void* enc_to_host_buf,
+        [user_check] void* host_to_enc_header,
+        [user_check] void* host_to_enc_buf,
+        uint64_t capacity
+    );
+    public int ecall_run([user_check] const void* config_json, uint64_t config_len);
     public int ecall_shutdown();
 };
 untrusted {

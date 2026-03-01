@@ -61,7 +61,7 @@
 //! [commit fbbcd2ac](https://github.com/bytecodealliance/wasmtime/commit/fbbcd2ac)).
 //!
 //! The fork provides:
-//! - Memory management via SGX2 EDMM (`sgx_mm_alloc`/`sgx_mm_modify_permissions`)
+//! - Memory management via RWX code pool (`.wasm_code` section) + heap allocation
 //! - Trap handling via VEH (`sgx_register_exception_handler`)
 //! - Thread-local storage via `sgx_tstd::thread_local!`
 //! - Stub unwind registration

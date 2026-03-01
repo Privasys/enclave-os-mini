@@ -2,7 +2,9 @@
 
 ## Reporting a Vulnerability
 
-We take a very active stance in eliminating security problems in Teaclave. We
-strongly encourage folks to report such problems to our private mailing list
-first ([private@teaclave.apache.org](mailto:private@teaclave.apache.org)),
-before disclosing them in a public forum.
+We take security seriously at Privasys. If you discover a vulnerability
+in enclave-os-mini, please report it responsibly through one of the
+following channels:
+
+- **Email:** [security@privasys.org](mailto:security@privasys.org)
+- **GitHub:** Open a [private security advisory](https://github.com/privasys/enclave-os-mini/security/advisories/new)

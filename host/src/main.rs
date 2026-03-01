@@ -297,16 +297,13 @@ fn read_pem_or_der(path: &str, expected_label: &str) -> Result<Vec<u8>> {
 /// ```
 fn wrap_ec_sec1_in_pkcs8(sec1_der: &[u8]) -> Vec<u8> {
     // Fixed PKCS#8 header for P-256 (ecPublicKey + prime256v1)
-    let header: &[u8] = &[
-        0x30, 0x81, 0x87,                   // SEQUENCE (outer, length placeholder)
-        0x02, 0x01, 0x00,                   // INTEGER version = 0
-        0x30, 0x13,                          // SEQUENCE (AlgorithmIdentifier)
-              0x06, 0x07,                    //   OID 1.2.840.10045.2.1 (ecPublicKey)
-              0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,
-              0x06, 0x08,                    //   OID 1.2.840.10045.3.1.7 (prime256v1)
-              0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,
-        0x04,                                // OCTET STRING tag
-    ];
+    //
+    // SEQUENCE (outer)
+    //   INTEGER version = 0
+    //   SEQUENCE (AlgorithmIdentifier)
+    //     OID 1.2.840.10045.2.1 (ecPublicKey)
+    //     OID 1.2.840.10045.3.1.7 (prime256v1)
+    //   OCTET STRING (SEC1 key)
 
     // The OCTET STRING wrapping the SEC1 key
     let sec1_len = sec1_der.len();

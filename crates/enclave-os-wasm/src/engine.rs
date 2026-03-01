@@ -11,12 +11,12 @@
 //!
 //! The wasmtime Privasys fork contains the `sys::sgx` runtime backend
 //! (from commit `fbbcd2ac`) which replaces `mmap`/`mprotect`/signals
-//! with SGX2 EDMM primitives:
+//! with SGX-compatible primitives:
 //!
 //! | Capability        | SGX backend                                  |
 //! |-------------------|----------------------------------------------|
-//! | Memory allocation | `sgx_mm_alloc` (reserve + commit)            |
-//! | Memory protection | `sgx_mm_modify_permissions`                  |
+//! | Memory allocation | RWX code pool (`.wasm_code` section, bump)   |
+//! | Memory protection | No-op (pool=RWX, heap=RW)                    |
 //! | Trap handling     | `sgx_register_exception_handler` (VEH)       |
 //! | Thread-local      | `std::thread_local!` (→ `sgx_tstd`)         |
 //! | Unwind            | Stub (no-op)                                 |

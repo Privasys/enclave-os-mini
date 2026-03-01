@@ -2,8 +2,8 @@
 
 WebAssembly Component runtime for Enclave OS (Mini). Executes third-party WASM
 bytecode inside an Intel SGX enclave with WASI support (random, clocks,
-filesystem, sockets) and Enclave OS platform APIs (crypto, keystore, HTTPS
-egress).
+filesystem, IO/streams, poll, sockets, CLI) and Enclave OS platform APIs
+(crypto, keystore, HTTPS egress).
 
 ## Wasmtime fork — rationale
 
