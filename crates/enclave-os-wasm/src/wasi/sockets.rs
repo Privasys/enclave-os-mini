@@ -1,7 +1,7 @@
 // Copyright (c) Privasys. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
-//! `wasi:sockets/{network,instance-network,tcp,tcp-create-socket}@0.2.3`
+//! `wasi:sockets/{network,instance-network,tcp,tcp-create-socket}@0.2.0`
 //!
 //! TCP sockets backed by enclave OS OCALLs.  The host performs the actual
 //! `socket()` / `bind()` / `listen()` / `accept()` / `connect()` kernel
@@ -34,11 +34,11 @@ use super::{
 };
 
 // =========================================================================
-//  wasi:sockets/network@0.2.3
+//  wasi:sockets/network@0.2.0
 // =========================================================================
 
 fn add_network(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:sockets/network@0.2.3")?;
+    let mut inst = linker.instance("wasi:sockets/network@0.2.0")?;
 
     // resource: network
     inst.resource(
@@ -51,11 +51,11 @@ fn add_network(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
 }
 
 // =========================================================================
-//  wasi:sockets/instance-network@0.2.3
+//  wasi:sockets/instance-network@0.2.0
 // =========================================================================
 
 fn add_instance_network(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:sockets/instance-network@0.2.3")?;
+    let mut inst = linker.instance("wasi:sockets/instance-network@0.2.0")?;
 
     // instance-network: func() -> network
     inst.func_wrap(
@@ -70,11 +70,11 @@ fn add_instance_network(linker: &mut Linker<AppContext>) -> Result<(), wasmtime:
 }
 
 // =========================================================================
-//  wasi:sockets/tcp-create-socket@0.2.3
+//  wasi:sockets/tcp-create-socket@0.2.0
 // =========================================================================
 
 fn add_tcp_create_socket(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:sockets/tcp-create-socket@0.2.3")?;
+    let mut inst = linker.instance("wasi:sockets/tcp-create-socket@0.2.0")?;
 
     // create-tcp-socket: func(address-family: ip-address-family) -> result<tcp-socket, error-code>
     //
@@ -107,11 +107,11 @@ fn add_tcp_create_socket(linker: &mut Linker<AppContext>) -> Result<(), wasmtime
 }
 
 // =========================================================================
-//  wasi:sockets/tcp@0.2.3
+//  wasi:sockets/tcp@0.2.0
 // =========================================================================
 
 fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:sockets/tcp@0.2.3")?;
+    let mut inst = linker.instance("wasi:sockets/tcp@0.2.0")?;
 
     // ── resource: tcp-socket ───────────────────────────────────────
     inst.resource(
@@ -136,7 +136,7 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let sock_rep = io_rep(&params[0], store.as_context_mut())?;
+            let sock_rep = io_rep::<TcpSocketRes>(&params[0], store.as_context_mut())?;
             // params[1] = network (ignored — we have one implicit network)
             let port = extract_port_from_address(&params[2]);
 
@@ -179,7 +179,7 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let sock_rep = io_rep(&params[0], store.as_context_mut())?;
+            let sock_rep = io_rep::<TcpSocketRes>(&params[0], store.as_context_mut())?;
             // params[1] = network
             let (host, port) = extract_host_port_from_address(&params[2]);
 
@@ -211,7 +211,7 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let sock_rep = io_rep(&params[0], store.as_context_mut())?;
+            let sock_rep = io_rep::<TcpSocketRes>(&params[0], store.as_context_mut())?;
             let fd = match store.data().tcp_sockets.get(&sock_rep) {
                 Some(s) if s.connected => match s.fd {
                     Some(fd) => fd,
@@ -260,7 +260,7 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let sock_rep = io_rep(&params[0], store.as_context_mut())?;
+            let sock_rep = io_rep::<TcpSocketRes>(&params[0], store.as_context_mut())?;
             if let Some(sock) = store.data_mut().tcp_sockets.get_mut(&sock_rep) {
                 sock.listening = true;
             }
@@ -289,7 +289,7 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let sock_rep = io_rep(&params[0], store.as_context_mut())?;
+            let sock_rep = io_rep::<TcpSocketRes>(&params[0], store.as_context_mut())?;
             let listener_fd = match store.data().tcp_sockets.get(&sock_rep) {
                 Some(s) if s.listening => match s.fd {
                     Some(fd) => fd,
@@ -365,7 +365,7 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let sock_rep = io_rep(&params[0], store.as_context_mut())?;
+            let sock_rep = io_rep::<TcpSocketRes>(&params[0], store.as_context_mut())?;
             if let Some(sock) = store.data_mut().tcp_sockets.get_mut(&sock_rep) {
                 if let Some(fd) = sock.fd.take() {
                     enclave_os_enclave::ocall::net_close(fd);
@@ -385,7 +385,7 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let sock_rep = io_rep(&params[0], store.as_context_mut())?;
+            let sock_rep = io_rep::<TcpSocketRes>(&params[0], store.as_context_mut())?;
             let port = store
                 .data()
                 .tcp_sockets
@@ -405,7 +405,7 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let sock_rep = io_rep(&params[0], store.as_context_mut())?;
+            let sock_rep = io_rep::<TcpSocketRes>(&params[0], store.as_context_mut())?;
             let port = store
                 .data()
                 .tcp_sockets
@@ -488,11 +488,11 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
 // =========================================================================
 
 /// Extract resource rep from a Val.
-fn io_rep(val: &Val, store: impl wasmtime::AsContextMut) -> Result<u32, wasmtime::Error> {
+fn io_rep<T: 'static>(val: &Val, store: impl wasmtime::AsContextMut) -> Result<u32, wasmtime::Error> {
     match val {
         Val::Resource(any) => {
-            let dyn_res = wasmtime::component::ResourceDynamic::try_from_resource_any(*any, store)?;
-            Ok(dyn_res.rep())
+            let res = wasmtime::component::Resource::<T>::try_from_resource_any(*any, store)?;
+            Ok(res.rep())
         }
         _ => Err(wasmtime::Error::msg("expected resource")),
     }

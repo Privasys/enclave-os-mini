@@ -1,7 +1,7 @@
 // Copyright (c) Privasys. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
-//! `wasi:io/{error,poll,streams}@0.2.3` — resource-based I/O primitives.
+//! `wasi:io/{error,poll,streams}@0.2.0` — resource-based I/O primitives.
 //!
 //! This is the foundation of the WASI I/O model.  All other WASI
 //! interfaces that perform I/O (cli, sockets, filesystem) build on top
@@ -23,11 +23,11 @@ use super::{
 };
 
 // =========================================================================
-//  wasi:io/error@0.2.3
+//  wasi:io/error@0.2.0
 // =========================================================================
 
 pub fn add_io_error(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:io/error@0.2.3")?;
+    let mut inst = linker.instance("wasi:io/error@0.2.0")?;
 
     // ── resource: error ────────────────────────────────────────────
     inst.resource("error", ResourceType::host::<IoErrorRes>(), |mut store, rep| {
@@ -53,11 +53,11 @@ pub fn add_io_error(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Err
 }
 
 // =========================================================================
-//  wasi:io/poll@0.2.3
+//  wasi:io/poll@0.2.0
 // =========================================================================
 
 pub fn add_io_poll(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:io/poll@0.2.3")?;
+    let mut inst = linker.instance("wasi:io/poll@0.2.0")?;
 
     // ── resource: pollable ─────────────────────────────────────────
     inst.resource(
@@ -99,11 +99,11 @@ pub fn add_io_poll(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Erro
 }
 
 // =========================================================================
-//  wasi:io/streams@0.2.3
+//  wasi:io/streams@0.2.0
 // =========================================================================
 
 pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:io/streams@0.2.3")?;
+    let mut inst = linker.instance("wasi:io/streams@0.2.0")?;
 
     // ── resource: input-stream ─────────────────────────────────────
     inst.resource(
@@ -142,7 +142,7 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            let rep = resource_rep(&params[0], store.as_context_mut())?;
+            let rep = resource_rep::<InputStreamRes>(&params[0], store.as_context_mut())?;
             let len = val_u64(&params[1])? as usize;
 
             let data = store.data_mut().read_stream(rep, len);
@@ -175,7 +175,7 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            let rep = resource_rep(&params[0], store.as_context_mut())?;
+            let rep = resource_rep::<InputStreamRes>(&params[0], store.as_context_mut())?;
             let len = val_u64(&params[1])? as usize;
 
             match store.data_mut().read_stream(rep, len) {
@@ -199,7 +199,7 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            let rep = resource_rep(&params[0], store.as_context_mut())?;
+            let rep = resource_rep::<InputStreamRes>(&params[0], store.as_context_mut())?;
             let len = val_u64(&params[1])? as usize;
 
             match store.data_mut().read_stream(rep, len) {
@@ -223,7 +223,7 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            let rep = resource_rep(&params[0], store.as_context_mut())?;
+            let rep = resource_rep::<InputStreamRes>(&params[0], store.as_context_mut())?;
             let len = val_u64(&params[1])? as usize;
 
             match store.data_mut().read_stream(rep, len) {
@@ -261,7 +261,7 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            let rep = resource_rep(&params[0], store.as_context_mut())?;
+            let rep = resource_rep::<OutputStreamRes>(&params[0], store.as_context_mut())?;
 
             if store.data().output_streams.contains_key(&rep) {
                 // Report 64 KiB writable (generous buffer).
@@ -281,7 +281,7 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            let rep = resource_rep(&params[0], store.as_context_mut())?;
+            let rep = resource_rep::<OutputStreamRes>(&params[0], store.as_context_mut())?;
             let data = val_list_u8(&params[1])?;
 
             match store.data_mut().write_stream(rep, &data) {
@@ -304,7 +304,7 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            let rep = resource_rep(&params[0], store.as_context_mut())?;
+            let rep = resource_rep::<OutputStreamRes>(&params[0], store.as_context_mut())?;
             let data = val_list_u8(&params[1])?;
 
             match store.data_mut().write_stream(rep, &data) {
@@ -326,7 +326,7 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
-            let _rep = resource_rep(&params[0], store.as_context_mut())?;
+            let _rep = resource_rep::<OutputStreamRes>(&params[0], store.as_context_mut())?;
             // Flush is a no-op for memory buffers and OCALLs (already delivered).
             results[0] = wasmtime::component::Val::Result(Ok(None));
             Ok(())
@@ -340,7 +340,7 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
-            let _rep = resource_rep(&params[0], store.as_context_mut())?;
+            let _rep = resource_rep::<OutputStreamRes>(&params[0], store.as_context_mut())?;
             results[0] = wasmtime::component::Val::Result(Ok(None));
             Ok(())
         },
@@ -364,7 +364,7 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            let rep = resource_rep(&params[0], store.as_context_mut())?;
+            let rep = resource_rep::<OutputStreamRes>(&params[0], store.as_context_mut())?;
             let len = val_u64(&params[1])? as usize;
             let zeroes = vec![0u8; len.min(65536)];
 
@@ -386,7 +386,7 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            let rep = resource_rep(&params[0], store.as_context_mut())?;
+            let rep = resource_rep::<OutputStreamRes>(&params[0], store.as_context_mut())?;
             let len = val_u64(&params[1])? as usize;
             let zeroes = vec![0u8; len.min(65536)];
 
@@ -408,8 +408,8 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            let out_rep = resource_rep(&params[0], store.as_context_mut())?;
-            let in_rep = resource_rep(&params[1], store.as_context_mut())?;
+            let out_rep = resource_rep::<OutputStreamRes>(&params[0], store.as_context_mut())?;
+            let in_rep = resource_rep::<InputStreamRes>(&params[1], store.as_context_mut())?;
             let len = val_u64(&params[2])? as usize;
 
             // Read from input, write to output
@@ -442,8 +442,8 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
          params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            let out_rep = resource_rep(&params[0], store.as_context_mut())?;
-            let in_rep = resource_rep(&params[1], store.as_context_mut())?;
+            let out_rep = resource_rep::<OutputStreamRes>(&params[0], store.as_context_mut())?;
+            let in_rep = resource_rep::<InputStreamRes>(&params[1], store.as_context_mut())?;
             let len = val_u64(&params[2])? as usize;
 
             let data = match store.data_mut().read_stream(in_rep, len) {
@@ -487,11 +487,11 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
 // =========================================================================
 
 /// Extract the resource representation (u32) from a `Val::Resource`.
-fn resource_rep(val: &wasmtime::component::Val, store: impl wasmtime::AsContextMut) -> Result<u32, wasmtime::Error> {
+fn resource_rep<T: 'static>(val: &wasmtime::component::Val, store: impl wasmtime::AsContextMut) -> Result<u32, wasmtime::Error> {
     match val {
         wasmtime::component::Val::Resource(any) => {
-            let dyn_res = wasmtime::component::ResourceDynamic::try_from_resource_any(*any, store)?;
-            Ok(dyn_res.rep())
+            let res = wasmtime::component::Resource::<T>::try_from_resource_any(*any, store)?;
+            Ok(res.rep())
         }
         _ => Err(wasmtime::Error::msg("expected resource value")),
     }

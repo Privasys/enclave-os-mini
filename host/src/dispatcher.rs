@@ -341,7 +341,7 @@ impl Backoff {
             std::thread::yield_now();
             self.spin_count += 1;
         } else {
-            // Sleep briefly (1ms) ÃƒÂ¢Ã¢â€šÂ¬Ã¢â‚¬Å“ the enclave will call ocall_notify to wake us
+            // Sleep briefly (1ms) — the enclave will call ocall_notify to wake us
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
     }

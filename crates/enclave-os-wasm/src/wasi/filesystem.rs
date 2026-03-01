@@ -1,7 +1,7 @@
 // Copyright (c) Privasys. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
-//! `wasi:filesystem/{types,preopens}@0.2.3`
+//! `wasi:filesystem/{types,preopens}@0.2.0`
 //!
 //! Lightweight filesystem implementation backed by the enclave OS sealed KV store.
 //!
@@ -44,11 +44,11 @@ use super::{
 const FS_DOMAIN: &str = "fs:";
 
 // =========================================================================
-//  wasi:filesystem/types@0.2.3
+//  wasi:filesystem/types@0.2.0
 // =========================================================================
 
 fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:filesystem/types@0.2.3")?;
+    let mut inst = linker.instance("wasi:filesystem/types@0.2.0")?;
 
     // ── resource: descriptor ───────────────────────────────────────
     inst.resource(
@@ -90,7 +90,7 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let rep = resource_rep(&params[0], store.as_context_mut())?;
+            let rep = resource_rep::<DescriptorRes>(&params[0], store.as_context_mut())?;
             let dtype = match store.data().fs_descriptors.get(&rep) {
                 Some(FsDescriptor::Directory { .. }) => "directory",
                 Some(FsDescriptor::File { .. }) => "regular-file",
@@ -112,7 +112,7 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let rep = resource_rep(&params[0], store.as_context_mut())?;
+            let rep = resource_rep::<DescriptorRes>(&params[0], store.as_context_mut())?;
             let (dtype, size) = match store.data().fs_descriptors.get(&rep) {
                 Some(FsDescriptor::Directory { .. }) => ("directory", 0u64),
                 Some(FsDescriptor::File { buf, .. }) => ("regular-file", buf.len() as u64),
@@ -134,7 +134,7 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let rep = resource_rep(&params[0], store.as_context_mut())?;
+            let rep = resource_rep::<DescriptorRes>(&params[0], store.as_context_mut())?;
             // params[1] = path-flags (ignored)
             let path = val_string(&params[2]);
 
@@ -179,10 +179,10 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let rep = resource_rep(&params[0], store.as_context_mut())?;
-            // params[1] = path-flags (u32, ignored)
+            let rep = resource_rep::<DescriptorRes>(&params[0], store.as_context_mut())?;
+            // params[1] = path-flags (flags, ignored)
             let path = val_string(&params[2]);
-            let open_flags = val_u32(&params[3]);
+            let open_flags = val_open_flags(&params[3]);
             // params[4] = descriptor-flags (ignored for now)
 
             let prefix = match store.data().fs_descriptors.get(&rep) {
@@ -259,7 +259,7 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let rep = resource_rep(&params[0], store.as_context_mut())?;
+            let rep = resource_rep::<DescriptorRes>(&params[0], store.as_context_mut())?;
             let offset = val_u64(&params[1]) as usize;
 
             let buf = match store.data().fs_descriptors.get(&rep) {
@@ -301,7 +301,7 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let rep = resource_rep(&params[0], store.as_context_mut())?;
+            let rep = resource_rep::<DescriptorRes>(&params[0], store.as_context_mut())?;
 
             // Mark file as dirty.
             match store.data_mut().fs_descriptors.get_mut(&rep) {
@@ -336,7 +336,7 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let rep = resource_rep(&params[0], store.as_context_mut())?;
+            let rep = resource_rep::<DescriptorRes>(&params[0], store.as_context_mut())?;
             match store.data_mut().fs_descriptors.get_mut(&rep) {
                 Some(FsDescriptor::File { dirty, .. }) => {
                     *dirty = true;
@@ -366,7 +366,7 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let rep = resource_rep(&params[0], store.as_context_mut())?;
+            let rep = resource_rep::<DescriptorRes>(&params[0], store.as_context_mut())?;
             let length = val_u64(&params[1]) as usize;
             let offset = val_u64(&params[2]) as usize;
 
@@ -401,7 +401,7 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let rep = resource_rep(&params[0], store.as_context_mut())?;
+            let rep = resource_rep::<DescriptorRes>(&params[0], store.as_context_mut())?;
             let data = val_list_u8(&params[1]);
             let offset = val_u64(&params[2]) as usize;
 
@@ -437,7 +437,7 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let rep = resource_rep(&params[0], store.as_context_mut())?;
+            let rep = resource_rep::<DescriptorRes>(&params[0], store.as_context_mut())?;
             match store.data().fs_descriptors.get(&rep) {
                 Some(FsDescriptor::Directory { .. }) => {}
                 _ => {
@@ -470,7 +470,7 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let rep = resource_rep(&params[0], store.as_context_mut())?;
+            let rep = resource_rep::<DirEntryStreamRes>(&params[0], store.as_context_mut())?;
 
             let entry = store
                 .data_mut()
@@ -521,7 +521,7 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let rep = resource_rep(&params[0], store.as_context_mut())?;
+            let rep = resource_rep::<DescriptorRes>(&params[0], store.as_context_mut())?;
             // Extract data to sync (immutable borrow).
             let sync_data = if let Some(FsDescriptor::File { key, buf, dirty, .. }) =
                 store.data().fs_descriptors.get(&rep)
@@ -558,7 +558,7 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let rep = resource_rep(&params[0], store.as_context_mut())?;
+            let rep = resource_rep::<DescriptorRes>(&params[0], store.as_context_mut())?;
             // Extract data to sync (immutable borrow).
             let sync_data = if let Some(FsDescriptor::File { key, buf, dirty, .. }) =
                 store.data().fs_descriptors.get(&rep)
@@ -621,8 +621,8 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let a = resource_rep(&params[0], store.as_context_mut()).unwrap_or(u32::MAX);
-            let b = resource_rep(&params[1], store.as_context_mut()).unwrap_or(u32::MAX - 1);
+            let a = resource_rep::<DescriptorRes>(&params[0], store.as_context_mut()).unwrap_or(u32::MAX);
+            let b = resource_rep::<DescriptorRes>(&params[1], store.as_context_mut()).unwrap_or(u32::MAX - 1);
             results[0] = Val::Bool(a == b);
             Ok(())
         },
@@ -675,11 +675,11 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
 }
 
 // =========================================================================
-//  wasi:filesystem/preopens@0.2.3
+//  wasi:filesystem/preopens@0.2.0
 // =========================================================================
 
 fn add_preopens(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:filesystem/preopens@0.2.3")?;
+    let mut inst = linker.instance("wasi:filesystem/preopens@0.2.0")?;
 
     // get-directories: func() -> list<tuple<own<descriptor>, string>>
     //
@@ -735,11 +735,11 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
 // =========================================================================
 
 /// Extract resource rep from a Val.
-fn resource_rep(val: &Val, store: impl wasmtime::AsContextMut) -> Result<u32, wasmtime::Error> {
+fn resource_rep<T: 'static>(val: &Val, store: impl wasmtime::AsContextMut) -> Result<u32, wasmtime::Error> {
     match val {
         Val::Resource(any) => {
-            let dyn_res = wasmtime::component::ResourceDynamic::try_from_resource_any(*any, store)?;
-            Ok(dyn_res.rep())
+            let res = wasmtime::component::Resource::<T>::try_from_resource_any(*any, store)?;
+            Ok(res.rep())
         }
         _ => Err(wasmtime::Error::msg("expected resource")),
     }
@@ -810,6 +810,34 @@ fn make_descriptor_stat(dtype: &str, size: u64) -> Val {
         ]
         .into(),
     )
+}
+
+/// Extract `open-flags` from a Val.
+///
+/// Component model flags arrive as `Val::Flags(names_set)` where the
+/// boxed slice contains only the flag names that are SET. We also
+/// accept `Val::U32` for robustness.
+///
+/// Bit mapping (matching WASI filesystem/types):
+///   create=1, directory=2, exclusive=4, truncate=8
+fn val_open_flags(val: &Val) -> u32 {
+    match val {
+        Val::Flags(names) => {
+            let mut bits = 0u32;
+            for name in names.iter() {
+                match name.as_str() {
+                    "create" => bits |= 1,
+                    "directory" => bits |= 2,
+                    "exclusive" => bits |= 4,
+                    "truncate" => bits |= 8,
+                    _ => {}
+                }
+            }
+            bits
+        }
+        Val::U32(v) => *v,
+        _ => 0,
+    }
 }
 
 /// Normalize a filesystem path from a directory prefix and relative path.

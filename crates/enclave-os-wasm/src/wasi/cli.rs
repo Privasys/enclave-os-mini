@@ -26,11 +26,11 @@ use super::{
 };
 
 // =========================================================================
-//  wasi:random/random@0.2.3
+//  wasi:random/random@0.2.0
 // =========================================================================
 
 fn add_random(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:random/random@0.2.3")?;
+    let mut inst = linker.instance("wasi:random/random@0.2.0")?;
 
     // get-random-bytes: func(len: u64) -> list<u8>
     inst.func_wrap(
@@ -59,11 +59,11 @@ fn add_random(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
 }
 
 // =========================================================================
-//  wasi:random/insecure@0.2.3  (optional, stub)
+//  wasi:random/insecure@0.2.0  (optional, stub)
 // =========================================================================
 
 fn add_random_insecure(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:random/insecure@0.2.3")?;
+    let mut inst = linker.instance("wasi:random/insecure@0.2.0")?;
 
     inst.func_wrap(
         "get-insecure-random-bytes",
@@ -90,11 +90,11 @@ fn add_random_insecure(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::
 }
 
 // =========================================================================
-//  wasi:random/insecure-seed@0.2.3  (optional, stub)
+//  wasi:random/insecure-seed@0.2.0  (optional, stub)
 // =========================================================================
 
 fn add_random_insecure_seed(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:random/insecure-seed@0.2.3")?;
+    let mut inst = linker.instance("wasi:random/insecure-seed@0.2.0")?;
 
     inst.func_wrap(
         "insecure-seed",
@@ -111,11 +111,11 @@ fn add_random_insecure_seed(linker: &mut Linker<AppContext>) -> Result<(), wasmt
 }
 
 // =========================================================================
-//  wasi:clocks/wall-clock@0.2.3
+//  wasi:clocks/wall-clock@0.2.0
 // =========================================================================
 
 fn add_wall_clock(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:clocks/wall-clock@0.2.3")?;
+    let mut inst = linker.instance("wasi:clocks/wall-clock@0.2.0")?;
 
     // now: func() -> datetime
     // datetime = record { seconds: u64, nanoseconds: u32 }
@@ -164,11 +164,11 @@ fn add_wall_clock(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error
 }
 
 // =========================================================================
-//  wasi:clocks/monotonic-clock@0.2.3
+//  wasi:clocks/monotonic-clock@0.2.0
 // =========================================================================
 
 fn add_monotonic_clock(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:clocks/monotonic-clock@0.2.3")?;
+    let mut inst = linker.instance("wasi:clocks/monotonic-clock@0.2.0")?;
 
     // now: func() -> instant (u64 nanoseconds)
     inst.func_wrap(
@@ -211,11 +211,11 @@ fn add_monotonic_clock(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::
 }
 
 // =========================================================================
-//  wasi:cli/environment@0.2.3
+//  wasi:cli/environment@0.2.0
 // =========================================================================
 
 fn add_cli_env(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:cli/environment@0.2.3")?;
+    let mut inst = linker.instance("wasi:cli/environment@0.2.0")?;
 
     // get-environment: func() -> list<tuple<string, string>>
     inst.func_wrap(
@@ -247,11 +247,11 @@ fn add_cli_env(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
 }
 
 // =========================================================================
-//  wasi:cli/stdin@0.2.3
+//  wasi:cli/stdin@0.2.0
 // =========================================================================
 
 fn add_cli_stdin(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:cli/stdin@0.2.3")?;
+    let mut inst = linker.instance("wasi:cli/stdin@0.2.0")?;
 
     // get-stdin: func() -> input-stream
     inst.func_wrap(
@@ -270,11 +270,11 @@ fn add_cli_stdin(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error>
 }
 
 // =========================================================================
-//  wasi:cli/stdout@0.2.3
+//  wasi:cli/stdout@0.2.0
 // =========================================================================
 
 fn add_cli_stdout(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:cli/stdout@0.2.3")?;
+    let mut inst = linker.instance("wasi:cli/stdout@0.2.0")?;
 
     // get-stdout: func() -> output-stream
     inst.func_wrap(
@@ -293,11 +293,11 @@ fn add_cli_stdout(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error
 }
 
 // =========================================================================
-//  wasi:cli/stderr@0.2.3
+//  wasi:cli/stderr@0.2.0
 // =========================================================================
 
 fn add_cli_stderr(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:cli/stderr@0.2.3")?;
+    let mut inst = linker.instance("wasi:cli/stderr@0.2.0")?;
 
     // get-stderr: func() -> output-stream
     inst.func_wrap(
@@ -316,11 +316,11 @@ fn add_cli_stderr(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error
 }
 
 // =========================================================================
-//  wasi:cli/exit@0.2.3
+//  wasi:cli/exit@0.2.0
 // =========================================================================
 
 fn add_cli_exit(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("wasi:cli/exit@0.2.3")?;
+    let mut inst = linker.instance("wasi:cli/exit@0.2.0")?;
 
     // exit: func(status: result)
     //
