@@ -16,8 +16,12 @@ use std::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 
-/// Maximum single frame payload: 4 MiB.
-pub const MAX_FRAME_SIZE: u32 = 4 * 1024 * 1024;
+/// Maximum single frame payload: 16 MiB.
+///
+/// The WASM management protocol double-encodes payloads (inner JSON
+/// inside Request::Data byte vector), which inflates the wire size
+/// significantly for large WASM artifacts.
+pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 
 /// A simple request type for the RA-TLS ingress server.
 #[derive(Debug, Clone, Serialize, Deserialize)]

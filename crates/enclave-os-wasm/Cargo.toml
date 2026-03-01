@@ -32,18 +32,17 @@ enclave-os-kvstore = { path = "../enclave-os-kvstore" }
 # Reference: https://github.com/bytecodealliance/wasmtime/commit/fbbcd2ac
 #
 # Features:
-#   cranelift        — Cranelift code generator (required)
 #   component-model  — Component Model / WIT support for typed interfaces
 #   runtime          — the core execution engine
 #   sgx              — routes to sys::custom + enables EDMM/VEH C API
 #
 # Excluded features:
+#   cranelift        — not needed; AOT-only (pre-compiled components)
 #   async            — not needed; synchronous dispatch only
 #   pooling-allocator— complex SGX memory constraints
 #   cache            — no filesystem in SGX
 #   wat              — text format parsing not needed at runtime
 wasmtime = { git = "https://github.com/Privasys/wasmtime", branch = "sgx", default-features = false, features = [
-    "cranelift",
     "component-model",
     "runtime",
     "std",

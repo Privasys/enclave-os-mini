@@ -1,0 +1,23 @@
+# Copyright (c) Privasys. All rights reserved.
+# Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
+
+[package]
+name = "wasm-precompile"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+description = "AOT pre-compiler for WASM components targeting the enclave-os WASM runtime."
+
+[[bin]]
+name = "wasm-precompile"
+path = "src/main.rs"
+
+[dependencies]
+# Wasmtime with Cranelift — needed to compile, NOT needed at runtime.
+# The enclave only deserialises; this tool does the heavy lifting.
+wasmtime = { git = "https://github.com/Privasys/wasmtime", branch = "sgx", default-features = false, features = [
+    "cranelift",
+    "component-model",
+    "runtime",
+    "std",
+] }

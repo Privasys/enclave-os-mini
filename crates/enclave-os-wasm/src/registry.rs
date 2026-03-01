@@ -120,17 +120,21 @@ impl AppRegistry {
         }
     }
 
-    /// Load a WASM component from raw bytes.
+    /// Load a WASM component from pre-compiled AOT bytes.
     ///
-    /// 1. Computes the SHA-256 code hash.
-    /// 2. Compiles via Cranelift.
+    /// 1. Computes the SHA-256 code hash over the pre-compiled artifact.
+    /// 2. Deserializes (no Cranelift — AOT only).
     /// 3. Introspects exports (root functions + interface members).
     /// 4. Registers under `name` with the given `hostname`.
+    ///
+    /// The `precompiled_bytes` must have been produced by
+    /// `Engine::precompile_component()` or `Component::serialize()`
+    /// outside the enclave with matching engine settings.
     ///
     /// If `encryption_key` is `Some`, the caller supplies the AES-256 key
     /// (BYOK). Otherwise a random key is generated via RDRAND.
     ///
-    /// Returns an error if `name` is already taken or compilation fails.
+    /// Returns an error if `name` is already taken or deserialization fails.
     pub fn load_app(
         &mut self,
         name: &str,
@@ -147,8 +151,8 @@ impl AppRegistry {
         let mut code_hash = [0u8; 32];
         code_hash.copy_from_slice(hash.as_ref());
 
-        // ── Compile ────────────────────────────────────────────────
-        let component = self.engine.compile(wasm_bytes)?;
+        // ── Deserialize (AOT) ──────────────────────────────────────
+        let component = self.engine.deserialize(wasm_bytes)?;
         // ── Per-app encryption key ─────────────────────────────────
         let (app_key, byok) = match encryption_key {
             Some(k) => (k, true),

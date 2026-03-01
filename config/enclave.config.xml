@@ -2,9 +2,9 @@
 <EnclaveConfiguration>
     <ProdID>0</ProdID>
     <ISVSVN>0</ISVSVN>
-    <StackMaxSize>0x400000</StackMaxSize>
-    <HeapMaxSize>0x4000000</HeapMaxSize>
-    <TCSNum>10</TCSNum>
+    <StackMaxSize>0x100000</StackMaxSize>
+    <HeapMaxSize>0x2000000</HeapMaxSize>
+    <TCSNum>2</TCSNum>
     <TCSPolicy>1</TCSPolicy>
     <!-- 0 = debug enabled, 1 = debug disabled -->
     <DisableDebug>0</DisableDebug>

@@ -44,6 +44,13 @@ use enclave_os_common::types::AEAD_KEY_SIZE;
 /// Create one per enclave lifetime.  Individual apps share the engine but
 /// get their own [`Store`] + [`Instance`].
 ///
+/// ## AOT-only
+///
+/// Cranelift is **not** compiled into the enclave.  WASM components must
+/// be pre-compiled outside the enclave with `Engine::precompile_component`
+/// or `Component::serialize`.  Inside the enclave we only call
+/// `Component::deserialize` — no code generation happens at runtime.
+///
 /// [`Instance`]: wasmtime::component::Instance
 pub struct WasmEngine {
     engine: Engine,
@@ -53,12 +60,11 @@ pub struct WasmEngine {
 impl WasmEngine {
     /// Create a new `WasmEngine` with SGX-appropriate wasmtime settings.
     ///
-    /// The engine is configured with:
-    /// - Cranelift code generator
+    /// The engine is configured for **AOT-only** operation:
+    /// - No Cranelift compiler (pre-compiled components only)
     /// - Component Model enabled
     /// - Conservative memory limits suitable for SGX EPC
     /// - No CoW image init (no mmap file backing in SGX)
-    /// - Backtraces enabled (useful for debugging inside enclave)
     pub fn new() -> Result<Self, String> {
         let mut config = Config::new();
 
@@ -112,14 +118,26 @@ impl WasmEngine {
         &self.linker
     }
 
-    /// Compile WASM component bytes into a [`Component`].
+    /// Deserialize a pre-compiled component from AOT bytes.
     ///
-    /// This performs full validation and compilation via Cranelift.
-    /// The resulting `Component` can be instantiated multiple times.
-    pub fn compile(&self, wasm_bytes: &[u8]) -> Result<Component, String> {
-        Component::from_binary(&self.engine, wasm_bytes).map_err(|e| {
-            format!("WASM compilation failed: {}", e)
-        })
+    /// The `precompiled_bytes` must have been produced by
+    /// `Engine::precompile_component()` or `Component::serialize()`
+    /// **outside** the enclave with matching engine settings.
+    ///
+    /// # Safety
+    ///
+    /// The caller must ensure the bytes originate from a trusted source
+    /// (the enclave build pipeline) and have not been tampered with.
+    /// Wasmtime validates the header and will reject corrupt data, but
+    /// loading arbitrary native code is inherently unsafe.
+    pub fn deserialize(&self, precompiled_bytes: &[u8]) -> Result<Component, String> {
+        // SAFETY: pre-compiled bytes come from the trusted build pipeline.
+        // The enclave verifies the code hash before loading.
+        unsafe {
+            Component::deserialize(&self.engine, precompiled_bytes).map_err(|e| {
+                format!("WASM deserialization failed: {}", e)
+            })
+        }
     }
 
     /// Create a new [`Store`] with a fresh [`AppContext`] scoped to an app.
