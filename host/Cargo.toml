@@ -21,8 +21,8 @@ base64 = "0.22"
 rocksdb = "0.22"
 
 # SGX untrusted runtime bindings
-sgx_types = { git = "https://github.com/Privasys/teaclave-sgx-sdk", branch = "main" }
-sgx_urts  = { git = "https://github.com/Privasys/teaclave-sgx-sdk", branch = "main" }
+sgx_types = { git = "https://github.com/Privasys/teaclave-sgx-sdk", rev = "70bbed32" }
+sgx_urts  = { git = "https://github.com/Privasys/teaclave-sgx-sdk", rev = "70bbed32" }
 
 [features]
 mock = []
