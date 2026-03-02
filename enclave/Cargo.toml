@@ -32,8 +32,8 @@ enclave-os-common = { path = "../common" }
 # NOTE: sgx_tstd is provided by the custom sysroot (rustlib/std), NOT as a crate dep.
 # NOTE: sgx_types and sgx_trts are also provided by the sysroot. Do NOT add them here
 #       or you get "two versions of sgx_types" errors. Use `extern crate sgx_types;` in code.
-sgx_tseal  = { git = "https://github.com/Privasys/teaclave-sgx-sdk", branch = "main" }
-sgx_tse    = { git = "https://github.com/Privasys/teaclave-sgx-sdk", branch = "main" }
+sgx_tseal  = { git = "https://github.com/Privasys/teaclave-sgx-sdk", rev = "70bbed32" }
+sgx_tse    = { git = "https://github.com/Privasys/teaclave-sgx-sdk", rev = "70bbed32" }
 
 # Lightweight TLS – rustls is a pure-Rust TLS 1.3 library.
 # In SGX we use ring for crypto (it has SGX support via teaclave).
