@@ -31,6 +31,10 @@ pub struct RaTlsSession {
     tls_conn: rustls::ServerConnection,
     /// Accumulation buffer for incomplete application-level frames.
     read_buf: Vec<u8>,
+    /// Random nonce sent to the client via the TLS CertificateRequest
+    /// extension `0xFFBB` (challenge mode only).  The client binds it
+    /// into its own attestation report_data.
+    client_challenge_nonce: Option<Vec<u8>>,
 }
 
 // SAFETY: RaTlsSession contains only owned types. rustls::ServerConnection
@@ -42,8 +46,16 @@ impl RaTlsSession {
     ///
     /// The caller (IngressServer) is responsible for creating the
     /// ServerConnection from the Acceptor flow.
-    pub fn new(tls_conn: rustls::ServerConnection) -> Self {
-        Self { tls_conn, read_buf: Vec::new() }
+    ///
+    /// `client_challenge_nonce` is the random nonce sent to the client
+    /// via the TLS CertificateRequest extension `0xFFBB` (challenge mode
+    /// only).  It will be used later to verify the client's RA-TLS cert
+    /// report_data.
+    pub fn new(
+        tls_conn: rustls::ServerConnection,
+        client_challenge_nonce: Option<Vec<u8>>,
+    ) -> Self {
+        Self { tls_conn, read_buf: Vec::new(), client_challenge_nonce }
     }
 
     /// Whether the TLS handshake is still in progress.
@@ -214,6 +226,31 @@ impl RaTlsSession {
             }
         }
         Ok(())
+    }
+
+    // ================================================================
+    //  Peer certificate access
+    // ================================================================
+
+    /// Return the DER-encoded leaf certificate presented by the TLS client.
+    ///
+    /// Returns `Some(der)` when the client presented a certificate during
+    /// the handshake (mutual RA-TLS), or `None` for unauthenticated
+    /// clients (e.g. browsers).
+    pub fn peer_cert_der(&self) -> Option<Vec<u8>> {
+        self.tls_conn
+            .peer_certificates()
+            .and_then(|certs| certs.first())
+            .map(|cert| cert.as_ref().to_vec())
+    }
+
+    /// Return the client challenge nonce stored for this connection.
+    ///
+    /// Present only when the server generated a challenge-mode certificate.
+    /// The nonce is sent to the client via the TLS CertificateRequest
+    /// extension `0xFFBB`.
+    pub fn client_challenge_nonce(&self) -> Option<&Vec<u8>> {
+        self.client_challenge_nonce.as_ref()
     }
 
     // ================================================================

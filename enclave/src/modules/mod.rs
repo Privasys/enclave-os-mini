@@ -81,6 +81,36 @@ pub struct AppIdentity {
 }
 
 // ---------------------------------------------------------------------------
+//  Request context
+// ---------------------------------------------------------------------------
+
+/// Per-request context passed to [`EnclaveModule::handle()`].
+///
+/// Carries optional metadata extracted from the TLS session, such as the
+/// peer's client certificate (when mutual RA-TLS is in use).
+pub struct RequestContext {
+    /// DER-encoded leaf certificate presented by the TLS client.
+    ///
+    /// `Some(…)` when the client provided a certificate during the TLS
+    /// handshake (mutual RA-TLS). `None` for regular browser clients
+    /// that do not present client certificates.
+    ///
+    /// Modules that require mutual attestation (e.g. the vault) can
+    /// extract the SGX/TDX quote and custom OID extensions from this
+    /// certificate to verify the caller's identity.
+    pub peer_cert_der: Option<Vec<u8>>,
+
+    /// Random nonce sent to the client via the TLS CertificateRequest
+    /// extension `0xFFBB` for bidirectional challenge-response attestation.
+    ///
+    /// When present (challenge mode only), modules can verify that the
+    /// client's RA-TLS certificate was generated specifically for this
+    /// connection by checking that the client's `report_data` binds to
+    /// this nonce: `report_data == SHA-512(SHA-256(client_pubkey) || nonce)`.
+    pub client_challenge_nonce: Option<Vec<u8>>,
+}
+
+// ---------------------------------------------------------------------------
 //  EnclaveModule trait
 // ---------------------------------------------------------------------------
 
@@ -90,7 +120,10 @@ pub trait EnclaveModule: Send + Sync {
     fn name(&self) -> &str;
 
     /// Handle a client request. Returns `Some(response)` if handled.
-    fn handle(&self, req: &Request) -> Option<Response>;
+    ///
+    /// The [`RequestContext`] carries per-connection metadata (e.g. the
+    /// peer's client certificate for mutual RA-TLS verification).
+    fn handle(&self, req: &Request, ctx: &RequestContext) -> Option<Response>;
 
     /// Config leaves to include in the configuration Merkle tree.
     ///
@@ -164,9 +197,9 @@ pub fn collect_app_identities() -> Vec<AppIdentity> {
 }
 
 /// Dispatch a request to the first module that handles it.
-pub fn dispatch(req: &Request) -> Option<Response> {
+pub fn dispatch(req: &Request, ctx: &RequestContext) -> Option<Response> {
     for module in MODULES.lock().unwrap().iter() {
-        if let Some(resp) = module.handle(req) {
+        if let Some(resp) = module.handle(req, ctx) {
             return Some(resp);
         }
     }

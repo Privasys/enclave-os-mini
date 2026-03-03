@@ -14,6 +14,7 @@ pub mod channel;
 pub mod oids;
 pub mod protocol;
 pub mod queue;
+pub mod quote;
 pub mod rpc;
 pub mod types;
 

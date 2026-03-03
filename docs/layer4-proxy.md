@@ -15,7 +15,7 @@ handshake reaches the enclave untouched.
 ## Architecture
 
 ```
-Client ──TLS──▶ Load Balancer (L4) ──TCP──▶ Host TCP Proxy (:8443)
+Client ──TLS──► Load Balancer (L4) ──TCP──► Host TCP Proxy (:8443)
                                                 │
                                           SPSC data channel
                                                 │

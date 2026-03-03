@@ -33,6 +33,9 @@ use sgx_types::types::{Quote3, Quote4};
 
 use enclave_os_common::oids;
 
+// Re-export shared quote primitives for callers building `RaTlsPolicy` values.
+pub use enclave_os_common::quote::TeeType;
+
 // Re-export the dotted-string OIDs for callers building `ExpectedOid` values.
 pub use enclave_os_common::oids::{
     CONFIG_MERKLE_ROOT_OID_STR as OID_CONFIG_MERKLE_ROOT,
@@ -46,15 +49,6 @@ pub use enclave_os_common::oids::{
 
 /// Mock quote prefix used in development/test builds.
 const MOCK_PREFIX: &[u8] = b"MOCK_QUOTE:";
-
-/// Target TEE type for RA-TLS verification.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum TeeType {
-    /// Intel SGX enclave (quote OID `1.2.840.113741.1.13.1.0`).
-    Sgx,
-    /// Intel TDX Confidential VM (quote OID `1.2.840.113741.1.5.5.1.6`).
-    Tdx,
-}
 
 /// How the verifier reproduces the 64-byte `ReportData` field in the quote.
 ///
@@ -301,12 +295,21 @@ fn build_client_config(
             policy: policy.clone(),
         };
 
-        ClientConfig::builder_with_provider(provider)
+        let mut cfg = ClientConfig::builder_with_provider(provider)
             .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
             .map_err(|_| "TLS config error")?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(verifier))
-            .with_no_client_auth()
+            .with_no_client_auth();
+
+        // When the policy uses challenge-response attestation, inject the
+        // nonce into the ClientHello extension 0xFFBB so the remote server
+        // can bind its attestation quote to our challenge.
+        if let ReportDataBinding::ChallengeResponse { ref nonce } = policy.report_data {
+            cfg.ratls_challenge = Some(nonce.clone());
+        }
+
+        cfg
     } else {
         // Standard TLS — no RA-TLS verification.
         ClientConfig::builder_with_provider(provider)
@@ -701,12 +704,10 @@ fn verify_tdx_report_data(
 }
 
 /// `SHA-512( SHA-256(pubkey_bytes) || binding )`
+///
+/// Re-exported from [`enclave_os_common::quote::compute_report_data_hash`].
 fn compute_report_data_hash(pubkey_bytes: &[u8], binding: &[u8]) -> digest::Digest {
-    let pk_hash = digest::digest(&digest::SHA256, pubkey_bytes);
-    let mut preimage = Vec::with_capacity(32 + binding.len());
-    preimage.extend_from_slice(pk_hash.as_ref());
-    preimage.extend_from_slice(binding);
-    digest::digest(&digest::SHA512, &preimage)
+    enclave_os_common::quote::compute_report_data_hash(pubkey_bytes, binding)
 }
 
 /// Build the DER-encoded SubjectPublicKeyInfo for an ECDSA P-256 public key.

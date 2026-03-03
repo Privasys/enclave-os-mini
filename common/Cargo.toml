@@ -13,8 +13,10 @@ default = ["std"]
 std = []
 # When building for the enclave (no_std), disable std
 sgx = []
+# Cryptographic primitives (ring) — used by quote::compute_report_data_hash
+crypto = ["dep:ring"]
 # JWT verification & encoding (ECDSA P-256 / ES256)
-jwt = ["dep:ring", "dep:base64", "dep:serde_json"]
+jwt = ["crypto", "dep:base64", "dep:serde_json"]
 
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }

@@ -24,20 +24,18 @@ use serde::{Deserialize, Serialize};
 pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 
 /// A simple request type for the RA-TLS ingress server.
+///
+/// Module-specific protocols (vault, WASM, etc.) are carried inside
+/// [`Data`](Request::Data) — each module deserializes the inner bytes
+/// into its own request type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
     /// Ping / health check.
     Ping,
     /// Arbitrary application-defined payload.
+    ///
+    /// Module-specific protocols are JSON-encoded inside this variant.
     Data(Vec<u8>),
-    /// Store a secret. The body is a JWT (compact serialisation) signed by
-    /// the secret manager.  The JWT payload must contain:
-    ///   `{ "secret": "<base64-encoded secret bytes>" }`
-    StoreSecret { jwt: Vec<u8> },
-    /// Retrieve a secret by its SHA-256 hash (hex-encoded in the JWT payload).
-    /// The body is a JWT signed by the same secret manager.
-    ///   `{ "secret_hash": "<hex SHA-256 of the secret>" }`
-    GetSecret { jwt: Vec<u8> },
     /// Shutdown the server gracefully.
     Shutdown,
 }
@@ -48,11 +46,9 @@ pub enum Response {
     /// Pong reply.
     Pong,
     /// Application data reply.
+    ///
+    /// Module-specific responses are JSON-encoded inside this variant.
     Data(Vec<u8>),
-    /// Secret stored successfully. Contains the SHA-256 hash of the secret.
-    SecretStored { secret_hash: Vec<u8> },
-    /// Secret retrieved successfully.
-    SecretValue { secret: Vec<u8> },
     /// Acknowledgement.
     Ok,
     /// Error with human-readable message.
@@ -132,32 +128,6 @@ mod tests {
     }
 
     #[test]
-    fn test_request_store_secret_serde() {
-        let req = Request::StoreSecret {
-            jwt: b"eyJhbGciOi...".to_vec(),
-        };
-        let json = serde_json::to_vec(&req).unwrap();
-        let back: Request = serde_json::from_slice(&json).unwrap();
-        match back {
-            Request::StoreSecret { jwt } => assert_eq!(jwt, b"eyJhbGciOi..."),
-            _ => panic!("expected StoreSecret"),
-        }
-    }
-
-    #[test]
-    fn test_request_get_secret_serde() {
-        let req = Request::GetSecret {
-            jwt: b"eyJhbGciOi...get".to_vec(),
-        };
-        let json = serde_json::to_vec(&req).unwrap();
-        let back: Request = serde_json::from_slice(&json).unwrap();
-        match back {
-            Request::GetSecret { jwt } => assert_eq!(jwt, b"eyJhbGciOi...get"),
-            _ => panic!("expected GetSecret"),
-        }
-    }
-
-    #[test]
     fn test_request_shutdown_serde() {
         let req = Request::Shutdown;
         let json = serde_json::to_vec(&req).unwrap();
@@ -174,34 +144,6 @@ mod tests {
     }
 
     #[test]
-    fn test_response_secret_stored_serde() {
-        let resp = Response::SecretStored {
-            secret_hash: b"abcdef".to_vec(),
-        };
-        let json = serde_json::to_vec(&resp).unwrap();
-        let back: Response = serde_json::from_slice(&json).unwrap();
-        match back {
-            Response::SecretStored { secret_hash } => {
-                assert_eq!(secret_hash, b"abcdef")
-            }
-            _ => panic!("expected SecretStored"),
-        }
-    }
-
-    #[test]
-    fn test_response_secret_value_serde() {
-        let resp = Response::SecretValue {
-            secret: vec![0xDE, 0xAD],
-        };
-        let json = serde_json::to_vec(&resp).unwrap();
-        let back: Response = serde_json::from_slice(&json).unwrap();
-        match back {
-            Response::SecretValue { secret } => assert_eq!(secret, vec![0xDE, 0xAD]),
-            _ => panic!("expected SecretValue"),
-        }
-    }
-
-    #[test]
     fn test_response_error_serde() {
         let resp = Response::Error(b"something went wrong".to_vec());
         let json = serde_json::to_vec(&resp).unwrap();
@@ -213,34 +155,16 @@ mod tests {
     }
 
     #[test]
-    fn test_store_secret_frame_roundtrip() {
-        let req = Request::StoreSecret {
-            jwt: b"test.jwt.token".to_vec(),
-        };
+    fn test_data_frame_roundtrip() {
+        let req = Request::Data(b"hello vault".to_vec());
         let payload = serde_json::to_vec(&req).unwrap();
         let frame = encode_frame(&payload);
         let (decoded_payload, consumed) = decode_frame(&frame).unwrap();
         assert_eq!(consumed, frame.len());
         let decoded: Request = serde_json::from_slice(&decoded_payload).unwrap();
         match decoded {
-            Request::StoreSecret { jwt } => assert_eq!(jwt, b"test.jwt.token"),
-            _ => panic!("expected StoreSecret"),
-        }
-    }
-
-    #[test]
-    fn test_get_secret_frame_roundtrip() {
-        let req = Request::GetSecret {
-            jwt: b"get.jwt.token".to_vec(),
-        };
-        let payload = serde_json::to_vec(&req).unwrap();
-        let frame = encode_frame(&payload);
-        let (decoded_payload, consumed) = decode_frame(&frame).unwrap();
-        assert_eq!(consumed, frame.len());
-        let decoded: Request = serde_json::from_slice(&decoded_payload).unwrap();
-        match decoded {
-            Request::GetSecret { jwt } => assert_eq!(jwt, b"get.jwt.token"),
-            _ => panic!("expected GetSecret"),
+            Request::Data(d) => assert_eq!(d, b"hello vault"),
+            _ => panic!("expected Data"),
         }
     }
 }

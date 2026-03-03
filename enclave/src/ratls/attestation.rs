@@ -22,7 +22,9 @@ use ring::digest;
 use ring::rand::SystemRandom;
 use ring::signature::{self, EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 
-use enclave_os_common::oids::{SGX_QUOTE_OID, CONFIG_MERKLE_ROOT_OID, APP_CONFIG_MERKLE_ROOT_OID};
+use enclave_os_common::oids::{
+    SGX_QUOTE_OID, CONFIG_MERKLE_ROOT_OID, APP_CONFIG_MERKLE_ROOT_OID,
+};
 
 use crate::ratls::cert_store::AppCertData;
 
@@ -107,14 +109,34 @@ pub fn compute_report_data(pubkey_der: &[u8], binding: &[u8]) -> [u8; 64] {
     out
 }
 
+/// Result of an RA-TLS certificate generation.
+///
+/// Contains the certificate chain, private key, and an optional
+/// client challenge nonce (only in challenge-response mode).
+pub struct CertGenerationResult {
+    /// DER-encoded certificate chain: `[leaf_cert_der, ca_cert_der]`.
+    pub cert_chain_der: Vec<Vec<u8>>,
+    /// PKCS#8-encoded private key for the leaf cert.
+    pub pkcs8_key: Vec<u8>,
+    /// Random nonce for the client to bind into its own RA-TLS certificate
+    /// (challenge-response mode only).  Sent via TLS CertificateRequest
+    /// extension `0xFFBB`, not embedded in the X.509 certificate.
+    pub client_challenge_nonce: Option<Vec<u8>>,
+}
+
 /// Generate an RA-TLS leaf certificate signed by the intermediary CA.
 ///
-/// Returns `(cert_chain_der, pkcs8_private_key)` where `cert_chain_der`
-/// contains `[leaf_cert_der, ca_cert_der]` ready for TLS presentation.
+/// Returns a [`CertGenerationResult`] containing the cert chain, key,
+/// and an optional client challenge nonce.  When `mode` is
+/// [`CertMode::Challenge`], a 32-byte random nonce is generated and
+/// returned in [`CertGenerationResult::client_challenge_nonce`].  The
+/// server sends this nonce to the client via a TLS CertificateRequest
+/// extension (`0xFFBB`) for bidirectional challenge-response attestation.
 pub fn generate_ratls_certificate(
     ca: &CaContext,
     mode: CertMode,
-) -> Result<(Vec<Vec<u8>>, Vec<u8>), String> {
+) -> Result<CertGenerationResult, String> {
+    let is_challenge = matches!(mode, CertMode::Challenge { .. });
     let ctx = prepare_attestation(&mode)?;
 
     // Collect enclave-wide extensions
@@ -126,12 +148,24 @@ pub fn generate_ratls_certificate(
         extensions.push((oid.oid, oid.value.clone()));
     }
 
+    // In challenge mode, generate a client challenge nonce (sent via
+    // TLS CertificateRequest extension 0xFFBB, not embedded in the cert)
+    let client_challenge_nonce = if is_challenge {
+        Some(generate_random_nonce()?)
+    } else {
+        None
+    };
+
     let leaf_der = build_leaf_cert(
         &ctx.pkcs8_bytes, &ctx.quote, ctx.validity_secs, ca,
         "Enclave OS RA-TLS", &extensions,
     )?;
 
-    Ok((vec![leaf_der, ca.ca_cert_der.clone()], ctx.pkcs8_bytes))
+    Ok(CertGenerationResult {
+        cert_chain_der: vec![leaf_der, ca.ca_cert_der.clone()],
+        pkcs8_key: ctx.pkcs8_bytes,
+        client_challenge_nonce,
+    })
 }
 
 /// Generate a per-app RA-TLS leaf certificate signed by the CA.
@@ -143,12 +177,13 @@ pub fn generate_ratls_certificate(
 /// - SGX quote (same as the enclave-wide cert)
 /// - Subject CN = app hostname (for SNI matching)
 ///
-/// Returns `(cert_chain_der, pkcs8_private_key)`.
+/// Returns a [`CertGenerationResult`].
 pub fn generate_app_certificate(
     ca: &CaContext,
     mode: CertMode,
     app: &AppCertData,
-) -> Result<(Vec<Vec<u8>>, Vec<u8>), String> {
+) -> Result<CertGenerationResult, String> {
+    let is_challenge = matches!(mode, CertMode::Challenge { .. });
     let ctx = prepare_attestation(&mode)?;
 
     // Collect per-app extensions
@@ -160,12 +195,24 @@ pub fn generate_app_certificate(
         extensions.push((*oid, value.clone()));
     }
 
+    // In challenge mode, generate a client challenge nonce (sent via
+    // TLS CertificateRequest extension 0xFFBB, not embedded in the cert)
+    let client_challenge_nonce = if is_challenge {
+        Some(generate_random_nonce()?)
+    } else {
+        None
+    };
+
     let leaf_der = build_leaf_cert(
         &ctx.pkcs8_bytes, &ctx.quote, ctx.validity_secs, ca,
         &app.hostname, &extensions,
     )?;
 
-    Ok((vec![leaf_der, ca.ca_cert_der.clone()], ctx.pkcs8_bytes))
+    Ok(CertGenerationResult {
+        cert_chain_der: vec![leaf_der, ca.ca_cert_der.clone()],
+        pkcs8_key: ctx.pkcs8_bytes,
+        client_challenge_nonce,
+    })
 }
 
 /// Generate an ECDSA P-256 key pair and return `(pkcs8_bytes, key_pair)`.
@@ -181,6 +228,16 @@ pub fn generate_keypair() -> Result<(Vec<u8>, EcdsaKeyPair), &'static str> {
     )
     .map_err(|_| "Failed to parse generated key")?;
     Ok((pkcs8_bytes, key_pair))
+}
+
+/// Generate a cryptographically random 32-byte nonce using `ring`'s
+/// `SystemRandom` (backed by `rdrand` inside the SGX enclave).\nfn generate_random_nonce() -> Result<Vec<u8>, String> {
+    use ring::rand::SecureRandom;
+    let rng = SystemRandom::new();
+    let mut nonce = vec![0u8; 32];
+    rng.fill(&mut nonce)
+        .map_err(|_| String::from("random nonce generation failed"))?;
+    Ok(nonce)
 }
 
 // ---------------------------------------------------------------------------

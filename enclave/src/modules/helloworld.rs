@@ -4,14 +4,14 @@
 //! HelloWorld example module.
 
 use enclave_os_common::protocol::{Request, Response};
-use crate::modules::EnclaveModule;
+use crate::modules::{EnclaveModule, RequestContext};
 
 pub struct HelloWorldModule;
 
 impl EnclaveModule for HelloWorldModule {
     fn name(&self) -> &str { "helloworld" }
 
-    fn handle(&self, req: &Request) -> Option<Response> {
+    fn handle(&self, req: &Request, _ctx: &RequestContext) -> Option<Response> {
         match req {
             Request::Data(payload) if payload == b"hello" => {
                 Some(Response::Data(b"world".to_vec()))

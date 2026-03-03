@@ -35,9 +35,9 @@ enclave-os-common = { path = "../common" }
 sgx_tseal  = { git = "https://github.com/Privasys/teaclave-sgx-sdk", tag = "privasys-v0.1.0" }
 sgx_tse    = { git = "https://github.com/Privasys/teaclave-sgx-sdk", tag = "privasys-v0.1.0" }
 
-# Lightweight TLS – rustls is a pure-Rust TLS 1.3 library.
+# Lightweight TLS – rustls is a pure-Rust TLS 1.3 library (Privasys fork with RA-TLS 0xFFBB extension).
 # In SGX we use ring for crypto (it has SGX support via teaclave).
-rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
+rustls = { git = "https://github.com/Privasys/rustls", tag = "privasys-v0.1.0", default-features = false, features = ["ring", "tls12", "std"] }
 # webpki for certificate verification
 webpki = { package = "rustls-webpki", version = "0.102", default-features = false, features = ["ring", "alloc", "std"] }
 # ring for low-level crypto (AEAD, key generation)

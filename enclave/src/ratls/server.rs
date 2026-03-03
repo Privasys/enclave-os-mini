@@ -39,9 +39,10 @@ use enclave_os_common::channel::{self, ChannelMsgType};
 use enclave_os_common::queue::SpscProducer;
 
 use rustls::crypto::ring::default_provider;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
-use rustls::server::Acceptor;
-use rustls::ServerConfig;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, UnixTime};
+use rustls::server::{Acceptor, ClientHello as RustlsClientHello};
+use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
+use rustls::{DigitallySignedStruct, DistinguishedName, Error as TlsError, ServerConfig, SignatureScheme};
 
 // ========================================================================
 //  Session states
@@ -265,10 +266,18 @@ impl IngressServer {
 
     /// Process all complete application-level frames from a session.
     fn dispatch_frames(&mut self, conn_id: u32, session: &mut RaTlsSession) {
+        // Build per-connection request context with optional peer cert
+        // and client challenge nonce (for bidirectional RA-TLS verification,
+        // sent via TLS CertificateRequest extension 0xFFBB)
+        let ctx = crate::modules::RequestContext {
+            peer_cert_der: session.peer_cert_der(),
+            client_challenge_nonce: session.client_challenge_nonce().cloned(),
+        };
+
         loop {
             match session.recv_frame() {
                 Ok(Some(payload)) => {
-                    match handle_frame(&payload) {
+                    match handle_frame(&payload, &ctx) {
                         HandleResult::Response(resp) => {
                             match session.send_frame(&resp) {
                                 Ok(tls_bytes) => {
@@ -335,8 +344,8 @@ impl IngressServer {
             enclave_log_info!("SNI: {} (conn_id={})", sni, conn_id);
         }
 
-        // Build per-connection TLS config
-        let tls_config = self.tls_config_for(
+        // Build per-connection TLS config (includes client challenge nonce)
+        let tls_result = self.tls_config_for(
             &hello.challenge_nonce, &hello.sni,
         )?;
 
@@ -367,7 +376,7 @@ impl IngressServer {
         };
 
         // Create the ServerConnection
-        let server_conn = match accepted.into_connection(tls_config) {
+        let server_conn = match accepted.into_connection(tls_result.config) {
             Ok(conn) => conn,
             Err(e) => {
                 return Err(format!(
@@ -377,8 +386,11 @@ impl IngressServer {
             }
         };
 
-        // Wrap in our session type
-        let mut session = RaTlsSession::new(server_conn);
+        // Wrap in our session type, storing the client challenge nonce
+        let mut session = RaTlsSession::new(
+            server_conn,
+            tls_result.client_challenge_nonce,
+        );
 
         // Collect any initial handshake output (ServerHello, etc.)
         let output = session.collect_tls_output()
@@ -397,14 +409,14 @@ impl IngressServer {
     /// Obtain a `ServerConfig` for this connection.
     ///
     /// - If `nonce` is present → challenge mode (fresh cert, per-app if
-    ///   SNI matches).
+    ///   SNI matches).  Also returns a client challenge nonce.
     /// - Otherwise → deterministic mode (cached by hostname, per-app if
-    ///   SNI matches).
+    ///   SNI matches).  No client challenge nonce.
     fn tls_config_for(
         &mut self,
         nonce: &Option<Vec<u8>>,
         sni: &Option<String>,
-    ) -> Result<Arc<ServerConfig>, String> {
+    ) -> Result<TlsConfigResult, String> {
         // Resolve per-app identity from the global CertStore
         let app_data = sni.as_deref()
             .and_then(|h| cert_store::cert_store().resolve(h));
@@ -420,18 +432,24 @@ impl IngressServer {
 
         if let Some(cached) = self.cached_configs.get(&cache_key) {
             if now < cached.expires_at {
-                return Ok(cached.config.clone());
+                return Ok(TlsConfigResult {
+                    config: cached.config.clone(),
+                    client_challenge_nonce: None,
+                });
             }
         }
 
         let mode = CertMode::Deterministic { creation_time: now };
-        let config = build_tls_config(&self.ca, mode, app_data.as_ref())?;
+        let tls_result = build_tls_config(&self.ca, mode, app_data.as_ref())?;
 
         self.cached_configs.insert(cache_key, CachedConfig {
-            config: config.clone(),
+            config: tls_result.config.clone(),
             expires_at: now + attestation::DETERMINISTIC_VALIDITY_SECS,
         });
-        Ok(config)
+        Ok(TlsConfigResult {
+            config: tls_result.config,
+            client_challenge_nonce: None, // deterministic mode: no nonce
+        })
     }
 
     // ====================================================================
@@ -475,32 +493,115 @@ impl Drop for IngressServer {
 //  TLS configuration helpers
 // ---------------------------------------------------------------------------
 
+// ── Permissive client-certificate verifier ────────────────────────────────
+//
+// The server optionally accepts client certificates but does NOT require
+// them (browsers never present one). When a client *does* present a cert
+// (mutual RA-TLS for vault GetSecret), we store it verbatim and let the
+// vault module extract and verify the SGX/TDX quote at the application
+// layer — there is no X.509 chain validation here.
+
+/// A [`ClientCertVerifier`] that *optionally* accepts any client cert.
+///
+/// * `client_auth_mandatory()` returns `false` → browsers may skip.
+/// * `verify_client_cert()` always succeeds → the vault module does
+///   the real attestation verification from the cert's extensions.
+#[derive(Debug)]
+struct PermissiveClientAuth;
+
+impl ClientCertVerifier for PermissiveClientAuth {
+    fn offer_client_auth(&self) -> bool {
+        true // ask for a client cert in the CertificateRequest
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        false // don't close the connection if client declines
+    }
+
+    fn root_hint_subjects(&self) -> &[DistinguishedName] {
+        &[] // no CA hints — accept any issuer
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: UnixTime,
+    ) -> Result<ClientCertVerified, TlsError> {
+        // Accept unconditionally — quote verification happens in the vault module.
+        Ok(ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, TlsError> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, TlsError> {
+        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![
+            SignatureScheme::ECDSA_NISTP256_SHA256,
+            SignatureScheme::ECDSA_NISTP384_SHA384,
+            SignatureScheme::ED25519,
+        ]
+    }
+}
+
+/// Result of building a TLS config for a single connection.
+struct TlsConfigResult {
+    config: Arc<ServerConfig>,
+    /// Client challenge nonce (present only in challenge-response mode).
+    client_challenge_nonce: Option<Vec<u8>>,
+}
+
 /// Build a `ServerConfig` from an RA-TLS certificate.
 fn build_tls_config(
     ca: &CaContext,
     mode: CertMode,
     app: Option<&cert_store::AppCertData>,
-) -> Result<Arc<ServerConfig>, String> {
-    let (cert_chain_der, pkcs8_key) = match app {
+) -> Result<TlsConfigResult, String> {
+    let result = match app {
         Some(a) => attestation::generate_app_certificate(ca, mode, a)?,
         None => attestation::generate_ratls_certificate(ca, mode)?,
     };
 
-    let certs: Vec<CertificateDer<'static>> = cert_chain_der
+    let certs: Vec<CertificateDer<'static>> = result.cert_chain_der
         .into_iter()
         .map(|der| CertificateDer::from(der).into_owned())
         .collect();
 
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8_key));
+    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(result.pkcs8_key));
 
-    let config = ServerConfig::builder_with_provider(Arc::new(default_provider()))
+    let mut config = ServerConfig::builder_with_provider(Arc::new(default_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| format!("TLS config error: {:?}", e))?
-        .with_no_client_auth()
+        .with_client_cert_verifier(Arc::new(PermissiveClientAuth))
         .with_single_cert(certs, key)
         .map_err(|e| format!("cert chain error: {:?}", e))?;
 
-    Ok(Arc::new(config))
+    // Inject the client's challenge nonce into the CertificateRequest
+    // extension 0xFFBB so the client can verify it against its own nonce
+    // (bidirectional challenge-response RA-TLS).
+    if let Some(ref nonce) = result.client_challenge_nonce {
+        config.ratls_challenge = Some(nonce.clone());
+    }
+
+    Ok(TlsConfigResult {
+        config: Arc::new(config),
+        client_challenge_nonce: result.client_challenge_nonce,
+    })
 }
 
 // ---------------------------------------------------------------------------
@@ -515,7 +616,7 @@ enum HandleResult {
 }
 
 /// Handle a complete, already-decoded frame payload from a client.
-fn handle_frame(payload: &[u8]) -> HandleResult {
+fn handle_frame(payload: &[u8], ctx: &modules::RequestContext) -> HandleResult {
     use enclave_os_common::protocol::{Request, Response};
     use crate::modules;
     match serde_json::from_slice::<Request>(payload) {
@@ -526,7 +627,7 @@ fn handle_frame(payload: &[u8]) -> HandleResult {
         Ok(Request::Shutdown) => HandleResult::Shutdown,
         Ok(req) => {
             // Try all registered modules first
-            if let Some(resp) = modules::dispatch(&req) {
+            if let Some(resp) = modules::dispatch(&req, ctx) {
                 HandleResult::Response(serde_json::to_vec(&resp).unwrap_or_default())
             } else if let Request::Data(payload) = req {
                 // Fallback: echo Data back if no module handled it

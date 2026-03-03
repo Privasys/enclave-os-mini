@@ -81,7 +81,7 @@ use ring::digest;
 use enclave_os_common::protocol::{Request, Response};
 use enclave_os_enclave::config_merkle::ConfigLeaf;
 use enclave_os_enclave::ecall::hex_decode;
-use enclave_os_enclave::modules::{AppIdentity, ConfigEntry, EnclaveModule, ModuleOid};
+use enclave_os_enclave::modules::{AppIdentity, ConfigEntry, EnclaveModule, ModuleOid, RequestContext};
 use enclave_os_enclave::ratls::cert_store;
 use enclave_os_common::types::AEAD_KEY_SIZE;
 
@@ -263,7 +263,7 @@ impl EnclaveModule for WasmModule {
     ///
     /// Returns `None` if the payload doesn't match any WASM envelope
     /// (letting other modules handle the request).
-    fn handle(&self, req: &Request) -> Option<Response> {
+    fn handle(&self, req: &Request, _ctx: &RequestContext) -> Option<Response> {
         let data = match req {
             Request::Data(d) => d,
             _ => return None,

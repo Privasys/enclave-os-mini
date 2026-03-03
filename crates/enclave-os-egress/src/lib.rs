@@ -60,7 +60,7 @@ use ring::digest;
 use rustls::RootCertStore;
 
 use enclave_os_enclave::config_merkle::ConfigLeaf;
-use enclave_os_enclave::modules::{EnclaveModule, ModuleOid};
+use enclave_os_enclave::modules::{EnclaveModule, ModuleOid, RequestContext};
 use enclave_os_common::oids;
 use enclave_os_common::protocol::{Request, Response};
 
@@ -132,7 +132,7 @@ impl EnclaveModule for EgressModule {
         "egress"
     }
 
-    fn handle(&self, _req: &Request) -> Option<Response> {
+    fn handle(&self, _req: &Request, _ctx: &RequestContext) -> Option<Response> {
         // Egress is an internal service — not a direct request handler.
         // Other modules call client::https_get / https_post directly.
         None

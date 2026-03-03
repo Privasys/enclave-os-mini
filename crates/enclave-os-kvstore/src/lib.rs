@@ -29,7 +29,7 @@ mod sealed;
 
 use std::sync::{Mutex, OnceLock};
 
-use enclave_os_enclave::modules::EnclaveModule;
+use enclave_os_enclave::modules::{EnclaveModule, RequestContext};
 use enclave_os_common::protocol::{Request, Response};
 use enclave_os_common::types::AEAD_KEY_SIZE;
 
@@ -72,7 +72,7 @@ impl EnclaveModule for KvStoreModule {
         "kvstore"
     }
 
-    fn handle(&self, _req: &Request) -> Option<Response> {
+    fn handle(&self, _req: &Request, _ctx: &RequestContext) -> Option<Response> {
         // KV is an internal service used by other modules.
         // Client-facing KV operations go through module-specific protocols.
         None
