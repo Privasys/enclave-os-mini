@@ -29,6 +29,7 @@ use std::string::String;
 use std::sync::Arc;
 use std::vec::Vec;
 
+use crate::modules;
 use crate::ocall;
 use crate::ratls::attestation::{self, CaContext, CertMode};
 use crate::ratls::cert_store;
@@ -40,7 +41,7 @@ use enclave_os_common::queue::SpscProducer;
 
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, UnixTime};
-use rustls::server::{Acceptor, ClientHello as RustlsClientHello};
+use rustls::server::Acceptor;
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, Error as TlsError, ServerConfig, SignatureScheme};
 
@@ -618,7 +619,6 @@ enum HandleResult {
 /// Handle a complete, already-decoded frame payload from a client.
 fn handle_frame(payload: &[u8], ctx: &modules::RequestContext) -> HandleResult {
     use enclave_os_common::protocol::{Request, Response};
-    use crate::modules;
     match serde_json::from_slice::<Request>(payload) {
         Ok(Request::Ping) => {
             let resp = serde_json::to_vec(&Response::Pong).unwrap_or_default();

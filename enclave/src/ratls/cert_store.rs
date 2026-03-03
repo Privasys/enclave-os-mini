@@ -31,7 +31,7 @@ use std::vec::Vec;
 
 use ring::digest;
 
-use crate::modules::{AppIdentity, ConfigEntry, ModuleOid};
+use crate::modules::{AppIdentity, ConfigEntry};
 use crate::ratls::attestation::CaContext;
 
 // ---------------------------------------------------------------------------
