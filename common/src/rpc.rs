@@ -52,6 +52,10 @@ pub enum RpcMethod {
     GetCurrentTime   = 0x0300,
     Log              = 0x0301,
 
+    // -- Attestation (DCAP quoting) --
+    QeGetTargetInfo  = 0x0400,
+    QeGetQuote       = 0x0401,
+
     // -- Lifecycle --
     Shutdown         = 0xFF00,
 }
@@ -71,6 +75,8 @@ impl RpcMethod {
             0x0203 => Some(Self::KvListKeys),
             0x0300 => Some(Self::GetCurrentTime),
             0x0301 => Some(Self::Log),
+            0x0400 => Some(Self::QeGetTargetInfo),
+            0x0401 => Some(Self::QeGetQuote),
             0xFF00 => Some(Self::Shutdown),
             _ => None,
         }
@@ -362,6 +368,14 @@ pub fn decode_log_req(p: &[u8]) -> Option<(i32, &str)> {
     let msg = core::str::from_utf8(&p[4..]).ok()?;
     Some((level, msg))
 }
+
+// -- QeGetTargetInfo --
+/// Request: no payload
+/// Response: [512 bytes target_info] (sgx_target_info_t)
+
+// -- QeGetQuote --
+/// Request: the raw SGX report bytes (432 bytes, sgx_report_t)
+/// Response: the full DCAP Quote v3 bytes (variable length)
 
 // ========================================================================
 //  Tests
@@ -780,6 +794,8 @@ mod tests {
         assert_eq!(RpcMethod::from_u16(0x0203), Some(RpcMethod::KvListKeys));
         assert_eq!(RpcMethod::from_u16(0x0300), Some(RpcMethod::GetCurrentTime));
         assert_eq!(RpcMethod::from_u16(0x0301), Some(RpcMethod::Log));
+        assert_eq!(RpcMethod::from_u16(0x0400), Some(RpcMethod::QeGetTargetInfo));
+        assert_eq!(RpcMethod::from_u16(0x0401), Some(RpcMethod::QeGetQuote));
         assert_eq!(RpcMethod::from_u16(0xFF00), Some(RpcMethod::Shutdown));
 
         // Invalid IDs

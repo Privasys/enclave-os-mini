@@ -288,20 +288,40 @@ fn prepare_attestation(mode: &CertMode) -> Result<AttestationContext, String> {
 //  SGX quote generation
 // ---------------------------------------------------------------------------
 
-/// Generate an SGX DCAP quote with the given 64-byte report_data.
+/// Generate an SGX DCAP Quote v3 with the given 64-byte report_data.
 ///
-/// In real SGX mode this calls `sgx_create_report` → `sgx_qe_get_quote`.
-/// In mock mode it returns a deterministic dummy quote.
+/// Two-phase RPC flow:
+///   1. Ask the host for the Quoting Enclave's `TargetInfo` (RPC: `QeGetTargetInfo`)
+///   2. Call `sgx_create_report()` inside the enclave, targeting the QE
+///   3. Send the raw report to the host (RPC: `QeGetQuote`) → host calls
+///      `sgx_qe_get_quote()` → returns the full DCAP Quote v3
+///
+/// In mock mode this returns a deterministic dummy quote.
 #[cfg(not(feature = "mock"))]
 fn generate_sgx_quote(report_data: &[u8; 64]) -> Result<Vec<u8>, String> {
     use sgx_types::types::{ReportData, TargetInfo};
 
+    let rpc = crate::rpc_client_ref();
+
+    // Phase 1: Get QE target info from the host (via DCAP QL)
+    let target_info_bytes = rpc.qe_get_target_info()
+        .map_err(|e| format!("QeGetTargetInfo RPC failed: status={}", e))?;
+
+    if target_info_bytes.len() != core::mem::size_of::<TargetInfo>() {
+        return Err(format!(
+            "QeGetTargetInfo: unexpected size {} (expected {})",
+            target_info_bytes.len(),
+            core::mem::size_of::<TargetInfo>()
+        ));
+    }
+
+    let target_info: TargetInfo = unsafe {
+        core::ptr::read_unaligned(target_info_bytes.as_ptr() as *const TargetInfo)
+    };
+
+    // Phase 2: Create SGX report targeting the QE
     let mut rd = ReportData::default();
     rd.d.copy_from_slice(report_data);
-
-    // In production, obtain target_info from the Quoting Enclave:
-    //   sgx_qe_get_target_info(&mut target_info)
-    let target_info = TargetInfo::default();
 
     let report = <sgx_types::types::Report as sgx_tse::EnclaveReport>::for_target(&target_info, &rd)
         .map_err(|e| format!("sgx_create_report failed: {:?}", e))?;
@@ -312,7 +332,12 @@ fn generate_sgx_quote(report_data: &[u8; 64]) -> Result<Vec<u8>, String> {
             core::mem::size_of::<sgx_types::types::Report>(),
         )
     };
-    Ok(report_bytes.to_vec())
+
+    // Phase 3: Ask the host to get a DCAP Quote v3 from the QE
+    let quote = rpc.qe_get_quote(report_bytes)
+        .map_err(|e| format!("QeGetQuote RPC failed: status={}", e))?;
+
+    Ok(quote)
 }
 
 #[cfg(feature = "mock")]

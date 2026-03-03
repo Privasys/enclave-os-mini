@@ -16,6 +16,8 @@ mod ocall_impl;
 mod net;
 mod kvstore;
 mod tcp_proxy;
+#[cfg(target_os = "linux")]
+mod dcap;
 
 use anyhow::Result;
 use clap::Parser;

@@ -241,4 +241,34 @@ impl RpcClient {
     pub fn shutdown(&self) {
         let _ = self.call(RpcMethod::Shutdown, &[]);
     }
+
+    // ====================================================================
+    //  DCAP attestation calls
+    // ====================================================================
+
+    /// Get the Quoting Enclave's target info (512-byte `sgx_target_info_t`).
+    ///
+    /// The enclave needs this to call `sgx_create_report()` targeting the QE,
+    /// which then signs the report as a DCAP Quote v3.
+    pub fn qe_get_target_info(&self) -> Result<Vec<u8>, i32> {
+        let (status, resp) = self.call(RpcMethod::QeGetTargetInfo, &[]);
+        if status == 0 {
+            Ok(resp)
+        } else {
+            Err(status)
+        }
+    }
+
+    /// Get a DCAP Quote v3 from a raw SGX report (432 bytes).
+    ///
+    /// The host calls `sgx_qe_get_quote()` which engages the Quoting Enclave
+    /// to sign the report. Returns the full DCAP quote (typically ~4-5 KB).
+    pub fn qe_get_quote(&self, report_bytes: &[u8]) -> Result<Vec<u8>, i32> {
+        let (status, resp) = self.call(RpcMethod::QeGetQuote, report_bytes);
+        if status == 0 {
+            Ok(resp)
+        } else {
+            Err(status)
+        }
+    }
 }

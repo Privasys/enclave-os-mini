@@ -104,8 +104,9 @@ fn main() {
     // -----------------------------------------------------------------------
     println!("cargo:rustc-link-search=native={}/lib64", sgx_sdk);
     println!("cargo:rustc-link-lib=sgx_urts");
-    // DCAP quoting libraries are dynamically loaded at runtime by AESM;
-    // we don't need to link them into the host binary.
+    // DCAP Quoting Library — provides sgx_qe_get_target_info / sgx_qe_get_quote.
+    // The library is installed by the libsgx-dcap-ql package.
+    println!("cargo:rustc-link-lib=dylib=sgx_dcap_ql");
 }
 
 // ---------------------------------------------------------------------------

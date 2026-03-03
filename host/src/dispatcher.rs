@@ -111,6 +111,10 @@ impl RpcDispatcher {
             RpcMethod::GetCurrentTime => self.handle_get_current_time(),
             RpcMethod::Log => self.handle_log(payload),
 
+            // ---- Attestation (DCAP quoting) ----
+            RpcMethod::QeGetTargetInfo => self.handle_qe_get_target_info(),
+            RpcMethod::QeGetQuote => self.handle_qe_get_quote(payload),
+
             // ---- Lifecycle ----
             RpcMethod::Shutdown => {
                 info!("RPC: Shutdown requested by enclave");
@@ -308,6 +312,49 @@ impl RpcDispatcher {
         }
         // Log is fire-and-forget; no meaningful response needed.
         (0, Vec::new())
+    }
+
+    // ====================================================================
+    //  DCAP attestation handlers
+    // ====================================================================
+
+    #[cfg(target_os = "linux")]
+    fn handle_qe_get_target_info(&self) -> (i32, Vec<u8>) {
+        debug!("RPC: QeGetTargetInfo");
+        match crate::dcap::qe_get_target_info() {
+            Ok(target_info) => (0, target_info),
+            Err(e) => {
+                error!("QeGetTargetInfo failed: {}", e);
+                (-1, Vec::new())
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn handle_qe_get_target_info(&self) -> (i32, Vec<u8>) {
+        error!("QeGetTargetInfo: not supported on this platform");
+        (-1, Vec::new())
+    }
+
+    #[cfg(target_os = "linux")]
+    fn handle_qe_get_quote(&self, payload: &[u8]) -> (i32, Vec<u8>) {
+        debug!("RPC: QeGetQuote ({} bytes)", payload.len());
+        match crate::dcap::qe_get_quote(payload) {
+            Ok(quote) => {
+                info!("QeGetQuote: generated {} byte DCAP quote", quote.len());
+                (0, quote)
+            }
+            Err(e) => {
+                error!("QeGetQuote failed: {}", e);
+                (-1, Vec::new())
+            }
+        }
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    fn handle_qe_get_quote(&self, _payload: &[u8]) -> (i32, Vec<u8>) {
+        error!("QeGetQuote: not supported on this platform");
+        (-1, Vec::new())
     }
 }
 
