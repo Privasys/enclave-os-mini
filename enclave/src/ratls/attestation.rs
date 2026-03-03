@@ -231,7 +231,8 @@ pub fn generate_keypair() -> Result<(Vec<u8>, EcdsaKeyPair), &'static str> {
 }
 
 /// Generate a cryptographically random 32-byte nonce using `ring`'s
-/// `SystemRandom` (backed by `rdrand` inside the SGX enclave).\nfn generate_random_nonce() -> Result<Vec<u8>, String> {
+/// `SystemRandom` (backed by `rdrand` inside the SGX enclave).
+fn generate_random_nonce() -> Result<Vec<u8>, String> {
     use ring::rand::SecureRandom;
     let rng = SystemRandom::new();
     let mut nonce = vec![0u8; 32];
