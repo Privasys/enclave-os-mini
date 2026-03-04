@@ -20,9 +20,11 @@ export TZ=UTC
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 
-# SGX SDK environment (pre-set variables the environment script appends to)
-export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-}"
+# SGX SDK environment (the script appends to vars that may not yet exist,
+# so temporarily relax nounset).
+set +u
 source /opt/intel/sgxsdk/environment
+set -u
 
 echo "╔══════════════════════════════════════════════════════════════╗"
 echo "║  enclave-os-mini — Reproducible Build                        ║"
