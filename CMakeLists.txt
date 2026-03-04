@@ -31,8 +31,13 @@ include(cmake/RustBuild.cmake)
 # The Cargo.lock in the workspace pins the teaclave-sgx-sdk commit hash.
 # We parse it and find the matching checkout directory under ~/.cargo/git/checkouts.
 
-# Find the teaclave-sgx-sdk base checkout directory
-file(GLOB TEACLAVE_BASE "$ENV{HOME}/.cargo/git/checkouts/teaclave-sgx-sdk-*")
+# Find the teaclave-sgx-sdk base checkout directory (respect CARGO_HOME)
+if(DEFINED ENV{CARGO_HOME})
+    set(_CARGO_DIR "$ENV{CARGO_HOME}")
+else()
+    set(_CARGO_DIR "$ENV{HOME}/.cargo")
+endif()
+file(GLOB TEACLAVE_BASE "${_CARGO_DIR}/git/checkouts/teaclave-sgx-sdk-*")
 list(GET TEACLAVE_BASE 0 TEACLAVE_BASE)
 
 # Extract the commit hash from the workspace Cargo.lock
