@@ -243,7 +243,7 @@ impl VaultModule {
         let val = pubkey_hex.to_lowercase();
 
         match kv.lock() {
-            Ok(mut store) => {
+            Ok(store) => {
                 match store.get(key.as_bytes()) {
                     Ok(Some(existing)) => {
                         if existing == val.as_bytes() {

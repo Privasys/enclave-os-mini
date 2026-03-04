@@ -36,7 +36,7 @@ use std::{string::String, vec::Vec, format};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use ring::signature::{KeyPair, UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
+use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
 
 // ---------------------------------------------------------------------------
 //  Constants
