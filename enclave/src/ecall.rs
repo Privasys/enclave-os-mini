@@ -452,25 +452,7 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
     // ── Vault module (policy-gated secrets, JWT + mRA-TLS) ───────────
     #[cfg(feature = "vault")]
     {
-        let pubkey_hex = match config
-            .extra
-            .get("vault_jwt_pubkey_hex")
-            .and_then(|v| v.as_str())
-        {
-            Some(hex) => hex,
-            None => {
-                enclave_log_error!("Missing required config: vault_jwt_pubkey_hex");
-                return -32;
-            }
-        };
-
-        let vault = match enclave_os_vault::VaultModule::new(pubkey_hex) {
-            Ok(m) => m,
-            Err(e) => {
-                enclave_log_error!("VaultModule init failed: {}", e);
-                return -33;
-            }
-        };
+        let vault = enclave_os_vault::VaultModule::new();
         crate::modules::register_module(Box::new(vault));
         _module_count += 1;
     }

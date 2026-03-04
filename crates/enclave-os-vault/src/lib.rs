@@ -16,10 +16,10 @@
 //!
 //! | VaultRequest | Auth | VaultResponse |
 //! |--------------|------|---------------|
-//! | `StoreSecret { jwt }` | JWT (ES256) | `SecretStored { name, expires_at }` |
+//! | `StoreSecret { jwt }` | Self-signed JWT (ES256 + `pk` header) | `SecretStored { name, expires_at }` |
 //! | `GetSecret { name, attestation_evidence, .. }` | Quote + token + OIDs | `SecretValue { secret, expires_at }` |
-//! | `DeleteSecret { jwt }` | JWT (owner) | `SecretDeleted` |
-//! | `UpdateSecretPolicy { jwt }` | JWT (owner) | `PolicyUpdated` |
+//! | `DeleteSecret { jwt }` | Self-signed JWT (secret owner) | `SecretDeleted` |
+//! | `UpdateSecretPolicy { jwt }` | Self-signed JWT (secret owner) | `PolicyUpdated` |
 //!
 //! ## Usage
 //!
@@ -34,8 +34,7 @@
 //! let kvstore = enclave_os_kvstore::KvStoreModule::new(sealed_cfg.master_key())?;
 //! register_module(Box::new(kvstore));
 //!
-//! let pubkey_hex = config.extra["vault_jwt_pubkey_hex"].as_str().unwrap();
-//! let vault = VaultModule::new(pubkey_hex)?;
+//! let vault = VaultModule::new();
 //! register_module(Box::new(vault));
 //!
 //! finalize_and_run(&config, &sealed_cfg);
@@ -49,9 +48,8 @@ use std::vec::Vec;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use ring::digest;
 
-use enclave_os_common::jwt::JwtVerifier;
+use enclave_os_common::jwt::{self, JwtVerifier};
 use enclave_os_common::protocol::{Request, Response};
 use enclave_os_common::modules::{EnclaveModule, RequestContext};
 
@@ -72,8 +70,10 @@ use crate::types::{
 /// Secrets are persisted in the sealed KV store (via `enclave-os-kvstore`).
 /// The KV key is the secret name (UTF-8 bytes).
 ///
-/// Storing, deleting, and updating secrets requires a JWT signed by the
-/// secret owner's ECDSA P-256 key.  Retrieving secrets requires a valid
+/// Storing, deleting, and updating secrets requires a self-signed JWT
+/// (ES256 with `pk` header) — anyone with a P-256 key can be a secret
+/// owner.  The signer's public-key hash is stored per-secret and checked
+/// on delete / policy update.  Retrieving secrets requires a valid
 /// SGX/TDX attestation quote matching the secret's policy whitelist, plus
 /// an optional bearer token and optional OID claims.
 ///
@@ -90,40 +90,17 @@ use crate::types::{
 /// The URL list is registered as a Merkle tree leaf and X.509 OID
 /// (`1.3.6.1.4.1.65230.2.4`), making it auditable.
 pub struct VaultModule {
-    verifier: JwtVerifier,
-    /// SHA-256 hash (hex) of the owner's raw public key bytes.
-    owner_pubkey_hash: String,
+    _private: (), // zero-sized — no global state needed
 }
 
 impl VaultModule {
     /// Construct the vault module.
     ///
-    /// `pubkey_hex` is the hex-encoded uncompressed P-256 public key
-    /// (65 bytes: `04 || x || y`) of the authorised secret owner.
-    ///
-    /// Attestation server URLs are read at runtime from the global
-    /// configuration set by [`EgressModule::new()`].  See
-    /// [`enclave_os_egress::attestation_servers()`].
-    pub fn new(pubkey_hex: &str) -> Result<Self, String> {
-        let raw = crate::quote::hex_decode(pubkey_hex)?;
-        let hash = digest::digest(&digest::SHA256, &raw);
-        let owner_pubkey_hash = hex_encode(hash.as_ref());
-        let verifier = JwtVerifier::from_public_key_bytes(&raw)?;
-        Ok(Self {
-            verifier,
-            owner_pubkey_hash,
-        })
-    }
-
-    /// Construct from raw public key bytes (65-byte uncompressed).
-    pub fn from_public_key_bytes(raw: &[u8]) -> Result<Self, String> {
-        let hash = digest::digest(&digest::SHA256, raw);
-        let owner_pubkey_hash = hex_encode(hash.as_ref());
-        let verifier = JwtVerifier::from_public_key_bytes(raw)?;
-        Ok(Self {
-            verifier,
-            owner_pubkey_hash,
-        })
+    /// The vault is open to all P-256 key holders — each secret tracks
+    /// its own owner via the `pk` field embedded in the JWT header.
+    /// Higher-level permissioning (e.g. OIDC) can be layered on later.
+    pub fn new() -> Self {
+        Self { _private: () }
     }
 }
 
@@ -172,10 +149,11 @@ impl EnclaveModule for VaultModule {
 impl VaultModule {
     /// Store a named secret with an access policy.
     fn handle_store(&self, jwt: &[u8]) -> VaultResponse {
-        let claims: StoreSecretClaims = match self.verifier.verify_and_decode(jwt) {
-            Ok(c) => c,
-            Err(e) => return VaultResponse::Error(e),
-        };
+        let (claims, owner_pubkey_hash): (StoreSecretClaims, String) =
+            match jwt::verify_self_signed(jwt) {
+                Ok(pair) => pair,
+                Err(e) => return VaultResponse::Error(e),
+            };
 
         // Decode base64url secret
         let secret_bytes = match URL_SAFE_NO_PAD.decode(&claims.secret) {
@@ -204,7 +182,7 @@ impl VaultModule {
             policy,
             created_at: now,
             expires_at,
-            owner_pubkey_hash: self.owner_pubkey_hash.clone(),
+            owner_pubkey_hash,
         };
 
         let record_json = match serde_json::to_vec(&record) {
@@ -430,10 +408,11 @@ impl VaultModule {
 
     /// Delete a named secret — only the original owner can delete.
     fn handle_delete(&self, jwt: &[u8]) -> VaultResponse {
-        let claims: DeleteSecretClaims = match self.verifier.verify_and_decode(jwt) {
-            Ok(c) => c,
-            Err(e) => return VaultResponse::Error(e),
-        };
+        let (claims, owner_pubkey_hash): (DeleteSecretClaims, String) =
+            match jwt::verify_self_signed(jwt) {
+                Ok(pair) => pair,
+                Err(e) => return VaultResponse::Error(e),
+            };
 
         let kv = match enclave_os_kvstore::kv_store() {
             Some(kv) => kv,
@@ -455,7 +434,7 @@ impl VaultModule {
             Err(e) => return VaultResponse::Error(format!("corrupt record: {e}")),
         };
 
-        if record.owner_pubkey_hash != self.owner_pubkey_hash {
+        if record.owner_pubkey_hash != owner_pubkey_hash {
             return VaultResponse::Error("not the secret owner".into());
         }
 
@@ -473,10 +452,11 @@ impl VaultModule {
 
     /// Update the access policy for an existing secret — owner only.
     fn handle_update_policy(&self, jwt: &[u8]) -> VaultResponse {
-        let claims: UpdateSecretPolicyClaims = match self.verifier.verify_and_decode(jwt) {
-            Ok(c) => c,
-            Err(e) => return VaultResponse::Error(e),
-        };
+        let (claims, owner_pubkey_hash): (UpdateSecretPolicyClaims, String) =
+            match jwt::verify_self_signed(jwt) {
+                Ok(pair) => pair,
+                Err(e) => return VaultResponse::Error(e),
+            };
 
         let kv = match enclave_os_kvstore::kv_store() {
             Some(kv) => kv,
@@ -497,7 +477,7 @@ impl VaultModule {
             Err(e) => return VaultResponse::Error(format!("corrupt record: {e}")),
         };
 
-        if record.owner_pubkey_hash != self.owner_pubkey_hash {
+        if record.owner_pubkey_hash != owner_pubkey_hash {
             return VaultResponse::Error("not the secret owner".into());
         }
 
