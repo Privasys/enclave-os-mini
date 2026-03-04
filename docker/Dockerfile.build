@@ -21,7 +21,8 @@
 # GCC            13.3.0
 # Binutils/ld    2.42
 # cmake          3.28.x  (from Ubuntu repos)
-# Intel SGX SDK  2.27.100.1
+# Intel SGX SDK  2.27.100.1  (binary installer — controls sgx_sign/sgx_edger8r)
+# SGX apt pkgs   latest from Intel repo (host-side only, don't affect MRENCLAVE)
 # Rust           nightly-2025-12-01  → rustc 1.93.0-nightly (b84478a1c)
 # LLVM           21.1.5  (bundled with rustc)
 # Teaclave SGX   privasys-v0.1.0  (pinned in Cargo.lock)
@@ -72,11 +73,14 @@ RUN mkdir -p /etc/apt/keyrings \
        > /etc/apt/sources.list.d/intel-sgx.list \
     && apt-get update \
     && apt-get install -y --no-install-recommends \
-        libsgx-headers=2.27.100.1-noble1 \
-        libsgx-enclave-common=2.27.100.1-noble1 \
-        libsgx-urts=2.27.100.1-noble1 \
+        libsgx-headers \
+        libsgx-enclave-common \
+        libsgx-urts \
         libsgx-dcap-ql-dev \
     && rm -rf /var/lib/apt/lists/*
+# NOTE: Version pins removed — these packages are host-side / link-time only
+# and do not affect MRENCLAVE. The SDK binary installer (pinned below) provides
+# sgx_sign, sgx_edger8r, and the enclave-side libraries that matter.
 
 # Install SGX SDK (provides sgx_edger8r, sgx_sign, headers, link libraries)
 RUN wget -qO /tmp/sgx_sdk.bin \
