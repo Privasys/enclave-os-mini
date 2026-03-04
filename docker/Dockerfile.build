@@ -75,6 +75,7 @@ RUN mkdir -p /etc/apt/keyrings \
         libsgx-headers=2.27.100.1-noble1 \
         libsgx-enclave-common=2.27.100.1-noble1 \
         libsgx-urts=2.27.100.1-noble1 \
+        libsgx-dcap-ql-dev \
     && rm -rf /var/lib/apt/lists/*
 
 # Install SGX SDK (provides sgx_edger8r, sgx_sign, headers, link libraries)
