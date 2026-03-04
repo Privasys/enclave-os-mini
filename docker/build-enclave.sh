@@ -24,7 +24,7 @@ export LC_ALL=C.UTF-8
 source /opt/intel/sgxsdk/environment
 
 echo "╔══════════════════════════════════════════════════════════════╗"
-echo "║  enclave-os-mini — Reproducible Build                       ║"
+echo "║  enclave-os-mini — Reproducible Build                        ║"
 echo "╚══════════════════════════════════════════════════════════════╝"
 echo ""
 echo "  rustc : $(rustc --version)"
