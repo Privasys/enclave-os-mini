@@ -36,7 +36,6 @@ use std::{string::String, vec::Vec, format};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use ring::digest;
 use ring::signature::{KeyPair, UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
 
 // ---------------------------------------------------------------------------
@@ -50,18 +49,14 @@ const EXPECTED_ALG: &str = "ES256";
 //  JWT header
 // ---------------------------------------------------------------------------
 
-/// Minimal JWT header — `alg` is required, `pk` is optional.
+/// Minimal JWT header — only `alg` is required.
 ///
-/// When `pk` is present it carries the hex-encoded uncompressed P-256
-/// public key (65 bytes: `04 || x || y`) of the signer.  This enables
-/// *self-signed* JWTs where the verifier does not need to know the key
-/// up-front.
+/// Additional standard fields (`typ`, `kid`, etc.) are accepted by
+/// serde but ignored during verification.  Callers that need `kid`
+/// should inspect the raw header bytes returned by [`JwtVerifier::verify`].
 #[derive(serde::Deserialize)]
 struct JwtHeader<'a> {
     alg: &'a str,
-    /// Optional hex-encoded public key of the signer (P-256 uncompressed).
-    #[serde(default)]
-    pk: Option<&'a str>,
     // `typ`, `kid`, etc. are ignored.
 }
 
@@ -166,102 +161,26 @@ impl JwtVerifier {
 }
 
 // ---------------------------------------------------------------------------
-//  Self-signed JWT verification
-// ---------------------------------------------------------------------------
-
-/// Verify a *self-signed* JWT whose header contains a `pk` field with the
-/// hex-encoded uncompressed P-256 public key of the signer.
-///
-/// Returns `(decoded_claims, owner_pubkey_hash_hex)` where the hash is
-/// `SHA-256(raw_public_key_bytes)` encoded as lowercase hex.  This hash
-/// can be stored alongside the data to identify the owner.
-///
-/// # Security model
-///
-/// The JWT *is* cryptographically verified — the signature must match the
-/// key in the `pk` header.  However, anyone with a P-256 key pair can
-/// produce a valid self-signed JWT.  The caller is responsible for any
-/// higher-level authorisation (OIDC, allow-lists, etc.).
-pub fn verify_self_signed<T: serde::de::DeserializeOwned>(
-    jwt: &[u8],
-) -> Result<(T, String), String> {
-    let jwt_str = core::str::from_utf8(jwt)
-        .map_err(|e| format!("jwt not utf8: {e}"))?;
-
-    // Split into exactly 3 segments
-    let mut parts = jwt_str.splitn(3, '.');
-    let header_b64 = parts.next().ok_or("missing header")?;
-    let payload_b64 = parts.next().ok_or("missing payload")?;
-    let sig_b64 = parts.next().ok_or("missing signature")?;
-
-    // --- Decode & validate header ---
-    let header_bytes = URL_SAFE_NO_PAD
-        .decode(header_b64)
-        .map_err(|e| format!("jwt header base64: {e}"))?;
-
-    let header: JwtHeader = serde_json::from_slice(&header_bytes)
-        .map_err(|e| format!("jwt header json: {e}"))?;
-
-    if header.alg != EXPECTED_ALG {
-        return Err(format!(
-            "unsupported alg '{}', expected '{EXPECTED_ALG}'",
-            header.alg
-        ));
-    }
-
-    // --- Extract public key from header ---
-    let pk_hex = header.pk.ok_or("jwt header missing 'pk' field")?;
-    let pk_raw = hex_decode(pk_hex).ok_or("invalid hex in jwt header 'pk'")?;
-    if pk_raw.len() != 65 || pk_raw[0] != 0x04 {
-        return Err("pk must be 65-byte uncompressed P-256 point (04 || x || y)".into());
-    }
-
-    // --- Decode signature ---
-    let sig_bytes = URL_SAFE_NO_PAD
-        .decode(sig_b64)
-        .map_err(|e| format!("jwt signature base64: {e}"))?;
-
-    // --- Verify: message = "header_b64.payload_b64" ---
-    let signed_data = &jwt_str[..header_b64.len() + 1 + payload_b64.len()];
-
-    let public_key = UnparsedPublicKey::new(&ECDSA_P256_SHA256_FIXED, &pk_raw);
-    public_key
-        .verify(signed_data.as_bytes(), &sig_bytes)
-        .map_err(|_| "jwt signature verification failed".to_string())?;
-
-    // --- Decode payload (only after signature is verified) ---
-    let payload_bytes = URL_SAFE_NO_PAD
-        .decode(payload_b64)
-        .map_err(|e| format!("jwt payload base64: {e}"))?;
-
-    let claims: T = serde_json::from_slice(&payload_bytes)
-        .map_err(|e| format!("jwt payload json: {e}"))?;
-
-    // --- Compute owner pubkey hash ---
-    let hash = digest::digest(&digest::SHA256, &pk_raw);
-    let owner_hash = hex_encode_bytes(hash.as_ref());
-
-    Ok((claims, owner_hash))
-}
-
-// ---------------------------------------------------------------------------
 //  JWT encoding (for tests and tooling)
 // ---------------------------------------------------------------------------
 
 /// Create a signed ES256 JWT from a serializable payload.
 ///
-/// The signer's public key is embedded in the header as a `pk` field
-/// (hex-encoded uncompressed P-256 point), making the JWT self-signed
-/// and verifiable via [`verify_self_signed`].
+/// If `kid` is provided it is included in the JWT header so the verifier
+/// can look up the corresponding public key (e.g. via the vault's
+/// `OpenVault` / KV-store flow).
 ///
 /// `key_pair` must be an ECDSA P-256 key pair in PKCS#8 format.
 pub fn encode_jwt<T: serde::Serialize>(
     payload: &T,
     key_pair: &ring::signature::EcdsaKeyPair,
     rng: &dyn ring::rand::SecureRandom,
+    kid: Option<&str>,
 ) -> Result<Vec<u8>, String> {
-    let pk_hex = hex_encode_bytes(key_pair.public_key().as_ref());
-    let header = format!(r#"{{"alg":"ES256","typ":"JWT","pk":"{pk_hex}"}}"#);
+    let header = match kid {
+        Some(k) => format!(r#"{{"alg":"ES256","typ":"JWT","kid":"{k}"}}"#),
+        None    => r#"{"alg":"ES256","typ":"JWT"}"#.to_string(),
+    };
     let payload_json = serde_json::to_vec(payload)
         .map_err(|e| format!("payload serialisation: {e}"))?;
 
@@ -309,16 +228,6 @@ pub fn decode_payload_unverified<T: serde::de::DeserializeOwned>(
 // ---------------------------------------------------------------------------
 //  Helpers
 // ---------------------------------------------------------------------------
-
-/// Hex-encode bytes to lowercase hex string.
-fn hex_encode_bytes(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        use core::fmt::Write;
-        let _ = write!(s, "{:02x}", b);
-    }
-    s
-}
 
 /// Hex-decode a string into bytes. Returns `None` on invalid hex.
 fn hex_decode(hex: &str) -> Option<Vec<u8>> {
@@ -387,7 +296,7 @@ mod tests {
             data: 42,
         };
 
-        let jwt = encode_jwt(&claims, &kp, &rng).unwrap();
+        let jwt = encode_jwt(&claims, &kp, &rng, None).unwrap();
         let verifier = JwtVerifier::from_public_key_bytes(&pub_bytes).unwrap();
         let decoded: TestClaims = verifier.verify_and_decode(&jwt).unwrap();
 
@@ -405,7 +314,7 @@ mod tests {
             data: 99,
         };
 
-        let jwt = encode_jwt(&claims, &kp, &rng).unwrap();
+        let jwt = encode_jwt(&claims, &kp, &rng, None).unwrap();
         let verifier = JwtVerifier::from_public_key_bytes(&wrong_pub).unwrap();
         assert!(verifier.verify_and_decode::<TestClaims>(&jwt).is_err());
     }
@@ -420,7 +329,7 @@ mod tests {
             data: 1,
         };
 
-        let jwt = encode_jwt(&claims, &kp, &rng).unwrap();
+        let jwt = encode_jwt(&claims, &kp, &rng, None).unwrap();
         let jwt_str = String::from_utf8(jwt).unwrap();
 
         // Tamper with the payload segment
@@ -467,7 +376,7 @@ mod tests {
             data: 7,
         };
 
-        let jwt = encode_jwt(&claims, &kp, &rng).unwrap();
+        let jwt = encode_jwt(&claims, &kp, &rng, None).unwrap();
         let decoded: TestClaims = decode_payload_unverified(&jwt).unwrap();
         assert_eq!(decoded, claims);
     }
@@ -480,76 +389,4 @@ mod tests {
         assert_eq!(decoded, original);
     }
 
-    #[test]
-    fn self_signed_roundtrip() {
-        let (kp, pub_bytes) = generate_key_pair();
-        let rng = SystemRandom::new();
-
-        let claims = TestClaims {
-            sub: "self-signed-owner".into(),
-            data: 77,
-        };
-
-        let jwt = encode_jwt(&claims, &kp, &rng).unwrap();
-
-        // verify_self_signed should extract the embedded pk and verify
-        let (decoded, owner_hash): (TestClaims, String) =
-            verify_self_signed(&jwt).unwrap();
-        assert_eq!(decoded, claims);
-
-        // The owner hash should be SHA-256 of the raw public key bytes
-        let expected_hash = ring::digest::digest(&ring::digest::SHA256, &pub_bytes);
-        let expected_hex = hex_encode_bytes(expected_hash.as_ref());
-        assert_eq!(owner_hash, expected_hex);
-    }
-
-    #[test]
-    fn self_signed_wrong_pk_rejects() {
-        // Manually craft a JWT where the pk header doesn't match the signer
-        let (kp, _) = generate_key_pair();
-        let (_, wrong_pub) = generate_key_pair();
-        let rng = SystemRandom::new();
-
-        let wrong_hex = hex_encode_bytes(&wrong_pub);
-        let header = format!(r#"{{"alg":"ES256","pk":"{wrong_hex}"}}"#);
-        let payload_json = serde_json::to_vec(&TestClaims {
-            sub: "attacker".into(),
-            data: 0,
-        }).unwrap();
-
-        let header_b64 = URL_SAFE_NO_PAD.encode(header.as_bytes());
-        let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
-        let message = format!("{header_b64}.{payload_b64}");
-
-        let sig = kp.sign(&rng, message.as_bytes()).unwrap();
-        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.as_ref());
-        let jwt = format!("{message}.{sig_b64}");
-
-        // Signature was made by kp but pk header has wrong_pub — must reject
-        assert!(verify_self_signed::<TestClaims>(jwt.as_bytes()).is_err());
-    }
-
-    #[test]
-    fn self_signed_missing_pk_rejects() {
-        // JWT without pk header — verify_self_signed should reject
-        let (kp, _) = generate_key_pair();
-        let rng = SystemRandom::new();
-
-        let header = br#"{"alg":"ES256","typ":"JWT"}"#;
-        let payload_json = serde_json::to_vec(&TestClaims {
-            sub: "nopk".into(),
-            data: 1,
-        }).unwrap();
-
-        let header_b64 = URL_SAFE_NO_PAD.encode(header);
-        let payload_b64 = URL_SAFE_NO_PAD.encode(&payload_json);
-        let message = format!("{header_b64}.{payload_b64}");
-
-        let sig = kp.sign(&rng, message.as_bytes()).unwrap();
-        let sig_b64 = URL_SAFE_NO_PAD.encode(sig.as_ref());
-        let jwt = format!("{message}.{sig_b64}");
-
-        let err = verify_self_signed::<TestClaims>(jwt.as_bytes()).unwrap_err();
-        assert!(err.contains("pk"), "expected 'pk' mention, got: {err}");
-    }
 }

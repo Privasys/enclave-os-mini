@@ -16,10 +16,12 @@
 //!
 //! | VaultRequest | Auth | VaultResponse |
 //! |--------------|------|---------------|
-//! | `StoreSecret { jwt }` | Self-signed JWT (ES256 + `pk` header) | `SecretStored { name, expires_at }` |
-//! | `GetSecret { name, attestation_evidence, .. }` | Quote + token + OIDs | `SecretValue { secret, expires_at }` |
-//! | `DeleteSecret { jwt }` | Self-signed JWT (secret owner) | `SecretDeleted` |
-//! | `UpdateSecretPolicy { jwt }` | Self-signed JWT (secret owner) | `PolicyUpdated` |
+//! | `OpenVault { pubkey_hex }` | None (registers owner key) | `VaultOpened { kid }` |
+//! | `CloseVault { jwt }` | ES256 JWT with `kid` (owner) | `VaultClosed { secrets_deleted }` |
+//! | `StoreSecret { jwt }` | ES256 JWT with `kid` header | `SecretStored { name, expires_at }` |
+//! | `GetSecret { name, .. }` | RA-TLS quote + token + OIDs | `SecretValue { secret, expires_at }` |
+//! | `DeleteSecret { jwt }` | ES256 JWT with `kid` (owner) | `SecretDeleted` |
+//! | `UpdateSecretPolicy { jwt }` | ES256 JWT with `kid` (owner) | `PolicyUpdated` |
 //!
 //! ## Usage
 //!
@@ -49,7 +51,7 @@ use std::vec::Vec;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 
-use enclave_os_common::jwt::{self, JwtVerifier};
+use enclave_os_common::jwt::JwtVerifier;
 use ring::digest;
 use serde_json::Value;
 use enclave_os_common::protocol::{Request, Response};
@@ -72,10 +74,10 @@ use crate::types::{
 /// Secrets are persisted in the sealed KV store (via `enclave-os-kvstore`).
 /// The KV key is the secret name (UTF-8 bytes).
 ///
-/// Storing, deleting, and updating secrets requires a self-signed JWT
-/// (ES256 with `pk` header) — anyone with a P-256 key can be a secret
-/// owner.  The signer's public-key hash is stored per-secret and checked
-/// on delete / policy update.  Retrieving secrets requires a valid
+/// Storing, deleting, and updating secrets requires an ES256 JWT whose
+/// `kid` header maps to a registered owner public key (see `OpenVault`).
+/// The owner's public-key hash is stored per-secret and checked on
+/// delete / policy update.  Retrieving secrets requires a valid
 /// SGX/TDX attestation quote matching the secret's policy whitelist, plus
 /// an optional bearer token and optional OID claims.
 ///
@@ -98,9 +100,10 @@ pub struct VaultModule {
 impl VaultModule {
     /// Construct the vault module.
     ///
-    /// The vault is open to all P-256 key holders — each secret tracks
-    /// its own owner via the `pk` field embedded in the JWT header.
-    /// Higher-level permissioning (e.g. OIDC) can be layered on later.
+    /// Secret owners register their P-256 public key via `OpenVault`
+    /// and receive a `kid`.  Subsequent store/delete/update JWTs carry
+    /// that `kid` in the header.  Higher-level permissioning (e.g. OIDC)
+    /// can be layered on later.
     pub fn new() -> Self {
         Self { _private: () }
     }
@@ -133,6 +136,7 @@ impl EnclaveModule for VaultModule {
             } => self.handle_get(&name, bearer_token.as_deref(), ctx),
             VaultRequest::DeleteSecret { jwt } => self.handle_delete(&jwt),
             VaultRequest::UpdateSecretPolicy { jwt } => self.handle_update_policy(&jwt),
+            VaultRequest::CloseVault { jwt } => self.handle_close(&jwt),
         };
 
         // Wrap VaultResponse inside Response::Data
@@ -556,11 +560,91 @@ impl VaultModule {
 
         VaultResponse::PolicyUpdated
     }
+
+    /// Close (unregister) a vault owner.
+    ///
+    /// The caller must present a JWT signed by the owner key, with a `kid`
+    /// header matching the registered vault.  On success the owner's
+    /// public-key mapping (`vault_owner:{kid}`) is deleted from the KV
+    /// store.
+    ///
+    /// **Note:** secrets previously stored by this owner remain in the KV
+    /// store but become inaccessible for write operations (delete / policy
+    /// update) because the owner key can no longer be resolved.  Read
+    /// access via `GetSecret` (RA-TLS) is unaffected — the secret's own
+    /// policy governs that.  To fully clean up, delete individual secrets
+    /// *before* closing the vault.
+    fn handle_close(&self, jwt: &[u8]) -> VaultResponse {
+        // Verify the JWT is signed by the owner identified by `kid`.
+        // We use `Value` as the claims type because the payload can be
+        // empty — all we need is the `kid` from the header.
+        let (_claims, _owner_hash): (Value, String) =
+            match self.verify_jwt_and_get_owner(jwt) {
+                Ok(pair) => pair,
+                Err(e) => return VaultResponse::Error(e),
+            };
+
+        // Extract `kid` from the JWT header (we know it's valid because
+        // verify_jwt_and_get_owner succeeded).
+        let kid = match extract_kid_from_jwt(jwt) {
+            Ok(k) => k,
+            Err(e) => return VaultResponse::Error(e),
+        };
+
+        // Delete the owner mapping from the KV store.
+        let kv = match enclave_os_kvstore::kv_store() {
+            Some(kv) => kv,
+            None => return VaultResponse::Error("kv store not initialised".into()),
+        };
+
+        let key = format!("vault_owner:{}", kid);
+
+        match kv.lock() {
+            Ok(mut store) => {
+                match store.delete(key.as_bytes()) {
+                    Ok(true) => VaultResponse::VaultClosed { secrets_deleted: 0 },
+                    Ok(false) => VaultResponse::Error("vault owner not found".into()),
+                    Err(e) => VaultResponse::Error(format!("kv delete failed: {e}")),
+                }
+            }
+            Err(_) => VaultResponse::Error("kv store lock poisoned".into()),
+        }
+    }
+}
+
+impl VaultModule {
+    fn verify_jwt_and_get_owner<T: serde::de::DeserializeOwned>(
+        &self,
+        jwt: &[u8],
+    ) -> Result<(T, String), String> {
+        verify_jwt_and_get_owner(jwt)
+    }
 }
 
 // ---------------------------------------------------------------------------
 //  Helpers
 // ---------------------------------------------------------------------------
+
+/// Extract the `kid` field from a JWT header without verifying the signature.
+///
+/// This is safe to call after `verify_jwt_and_get_owner` has already
+/// validated the JWT — we just need the raw `kid` string for KV key
+/// construction.
+fn extract_kid_from_jwt(jwt: &[u8]) -> Result<String, String> {
+    let jwt_str = core::str::from_utf8(jwt)
+        .map_err(|e| format!("jwt not utf8: {e}"))?;
+    let header_b64 = jwt_str.splitn(2, '.').next().ok_or("missing header")?;
+    let header_bytes = URL_SAFE_NO_PAD
+        .decode(header_b64)
+        .map_err(|e| format!("jwt header base64: {e}"))?;
+    let header_val: Value = serde_json::from_slice(&header_bytes)
+        .map_err(|e| format!("jwt header json: {e}"))?;
+    header_val
+        .get("kid")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .ok_or_else(|| "jwt header missing 'kid' field".into())
+}
 
 /// Normalise a secret policy: lowercase hex values, cap TTL.
 fn normalise_policy(mut policy: types::SecretPolicy) -> types::SecretPolicy {

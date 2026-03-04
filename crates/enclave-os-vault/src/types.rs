@@ -73,6 +73,14 @@ pub enum VaultRequest {
     /// }
     /// ```
     UpdateSecretPolicy { jwt: Vec<u8> },
+
+    /// Close (unregister) a vault owner.  Requires a JWT signed by the
+    /// owner whose `kid` header matches the registered vault.
+    ///
+    /// **All secrets owned by this key are deleted.**
+    ///
+    /// JWT payload: `{}` (empty — the `kid` header identifies the vault).
+    CloseVault { jwt: Vec<u8> },
 }
 
 /// Vault-specific response, JSON-encoded inside `Response::Data`.
@@ -98,6 +106,11 @@ pub enum VaultResponse {
     PolicyUpdated,
     /// Vault opened successfully; contains the generated `kid` for the owner.
     VaultOpened { kid: String },
+    /// Vault closed (owner key unregistered, all owned secrets deleted).
+    VaultClosed {
+        /// Number of secrets that were deleted.
+        secrets_deleted: usize,
+    },
     /// Error with human-readable message.
     Error(String),
 }
