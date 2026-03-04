@@ -52,7 +52,7 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 
 use enclave_os_common::jwt::JwtVerifier;
-use ring::digest;
+use enclave_os_common::digest;
 use serde_json::Value;
 use enclave_os_common::protocol::{Request, Response};
 use enclave_os_common::modules::{EnclaveModule, RequestContext};
@@ -157,10 +157,11 @@ impl VaultModule {
     /// Store a named secret with an access policy.
     fn handle_store(&self, jwt: &[u8]) -> VaultResponse {
         // Extract `kid` from JWT header, look up owner's pubkey and verify
-        let (claims, owner_pubkey_hash) = match verify_jwt_and_get_owner(jwt) {
-            Ok(pair) => pair,
-            Err(e) => return VaultResponse::Error(e),
-        };
+        let (claims, owner_pubkey_hash): (StoreSecretClaims, String) =
+            match verify_jwt_and_get_owner(jwt) {
+                Ok(pair) => pair,
+                Err(e) => return VaultResponse::Error(e),
+            };
 
         // Decode base64url secret
         let secret_bytes = match URL_SAFE_NO_PAD.decode(&claims.secret) {
@@ -464,10 +465,11 @@ impl VaultModule {
 
     /// Delete a named secret — only the original owner can delete.
     fn handle_delete(&self, jwt: &[u8]) -> VaultResponse {
-        let (claims, owner_pubkey_hash) = match verify_jwt_and_get_owner(jwt) {
-            Ok(pair) => pair,
-            Err(e) => return VaultResponse::Error(e),
-        };
+        let (claims, owner_pubkey_hash): (DeleteSecretClaims, String) =
+            match verify_jwt_and_get_owner(jwt) {
+                Ok(pair) => pair,
+                Err(e) => return VaultResponse::Error(e),
+            };
 
         let kv = match enclave_os_kvstore::kv_store() {
             Some(kv) => kv,
@@ -507,10 +509,11 @@ impl VaultModule {
 
     /// Update the access policy for an existing secret — owner only.
     fn handle_update_policy(&self, jwt: &[u8]) -> VaultResponse {
-        let (claims, owner_pubkey_hash) = match verify_jwt_and_get_owner(jwt) {
-            Ok(pair) => pair,
-            Err(e) => return VaultResponse::Error(e),
-        };
+        let (claims, owner_pubkey_hash): (UpdateSecretPolicyClaims, String) =
+            match verify_jwt_and_get_owner(jwt) {
+                Ok(pair) => pair,
+                Err(e) => return VaultResponse::Error(e),
+            };
 
         let kv = match enclave_os_kvstore::kv_store() {
             Some(kv) => kv,

@@ -27,6 +27,10 @@ pub mod jwt;
 #[cfg(feature = "crypto")]
 pub mod aead;
 
+/// Re-export `ring::digest` for downstream crates that need hashing.
+#[cfg(feature = "crypto")]
+pub use ring::digest;
+
 // ── Convenience logging macros (call through the OCall vtable) ──────────
 
 /// Log an info-level message via the host.
