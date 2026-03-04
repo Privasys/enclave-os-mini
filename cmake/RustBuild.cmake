@@ -75,6 +75,11 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME)
         set(_FEATURES_ARGS --no-default-features --features "sgx,default-ecall,${_FEATURES}")
     endif()
 
+    set(_BUILD_COMMENT "Building enclave Rust crate: ${OUTPUT_NAME}")
+    if(_FEATURES)
+        string(APPEND _BUILD_COMMENT " [${_FEATURES}]")
+    endif()
+
     add_custom_target(${OUTPUT_NAME} ALL
         COMMAND ${CMAKE_COMMAND} -E env
             "SGX_SDK_PATH=${SGX_SDK_PATH}"
@@ -86,7 +91,7 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME)
                 --target "${TARGET_JSON}"
                 ${_FEATURES_ARGS}
         WORKING_DIRECTORY "${CRATE_DIR}"
-        COMMENT "Building enclave Rust crate: ${OUTPUT_NAME}${_FEATURES:+ [${_FEATURES}]}"
+        COMMENT "${_BUILD_COMMENT}"
     )
 
     set(${OUTPUT_NAME}_STATIC_LIB
