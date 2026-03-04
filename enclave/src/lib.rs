@@ -17,18 +17,26 @@
 //!
 //! ## Composition
 //!
-//! By default, the `default-ecall` feature provides a minimal `ecall_run`
-//! that registers only the HelloWorld diagnostic module, keeping the
-//! enclave binary small.
+//! Module registration is controlled by Cargo features.  The `default-ecall`
+//! feature provides an `ecall_run` that registers whichever modules are
+//! enabled:
 //!
-//! To add modules (e.g. WASM runtime), create a separate crate that:
+//! | Feature | Module |
+//! |---------|--------|
+//! | `egress` | EgressModule (outbound HTTPS + attestation URLs) |
+//! | `kvstore` | KvStoreModule (sealed AES-256-GCM storage) |
+//! | `vault` | VaultModule (implies kvstore + egress) |
+//! | `wasm` | WasmModule (implies kvstore + egress) |
+//!
+//! CMake maps `-DENABLE_VAULT=ON` etc. to Cargo features automatically.
+//!
+//! For fully custom registration, disable `default-ecall` and provide
+//! your own `ecall_run` in an external composition crate:
 //! 1. Depends on `enclave-os-enclave` with `default-features = false`
 //!    and `features = ["sgx"]` (disabling `default-ecall`).
 //! 2. Provides its own `#[no_mangle] pub extern "C" fn ecall_run(…)`.
 //! 3. Calls [`ecall::init_enclave()`] → registers modules →
 //!    [`ecall::finalize_and_run()`].
-//!
-//! See https://github.com/Privasys/wasm-app-example for a complete example.
 //!
 //! **Build mode**: sysroot replacement.
 //! `sgx_tstd` is compiled as `std` in a custom sysroot, so all crates

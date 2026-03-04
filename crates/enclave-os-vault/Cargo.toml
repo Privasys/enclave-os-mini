@@ -19,6 +19,9 @@ enclave-os-common  = { path = "../../common", features = ["jwt"] }
 # KV store for persisting secrets (sealed with MRENCLAVE-bound key)
 enclave-os-kvstore = { path = "../enclave-os-kvstore" }
 
+# Outbound HTTPS + attestation server verification
+enclave-os-egress = { path = "../enclave-os-egress" }
+
 # Crypto (SHA-256 for secret hashing)
 ring = "0.17"
 

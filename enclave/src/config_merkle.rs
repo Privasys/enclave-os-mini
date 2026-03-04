@@ -14,6 +14,7 @@
 //!
 //! 2. **Module leaves** (added by each `EnclaveModule::config_leaves()`):
 //!    - `egress.ca_bundle` — egress CA bundle (PEM), or absent
+//!    - `egress.attestation_servers` — attestation server URLs (canonical form), or absent
 //!    - `wasm.code_hash` — WASM bytecode hash, or absent
 //!    - Any custom leaves registered by third-party modules
 //!

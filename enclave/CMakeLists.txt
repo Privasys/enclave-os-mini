@@ -4,30 +4,72 @@
 # enclave/CMakeLists.txt
 # Build the enclave crate → link enclave.so → sign it.
 #
-# By default this builds enclave-os-enclave (HelloWorld only).
-# Set -DENABLE_WASM=ON to build the wasm-enclave composition crate
-# which registers the WASM runtime module alongside HelloWorld.
+# ── Composable module flags ─────────────────────────────────────────────
+# Each module is independently enabled.  Combine freely:
+#
+#   cmake -DENABLE_VAULT=ON                    → vault + kvstore + egress
+#   cmake -DENABLE_WASM=ON                     → wasm  + kvstore + egress
+#   cmake -DENABLE_EGRESS=ON                   → egress only
+#   cmake -DENABLE_KVSTORE=ON                  → kvstore only
+#   cmake -DENABLE_VAULT=ON -DENABLE_WASM=ON   → all four modules
+#
+# Each flag maps to a Cargo feature on the enclave crate.  The default
+# ecall_run (feature = "default-ecall") registers whichever modules are
+# enabled.  With no flags → HelloWorld only.
+#
+# For a completely custom ecall_run, set CUSTOM_ENCLAVE_DIR to an external
+# composition crate (disables default-ecall automatically).
 
 # -- Step 2: Build enclave crate (staticlib) --
-option(ENABLE_WASM "Build with WASM runtime module" OFF)
-set(WASM_ENCLAVE_DIR "" CACHE PATH "Path to the wasm-enclave composition crate (required when ENABLE_WASM=ON)")
+option(ENABLE_EGRESS  "Include the HTTPS egress module"                       OFF)
+option(ENABLE_KVSTORE "Include the sealed KV store module"                    OFF)
+option(ENABLE_VAULT   "Include the vault module (implies egress + kvstore)"   OFF)
+option(ENABLE_WASM    "Include the WASM runtime module (implies egress + kvstore)" OFF)
 
-if(ENABLE_WASM)
-    if(WASM_ENCLAVE_DIR STREQUAL "")
-        message(FATAL_ERROR
-            "ENABLE_WASM=ON requires WASM_ENCLAVE_DIR to be set.\n"
-            "Point it at your composition crate, e.g.:\n"
-            "  cmake -DENABLE_WASM=ON -DWASM_ENCLAVE_DIR=/path/to/wasm-app-example/enclave ..")
-    endif()
-    set(_ENCLAVE_CRATE_DIR "${WASM_ENCLAVE_DIR}")
-    set(_ENCLAVE_CRATE_NAME "enclave_os_wasm_app")
-    message(STATUS "WASM runtime enabled — building ${_ENCLAVE_CRATE_DIR}")
+set(CUSTOM_ENCLAVE_DIR "" CACHE PATH
+    "Path to an external composition crate with a custom ecall_run. \
+     When set, all ENABLE_* flags are ignored and this crate is built instead.")
+
+# ── Resolve crate directory and feature list ────────────────────────────
+if(NOT CUSTOM_ENCLAVE_DIR STREQUAL "")
+    # Escape hatch: fully custom composition crate
+    set(_ENCLAVE_CRATE_DIR  "${CUSTOM_ENCLAVE_DIR}")
+    # Derive the crate name from the directory (convention: last component)
+    get_filename_component(_dir_name "${CUSTOM_ENCLAVE_DIR}" NAME)
+    string(REPLACE "-" "_" _ENCLAVE_CRATE_NAME "${_dir_name}")
+    set(_ENCLAVE_FEATURES "")
+    message(STATUS "Custom enclave crate — building ${_ENCLAVE_CRATE_DIR} (${_ENCLAVE_CRATE_NAME})")
 else()
-    set(_ENCLAVE_CRATE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+    # Default: build enclave-os-enclave with composable features
+    set(_ENCLAVE_CRATE_DIR  "${CMAKE_CURRENT_SOURCE_DIR}")
     set(_ENCLAVE_CRATE_NAME "enclave_os_enclave")
+
+    # Build the feature list from ENABLE_* flags
+    set(_features "")
+    if(ENABLE_EGRESS)
+        list(APPEND _features "egress")
+    endif()
+    if(ENABLE_KVSTORE)
+        list(APPEND _features "kvstore")
+    endif()
+    if(ENABLE_VAULT)
+        list(APPEND _features "vault")
+    endif()
+    if(ENABLE_WASM)
+        list(APPEND _features "wasm")
+    endif()
+
+    # Join into comma-separated string for Cargo
+    string(REPLACE ";" "," _ENCLAVE_FEATURES "${_features}")
+
+    if(_ENCLAVE_FEATURES)
+        message(STATUS "Enclave modules: ${_ENCLAVE_FEATURES}")
+    else()
+        message(STATUS "Enclave modules: none (HelloWorld only)")
+    endif()
 endif()
 
-rust_build_enclave("${_ENCLAVE_CRATE_DIR}" ${_ENCLAVE_CRATE_NAME})
+rust_build_enclave("${_ENCLAVE_CRATE_DIR}" ${_ENCLAVE_CRATE_NAME} "${_ENCLAVE_FEATURES}")
 add_dependencies(${_ENCLAVE_CRATE_NAME} sgx_sysroot)
 set(ENCLAVE_STATIC_LIB "${${_ENCLAVE_CRATE_NAME}_STATIC_LIB}")
 

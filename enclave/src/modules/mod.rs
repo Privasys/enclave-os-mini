@@ -13,10 +13,11 @@
 //  Built-in modules
 // ---------------------------------------------------------------------------
 // HelloWorld is the only built-in module — it exists as a minimal smoke-test
-// for the `default-ecall` feature. Additional modules (egress, kvstore,
-// vault, wasm, etc.) live in `crates/enclave-os-*` and are registered by a
-// custom `ecall_run` in a separate composition crate.
-// See https://github.com/Privasys/wasm-app-example for a complete example.
+// for when no module features are enabled.  Additional modules (egress,
+// kvstore, vault, wasm) live in `crates/enclave-os-*` and are pulled in
+// via Cargo features (e.g. `--features vault`).  The default `ecall_run`
+// registers whichever modules are enabled.  For fully custom registration,
+// disable `default-ecall` and use an external composition crate.
 
 pub mod helloworld;
 

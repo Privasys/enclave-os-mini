@@ -11,20 +11,29 @@
 //! ## Composition
 //!
 //! When the `default-ecall` feature is enabled (the default), this module
-//! provides a minimal `ecall_run` that registers only the HelloWorld
-//! diagnostic module.
+//! provides an `ecall_run` that registers modules based on Cargo features:
 //!
-//! To add modules (e.g. WASM runtime), create a separate crate:
-//! 1. Depend on `enclave-os-enclave` with `default-features = false` and
-//!    `features = ["sgx"]` (excluding `default-ecall`).
+//! | Feature | Module | Implies |
+//! |---------|--------|---------|
+//! | `egress` | EgressModule | — |
+//! | `kvstore` | KvStoreModule | — |
+//! | `vault` | VaultModule | `kvstore`, `egress` |
+//! | `wasm` | WasmModule | `kvstore`, `egress` |
+//!
+//! With no module features enabled, only HelloWorld is registered.
+//! Features compose freely: `--features vault,wasm` registers all four.
+//!
+//! The CMake build system maps `-DENABLE_VAULT=ON` etc. to the
+//! corresponding Cargo features.
+//!
+//! For fully custom registration logic, disable `default-ecall`:
+//! 1. Depend on `enclave-os-enclave` with `default-features = false`
+//!    and `features = ["sgx"]`.
 //! 2. Provide your own `#[no_mangle] pub extern "C" fn ecall_run(…)`.
 //! 3. Call [`init_enclave()`] to get the parsed config and sealed state.
-//! 4. Construct modules using `sealed_cfg.master_key()` and
-//!    [`register_module()`](crate::modules::register_module) them.
+//! 4. Construct modules and [`register_module()`](crate::modules::register_module) them.
 //! 5. Call [`finalize_and_run()`] to build the Merkle tree, start the
 //!    RA-TLS server, and enter the event loop.
-//!
-//! See https://github.com/Privasys/wasm-app-example for a complete example.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -344,11 +353,16 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
 //  ecall_run – default implementation (feature-gated)
 // ==========================================================================
 
-/// Default `ecall_run` implementation that registers only the HelloWorld
-/// diagnostic module.
+/// Default `ecall_run` that registers modules based on enabled Cargo features.
 ///
-/// To add modules, create a separate composition crate that disables the
-/// `default-ecall` feature. See https://github.com/Privasys/wasm-app-example for a full example.
+/// With no module features: registers only HelloWorld (smoke test).
+/// With `--features vault`: registers Egress + KvStore + Vault.
+/// With `--features wasm`: registers Egress + KvStore + Wasm.
+/// Mix and match freely — `--features vault,wasm` registers all four.
+///
+/// For fully custom module registration, disable this feature
+/// (`default-features = false`) and provide your own `ecall_run` in an
+/// external composition crate.
 #[cfg(feature = "default-ecall")]
 #[no_mangle]
 pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
@@ -357,11 +371,106 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
         Err(code) => return code,
     };
 
-    // Register the HelloWorld example module
-    crate::modules::register_module(Box::new(
-        crate::modules::helloworld::HelloWorldModule,
-    ));
-    enclave_log_info!("All modules registered (default-ecall: HelloWorld only)");
+    let mut _module_count: u32 = 0;
+
+    // ── Egress module (outbound HTTPS + attestation server URLs) ─────
+    #[cfg(feature = "egress")]
+    {
+        let egress_pem = config
+            .extra
+            .get("egress_ca_bundle_hex")
+            .and_then(|v| v.as_str())
+            .and_then(|hex| hex_decode(hex));
+
+        let attestation_servers: Option<Vec<String>> = config
+            .extra
+            .get("attestation_servers")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+
+        let (egress, cert_count) = match enclave_os_egress::EgressModule::new(
+            egress_pem,
+            attestation_servers,
+        ) {
+            Ok(pair) => pair,
+            Err(e) => {
+                enclave_log_error!("EgressModule init failed: {}", e);
+                return -30;
+            }
+        };
+        enclave_log_info!("EgressModule: {} CA certs loaded", cert_count);
+        crate::modules::register_module(Box::new(egress));
+        _module_count += 1;
+    }
+
+    // ── KvStore module (sealed storage, MRENCLAVE-bound AES-256-GCM) ─
+    #[cfg(feature = "kvstore")]
+    {
+        let kvstore = match enclave_os_kvstore::KvStoreModule::new(sealed_cfg.master_key()) {
+            Ok(m) => m,
+            Err(e) => {
+                enclave_log_error!("KvStoreModule init failed: {}", e);
+                return -31;
+            }
+        };
+        crate::modules::register_module(Box::new(kvstore));
+        _module_count += 1;
+    }
+
+    // ── Vault module (policy-gated secrets, JWT + mRA-TLS) ───────────
+    #[cfg(feature = "vault")]
+    {
+        let pubkey_hex = match config
+            .extra
+            .get("vault_jwt_pubkey_hex")
+            .and_then(|v| v.as_str())
+        {
+            Some(hex) => hex,
+            None => {
+                enclave_log_error!("Missing required config: vault_jwt_pubkey_hex");
+                return -32;
+            }
+        };
+
+        let vault = match enclave_os_vault::VaultModule::new(pubkey_hex) {
+            Ok(m) => m,
+            Err(e) => {
+                enclave_log_error!("VaultModule init failed: {}", e);
+                return -33;
+            }
+        };
+        crate::modules::register_module(Box::new(vault));
+        _module_count += 1;
+    }
+
+    // ── WASM module (Component Model runtime) ────────────────────────
+    #[cfg(feature = "wasm")]
+    {
+        let wasm = match enclave_os_wasm::WasmModule::new() {
+            Ok(m) => m,
+            Err(e) => {
+                enclave_log_error!("WasmModule init failed: {}", e);
+                return -34;
+            }
+        };
+        crate::modules::register_module(Box::new(wasm));
+        _module_count += 1;
+    }
+
+    // ── Fallback: HelloWorld only (no module features enabled) ───────
+    #[cfg(not(any(
+        feature = "egress",
+        feature = "kvstore",
+        feature = "vault",
+        feature = "wasm"
+    )))]
+    {
+        crate::modules::register_module(Box::new(
+            crate::modules::helloworld::HelloWorldModule,
+        ));
+        _module_count += 1;
+    }
+
+    enclave_log_info!("All modules registered ({} module(s))", _module_count);
 
     finalize_and_run(&config, &sealed_cfg)
 }

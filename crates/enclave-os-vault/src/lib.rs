@@ -76,6 +76,19 @@ use crate::types::{
 /// secret owner's ECDSA P-256 key.  Retrieving secrets requires a valid
 /// SGX/TDX attestation quote matching the secret's policy whitelist, plus
 /// an optional bearer token and optional OID claims.
+///
+/// ## Attestation server verification
+///
+/// When a client requests a secret via mutual RA-TLS, the vault sends the
+/// client's attestation quote to the configured attestation servers for
+/// cryptographic verification (signature chain, TCB status, platform
+/// identity) before trusting the measurements.  The attestation server is
+/// TEE-agnostic (SGX, TDX, SEV-SNP, etc.).
+///
+/// Attestation server URLs are configured via [`EgressModule::new()`] at
+/// startup and accessed at runtime through [`enclave_os_egress::attestation_servers()`].
+/// The URL list is registered as a Merkle tree leaf and X.509 OID
+/// (`1.3.6.1.4.1.65230.2.4`), making it auditable.
 pub struct VaultModule {
     verifier: JwtVerifier,
     /// SHA-256 hash (hex) of the owner's raw public key bytes.
@@ -87,6 +100,10 @@ impl VaultModule {
     ///
     /// `pubkey_hex` is the hex-encoded uncompressed P-256 public key
     /// (65 bytes: `04 || x || y`) of the authorised secret owner.
+    ///
+    /// Attestation server URLs are read at runtime from the global
+    /// configuration set by [`EgressModule::new()`].  See
+    /// [`enclave_os_egress::attestation_servers()`].
     pub fn new(pubkey_hex: &str) -> Result<Self, String> {
         let raw = crate::quote::hex_decode(pubkey_hex)?;
         let hash = digest::digest(&digest::SHA256, &raw);
@@ -266,7 +283,30 @@ impl VaultModule {
         if now > record.expires_at {
             return VaultResponse::Error("secret has expired".into());
         }
-
+        // ── 4b. Verify quote via attestation server(s) ──────────────
+        //
+        // The attestation servers cryptographically verify the quote's
+        // signature chain, TCB status, and platform identity.  This
+        // prevents a malicious host from forging a quote with arbitrary
+        // measurement values.  All configured servers must confirm the
+        // quote before we trust the measurements extracted in step 5.
+        //
+        // The server list is configured at startup via EgressModule and
+        // registered in the config Merkle tree (leaf: egress.attestation_servers,
+        // OID: 1.3.6.1.4.1.65230.2.4).
+        let attestation_servers = enclave_os_egress::attestation_servers()
+            .ok_or_else(|| "EgressModule not initialised (attestation servers unavailable)")
+            .map_err(|e| e.to_string());
+        let attestation_servers = match attestation_servers {
+            Ok(servers) => servers,
+            Err(e) => return VaultResponse::Error(format!("attestation verification: {e}")),
+        };
+        if let Err(e) = enclave_os_egress::attestation::verify_quote(
+            &attestation_evidence,
+            attestation_servers,
+        ) {
+            return VaultResponse::Error(format!("attestation verification: {e}"));
+        }
         // ── 5. Parse attestation evidence (quote) ───────────────────────
         let identity = match parse_quote(&attestation_evidence) {
             Ok(id) => id,
@@ -537,6 +577,7 @@ const CLAIM_OIDS: &[&str] = &[
     enclave_os_common::oids::CONFIG_MERKLE_ROOT_OID_STR,
     enclave_os_common::oids::EGRESS_CA_HASH_OID_STR,
     enclave_os_common::oids::WASM_APPS_HASH_OID_STR,
+    enclave_os_common::oids::ATTESTATION_SERVERS_HASH_OID_STR,
     enclave_os_common::oids::APP_CONFIG_MERKLE_ROOT_OID_STR,
     enclave_os_common::oids::APP_CODE_HASH_OID_STR,
 ];

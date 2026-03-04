@@ -49,17 +49,31 @@ function(rust_build_host CRATE_DIR OUTPUT_NAME)
 endfunction()
 
 # ---------------------------------------------------------------------------
-# rust_build_enclave(CRATE_DIR OUTPUT_NAME)
+# rust_build_enclave(CRATE_DIR OUTPUT_NAME [FEATURES])
 #   Build an enclave-side Rust crate (staticlib) with the SGX sysroot.
 #   Requires the sgx_sysroot target to have been built first (from the
 #   Teaclave fork's CMakeLists.txt).
+#
+#   FEATURES (optional): comma-separated Cargo feature names to enable.
+#     Passed as --no-default-features --features "sgx,default-ecall,<FEATURES>"
+#     so that the caller controls exactly which modules are compiled in.
+#     When empty, default features are used.
 # ---------------------------------------------------------------------------
 function(rust_build_enclave CRATE_DIR OUTPUT_NAME)
+    # Optional 3rd argument: features
+    set(_FEATURES "${ARGN}")
+
     if(NOT TEACLAVE_CHECKOUT)
         message(FATAL_ERROR "TEACLAVE_CHECKOUT not set. Run resolve_teaclave() first.")
     endif()
 
     set(TARGET_JSON "${TEACLAVE_CHECKOUT}/rustlib/${RUST_ENCLAVE_TARGET}.json")
+
+    # Build the --features flag if modules were requested
+    set(_FEATURES_ARGS "")
+    if(_FEATURES)
+        set(_FEATURES_ARGS --no-default-features --features "sgx,default-ecall,${_FEATURES}")
+    endif()
 
     add_custom_target(${OUTPUT_NAME} ALL
         COMMAND ${CMAKE_COMMAND} -E env
@@ -70,8 +84,9 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME)
                 ${CARGO_BUILD_TYPE}
                 --manifest-path "${CRATE_DIR}/Cargo.toml"
                 --target "${TARGET_JSON}"
+                ${_FEATURES_ARGS}
         WORKING_DIRECTORY "${CRATE_DIR}"
-        COMMENT "Building enclave Rust crate: ${OUTPUT_NAME}"
+        COMMENT "Building enclave Rust crate: ${OUTPUT_NAME}${_FEATURES:+ [${_FEATURES}]}"
     )
 
     set(${OUTPUT_NAME}_STATIC_LIB

@@ -41,6 +41,7 @@ pub use enclave_os_common::oids::{
     CONFIG_MERKLE_ROOT_OID_STR as OID_CONFIG_MERKLE_ROOT,
     EGRESS_CA_HASH_OID_STR as OID_EGRESS_CA_HASH,
     WASM_APPS_HASH_OID_STR as OID_WASM_APPS_HASH,
+    ATTESTATION_SERVERS_HASH_OID_STR as OID_ATTESTATION_SERVERS_HASH,
 };
 
 // =========================================================================
@@ -103,7 +104,8 @@ pub struct ExpectedOid {
     /// Dotted-string OID (e.g. `"1.3.6.1.4.1.65230.1.1"`).
     ///
     /// Use the constants [`OID_CONFIG_MERKLE_ROOT`], [`OID_EGRESS_CA_HASH`],
-    /// or [`OID_WASM_APPS_HASH`] for well-known Privasys OIDs.
+    /// [`OID_WASM_APPS_HASH`], or [`OID_ATTESTATION_SERVERS_HASH`] for well-known
+    /// Privasys OIDs.
     pub oid: String,
     /// Expected raw extension value. The certificate's extension value must
     /// match this exactly.
@@ -127,6 +129,12 @@ pub struct ExpectedOid {
 /// 4. **Configuration OIDs** — custom X.509 extensions (config Merkle root,
 ///    egress CA hash, WASM apps hash, etc.) are compared against expected
 ///    values when provided in [`expected_oids`](Self::expected_oids).
+/// 5. **Attestation server verification** — when
+///    [`attestation_servers`](Self::attestation_servers) is non-empty, the
+///    raw attestation quote is POSTed to each server for cryptographic
+///    verification (signature chain, TCB status, platform identity).  The
+///    attestation server is TEE-agnostic (SGX, TDX, SEV-SNP, etc.).
+///    All servers must confirm the quote.
 #[derive(Debug, Clone)]
 pub struct RaTlsPolicy {
     /// Which TEE type to expect.
@@ -155,9 +163,40 @@ pub struct RaTlsPolicy {
     /// | [`OID_CONFIG_MERKLE_ROOT`] | `1.3.6.1.4.1.65230.1.1` | All config inputs (Merkle tree root) |
     /// | [`OID_EGRESS_CA_HASH`] | `1.3.6.1.4.1.65230.2.1` | Egress CA bundle identity |
     /// | [`OID_WASM_APPS_HASH`] | `1.3.6.1.4.1.65230.2.3` | WASM application code identity |
+    /// | [`OID_ATTESTATION_SERVERS_HASH`] | `1.3.6.1.4.1.65230.2.4` | Attestation server URL list identity |
     ///
     /// An empty `Vec` (the default) skips OID verification.
     pub expected_oids: Vec<ExpectedOid>,
+
+    /// Attestation server URLs for cryptographic quote verification.
+    ///
+    /// When non-empty, the raw attestation quote from the server's
+    /// certificate is POSTed to each URL.  **All** servers must confirm
+    /// the quote for the TLS handshake to succeed.
+    ///
+    /// This enables multi-party trust: the enclave operator and the secret
+    /// owner can each run an independent attestation verification server.
+    ///
+    /// The Privasys attestation server is TEE-agnostic and supports
+    /// Intel SGX, Intel TDX, AMD SEV-SNP, NVIDIA, and ARM CCA.
+    ///
+    /// The default is an empty `Vec` (no remote verification).  Callers
+    /// who want attestation server verification can populate this from
+    /// the globally configured list via [`crate::attestation_servers()`].
+    ///
+    /// # Example
+    ///
+    /// ```rust,ignore
+    /// let servers = enclave_os_egress::attestation_servers()
+    ///     .cloned()
+    ///     .unwrap_or_default();
+    ///
+    /// let policy = RaTlsPolicy {
+    ///     // ... other fields ...
+    ///     attestation_servers: servers,
+    /// };
+    /// ```
+    pub attestation_servers: Vec<String>,
 }
 
 /// Perform an HTTPS GET request.
@@ -527,6 +566,16 @@ fn verify_ratls_cert(der: &[u8], policy: &RaTlsPolicy) -> Result<(), String> {
 
     // --- Verify configuration OIDs ---
     verify_expected_oids(&cert, &policy.expected_oids)?;
+
+    // --- Verify quote via attestation server(s) ---
+    //
+    // After all local checks pass, send the raw quote to each configured
+    // attestation server for full cryptographic verification (signature
+    // chain, TCB status, platform identity).  The attestation server is
+    // TEE-agnostic and auto-detects the quote format.  This is the
+    // authoritative proof that the quote was produced by genuine TEE
+    // hardware and has not been tampered with.
+    crate::attestation::verify_quote(quote, &policy.attestation_servers)?;
 
     Ok(())
 }

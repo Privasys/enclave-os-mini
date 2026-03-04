@@ -25,7 +25,10 @@ use rcgen::{
 use x509_parser::prelude::*;
 
 // OIDs imported from common — single source of truth.
-use enclave_os_common::oids::{CONFIG_MERKLE_ROOT_OID, CONFIG_MERKLE_ROOT_OID_STR};
+use enclave_os_common::oids::{
+    CONFIG_MERKLE_ROOT_OID, CONFIG_MERKLE_ROOT_OID_STR,
+    ATTESTATION_SERVERS_HASH_OID, ATTESTATION_SERVERS_HASH_OID_STR,
+};
 
 // ---------------------------------------------------------------------------
 //  Helpers — mirror the enclave ConfigMerkleTree logic
@@ -273,4 +276,68 @@ fn merkle_root_extension_is_32_bytes() {
     let leaf = build_leaf_cert_with_root(&ca_der, &ca_key, &root);
     let ext = extract_merkle_root_extension(&leaf).unwrap();
     assert_eq!(ext.len(), 32);
+}
+
+// ---------------------------------------------------------------------------
+//  Attestation servers leaf tests
+// ---------------------------------------------------------------------------
+
+/// Compute the canonical hash of an attestation server URL list:
+/// sort, newline-join, SHA-256.
+fn attestation_servers_hash(urls: &[&str]) -> [u8; 32] {
+    let mut sorted: Vec<&str> = urls.to_vec();
+    sorted.sort();
+    let canonical = sorted.join("\n");
+    let d = digest::digest(&digest::SHA256, canonical.as_bytes());
+    let mut h = [0u8; 32];
+    h.copy_from_slice(d.as_ref());
+    h
+}
+
+/// The attestation servers leaf changes the Merkle root when URLs change.
+#[test]
+fn attestation_servers_leaf_changes_root() {
+    let ca_hash = leaf_hash(Some(b"intermediary CA cert"));
+    let egress_hash = leaf_hash(Some(b"egress CA bundle"));
+
+    // Tree with one attestation server
+    let as_hash_a = leaf_hash(Some(
+        &attestation_servers_hash(&["https://as.privasys.org/verify"]),
+    ));
+    let root_a = merkle_root(&[ca_hash, egress_hash, as_hash_a]);
+
+    // Tree with a different attestation server
+    let as_hash_b = leaf_hash(Some(
+        &attestation_servers_hash(&["https://as.customer-corp.com/verify"]),
+    ));
+    let root_b = merkle_root(&[ca_hash, egress_hash, as_hash_b]);
+
+    assert_ne!(root_a, root_b,
+        "Different attestation server URLs must produce different roots");
+}
+
+/// The canonical form is order-independent: sorted before hashing.
+#[test]
+fn attestation_servers_hash_is_order_independent() {
+    let hash_ab = attestation_servers_hash(&[
+        "https://as.privasys.org/verify",
+        "https://as.customer-corp.com/verify",
+    ]);
+    let hash_ba = attestation_servers_hash(&[
+        "https://as.customer-corp.com/verify",
+        "https://as.privasys.org/verify",
+    ]);
+    assert_eq!(hash_ab, hash_ba,
+        "URL order must not affect the canonical hash");
+}
+
+/// Empty attestation server list produces a zero leaf hash (absent data).
+#[test]
+fn empty_attestation_servers_is_absent_leaf() {
+    let h = leaf_hash(None); // absent
+    let non_empty = leaf_hash(Some(
+        &attestation_servers_hash(&["https://as.privasys.org/verify"]),
+    ));
+    assert_ne!(h, non_empty,
+        "Absent attestation servers must differ from a configured server");
 }

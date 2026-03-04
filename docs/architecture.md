@@ -299,6 +299,31 @@ No PRNG seeds, no `/dev/urandom`, no OCALLs for randomness.
 
 ---
 
+## Quote Generation
+
+The DCAP Quoting Library (`libsgx_dcap_ql.so`) makes **system calls** to the Quoting Enclave (QE) via the AESM daemon. None of that is possible from inside an SGX enclave, which has no access to system calls, so we use our RPC channel for this.
+
+```
+┌─ Application Enclave ─────────────────────────────────────┐
+│  1. RPC call → QeGetTargetInfo                            │
+│  2. sgx_create_report(target_info, report_data) → report  │  ← runs inside enclave
+│  3. RPC call → QeGetQuote(report)                         │
+│  4. Receives quote bytes back                             │
+└───────────────────────────────────────────────────────────┘
+        ↕ SPSC RPC channel (shared memory)
+┌─ Host (untrusted) ────────────────────────────────────────┐
+│  sgx_qe_get_target_info()  → talks to AESM/QE             │  ← needs syscalls
+│  sgx_qe_get_quote_size()   → talks to AESM/QE             │  ← needs syscalls
+│  sgx_qe_get_quote(report)  → QE signs the report          │  ← needs syscalls
+└───────────────────────────────────────────────────────────┘
+```
+
+The critical security property is: the report is created inside the enclave (step 2) with report_data binding the enclave's public key. The host can't forge a report, only the CPU can produce one. The host merely acts as a courier, passing the report to the Quoting Enclave which verifies it came from a genuine enclave on the same platform and then signs it into a quote.
+
+So even though the host calls `sgx_qe_get_quote`, it can't tamper with the content. The QE validates the report's MAC (produced by the CPU) before signing.
+
+---
+
 ## Design Decisions
 
 1. **SPSC queues over traditional OCALLs** — eliminates ~12 context switches per request

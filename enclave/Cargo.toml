@@ -18,11 +18,33 @@ crate-type = ["staticlib", "rlib"]
 [features]
 default = ["sgx", "default-ecall"]
 sgx = []
-# Provides the default ecall_run implementation (HelloWorld only).
-# Disable this to provide a custom ecall_run for module registration.
+# Provides the default ecall_run implementation.
+# When no module features are enabled, registers only HelloWorld.
+# When module features are enabled, registers those modules instead.
+# Disable this feature to provide a completely custom ecall_run from
+# an external composition crate.
 default-ecall = []
 # Mock mode for development/testing on platforms without SGX
 mock = []
+
+# ── Composable module features ──────────────────────────────────────────
+# Enable any combination — they are NOT mutually exclusive.
+# Each feature adds the corresponding module crate as a dependency and
+# registers it in the default ecall_run.
+#
+#   cmake -DENABLE_VAULT=ON → --features vault
+#   cmake -DENABLE_WASM=ON  → --features wasm
+#   cmake -DENABLE_VAULT=ON -DENABLE_WASM=ON → --features vault,wasm
+#
+# Dependency graph:
+#   vault → kvstore, egress
+#   wasm  → kvstore, egress
+#   kvstore (standalone)
+#   egress  (standalone)
+egress  = ["dep:enclave-os-egress"]
+kvstore = ["dep:enclave-os-kvstore"]
+vault   = ["dep:enclave-os-vault", "kvstore", "egress"]
+wasm    = ["dep:enclave-os-wasm", "kvstore", "egress"]
 
 [dependencies]
 # Common types
@@ -55,6 +77,12 @@ serde_json = "1"
 
 # Pin transitive deps that shipped edition2024 (requires Rust 1.85+)
 time-core = ">=0.1, <0.1.8"
+
+# ── Optional module crate dependencies (gated by features above) ────────
+enclave-os-egress  = { path = "../crates/enclave-os-egress", optional = true }
+enclave-os-kvstore = { path = "../crates/enclave-os-kvstore", optional = true }
+enclave-os-vault   = { path = "../crates/enclave-os-vault", optional = true }
+enclave-os-wasm    = { path = "../crates/enclave-os-wasm", optional = true }
 
 [profile.release]
 opt-level = "s"        # optimize for size

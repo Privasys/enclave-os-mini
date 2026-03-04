@@ -55,6 +55,15 @@ pub const WASM_APPS_HASH_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 2, 3];
 /// WASM Apps Combined Code Hash (dotted-string).
 pub const WASM_APPS_HASH_OID_STR: &str = "1.3.6.1.4.1.65230.2.3";
 
+/// Attestation Servers Hash — `1.3.6.1.4.1.65230.2.4`
+///
+/// 32-byte SHA-256 hash of the canonical attestation server URL list
+/// trusted by the enclave for remote attestation verification.  The hash
+/// is computed over the sorted, newline-joined URL strings.
+pub const ATTESTATION_SERVERS_HASH_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 2, 4];
+/// Attestation Servers Hash (dotted-string).
+pub const ATTESTATION_SERVERS_HASH_OID_STR: &str = "1.3.6.1.4.1.65230.2.4";
+
 // =========================================================================
 //  Per-app certificate OIDs
 // =========================================================================

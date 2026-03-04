@@ -64,6 +64,13 @@ struct Cli {
     #[arg(long)]
     egress_ca_bundle: Option<String>,
 
+    /// Comma-separated list of attestation server URLs for remote quote
+    /// verification.  e.g. "https://as.privasys.org/verify,https://as.customer.com/verify"
+    /// The list is hashed into the config Merkle tree (leaf: egress.attestation_servers)
+    /// and embedded as X.509 OID 1.3.6.1.4.1.65230.2.4.
+    #[arg(long, value_delimiter = ',')]
+    attestation_servers: Option<Vec<String>>,
+
     /// Enable debug logging
     #[arg(short, long)]
     debug: bool,
@@ -204,6 +211,13 @@ fn main() -> Result<()> {
             .map_err(|e| anyhow::anyhow!("Failed to read egress CA bundle '{}': {}", bundle_path, e))?;
         info!("Egress CA bundle: {} bytes from {}", pem_bytes.len(), bundle_path);
         config["egress_ca_bundle_hex"] = serde_json::Value::String(hex::encode(&pem_bytes));
+    }
+
+    // If attestation server URLs are provided, pass them as a JSON array
+    if let Some(ref servers) = cli.attestation_servers {
+        info!("Attestation servers: {:?}", servers);
+        config["attestation_servers"] = serde_json::to_value(servers)
+            .map_err(|e| anyhow::anyhow!("Failed to serialise attestation servers: {}", e))?;
     }
 
     let config_bytes = serde_json::to_vec(&config)?;
