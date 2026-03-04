@@ -95,6 +95,9 @@ jobs:
             -e SOURCE_DATE_EPOCH=0 \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
 
+      - name: Fix build output permissions
+        run: sudo chown -R "$(id -u):$(id -g)" build/ target/
+
       - name: Read MRENCLAVE
         id: mrenclave
         run: |
