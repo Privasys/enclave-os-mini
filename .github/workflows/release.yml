@@ -33,7 +33,8 @@ permissions:
 
 env:
   REGISTRY: ghcr.io
-  IMAGE_NAME: ${{ github.repository }}/build
+  # github.repository may contain uppercase chars; Docker requires lowercase.
+  IMAGE_NAME: privasys/enclave-os-mini/build
 
 jobs:
   # ────────────────────────────────────────────────────────────────────────
