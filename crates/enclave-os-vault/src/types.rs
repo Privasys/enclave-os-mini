@@ -41,6 +41,12 @@ pub enum VaultRequest {
     /// ```
     StoreSecret { jwt: Vec<u8> },
 
+    /// Open a top-level vault for a secret owner by registering their
+    /// hex-encoded uncompressed P-256 public key.  Returns a `kid` that
+    /// clients will put in the JWT header when later storing/deleting
+    /// secrets.
+    OpenVault { pubkey_hex: String },
+
     /// Retrieve a named secret.  Authorised by the caller's mutual RA-TLS
     /// client certificate (which contains the SGX/TDX quote and OID
     /// extensions) + optional bearer token.
@@ -90,6 +96,8 @@ pub enum VaultResponse {
     SecretDeleted,
     /// Secret policy updated successfully.
     PolicyUpdated,
+    /// Vault opened successfully; contains the generated `kid` for the owner.
+    VaultOpened { kid: String },
     /// Error with human-readable message.
     Error(String),
 }

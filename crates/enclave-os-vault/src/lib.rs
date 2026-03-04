@@ -50,6 +50,8 @@ use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 
 use enclave_os_common::jwt::{self, JwtVerifier};
+use ring::digest;
+use serde_json::Value;
 use enclave_os_common::protocol::{Request, Response};
 use enclave_os_common::modules::{EnclaveModule, RequestContext};
 
@@ -123,6 +125,7 @@ impl EnclaveModule for VaultModule {
         };
 
         let vault_resp = match vault_req {
+            VaultRequest::OpenVault { pubkey_hex } => self.handle_open(pubkey_hex),
             VaultRequest::StoreSecret { jwt } => self.handle_store(&jwt),
             VaultRequest::GetSecret {
                 name,
@@ -149,11 +152,11 @@ impl EnclaveModule for VaultModule {
 impl VaultModule {
     /// Store a named secret with an access policy.
     fn handle_store(&self, jwt: &[u8]) -> VaultResponse {
-        let (claims, owner_pubkey_hash): (StoreSecretClaims, String) =
-            match jwt::verify_self_signed(jwt) {
-                Ok(pair) => pair,
-                Err(e) => return VaultResponse::Error(e),
-            };
+        // Extract `kid` from JWT header, look up owner's pubkey and verify
+        let (claims, owner_pubkey_hash) = match verify_jwt_and_get_owner(jwt) {
+            Ok(pair) => pair,
+            Err(e) => return VaultResponse::Error(e),
+        };
 
         // Decode base64url secret
         let secret_bytes = match URL_SAFE_NO_PAD.decode(&claims.secret) {
@@ -208,6 +211,55 @@ impl VaultModule {
             name: claims.name,
             expires_at,
         }
+    }
+
+    /// Register a secret owner pubkey and return the `kid` (sha256 hex).
+    fn handle_open(&self, pubkey_hex: String) -> VaultResponse {
+        // Decode hex
+        let raw = match crate::quote::hex_decode(&pubkey_hex) {
+            Ok(b) => b,
+            Err(e) => return VaultResponse::Error(format!("invalid pubkey hex: {e}")),
+        };
+        if raw.len() != 65 || raw[0] != 0x04 {
+            return VaultResponse::Error("expected 65-byte uncompressed P-256 point (04 || x || y)".into());
+        }
+
+        // Compute kid = SHA-256(raw) hex
+        let hash = digest::digest(&digest::SHA256, &raw);
+        let kid = hex_encode(hash.as_ref());
+
+        // Store mapping in KV: key = "vault_owner:{kid}" -> pubkey_hex (lowercase)
+        let kv = match enclave_os_kvstore::kv_store() {
+            Some(kv) => kv,
+            None => return VaultResponse::Error("kv store not initialised".into()),
+        };
+
+        let key = format!("vault_owner:{}", kid);
+        let val = pubkey_hex.to_lowercase();
+
+        match kv.lock() {
+            Ok(mut store) => {
+                match store.get(key.as_bytes()) {
+                    Ok(Some(existing)) => {
+                        if existing == val.as_bytes() {
+                            // idempotent: already registered
+                            return VaultResponse::VaultOpened { kid };
+                        } else {
+                            return VaultResponse::Error("kid already registered with a different key".into());
+                        }
+                    }
+                    Ok(None) => {
+                        if let Err(e) = store.put(key.as_bytes(), val.as_bytes()) {
+                            return VaultResponse::Error(format!("kv put failed: {e}"));
+                        }
+                    }
+                    Err(e) => return VaultResponse::Error(format!("kv get failed: {e}")),
+                }
+            }
+            Err(_) => return VaultResponse::Error("kv store lock poisoned".into()),
+        }
+
+        VaultResponse::VaultOpened { kid }
     }
 
     /// Retrieve a named secret — authorised by mutual RA-TLS (peer cert) + optional bearer token.
@@ -408,11 +460,10 @@ impl VaultModule {
 
     /// Delete a named secret — only the original owner can delete.
     fn handle_delete(&self, jwt: &[u8]) -> VaultResponse {
-        let (claims, owner_pubkey_hash): (DeleteSecretClaims, String) =
-            match jwt::verify_self_signed(jwt) {
-                Ok(pair) => pair,
-                Err(e) => return VaultResponse::Error(e),
-            };
+        let (claims, owner_pubkey_hash) = match verify_jwt_and_get_owner(jwt) {
+            Ok(pair) => pair,
+            Err(e) => return VaultResponse::Error(e),
+        };
 
         let kv = match enclave_os_kvstore::kv_store() {
             Some(kv) => kv,
@@ -452,11 +503,10 @@ impl VaultModule {
 
     /// Update the access policy for an existing secret — owner only.
     fn handle_update_policy(&self, jwt: &[u8]) -> VaultResponse {
-        let (claims, owner_pubkey_hash): (UpdateSecretPolicyClaims, String) =
-            match jwt::verify_self_signed(jwt) {
-                Ok(pair) => pair,
-                Err(e) => return VaultResponse::Error(e),
-            };
+        let (claims, owner_pubkey_hash) = match verify_jwt_and_get_owner(jwt) {
+            Ok(pair) => pair,
+            Err(e) => return VaultResponse::Error(e),
+        };
 
         let kv = match enclave_os_kvstore::kv_store() {
             Some(kv) => kv,
@@ -620,3 +670,61 @@ fn extract_pubkey_from_cert(der: &[u8]) -> Result<Vec<u8>, String> {
 
     Ok(pubkey_data.to_vec())
 }
+
+    /// Verify a JWT whose header contains `kid`.
+    ///
+    /// Looks up the registered owner pubkey for `kid` in the sealed KV store,
+    /// constructs a `JwtVerifier` from it, verifies the JWT, decodes the
+    /// payload into the requested claim type `T`, and returns the claims
+    /// along with the owner pubkey hash (SHA-256 hex).
+    fn verify_jwt_and_get_owner<T: serde::de::DeserializeOwned>(
+        jwt: &[u8],
+    ) -> Result<(T, String), String> {
+        // 1) Extract header
+        let jwt_str = core::str::from_utf8(jwt)
+            .map_err(|e| format!("jwt not utf8: {e}"))?;
+        let mut parts = jwt_str.splitn(3, '.');
+        let header_b64 = parts.next().ok_or("missing header")?;
+
+        let header_bytes = URL_SAFE_NO_PAD
+            .decode(header_b64)
+            .map_err(|e| format!("jwt header base64: {e}"))?;
+
+        let header_val: Value = serde_json::from_slice(&header_bytes)
+            .map_err(|e| format!("jwt header json: {e}"))?;
+
+        let kid = header_val
+            .get("kid")
+            .and_then(|v| v.as_str())
+            .ok_or("jwt header missing 'kid' field")?
+            .to_string();
+
+        // 2) Lookup pubkey_hex in KV store under key "vault_owner:{kid}"
+        let kv = enclave_os_kvstore::kv_store().ok_or("kv store not initialised".to_string())?;
+        let kv_key = format!("vault_owner:{}", kid);
+        let pubkey_hex = match kv.lock() {
+            Ok(store) => match store.get(kv_key.as_bytes()) {
+                Ok(Some(v)) => match String::from_utf8(v) {
+                    Ok(s) => s,
+                    Err(_) => return Err("corrupt pubkey entry".into()),
+                },
+                Ok(None) => return Err("unknown kid".into()),
+                Err(e) => return Err(format!("kv get failed: {e}")),
+            },
+            Err(_) => return Err("kv store lock poisoned".into()),
+        };
+
+        // 3) Decode pubkey hex -> raw bytes and compute owner hash
+        let raw = match crate::quote::hex_decode(&pubkey_hex) {
+            Ok(b) => b,
+            Err(e) => return Err(format!("invalid pubkey stored for kid: {e}")),
+        };
+        let hash = digest::digest(&digest::SHA256, &raw);
+        let owner_pubkey_hash = hex_encode(hash.as_ref());
+
+        // 4) Verify JWT using this pubkey
+        let verifier = JwtVerifier::from_public_key_bytes(&raw).map_err(|e| format!("invalid stored pubkey: {e}"))?;
+        let claims = verifier.verify_and_decode(jwt).map_err(|e| format!("jwt verification failed: {e}"))?;
+
+        Ok((claims, owner_pubkey_hash))
+    }
