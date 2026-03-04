@@ -1,0 +1,100 @@
+# Copyright (c) Privasys. All rights reserved.
+# Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
+#
+# Reproducible build container for enclave-os-mini.
+#
+# Produces deterministic SGX enclave binaries → identical MRENCLAVE on every run.
+#
+# BUILD:
+#   docker build -f docker/Dockerfile.build -t privasys/enclave-os-build:v0.3 .
+#
+# USE (build the enclave):
+#   docker run --rm -v $(pwd):/src privasys/enclave-os-build:v0.3
+#
+# The container outputs:
+#   /src/build/bin/enclave.signed.so   — Signed enclave binary
+#   /src/build/bin/enclave-os-host     — Host binary
+#   /src/build/mrenclave.txt           — Hex-encoded MRENCLAVE
+#
+# ─── Pinned versions ─────────────────────────────────────────────────────
+# Ubuntu         24.04  (noble)
+# GCC            13.3.0
+# Binutils/ld    2.42
+# cmake          3.28.x  (from Ubuntu repos)
+# Intel SGX SDK  2.27.100.1
+# Rust           nightly-2025-12-01  → rustc 1.93.0-nightly (b84478a1c)
+# LLVM           21.1.5  (bundled with rustc)
+# Teaclave SGX   privasys-v0.1.0  (pinned in Cargo.lock)
+# ─────────────────────────────────────────────────────────────────────────
+
+# Pin by tag; for maximum reproducibility, replace with a digest:
+#   docker pull ubuntu:24.04 && docker inspect --format='{{index .RepoDigests 0}}' ubuntu:24.04
+FROM ubuntu:24.04
+
+LABEL org.opencontainers.image.source="https://github.com/Privasys/enclave-os-mini"
+LABEL org.opencontainers.image.description="Reproducible build environment for enclave-os-mini"
+
+# ── Deterministic build environment ──────────────────────────────────────
+ENV DEBIAN_FRONTEND=noninteractive \
+    LANG=C.UTF-8 \
+    LC_ALL=C.UTF-8 \
+    TZ=UTC \
+    SOURCE_DATE_EPOCH=0 \
+    CARGO_INCREMENTAL=0 \
+    CARGO_HOME=/opt/cargo \
+    RUSTUP_HOME=/opt/rustup
+
+ENV PATH="${CARGO_HOME}/bin:${PATH}"
+
+# ── System packages ──────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        build-essential \
+        cmake \
+        autoconf \
+        automake \
+        libtool \
+        pkg-config \
+        curl \
+        wget \
+        ca-certificates \
+        gnupg \
+        git \
+        python3 \
+    && rm -rf /var/lib/apt/lists/*
+
+# ── Intel SGX SDK (build tools only — no hardware needed) ────────────────
+# Add Intel SGX repo
+RUN mkdir -p /etc/apt/keyrings \
+    && wget -qO- https://download.01.org/intel-sgx/sgx_repo/ubuntu/intel-sgx-deb.key \
+       | gpg --dearmor -o /etc/apt/keyrings/intel-sgx.gpg \
+    && echo "deb [arch=amd64 signed-by=/etc/apt/keyrings/intel-sgx.gpg] https://download.01.org/intel-sgx/sgx_repo/ubuntu noble main" \
+       > /etc/apt/sources.list.d/intel-sgx.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends \
+        libsgx-headers=2.27.100.1-noble1 \
+        libsgx-enclave-common=2.27.100.1-noble1 \
+        libsgx-urts=2.27.100.1-noble1 \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install SGX SDK (provides sgx_edger8r, sgx_sign, headers, link libraries)
+RUN wget -qO /tmp/sgx_sdk.bin \
+        "https://download.01.org/intel-sgx/sgx-linux/2.27/distro/ubuntu24.04-server/sgx_linux_x64_sdk_2.27.100.1.bin" \
+    && chmod +x /tmp/sgx_sdk.bin \
+    && echo "yes" | /tmp/sgx_sdk.bin --prefix=/opt/intel \
+    && rm /tmp/sgx_sdk.bin
+
+# ── Rust toolchain (exact nightly pinned) ────────────────────────────────
+RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+    | sh -s -- -y --default-toolchain none \
+    && rustup toolchain install nightly-2025-12-01 \
+         --component rust-src \
+         --profile minimal \
+    && rustup default nightly-2025-12-01 \
+    && rustc --version --verbose
+
+# ── Build script ─────────────────────────────────────────────────────────
+COPY docker/build-enclave.sh /usr/local/bin/build-enclave
+RUN chmod +x /usr/local/bin/build-enclave
+
+WORKDIR /src
+ENTRYPOINT ["build-enclave"]

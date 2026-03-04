@@ -37,6 +37,7 @@ function(rust_build_host CRATE_DIR OUTPUT_NAME)
             "RUSTUP_TOOLCHAIN=${RUST_ENCLAVE_TOOLCHAIN}"
             ${CARGO_EXECUTABLE} build
                 ${CARGO_BUILD_TYPE}
+                --locked
                 --manifest-path "${CRATE_DIR}/Cargo.toml"
         WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
         COMMENT "Building host Rust crate: ${OUTPUT_NAME}"
@@ -87,6 +88,7 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME)
             "RUSTFLAGS=--sysroot ${SGX_SYSROOT_DIR} -C target-feature=+rdrand"
             ${CARGO_EXECUTABLE} build
                 ${CARGO_BUILD_TYPE}
+                --locked
                 --manifest-path "${CRATE_DIR}/Cargo.toml"
                 --target "${TARGET_JSON}"
                 ${_FEATURES_ARGS}

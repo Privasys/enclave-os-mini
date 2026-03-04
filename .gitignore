@@ -1,9 +1,11 @@
 # Build artifacts
 /build/
 /target/
-Cargo.lock
 /enclave/target/
 /sysroot/
+
+# NOTE: Cargo.lock is intentionally COMMITTED for reproducible builds.
+# Do not add it to .gitignore.
 
 # IDE
 .vscode/

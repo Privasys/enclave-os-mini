@@ -1,0 +1,6 @@
+# Pin the exact Rust nightly used for enclave builds.
+# This ensures `rustup` automatically installs the right toolchain.
+# Corresponds to: rustc 1.93.0-nightly (b84478a1c 2025-11-30), LLVM 21.1.5
+[toolchain]
+channel = "nightly-2025-12-01"
+components = ["rust-src"]
