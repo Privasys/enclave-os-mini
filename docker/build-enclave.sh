@@ -20,7 +20,8 @@ export TZ=UTC
 export LANG=C.UTF-8
 export LC_ALL=C.UTF-8
 
-# SGX SDK environment
+# SGX SDK environment (pre-set variables the environment script appends to)
+export PKG_CONFIG_PATH="${PKG_CONFIG_PATH:-}"
 source /opt/intel/sgxsdk/environment
 
 echo "╔══════════════════════════════════════════════════════════════╗"
