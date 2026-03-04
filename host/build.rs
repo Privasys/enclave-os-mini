@@ -157,11 +157,17 @@ fn find_teaclave_edl_dir() -> Option<PathBuf> {
         }
     }
 
-    // 2. Cargo git checkouts
-    let home = env::var("HOME")
-        .or_else(|_| env::var("USERPROFILE"))
-        .unwrap_or_default();
-    let checkouts = PathBuf::from(&home).join(".cargo/git/checkouts");
+    // 2. Cargo git checkouts — respect CARGO_HOME if set
+    let cargo_dir = env::var("CARGO_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| {
+            let home = env::var("HOME")
+                .or_else(|_| env::var("USERPROFILE"))
+                .unwrap_or_default();
+            PathBuf::from(&home).join(".cargo")
+        });
+    let checkouts = cargo_dir.join("git/checkouts");
 
     if checkouts.is_dir() {
         if let Ok(entries) = std::fs::read_dir(&checkouts) {
