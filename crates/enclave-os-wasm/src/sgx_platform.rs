@@ -182,13 +182,13 @@ pub unsafe extern "C" fn wasmtime_mmap_new(
         let ptr = code_pool_alloc(aligned);
         if ptr.is_null() {
             // Code pool exhausted, fall back to heap
-            enclave_os_enclave::enclave_log_info!(
+            enclave_os_common::enclave_log_info!(
                 "[sgx_platform] mmap: code pool exhausted, falling back to heap for {} bytes",
                 aligned
             );
             heap_alloc_pages(aligned)
         } else {
-            enclave_os_enclave::enclave_log_info!(
+            enclave_os_common::enclave_log_info!(
                 "[sgx_platform] mmap: code pool alloc {} bytes at {:p}",
                 aligned, ptr
             );
@@ -196,7 +196,7 @@ pub unsafe extern "C" fn wasmtime_mmap_new(
         }
     } else {
         let ptr = heap_alloc_pages(aligned);
-        enclave_os_enclave::enclave_log_info!(
+        enclave_os_common::enclave_log_info!(
             "[sgx_platform] mmap: heap alloc {} bytes at {:p}",
             aligned, ptr
         );
@@ -233,12 +233,12 @@ pub unsafe extern "C" fn wasmtime_munmap(ptr: *mut u8, size: usize) -> i32 {
     if is_code_pool(ptr) {
         // Code pool: can't free individual allocations from bump allocator.
         // The memory stays allocated until enclave teardown.
-        enclave_os_enclave::enclave_log_info!(
+        enclave_os_common::enclave_log_info!(
             "[sgx_platform] munmap: code pool page {:p} ({} bytes) — retained",
             ptr, aligned
         );
     } else {
-        enclave_os_enclave::enclave_log_info!(
+        enclave_os_common::enclave_log_info!(
             "[sgx_platform] munmap: heap dealloc {:p} ({} bytes)",
             ptr, aligned
         );
@@ -260,7 +260,7 @@ pub unsafe extern "C" fn wasmtime_mprotect(
 ) -> i32 {
     let aligned = page_align(size);
     let in_pool = is_code_pool(ptr);
-    enclave_os_enclave::enclave_log_info!(
+    enclave_os_common::enclave_log_info!(
         "[sgx_platform] mprotect: addr={:p} size={} prot={} pool={} (no-op)",
         ptr, aligned, prot_flags, in_pool
     );
@@ -295,7 +295,7 @@ unsafe extern "C" fn sgx_veh_handler(info: *mut SgxExceptionInfo) -> i32 {
 pub extern "C" fn wasmtime_init_traps() -> *const u8 {
     unsafe {
         let handle = sgx_register_exception_handler(1, sgx_veh_handler);
-        enclave_os_enclave::enclave_log_info!(
+        enclave_os_common::enclave_log_info!(
             "[sgx_platform] VEH trap handler registered (handle={:p})",
             handle
         );

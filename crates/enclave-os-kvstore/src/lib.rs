@@ -29,7 +29,7 @@ mod sealed;
 
 use std::sync::{Mutex, OnceLock};
 
-use enclave_os_enclave::modules::{EnclaveModule, RequestContext};
+use enclave_os_common::modules::{EnclaveModule, RequestContext};
 use enclave_os_common::protocol::{Request, Response};
 use enclave_os_common::types::AEAD_KEY_SIZE;
 

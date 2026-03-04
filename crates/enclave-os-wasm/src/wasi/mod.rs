@@ -245,7 +245,7 @@ impl AppContext {
     pub fn flush_stdout(&mut self) {
         if !self.stdout_buf.is_empty() {
             if let Ok(s) = core::str::from_utf8(&self.stdout_buf) {
-                enclave_os_enclave::enclave_log_info!("[wasm:{}] {}", self.app_name, s);
+                enclave_os_common::enclave_log_info!("[wasm:{}] {}", self.app_name, s);
             }
             self.stdout_buf.clear();
         }
@@ -255,7 +255,7 @@ impl AppContext {
     pub fn flush_stderr(&mut self) {
         if !self.stderr_buf.is_empty() {
             if let Ok(s) = core::str::from_utf8(&self.stderr_buf) {
-                enclave_os_enclave::enclave_log_error!("[wasm:{}] {}", self.app_name, s);
+                enclave_os_common::enclave_log_error!("[wasm:{}] {}", self.app_name, s);
             }
             self.stderr_buf.clear();
         }
@@ -278,9 +278,9 @@ impl AppContext {
         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
             if let Ok(line) = core::str::from_utf8(&buf[..pos]) {
                 if is_stderr {
-                    enclave_os_enclave::enclave_log_error!("[wasm:{}] {}", app_name, line);
+                    enclave_os_common::enclave_log_error!("[wasm:{}] {}", app_name, line);
                 } else {
-                    enclave_os_enclave::enclave_log_info!("[wasm:{}] {}", app_name, line);
+                    enclave_os_common::enclave_log_info!("[wasm:{}] {}", app_name, line);
                 }
             }
             buf.drain(..=pos);
@@ -304,7 +304,7 @@ impl AppContext {
                 Self::forward_to_log(&mut self.stderr_buf, &self.app_name, data, true);
             }
             OutputStreamKind::TcpSocket(fd) => {
-                if let Err(_) = enclave_os_enclave::ocall::net_send(fd, data) {
+                if let Err(_) = enclave_os_common::ocall::net_send(fd, data) {
                     return Err("last-operation-failed");
                 }
             }
@@ -332,7 +332,7 @@ impl AppContext {
             InputStreamKind::TcpSocket(fd) => {
                 let fd = *fd;
                 let mut buf = vec![0u8; max_len.min(65536)];
-                match enclave_os_enclave::ocall::net_recv(fd, &mut buf) {
+                match enclave_os_common::ocall::net_recv(fd, &mut buf) {
                     Ok(n) => {
                         buf.truncate(n);
                         Ok(buf)

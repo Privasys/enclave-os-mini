@@ -14,7 +14,7 @@ use std::vec::Vec;
 use core::mem;
 
 use ring::digest;
-use enclave_os_enclave::ocall;
+use enclave_os_common::ocall;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::WebPkiServerVerifier;

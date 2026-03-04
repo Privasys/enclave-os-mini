@@ -12,8 +12,7 @@ description = "Secret store/fetch module for enclave-os — JWT-gated storage in
 name = "enclave_os_vault"
 
 [dependencies]
-# Core enclave library (without default-ecall — adopter provides their own)
-enclave-os-enclave = { path = "../../enclave", default-features = false, features = ["sgx"] }
+# Shared types, module trait, and OCall vtable
 enclave-os-common  = { path = "../../common", features = ["jwt"] }
 
 # KV store for persisting secrets (sealed with MRENCLAVE-bound key)

@@ -3,8 +3,8 @@
 
 //! HelloWorld example module.
 
+use enclave_os_common::modules::{EnclaveModule, RequestContext};
 use enclave_os_common::protocol::{Request, Response};
-use crate::modules::{EnclaveModule, RequestContext};
 
 pub struct HelloWorldModule;
 

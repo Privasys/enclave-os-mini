@@ -3,5 +3,4 @@
 
 //! Cryptographic primitives for the enclave.
 
-pub mod aead;
 pub mod sealing;

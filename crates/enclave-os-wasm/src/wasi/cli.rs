@@ -365,5 +365,5 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
 
 /// Fetch UNIX timestamp (seconds) via the host OCALL.
 fn get_time_secs() -> u64 {
-    enclave_os_enclave::ocall::get_current_time().unwrap_or(0)
+    enclave_os_common::ocall::get_current_time().unwrap_or(0)
 }

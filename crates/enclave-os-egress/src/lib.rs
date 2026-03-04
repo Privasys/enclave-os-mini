@@ -33,8 +33,9 @@
 //!
 //! ```rust,ignore
 //! use enclave_os_egress::{EgressModule, client};
-//! use enclave_os_enclave::ecall::{init_enclave, finalize_and_run, hex_decode};
+//! use enclave_os_enclave::ecall::{init_enclave, finalize_and_run};
 //! use enclave_os_enclave::modules::register_module;
+//! use enclave_os_common::hex::hex_decode;
 //!
 //! let (config, mut sealed_cfg) = init_enclave(config_json, config_len)?;
 //!
@@ -69,9 +70,8 @@ use std::vec::Vec;
 use ring::digest;
 use rustls::RootCertStore;
 
-use enclave_os_enclave::config_merkle::ConfigLeaf;
-use enclave_os_enclave::modules::{EnclaveModule, ModuleOid, RequestContext};
-use enclave_os_common::oids;
+use enclave_os_common::modules::ConfigLeaf;
+use enclave_os_common::modules::{EnclaveModule, ModuleOid, RequestContext};
 use enclave_os_common::protocol::{Request, Response};
 
 /// OID for the egress CA bundle hash — imported from common.

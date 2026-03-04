@@ -53,7 +53,7 @@ use ring::digest;
 
 use enclave_os_common::jwt::JwtVerifier;
 use enclave_os_common::protocol::{Request, Response};
-use enclave_os_enclave::modules::{EnclaveModule, RequestContext};
+use enclave_os_common::modules::{EnclaveModule, RequestContext};
 
 use crate::quote::{hex_encode, extract_report_data, is_permitted, parse_quote};
 use enclave_os_common::quote::compute_report_data_hash;
@@ -561,7 +561,7 @@ fn normalise_policy(mut policy: types::SecretPolicy) -> types::SecretPolicy {
 
 /// Get the current UNIX timestamp (seconds) via OCall.
 fn current_time_secs() -> u64 {
-    enclave_os_enclave::ocall::get_current_time().unwrap_or(0)
+    enclave_os_common::ocall::get_current_time().unwrap_or(0)
 }
 
 // ---------------------------------------------------------------------------

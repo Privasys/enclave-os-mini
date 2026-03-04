@@ -270,7 +270,7 @@ impl IngressServer {
         // Build per-connection request context with optional peer cert
         // and client challenge nonce (for bidirectional RA-TLS verification,
         // sent via TLS CertificateRequest extension 0xFFBB)
-        let ctx = crate::modules::RequestContext {
+        let ctx = enclave_os_common::modules::RequestContext {
             peer_cert_der: session.peer_cert_der(),
             client_challenge_nonce: session.client_challenge_nonce().cloned(),
         };
@@ -617,7 +617,7 @@ enum HandleResult {
 }
 
 /// Handle a complete, already-decoded frame payload from a client.
-fn handle_frame(payload: &[u8], ctx: &modules::RequestContext) -> HandleResult {
+fn handle_frame(payload: &[u8], ctx: &enclave_os_common::modules::RequestContext) -> HandleResult {
     use enclave_os_common::protocol::{Request, Response};
     match serde_json::from_slice::<Request>(payload) {
         Ok(Request::Ping) => {

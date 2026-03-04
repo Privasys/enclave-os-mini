@@ -48,7 +48,7 @@ wasm    = ["dep:enclave-os-wasm", "kvstore", "egress"]
 
 [dependencies]
 # Common types
-enclave-os-common = { path = "../common" }
+enclave-os-common = { path = "../common", features = ["crypto"] }
 
 # Teaclave SGX SDK – trusted libraries (Privasys fork with Rust 1.84 + SGX 2.25 patches)
 # NOTE: sgx_tstd is provided by the custom sysroot (rustlib/std), NOT as a crate dep.

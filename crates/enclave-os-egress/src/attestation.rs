@@ -54,7 +54,6 @@
 //! vault) access the configured servers via [`crate::attestation_servers()`].
 
 use std::string::String;
-use std::vec::Vec;
 
 use base64::engine::general_purpose::STANDARD;
 use base64::Engine;

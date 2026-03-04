@@ -17,9 +17,9 @@
 use std::string::String;
 use std::vec::Vec;
 
-use enclave_os_enclave::crypto::aead::AeadCipher;
-use enclave_os_enclave::ocall;
-use enclave_os_common::types::{AEAD_KEY_SIZE, KV_MAX_VALUE_SIZE};
+use enclave_os_common::aead::AeadCipher;
+use enclave_os_common::ocall;
+use enclave_os_common::types::AEAD_KEY_SIZE;
 
 /// AAD (Additional Authenticated Data) tags to differentiate key vs value
 /// ciphertexts and prevent cross-use.
@@ -72,7 +72,7 @@ impl SealedKvStore {
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
         let enc_key = self.encrypt_key(key)?;
 
-        match ocall::kv_store_get(&self.table, &enc_key, KV_MAX_VALUE_SIZE + 256) {
+        match ocall::kv_store_get(&self.table, &enc_key) {
             Ok(Some(enc_val)) => {
                 let plaintext = self.cipher
                     .decrypt(&enc_val, AAD_VALUE)

@@ -163,7 +163,7 @@ fn do_https_fetch(
     let tls_config = Arc::new(tls_config);
 
     // TCP connect via OCALL.
-    let fd = enclave_os_enclave::ocall::net_tcp_connect(&host, port)
+    let fd = enclave_os_common::ocall::net_tcp_connect(&host, port)
         .map_err(|e| format!("TCP connect failed: {}", e))?;
 
     // TLS handshake.
@@ -186,7 +186,7 @@ fn do_https_fetch(
     let mut response_data = Vec::new();
     loop {
         let mut net_buf = vec![0u8; 16384];
-        match enclave_os_enclave::ocall::net_recv(fd, &mut net_buf) {
+        match enclave_os_common::ocall::net_recv(fd, &mut net_buf) {
             Ok(0) => break,
             Ok(n) => {
                 // Feed ALL received bytes to rustls.  read_tls may only
@@ -223,7 +223,7 @@ fn do_https_fetch(
     // Close.
     tls_conn.send_close_notify();
     let _ = flush_tls(fd, &mut tls_conn);
-    enclave_os_enclave::ocall::net_close(fd);
+    enclave_os_common::ocall::net_close(fd);
 
     // Parse HTTP response.
     parse_http_response(&response_data)
@@ -247,7 +247,7 @@ fn tls_handshake(fd: i32, tls_conn: &mut ClientConnection) -> Result<(), i32> {
 
         // Read the next chunk of TLS handshake data from the server.
         let mut buf = vec![0u8; 16384];
-        match enclave_os_enclave::ocall::net_recv(fd, &mut buf) {
+        match enclave_os_common::ocall::net_recv(fd, &mut buf) {
             Ok(n) if n > 0 => {
                 let mut cursor = std::io::Cursor::new(&buf[..n]);
                 while (cursor.position() as usize) < n {
@@ -282,7 +282,7 @@ fn flush_tls(fd: i32, tls_conn: &mut ClientConnection) -> Result<(), i32> {
                 let data = &buf[..n];
                 let mut offset = 0;
                 while offset < data.len() {
-                    match enclave_os_enclave::ocall::net_send(fd, &data[offset..]) {
+                    match enclave_os_common::ocall::net_send(fd, &data[offset..]) {
                         Ok(sent) => offset += sent,
                         Err(_) => return Err(-1),
                     }

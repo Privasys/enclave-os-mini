@@ -206,7 +206,7 @@ impl AppRegistry {
             .map(|app| crate::protocol::AppInfo {
                 name: app.name.clone(),
                 hostname: app.hostname.clone(),
-                code_hash: enclave_os_enclave::ecall::hex_encode(&app.code_hash),
+                code_hash: enclave_os_common::hex::hex_encode(&app.code_hash),
                 key_source: if app.byok { "byok".into() } else { "generated".into() },
                 exports: app.exported_funcs(),
             })

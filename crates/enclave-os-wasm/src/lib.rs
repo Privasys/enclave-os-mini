@@ -78,11 +78,9 @@ use std::sync::Mutex;
 use std::vec::Vec;
 
 use ring::digest;
+use enclave_os_common::hex::hex_decode;
+use enclave_os_common::modules::{AppIdentity, ConfigEntry, ConfigLeaf, EnclaveModule, ModuleOid, RequestContext};
 use enclave_os_common::protocol::{Request, Response};
-use enclave_os_enclave::config_merkle::ConfigLeaf;
-use enclave_os_enclave::ecall::hex_decode;
-use enclave_os_enclave::modules::{AppIdentity, ConfigEntry, EnclaveModule, ModuleOid, RequestContext};
-use enclave_os_enclave::ratls::cert_store;
 use enclave_os_common::types::AEAD_KEY_SIZE;
 
 use crate::protocol::{WasmCall, WasmEnvelope, WasmManagementResult, WasmResult};
@@ -174,7 +172,7 @@ impl WasmModule {
                 },
             ],
         };
-        cert_store::cert_store().register(identity);
+        enclave_os_common::ocall::cert_store_register(identity);
 
         Ok(())
     }
@@ -190,7 +188,7 @@ impl WasmModule {
             .and_then(|mut r| r.unload_app(name));
 
         if let Some(ref h) = hostname {
-            cert_store::cert_store().unregister(h);
+            enclave_os_common::ocall::cert_store_unregister(h);
         }
 
         hostname.is_some()

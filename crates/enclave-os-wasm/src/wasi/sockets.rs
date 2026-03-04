@@ -120,7 +120,7 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
         |mut store, rep| {
             if let Some(sock) = store.data_mut().tcp_sockets.remove(&rep) {
                 if let Some(fd) = sock.fd {
-                    enclave_os_enclave::ocall::net_close(fd);
+                    enclave_os_common::ocall::net_close(fd);
                 }
             }
             Ok(())
@@ -140,7 +140,7 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
             // params[1] = network (ignored — we have one implicit network)
             let port = extract_port_from_address(&params[2]);
 
-            let fd = match enclave_os_enclave::ocall::net_tcp_listen(port, 128) {
+            let fd = match enclave_os_common::ocall::net_tcp_listen(port, 128) {
                 Ok(fd) => fd,
                 Err(_) => {
                     results[0] = error_code_result("address-in-use");
@@ -183,7 +183,7 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
             // params[1] = network
             let (host, port) = extract_host_port_from_address(&params[2]);
 
-            let fd = match enclave_os_enclave::ocall::net_tcp_connect(&host, port) {
+            let fd = match enclave_os_common::ocall::net_tcp_connect(&host, port) {
                 Ok(fd) => fd,
                 Err(_) => {
                     results[0] = error_code_result("connection-refused");
@@ -305,7 +305,7 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
             };
 
             let (client_fd, _peer_addr) =
-                match enclave_os_enclave::ocall::net_tcp_accept(listener_fd) {
+                match enclave_os_common::ocall::net_tcp_accept(listener_fd) {
                     Ok(pair) => pair,
                     Err(_) => {
                         results[0] = error_code_result("unknown");
@@ -368,7 +368,7 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
             let sock_rep = io_rep::<TcpSocketRes>(&params[0], store.as_context_mut())?;
             if let Some(sock) = store.data_mut().tcp_sockets.get_mut(&sock_rep) {
                 if let Some(fd) = sock.fd.take() {
-                    enclave_os_enclave::ocall::net_close(fd);
+                    enclave_os_common::ocall::net_close(fd);
                 }
                 sock.connected = false;
             }

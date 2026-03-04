@@ -11,6 +11,9 @@
 #[cfg(feature = "sgx")]
 extern crate alloc;
 pub mod channel;
+pub mod hex;
+pub mod modules;
+pub mod ocall;
 pub mod oids;
 pub mod protocol;
 pub mod queue;
@@ -20,3 +23,32 @@ pub mod types;
 
 #[cfg(feature = "jwt")]
 pub mod jwt;
+
+#[cfg(feature = "crypto")]
+pub mod aead;
+
+// ── Convenience logging macros (call through the OCall vtable) ──────────
+
+/// Log an info-level message via the host.
+#[macro_export]
+macro_rules! enclave_log_info {
+    ($($arg:tt)*) => {
+        $crate::ocall::log(2, &format!($($arg)*))
+    };
+}
+
+/// Log an error-level message via the host.
+#[macro_export]
+macro_rules! enclave_log_error {
+    ($($arg:tt)*) => {
+        $crate::ocall::log(4, &format!($($arg)*))
+    };
+}
+
+/// Log a debug-level message via the host.
+#[macro_export]
+macro_rules! enclave_log_debug {
+    ($($arg:tt)*) => {
+        $crate::ocall::log(1, &format!($($arg)*))
+    };
+}

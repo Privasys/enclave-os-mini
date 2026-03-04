@@ -53,17 +53,11 @@ use std::sync::OnceLock;
 use std::vec::Vec;
 use ring::digest;
 
+use enclave_os_common::modules::ConfigLeaf;
+
 // ---------------------------------------------------------------------------
 //  Builder (mutable, used during init)
 // ---------------------------------------------------------------------------
-
-/// A named leaf: `(name, raw_data)`.
-pub struct ConfigLeaf {
-    /// Stable, human-readable identifier (e.g. `"core.ca_cert"`).
-    pub name: String,
-    /// Raw bytes to hash. `None` means the input is absent (leaf = 32 zero bytes).
-    pub data: Option<Vec<u8>>,
-}
 
 /// Mutable builder — accumulates leaves during enclave init.
 pub struct ConfigMerkleTree {

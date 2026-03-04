@@ -814,33 +814,33 @@ mod tests {
         assert_eq!(&quote[11..], &report_data[..]);
     }
 
-    // ----- hex_decode (from ecall) ----------------------------------------
+    // ----- hex_decode (from common) ----------------------------------------
 
     #[test]
     fn hex_decode_basic() {
-        let decoded = crate::ecall::hex_decode("48656c6c6f").unwrap();
+        let decoded = enclave_os_common::hex::hex_decode("48656c6c6f").unwrap();
         assert_eq!(&decoded, b"Hello");
     }
 
     #[test]
     fn hex_decode_empty() {
-        let decoded = crate::ecall::hex_decode("").unwrap();
+        let decoded = enclave_os_common::hex::hex_decode("").unwrap();
         assert!(decoded.is_empty());
     }
 
     #[test]
     fn hex_decode_uppercase() {
-        let decoded = crate::ecall::hex_decode("4F6B").unwrap();
+        let decoded = enclave_os_common::hex::hex_decode("4F6B").unwrap();
         assert_eq!(&decoded, b"Ok");
     }
 
     #[test]
     fn hex_decode_odd_length() {
-        assert!(crate::ecall::hex_decode("abc").is_none());
+        assert!(enclave_os_common::hex::hex_decode("abc").is_none());
     }
 
     #[test]
     fn hex_decode_invalid_char() {
-        assert!(crate::ecall::hex_decode("zz").is_none());
+        assert!(enclave_os_common::hex::hex_decode("zz").is_none());
     }
 }

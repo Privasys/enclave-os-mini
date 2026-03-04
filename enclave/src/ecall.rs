@@ -43,6 +43,7 @@ use crate::ratls::attestation::CaContext;
 use crate::ratls::server::IngressServer;
 use crate::sealed_config::SealedConfig;
 use crate::{enclave_log_info, enclave_log_error};
+use enclave_os_common::hex::{hex_decode, hex_encode};
 use enclave_os_common::types::AEAD_KEY_SIZE;
 use enclave_os_common::queue::{SpscProducer, SpscConsumer, SpscQueueHeader};
 use enclave_os_common::channel;
@@ -366,6 +367,38 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
 #[cfg(feature = "default-ecall")]
 #[no_mangle]
 pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
+    // Register the OCall vtable so module crates (which depend on common,
+    // not on enclave) can reach host services.
+    enclave_os_common::ocall::register(enclave_os_common::ocall::OcallVtable {
+        net_tcp_listen:    crate::ocall::net_tcp_listen,
+        net_tcp_accept:    crate::ocall::net_tcp_accept,
+        net_tcp_connect:   crate::ocall::net_tcp_connect,
+        net_send:          crate::ocall::net_send,
+        net_recv:          crate::ocall::net_recv,
+        net_close:         crate::ocall::net_close,
+        kv_store_put:      crate::ocall::kv_store_put,
+        kv_store_get:      |table, key| crate::ocall::kv_store_get(table, key, 0),
+        kv_store_delete:   crate::ocall::kv_store_delete,
+        kv_store_list_keys: crate::ocall::kv_store_list_keys,
+        get_current_time:  crate::ocall::get_current_time,
+        log:               |level, msg| {
+            let ll = match level {
+                0 => enclave_os_common::types::LogLevel::Trace,
+                1 => enclave_os_common::types::LogLevel::Debug,
+                2 => enclave_os_common::types::LogLevel::Info,
+                3 => enclave_os_common::types::LogLevel::Warn,
+                _ => enclave_os_common::types::LogLevel::Error,
+            };
+            crate::ocall::log(ll, msg);
+        },
+        cert_store_register:   |identity| {
+            crate::ratls::cert_store::cert_store().register(identity);
+        },
+        cert_store_unregister: |hostname| {
+            crate::ratls::cert_store::cert_store().unregister(hostname)
+        },
+    });
+
     let (config, sealed_cfg) = match init_enclave(config_json, config_len) {
         Ok(pair) => pair,
         Err(code) => return code,
@@ -518,41 +551,6 @@ pub struct EnclaveConfig {
 
 fn default_port() -> u16 { 443 }
 fn default_backlog() -> i32 { 128 }
-
-/// Minimal hex decoder (no external dependency).
-pub fn hex_decode(hex: &str) -> Option<Vec<u8>> {
-    let hex = hex.as_bytes();
-    if hex.len() % 2 != 0 {
-        return None;
-    }
-    let mut out = Vec::with_capacity(hex.len() / 2);
-    for chunk in hex.chunks_exact(2) {
-        let hi = hex_nibble(chunk[0])?;
-        let lo = hex_nibble(chunk[1])?;
-        out.push((hi << 4) | lo);
-    }
-    Some(out)
-}
-
-pub fn hex_nibble(b: u8) -> Option<u8> {
-    match b {
-        b'0'..=b'9' => Some(b - b'0'),
-        b'a'..=b'f' => Some(b - b'a' + 10),
-        b'A'..=b'F' => Some(b - b'A' + 10),
-        _ => None,
-    }
-}
-
-/// Minimal hex encoder (no external dependency).
-pub fn hex_encode(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        s.push(HEX[(b >> 4) as usize] as char);
-        s.push(HEX[(b & 0x0f) as usize] as char);
-    }
-    s
-}
 
 // ==========================================================================
 //  Unified sealed config resolution
