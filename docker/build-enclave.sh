@@ -59,7 +59,7 @@ cmake --build "${BUILD_DIR}" -j"$(nproc)"
 
 # ── Step 4: Extract MRENCLAVE ───────────────────────────────────────────
 echo "==> Extracting MRENCLAVE..."
-MRENCLAVE=$("${SRC}/scripts/extract-mrenclave.sh" "${BIN_DIR}/enclave.signed.so")
+MRENCLAVE=$(bash "${SRC}/scripts/extract-mrenclave.sh" "${BIN_DIR}/enclave.signed.so")
 echo "${MRENCLAVE}" > "${BUILD_DIR}/mrenclave.txt"
 
 # ── Step 5: Build summary ──────────────────────────────────────────────
