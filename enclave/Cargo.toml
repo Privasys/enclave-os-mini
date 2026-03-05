@@ -25,7 +25,7 @@ sgx = []
 # an external composition crate.
 default-ecall = []
 # Mock mode for development/testing on platforms without SGX
-mock = []
+mock = ["enclave-os-egress?/mock", "enclave-os-vault?/mock"]
 
 # ── Composable module features ──────────────────────────────────────────
 # Enable any combination — they are NOT mutually exclusive.

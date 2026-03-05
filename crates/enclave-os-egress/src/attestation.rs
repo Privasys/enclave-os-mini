@@ -68,6 +68,8 @@ use crate::root_store;
 // ---------------------------------------------------------------------------
 
 /// Mock attestation quote prefix (used in development / test builds).
+/// Only available when the `mock` feature is enabled.
+#[cfg(feature = "mock")]
 const MOCK_PREFIX: &[u8] = b"MOCK_QUOTE:";
 
 // ---------------------------------------------------------------------------
@@ -119,7 +121,7 @@ pub struct VerifyResponse {
 ///
 /// * `Ok(())` when:
 ///   - `attestation_servers` is empty (verification skipped), or
-///   - `evidence` starts with `MOCK_QUOTE:` (test mode), or
+///   - `evidence` starts with `MOCK_QUOTE:` (only with `mock` feature), or
 ///   - every server confirmed the quote.
 ///
 /// * `Err(String)` when:
@@ -147,6 +149,7 @@ pub fn verify_quote(
     }
 
     // Mock quotes are used in dev/test — skip verification.
+    #[cfg(feature = "mock")]
     if evidence.starts_with(MOCK_PREFIX) {
         return Ok(());
     }

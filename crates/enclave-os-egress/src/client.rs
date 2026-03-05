@@ -49,6 +49,8 @@ pub use enclave_os_common::oids::{
 // =========================================================================
 
 /// Mock quote prefix used in development/test builds.
+/// Only available when the `mock` feature is enabled.
+#[cfg(feature = "mock")]
 const MOCK_PREFIX: &[u8] = b"MOCK_QUOTE:";
 
 /// How the verifier reproduces the 64-byte `ReportData` field in the quote.
@@ -547,9 +549,12 @@ fn verify_ratls_cert(der: &[u8], policy: &RaTlsPolicy) -> Result<(), String> {
     let quote = quote_ext.value;
 
     // --- Parse quote via sgx_types and verify measurements + ReportData ---
-    if quote.starts_with(MOCK_PREFIX) {
-        // Mock quotes: skip measurement + ReportData checks.
-    } else {
+    #[cfg(feature = "mock")]
+    let is_mock = quote.starts_with(MOCK_PREFIX);
+    #[cfg(not(feature = "mock"))]
+    let is_mock = false;
+
+    if !is_mock {
         match policy.tee {
             TeeType::Sgx => {
                 let q = parse_quote3(quote)?;

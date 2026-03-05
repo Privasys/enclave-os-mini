@@ -11,6 +11,10 @@ description = "Secret store/fetch module for enclave-os — JWT-gated storage in
 [lib]
 name = "enclave_os_vault"
 
+[features]
+# Forward mock to the egress crate (accepts MOCK_QUOTE: prefixed quotes)
+mock = ["enclave-os-egress/mock"]
+
 [dependencies]
 # Shared types, module trait, and OCall vtable
 enclave-os-common  = { path = "../../common", features = ["jwt"] }

@@ -11,6 +11,11 @@ description = "HTTPS egress module for enclave-os — outbound TLS from inside S
 [lib]
 name = "enclave_os_egress"
 
+[features]
+# Mock mode — accepts MOCK_QUOTE: prefixed quotes without verification.
+# Only enable for development/testing on platforms without SGX hardware.
+mock = []
+
 [dependencies]
 # Shared types, module trait, and OCall vtable
 enclave-os-common = { path = "../../common", features = ["crypto"] }
