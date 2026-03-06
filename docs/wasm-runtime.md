@@ -242,13 +242,14 @@ app-specific X.509 certificate containing:
 | SGX Quote | `1.2.840.113741.1.13.1.0` | Same enclave quote (proves enclave identity) |
 | App Config Merkle Root | `1.3.6.1.4.1.65230.3.1` | SHA-256 tree of app-specific config |
 | App Code Hash | `1.3.6.1.4.1.65230.3.2` | SHA-256 of the WASM bytecode |
+| App Key Source | `1.3.6.1.4.1.65230.3.4` | `"generated"` or `"byok:<fingerprint>"` |
 
 The per-app Merkle tree contains:
 
 | Leaf | Value |
 |------|-------|
 | `wasm.<name>.code_hash` | SHA-256 of the `.cwasm` bytecode |
-| `wasm.<name>.key_source` | `"byok"` or `"generated"` |
+| `wasm.<name>.key_source` | `"generated"` or `"byok:<fingerprint>"` |
 
 This means a client can verify **exactly which WASM code is running** for
 a specific app without knowing about other apps in the same enclave.

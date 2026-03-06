@@ -173,6 +173,8 @@ pub fn generate_ratls_certificate(
 /// Like [`generate_ratls_certificate()`] but the leaf cert contains
 /// per-app data instead of enclave-wide module OIDs:
 /// - Per-app config Merkle root (OID `1.3.6.1.4.1.65230.3.1`)
+/// - Per-app code hash (OID `1.3.6.1.4.1.65230.3.2`)
+/// - Per-app key source (OID `1.3.6.1.4.1.65230.3.4`)
 /// - Per-app OID extensions flagged by config entries
 /// - SGX quote (same as the enclave-wide cert)
 /// - Subject CN = app hostname (for SNI matching)

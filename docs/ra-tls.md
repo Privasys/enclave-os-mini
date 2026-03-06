@@ -97,7 +97,8 @@ that encode the enclave's attestation data and configuration state.
 │   └── 2.3                          Combined WASM apps hash
 └── 3.*                              Per-app OIDs
     ├── 3.1                          App config Merkle root
-    └── 3.2                          App code hash
+    ├── 3.2                          App code hash
+    └── 3.4                          App key source
 ```
 
 ### Enclave-Wide OIDs
@@ -118,6 +119,7 @@ a dedicated certificate with app-level OIDs:
 |-----|------|-------|------|
 | `1.3.6.1.4.1.65230.3.1` | App Config Merkle Root | SHA-256 tree of app config | 32 bytes |
 | `1.3.6.1.4.1.65230.3.2` | App Code Hash | SHA-256 of WASM bytecode | 32 bytes |
+| `1.3.6.1.4.1.65230.3.4` | App Key Source | `"generated"` or `"byok:<fingerprint>"` | variable |
 
 ### Module OID Registration
 
@@ -370,11 +372,13 @@ Root CA (operator-provisioned)
             ├── App Leaf: "payments-api"
             │     ├── OID 1.3.6.1.4.1.65230.3.2  App Code Hash
             │     ├── OID 1.3.6.1.4.1.65230.3.1  App Config Merkle Root
+            │     ├── OID 1.3.6.1.4.1.65230.3.4  App Key Source
             │     └── OID 1.3.6.1.4.1.65230.3.*   App-specific custom OIDs
             │
             ├── App Leaf: "analytics-api"
             │     ├── OID 1.3.6.1.4.1.65230.3.2  App Code Hash
             │     ├── OID 1.3.6.1.4.1.65230.3.1  App Config Merkle Root
+            │     ├── OID 1.3.6.1.4.1.65230.3.4  App Key Source
             │     └── ...
             │
             └── ... (scales to thousands of apps)
@@ -404,7 +408,7 @@ tree.  Typical leaves:
 | Leaf name | Input |
 |-----------|-------|
 | `app.code_hash` | SHA-256 of the WASM `.cwasm` bytecode |
-| `app.key_source` | `"rdrand"` or `"byok:<key-id>"` |
+| `app.key_source` | `"generated"` or `"byok:<fingerprint>"` |
 | `app.name` | App name string |
 
 The root of this per-app tree is embedded as OID `1.3.6.1.4.1.65230.3.1`
@@ -454,7 +458,7 @@ fn app_identities(&self) -> Vec<AppIdentity> {
         code_hash: sha256_of_wasm_bytes,
         config_leaves: vec![
             ConfigLeaf { name: "app.code_hash".into(), data: wasm_bytes },
-            ConfigLeaf { name: "app.key_source".into(), data: b"rdrand" },
+            ConfigLeaf { name: "app.key_source".into(), data: b"generated" },
         ],
         custom_oids: vec![],
     }]

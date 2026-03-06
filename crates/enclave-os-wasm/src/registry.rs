@@ -72,9 +72,13 @@ pub struct LoadedApp {
     /// is dropped from memory, making any on-disk data permanently
     /// unrecoverable.
     encryption_key: [u8; AEAD_KEY_SIZE],
-    /// Whether the encryption key was supplied by the caller (BYOK)
-    /// or generated inside the enclave.
-    pub byok: bool,
+    /// How the encryption key was provisioned.
+    ///
+    /// - `"generated"` — key was generated inside the enclave.
+    /// - `"byok:<fingerprint>"` — caller supplied the key;
+    ///   `<fingerprint>` is the lowercase hex SHA-256 of the raw key
+    ///   bytes so attesters can verify which key is in use.
+    pub key_source: String,
     /// Compiled component (cheap to clone — refcounted internally).
     component: Component,
     /// Exported functions discovered from the component's WIT.
@@ -154,14 +158,25 @@ impl AppRegistry {
         // ── Deserialize (AOT) ──────────────────────────────────────
         let component = self.engine.deserialize(wasm_bytes)?;
         // ── Per-app encryption key ─────────────────────────────────
-        let (app_key, byok) = match encryption_key {
-            Some(k) => (k, true),
+        let (app_key, key_source) = match encryption_key {
+            Some(k) => {
+                let fingerprint = {
+                    let d = digest::digest(&digest::SHA256, &k);
+                    let mut buf = String::with_capacity(64);
+                    for b in d.as_ref() {
+                        use core::fmt::Write;
+                        let _ = write!(buf, "{:02x}", b);
+                    }
+                    buf
+                };
+                (k, format!("byok:{}", fingerprint))
+            }
             None => {
                 let rng = SystemRandom::new();
                 let mut k = [0u8; AEAD_KEY_SIZE];
                 rng.fill(&mut k)
                     .map_err(|_| String::from("RDRAND failed generating app encryption key"))?;
-                (k, false)
+                (k, String::from("generated"))
             }
         };
         // ── Introspect exports ─────────────────────────────────────
@@ -185,7 +200,7 @@ impl AppRegistry {
                 hostname: hostname.to_string(),
                 code_hash,
                 encryption_key: app_key,
-                byok,
+                key_source,
                 component,
                 exports,
             },
@@ -207,7 +222,7 @@ impl AppRegistry {
                 name: app.name.clone(),
                 hostname: app.hostname.clone(),
                 code_hash: enclave_os_common::hex::hex_encode(&app.code_hash),
-                key_source: if app.byok { "byok".into() } else { "generated".into() },
+                key_source: app.key_source.clone(),
                 exports: app.exported_funcs(),
             })
             .collect()
@@ -218,9 +233,11 @@ impl AppRegistry {
         self.apps.get(name).map(|app| &app.code_hash)
     }
 
-    /// Check whether an app uses Bring-Your-Own-Key for KV encryption.
-    pub fn app_byok(&self, name: &str) -> Option<bool> {
-        self.apps.get(name).map(|app| app.byok)
+    /// Get the key-source string for an app.
+    ///
+    /// Returns `"generated"` or `"byok:<fingerprint>"`.
+    pub fn app_key_source(&self, name: &str) -> Option<&str> {
+        self.apps.get(name).map(|app| app.key_source.as_str())
     }
 
     /// Get all loaded apps' code hashes (sorted by name).
@@ -233,11 +250,11 @@ impl AppRegistry {
 
     /// Get all loaded apps' attestation metadata (sorted by name).
     ///
-    /// Returns `(name, code_hash, byok)` for each loaded app.
-    pub fn all_app_metadata(&self) -> Vec<(&str, &[u8; 32], bool)> {
+    /// Returns `(name, code_hash, key_source)` for each loaded app.
+    pub fn all_app_metadata(&self) -> Vec<(&str, &[u8; 32], &str)> {
         self.apps
             .iter()
-            .map(|(name, app)| (name.as_str(), &app.code_hash, app.byok))
+            .map(|(name, app)| (name.as_str(), &app.code_hash, app.key_source.as_str()))
             .collect()
     }
 

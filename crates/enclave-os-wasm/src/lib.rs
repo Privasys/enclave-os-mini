@@ -142,7 +142,7 @@ impl WasmModule {
         encryption_key: Option<[u8; AEAD_KEY_SIZE]>,
     ) -> Result<(), String> {
         // Load into the registry (compile + introspect + per-app key)
-        let (code_hash, byok) = {
+        let (code_hash, key_source) = {
             let mut reg = self.registry
                 .lock()
                 .map_err(|_| String::from("registry lock poisoned"))?;
@@ -151,12 +151,13 @@ impl WasmModule {
             let hash = reg.app_code_hash(name)
                 .copied()
                 .ok_or_else(|| String::from("app loaded but hash not found"))?;
-            let byok = reg.app_byok(name).unwrap_or(false);
-            (hash, byok)
+            let ks = reg.app_key_source(name)
+                .unwrap_or("generated")
+                .to_string();
+            (hash, ks)
         };
 
         // Register per-app identity with the global CertStore
-        let key_source_str = if byok { "byok" } else { "generated" };
         let identity = AppIdentity {
             hostname: hostname.to_string(),
             config: vec![
@@ -167,8 +168,8 @@ impl WasmModule {
                 },
                 ConfigEntry {
                     key: format!("wasm.{}.key_source", name),
-                    value: key_source_str.as_bytes().to_vec(),
-                    oid: None,
+                    value: key_source.as_bytes().to_vec(),
+                    oid: Some(enclave_os_common::oids::APP_KEY_SOURCE_OID),
                 },
             ],
         };
@@ -349,7 +350,11 @@ impl EnclaveModule for WasmModule {
         None
     }
 
-    /// Config Merkle leaves for attestation.\n    ///\n    /// Each loaded app contributes two leaves:\n    ///   - `wasm.<app_name>.code_hash` = SHA-256 of the WASM bytecode\n    ///   - `wasm.<app_name>.key_source` = `\"byok\"` or `\"generated\"`
+    /// Config Merkle leaves for attestation.
+    ///
+    /// Each loaded app contributes two leaves:
+    ///   - `wasm.<app_name>.code_hash` = SHA-256 of the WASM bytecode
+    ///   - `wasm.<app_name>.key_source` = `"generated"` or `"byok:<fingerprint>"`
     fn config_leaves(&self) -> Vec<ConfigLeaf> {
         let registry = match self.registry.lock() {
             Ok(r) => r,
@@ -357,15 +362,14 @@ impl EnclaveModule for WasmModule {
         };
 
         let mut leaves = Vec::new();
-        for (name, hash, byok) in registry.all_app_metadata() {
+        for (name, hash, key_source) in registry.all_app_metadata() {
             leaves.push(ConfigLeaf {
                 name: format!("wasm.{}.code_hash", name),
                 data: Some(hash.to_vec()),
             });
-            let source = if byok { "byok" } else { "generated" };
             leaves.push(ConfigLeaf {
                 name: format!("wasm.{}.key_source", name),
-                data: Some(source.as_bytes().to_vec()),
+                data: Some(key_source.as_bytes().to_vec()),
             });
         }
         leaves

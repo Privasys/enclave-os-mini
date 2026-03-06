@@ -101,17 +101,17 @@ fn wasm_load_with_byok_key() {
     assert_eq!(parsed["encryption_key"], hex_key);
 }
 
-/// `AppInfo.key_source` is "byok" or "generated".
+/// `AppInfo.key_source` is `"byok:<fingerprint>"` or `"generated"`.
 #[test]
 fn app_info_key_source_values() {
     let info_byok = serde_json::json!({
         "name": "app-a",
         "hostname": "app-a.local",
         "code_hash": "abcd1234",
-        "key_source": "byok",
+        "key_source": "byok:abc123",
         "exports": []
     });
-    assert_eq!(info_byok["key_source"], "byok");
+    assert!(info_byok["key_source"].as_str().unwrap().starts_with("byok:"));
 
     let info_gen = serde_json::json!({
         "name": "app-b",
@@ -170,7 +170,7 @@ fn wasm_list_response_includes_key_source() {
                 "name": "app-b",
                 "hostname": "app-b.local",
                 "code_hash": "bb",
-                "key_source": "byok",
+                "key_source": "byok:abc123",
                 "exports": []
             }
         ]
@@ -178,7 +178,7 @@ fn wasm_list_response_includes_key_source() {
 
     let apps = response["apps"].as_array().unwrap();
     assert_eq!(apps[0]["key_source"], "generated");
-    assert_eq!(apps[1]["key_source"], "byok");
+    assert!(apps[1]["key_source"].as_str().unwrap().starts_with("byok:"));
 }
 
 // ---------------------------------------------------------------------------
@@ -352,7 +352,7 @@ fn key_source_leaf_affects_attestation() {
 
     let root_byok = per_app_merkle_root(&[
         &code_hash_bytes,
-        b"byok",
+        b"byok:abc123",
     ]);
 
     assert_ne!(

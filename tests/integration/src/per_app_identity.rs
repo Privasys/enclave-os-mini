@@ -7,6 +7,7 @@
 //! certificate (signed by the Enclave CA) with:
 //!   - A per-app config Merkle root (code_hash + key_source leaves)
 //!   - A code hash OID extension for fast-path verification
+//!   - A key source OID extension (`"generated"` or `"byok:<fingerprint>"`)
 //!   - An SNI-routed hostname
 //!
 //! These tests reproduce the Merkle tree + X.509 extension logic
@@ -22,6 +23,7 @@ use x509_parser::prelude::*;
 use enclave_os_common::oids::{
     APP_CODE_HASH_OID, APP_CODE_HASH_OID_STR,
     APP_CONFIG_MERKLE_ROOT_OID, APP_CONFIG_MERKLE_ROOT_OID_STR,
+    APP_KEY_SOURCE_OID, APP_KEY_SOURCE_OID_STR,
 };
 
 // ---------------------------------------------------------------------------
@@ -61,7 +63,7 @@ fn per_app_merkle_root(entry_values: &[&[u8]]) -> [u8; 32] {
 ///
 /// The enclave registers these entries in `WasmModule::load_app()`:
 ///   1. `wasm.<name>.code_hash` → raw 32-byte SHA-256
-///   2. `wasm.<name>.key_source` → `"byok"` or `"generated"`
+///   2. `wasm.<name>.key_source` → `"generated"` or `"byok:<fingerprint>"`
 fn app_merkle_root(code_hash: &[u8; 32], key_source: &str) -> [u8; 32] {
     per_app_merkle_root(&[code_hash.as_slice(), key_source.as_bytes()])
 }
@@ -84,6 +86,7 @@ fn generate_ca(cn: &str) -> (Vec<u8>, Vec<u8>) {
 /// Build a per-app leaf certificate with both:
 ///   - `APP_CONFIG_MERKLE_ROOT_OID` (per-app Merkle root)
 ///   - `APP_CODE_HASH_OID` (per-app code hash)
+///   - `APP_KEY_SOURCE_OID` (per-app key source)
 ///
 /// This mirrors the attestation logic in `generate_app_certificate()`.
 fn build_app_leaf_cert(
@@ -92,6 +95,7 @@ fn build_app_leaf_cert(
     hostname: &str,
     merkle_root: &[u8; 32],
     code_hash: &[u8; 32],
+    key_source: &str,
 ) -> Vec<u8> {
     use rustls_pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
@@ -121,6 +125,14 @@ fn build_app_leaf_cert(
         CustomExtension::from_oid_content(
             APP_CODE_HASH_OID,
             code_hash.to_vec(),
+        ),
+    );
+
+    // Per-app key source extension
+    leaf_params.custom_extensions.push(
+        CustomExtension::from_oid_content(
+            APP_KEY_SOURCE_OID,
+            key_source.as_bytes().to_vec(),
         ),
     );
 
@@ -176,7 +188,7 @@ fn different_key_source_produces_different_merkle_root() {
     let code_hash = entry_hash(b"some wasm bytecode");
 
     let root_generated = app_merkle_root(&code_hash, "generated");
-    let root_byok = app_merkle_root(&code_hash, "byok");
+    let root_byok = app_merkle_root(&code_hash, "byok:abc123");
 
     assert_ne!(
         root_generated, root_byok,
@@ -204,8 +216,8 @@ fn different_code_hash_produces_different_merkle_root() {
 fn same_config_produces_same_merkle_root() {
     let code_hash = entry_hash(b"identical wasm bytecode");
 
-    let root_a = app_merkle_root(&code_hash, "byok");
-    let root_b = app_merkle_root(&code_hash, "byok");
+    let root_a = app_merkle_root(&code_hash, "byok:abc123");
+    let root_b = app_merkle_root(&code_hash, "byok:abc123");
 
     assert_eq!(root_a, root_b, "Identical config must produce identical roots");
 }
@@ -248,7 +260,7 @@ fn entry_order_affects_merkle_root() {
 //  Tests — Per-app X.509 certificates
 // ---------------------------------------------------------------------------
 
-/// Per-app leaf cert contains both the Merkle root and code hash extensions.
+/// Per-app leaf cert contains the Merkle root, code hash, and key source extensions.
 #[test]
 fn app_leaf_cert_contains_expected_extensions() {
     let (ca_der, ca_key) = generate_ca("Test Enclave CA");
@@ -258,16 +270,19 @@ fn app_leaf_cert_contains_expected_extensions() {
     let leaf = build_app_leaf_cert(
         &ca_der, &ca_key,
         "hello.enclave.local",
-        &root, &code_hash,
+        &root, &code_hash, "generated",
     );
 
     let ext_root = extract_extension(&leaf, APP_CONFIG_MERKLE_ROOT_OID_STR)
         .expect("Per-app Merkle root extension missing");
     let ext_hash = extract_extension(&leaf, APP_CODE_HASH_OID_STR)
         .expect("Per-app code hash extension missing");
+    let ext_ks = extract_extension(&leaf, APP_KEY_SOURCE_OID_STR)
+        .expect("Per-app key source extension missing");
 
     assert_eq!(ext_root.as_slice(), root.as_slice());
     assert_eq!(ext_hash.as_slice(), code_hash.as_slice());
+    assert_eq!(ext_ks.as_slice(), b"generated");
 }
 
 /// Per-app leaf cert has the hostname as Subject CN.
@@ -275,12 +290,12 @@ fn app_leaf_cert_contains_expected_extensions() {
 fn app_leaf_cert_has_hostname_as_cn() {
     let (ca_der, ca_key) = generate_ca("Test Enclave CA");
     let code_hash = entry_hash(b"payments.wasm");
-    let root = app_merkle_root(&code_hash, "byok");
+    let root = app_merkle_root(&code_hash, "byok:abc123");
 
     let leaf = build_app_leaf_cert(
         &ca_der, &ca_key,
         "payments.example.com",
-        &root, &code_hash,
+        &root, &code_hash, "byok:abc123",
     );
 
     let cn = extract_cn(&leaf).expect("Subject CN missing");
@@ -295,13 +310,13 @@ fn different_apps_get_different_certs() {
     let hash_a = entry_hash(b"app-a.wasm");
     let root_a = app_merkle_root(&hash_a, "generated");
     let leaf_a = build_app_leaf_cert(
-        &ca_der, &ca_key, "app-a.enclave.local", &root_a, &hash_a,
+        &ca_der, &ca_key, "app-a.enclave.local", &root_a, &hash_a, "generated",
     );
 
     let hash_b = entry_hash(b"app-b.wasm");
-    let root_b = app_merkle_root(&hash_b, "byok");
+    let root_b = app_merkle_root(&hash_b, "byok:def456");
     let leaf_b = build_app_leaf_cert(
-        &ca_der, &ca_key, "app-b.enclave.local", &root_b, &hash_b,
+        &ca_der, &ca_key, "app-b.enclave.local", &root_b, &hash_b, "byok:def456",
     );
 
     let ext_root_a = extract_extension(&leaf_a, APP_CONFIG_MERKLE_ROOT_OID_STR).unwrap();
@@ -312,12 +327,16 @@ fn different_apps_get_different_certs() {
     let ext_hash_b = extract_extension(&leaf_b, APP_CODE_HASH_OID_STR).unwrap();
     assert_ne!(ext_hash_a, ext_hash_b, "Different apps must have different code hashes");
 
+    let ext_ks_a = extract_extension(&leaf_a, APP_KEY_SOURCE_OID_STR).unwrap();
+    let ext_ks_b = extract_extension(&leaf_b, APP_KEY_SOURCE_OID_STR).unwrap();
+    assert_ne!(ext_ks_a, ext_ks_b, "Different apps must have different key sources");
+
     let cn_a = extract_cn(&leaf_a).unwrap();
     let cn_b = extract_cn(&leaf_b).unwrap();
     assert_ne!(cn_a, cn_b, "Different apps must have different hostnames");
 }
 
-/// Changing only the key_source (byok ↔ generated) changes the Merkle root
+/// Changing only the key_source (byok:… ↔ generated) changes the Merkle root
 /// but NOT the code hash extension — proving they are independent.
 #[test]
 fn key_source_change_affects_only_merkle_root() {
@@ -325,13 +344,13 @@ fn key_source_change_affects_only_merkle_root() {
     let code_hash = entry_hash(b"same-code.wasm");
 
     let root_gen = app_merkle_root(&code_hash, "generated");
-    let root_byok = app_merkle_root(&code_hash, "byok");
+    let root_byok = app_merkle_root(&code_hash, "byok:abc123");
 
     let leaf_gen = build_app_leaf_cert(
-        &ca_der, &ca_key, "app.local", &root_gen, &code_hash,
+        &ca_der, &ca_key, "app.local", &root_gen, &code_hash, "generated",
     );
     let leaf_byok = build_app_leaf_cert(
-        &ca_der, &ca_key, "app.local", &root_byok, &code_hash,
+        &ca_der, &ca_key, "app.local", &root_byok, &code_hash, "byok:abc123",
     );
 
     // Merkle roots differ
@@ -343,9 +362,17 @@ fn key_source_change_affects_only_merkle_root() {
     let ext_hash_gen = extract_extension(&leaf_gen, APP_CODE_HASH_OID_STR).unwrap();
     let ext_hash_byok = extract_extension(&leaf_byok, APP_CODE_HASH_OID_STR).unwrap();
     assert_eq!(ext_hash_gen, ext_hash_byok, "Code hash must be unchanged");
+
+    // Key source extensions differ
+    let ext_ks_gen = extract_extension(&leaf_gen, APP_KEY_SOURCE_OID_STR).unwrap();
+    let ext_ks_byok = extract_extension(&leaf_byok, APP_KEY_SOURCE_OID_STR).unwrap();
+    assert_eq!(ext_ks_gen.as_slice(), b"generated");
+    assert!(ext_ks_byok.starts_with(b"byok:"), "BYOK key source must start with byok:");
+    assert_ne!(ext_ks_gen, ext_ks_byok, "Key source extensions must differ");
 }
 
-/// Both per-app extensions are exactly 32 bytes (SHA-256 size).
+/// Per-app binary extensions (Merkle root, code hash) are exactly 32 bytes;
+/// the key source extension is a variable-length UTF-8 string.
 #[test]
 fn per_app_extensions_are_32_bytes() {
     let (ca_der, ca_key) = generate_ca("Test Enclave CA");
@@ -353,14 +380,16 @@ fn per_app_extensions_are_32_bytes() {
     let root = app_merkle_root(&code_hash, "generated");
 
     let leaf = build_app_leaf_cert(
-        &ca_der, &ca_key, "check.local", &root, &code_hash,
+        &ca_der, &ca_key, "check.local", &root, &code_hash, "generated",
     );
 
     let ext_root = extract_extension(&leaf, APP_CONFIG_MERKLE_ROOT_OID_STR).unwrap();
     let ext_hash = extract_extension(&leaf, APP_CODE_HASH_OID_STR).unwrap();
+    let ext_ks = extract_extension(&leaf, APP_KEY_SOURCE_OID_STR).unwrap();
 
     assert_eq!(ext_root.len(), 32, "Merkle root extension must be 32 bytes");
     assert_eq!(ext_hash.len(), 32, "Code hash extension must be 32 bytes");
+    assert_eq!(ext_ks.as_slice(), b"generated", "Key source must be \"generated\"");
 }
 
 /// A cert without per-app extensions (simulating the enclave-wide cert)
@@ -405,5 +434,9 @@ fn enclave_wide_cert_lacks_per_app_extensions() {
     assert!(
         extract_extension(&leaf_der, APP_CODE_HASH_OID_STR).is_none(),
         "Enclave-wide cert must NOT contain per-app code hash OID"
+    );
+    assert!(
+        extract_extension(&leaf_der, APP_KEY_SOURCE_OID_STR).is_none(),
+        "Enclave-wide cert must NOT contain per-app key source OID"
     );
 }

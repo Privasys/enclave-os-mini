@@ -270,7 +270,8 @@ pub struct AppInfo {
     pub code_hash: String,
     /// How the app's KV store encryption key was provisioned.
     ///
-    /// - `"byok"`: Bring-Your-Own-Key — caller supplied the key.
+    /// - `"byok:<fingerprint>"`: Bring-Your-Own-Key — caller supplied the
+    ///   key; `<fingerprint>` is the hex SHA-256 of the raw key bytes.
     /// - `"generated"`: Key was generated inside the enclave via RDRAND.
     pub key_source: String,
     /// Exported function signatures discovered from the component.

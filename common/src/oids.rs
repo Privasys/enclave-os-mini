@@ -84,3 +84,16 @@ pub const APP_CONFIG_MERKLE_ROOT_OID_STR: &str = "1.3.6.1.4.1.65230.3.1";
 pub const APP_CODE_HASH_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 3, 2];
 /// Per-app Code Hash (dotted-string).
 pub const APP_CODE_HASH_OID_STR: &str = "1.3.6.1.4.1.65230.3.2";
+
+/// Per-app Key Source — `1.3.6.1.4.1.65230.3.4`
+///
+/// UTF-8 string indicating the encryption key provenance for a WASM app:
+/// `"generated"` for enclave-generated keys (RDRAND), or
+/// `"byok:<fingerprint>"` where `<fingerprint>` is the hex SHA-256 of
+/// the raw key bytes, allowing attesters to verify which specific key
+/// is in use without revealing the key itself.
+///
+/// Aligned with enclave-os-virtual's OID 3.4 (Container Volume Encryption).
+pub const APP_KEY_SOURCE_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 3, 4];
+/// Per-app Key Source (dotted-string).
+pub const APP_KEY_SOURCE_OID_STR: &str = "1.3.6.1.4.1.65230.3.4";
