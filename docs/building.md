@@ -262,7 +262,8 @@ openssl s_client -connect enclave.example.com:443 </dev/null 2>&1 | \
 Expected OIDs:
 - `1.3.6.1.4.1.65230.1.1` — Config Merkle Root
 - `1.3.6.1.4.1.65230.2.1` — Egress CA Hash
-- `1.3.6.1.4.1.65230.2.3` — WASM Apps Hash
+- `1.3.6.1.4.1.65230.2.5` — Combined Workloads Hash (WASM apps)
+- `1.3.6.1.4.1.65230.2.7` — Attestation Servers Hash
 
 ---
 

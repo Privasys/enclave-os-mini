@@ -48,8 +48,8 @@ without requesting the full manifest:
 |-----|----------|----------------|
 | `1.3.6.1.4.1.65230.1.1` | `CONFIG_MERKLE_ROOT_OID` | All config inputs (Merkle root) |
 | `1.3.6.1.4.1.65230.2.1` | `EGRESS_CA_HASH_OID` | Egress CA bundle identity |
-| `1.3.6.1.4.1.65230.2.3` | `WASM_APPS_HASH_OID` | WASM application code identity |
-| `1.3.6.1.4.1.65230.2.4` | `ATTESTATION_SERVERS_HASH_OID` | Attestation server URL list |
+| `1.3.6.1.4.1.65230.2.5` | `COMBINED_WORKLOADS_HASH_OID` | Combined workloads (WASM apps) hash |
+| `1.3.6.1.4.1.65230.2.7` | `ATTESTATION_SERVERS_HASH_OID` | Attestation server URL list |
 | `1.3.6.1.4.1.65230.3.1` | `APP_CONFIG_MERKLE_ROOT_OID` | Per-app config Merkle root |
 | `1.3.6.1.4.1.65230.3.2` | `APP_CODE_HASH_OID` | Per-app code hash |
 
@@ -116,12 +116,12 @@ Inside the enclave, the `EgressModule` canonicalises the URL list (sorted,
 newline-joined) and hashes it to produce:
 
 - Merkle leaf `egress.attestation_servers` (included in the root)
-- OID `1.3.6.1.4.1.65230.2.4` (individual fast-path)
+- OID `1.3.6.1.4.1.65230.2.7` (individual fast-path)
 
 **How to update:**
 
 1. Restart the host with the new `--attestation-servers` value.
-2. The Merkle root and OID `2.4` reflect the updated server list.
+2. The Merkle root and OID `2.7` reflect the updated server list.
 3. Remote verifiers that pin either value will detect the change.
 
 **Multi-party trust**: by specifying multiple URLs, the enclave operator and
@@ -152,7 +152,7 @@ To verify:
 1. Extract the attestation quote → verify via attestation server
 2. Extract OID 1.3.6.1.4.1.65230.1.1 → compare against known-good root
    (OR)
-   Extract individual OIDs (2.1, 2.3, 2.4, …) → compare specific values
+   Extract individual OIDs (2.1, 2.5, 2.7, …) → compare specific values
 3. (Optional) Request the full manifest from the enclave → recompute
    root from leaf hashes → confirm it matches the cert OID
 ```
@@ -165,7 +165,7 @@ To verify:
 sha256sum /path/to/ca-bundle.pem
 ```
 
-**Attestation servers hash** (OID `2.4`):
+**Attestation servers hash** (OID `2.7`):
 
 ```bash
 # Sort URLs, join with newlines, SHA-256

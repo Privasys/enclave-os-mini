@@ -23,11 +23,11 @@ single SGX enclave.
 ┌────────────────────────────────────────────────────────────┐
 │                     Host (Untrusted)                       │
 │                                                            │
-│  ┌──────────────┐   ┌─────────────┐   ┌────────────────┐   │
-│  │ TCP Socket   │   │ KV Store    │   │ RPC Dispatcher │   │
-│  │ Table        │   │ Backend     │   │ (spin-polls    │   │
-│  │ (net/)       │   │ (kvstore/)  │   │  enc_to_host)  │   │
-│  └──────┬───────┘   └──────┬──────┘   └────────┬───────┘   │
+│  ┌──────────────┐   ┌─────────────┐   ┌─────────────────┐  │
+│  │ TCP Socket   │   │ KV Store    │   │ RPC Dispatcher  │  │
+│  │ Table        │   │ Backend     │   │ (spin-polls     │  │
+│  │ (net/)       │   │ (kvstore/)  │   │  enc_to_host)   │  │
+│  └──────┬───────┘   └──────┬──────┘   └────────┬────────┘  │
 │         │                  │                   │           │
 │  ┌──────┴──────────────────┴───────────────────┴────────┐  │
 │  │            Shared Memory SPSC Queues                 │  │
@@ -38,10 +38,10 @@ single SGX enclave.
 ├───────────────────────────┼────────────────────────────────┤
 │                           │     ← SGX boundary             │
 │                           │       (4 ECALLs + 1 OCALL)     │
-│  ┌────────────────────────┴────────────────────────────┐   │
-│  │                RPC Client                           │   │
-│  │  (encodes requests → enc_to_host, reads responses)  │   │
-│  └───┬──────────────┬──────────────┬───────────────────┘   │
+│  ┌────────────────────────┴─────────────────────────────┐  │
+│  │                RPC Client                            │  │
+│  │  (encodes requests → enc_to_host, reads responses)   │  │
+│  └───┬──────────────┬──────────────┬────────────────────┘  │
 │      │              │              │                       │
 │  ┌───┴──────┐  ┌────┴───────┐  ┌───┴────────┐              │
 │  │ RA-TLS   │  │ HTTPS      │  │ Sealed KV  │              │
@@ -65,7 +65,7 @@ Business logic is implemented as **pluggable modules** conforming to the
 |--------|-------|---------|
 | **egress** | `crates/enclave-os-egress` | `1.3.6.1.4.1.65230.2.1` (Egress CA Hash) |
 | **kvstore** | `crates/enclave-os-kvstore` | — |
-| **wasm** | `crates/enclave-os-wasm` | `1.3.6.1.4.1.65230.2.3` (WASM Apps Hash) |
+| **wasm** | `crates/enclave-os-wasm` | `1.3.6.1.4.1.65230.2.5` (Combined Workloads Hash) |
 | **vault** | `crates/enclave-os-vault` | — |
 
 See [Architecture](docs/architecture.md) for the full module interface, composition model, and how to add your own.

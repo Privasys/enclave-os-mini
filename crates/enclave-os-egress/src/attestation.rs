@@ -49,7 +49,7 @@
 //!
 //! Attestation server URLs are passed to [`EgressModule::new()`] at
 //! startup and registered as a config Merkle leaf (`egress.attestation_servers`)
-//! with a dedicated X.509 OID (`1.3.6.1.4.1.65230.2.4`), making the
+//! with a dedicated X.509 OID (`1.3.6.1.4.1.65230.2.7`), making the
 //! configuration auditable by remote verifiers.  Other modules (e.g. the
 //! vault) access the configured servers via [`crate::attestation_servers()`].
 

@@ -164,8 +164,8 @@ pub struct RaTlsPolicy {
     /// |----------|-----|----------------|
     /// | [`OID_CONFIG_MERKLE_ROOT`] | `1.3.6.1.4.1.65230.1.1` | All config inputs (Merkle tree root) |
     /// | [`OID_EGRESS_CA_HASH`] | `1.3.6.1.4.1.65230.2.1` | Egress CA bundle identity |
-    /// | [`OID_WASM_APPS_HASH`] | `1.3.6.1.4.1.65230.2.3` | WASM application code identity |
-    /// | [`OID_ATTESTATION_SERVERS_HASH`] | `1.3.6.1.4.1.65230.2.4` | Attestation server URL list identity |
+    /// | [`OID_WASM_APPS_HASH`] | `1.3.6.1.4.1.65230.2.5` | Combined workloads (WASM apps) hash |
+    /// | [`OID_ATTESTATION_SERVERS_HASH`] | `1.3.6.1.4.1.65230.2.7` | Attestation server URL list identity |
     ///
     /// An empty `Vec` (the default) skips OID verification.
     pub expected_oids: Vec<ExpectedOid>,

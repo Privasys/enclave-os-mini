@@ -94,7 +94,8 @@ that encode the enclave's attestation data and configuration state.
 ├── 1.1                              Config Merkle root (enclave-wide)
 ├── 2.*                              Module OIDs (enclave-wide)
 │   ├── 2.1                          Egress CA bundle hash
-│   └── 2.3                          Combined WASM apps hash
+│   ├── 2.5                          Combined workloads hash (WASM apps)
+│   └── 2.7                          Attestation servers hash
 └── 3.*                              Per-app OIDs
     ├── 3.1                          App config Merkle root
     ├── 3.2                          App code hash
@@ -108,7 +109,8 @@ that encode the enclave's attestation data and configuration state.
 | `1.2.840.113741.1.13.1.0` | SGX Quote | Raw DCAP quote bytes | ~4 KB |
 | `1.3.6.1.4.1.65230.1.1` | Config Merkle Root | SHA-256 hash | 32 bytes |
 | `1.3.6.1.4.1.65230.2.1` | Egress CA Hash | SHA-256 of CA bundle PEM | 32 bytes |
-| `1.3.6.1.4.1.65230.2.3` | WASM Apps Hash | SHA-256 of all app hashes | 32 bytes |
+| `1.3.6.1.4.1.65230.2.5` | Combined Workloads Hash | SHA-256 of all app hashes | 32 bytes |
+| `1.3.6.1.4.1.65230.2.7` | Attestation Servers Hash | SHA-256 of server URL list | 32 bytes |
 
 ### Per-App OIDs
 
@@ -435,8 +437,8 @@ No need to inspect other apps' certificates or parse a combined hash.
 | **Enclave-wide** | Enclave CA cert (or default leaf if no SNI) | SGX Quote, Config Merkle Root (`1.1`), Module OIDs (`2.*`) |
 | **Per-app** | App leaf cert (via SNI) | App Code Hash (`3.2`), App Config Merkle Root (`3.1`), app-specific (`3.*`) |
 
-The enclave-wide certificate still contains the **combined WASM apps hash**
-(OID `1.3.6.1.4.1.65230.2.3`) for clients that want a single check covering
+The enclave-wide certificate still contains the **combined workloads hash**
+(OID `1.3.6.1.4.1.65230.2.5`) for clients that want a single check covering
 all loaded apps without SNI routing.
 
 ### SNI routing in `CertStore`

@@ -92,7 +92,7 @@ use crate::types::{
 /// Attestation server URLs are configured via [`EgressModule::new()`] at
 /// startup and accessed at runtime through [`enclave_os_egress::attestation_servers()`].
 /// The URL list is registered as a Merkle tree leaf and X.509 OID
-/// (`1.3.6.1.4.1.65230.2.4`), making it auditable.
+/// (`1.3.6.1.4.1.65230.2.7`), making it auditable.
 pub struct VaultModule {
     _private: (), // zero-sized — no global state needed
 }
@@ -328,7 +328,7 @@ impl VaultModule {
         //
         // The server list is configured at startup via EgressModule and
         // registered in the config Merkle tree (leaf: egress.attestation_servers,
-        // OID: 1.3.6.1.4.1.65230.2.4).
+        // OID: 1.3.6.1.4.1.65230.2.7).
         let attestation_servers = enclave_os_egress::attestation_servers()
             .ok_or_else(|| "EgressModule not initialised (attestation servers unavailable)")
             .map_err(|e| e.to_string());

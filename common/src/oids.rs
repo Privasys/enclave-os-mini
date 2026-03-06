@@ -47,22 +47,46 @@ pub const EGRESS_CA_HASH_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 2, 1];
 /// Egress CA Bundle Hash (dotted-string).
 pub const EGRESS_CA_HASH_OID_STR: &str = "1.3.6.1.4.1.65230.2.1";
 
-/// WASM Apps Combined Code Hash — `1.3.6.1.4.1.65230.2.3`
+/// Runtime Version Hash — `1.3.6.1.4.1.65230.2.4`
 ///
-/// 32-byte SHA-256 hash of the combined WASM application code loaded in
-/// the enclave.
-pub const WASM_APPS_HASH_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 2, 3];
-/// WASM Apps Combined Code Hash (dotted-string).
-pub const WASM_APPS_HASH_OID_STR: &str = "1.3.6.1.4.1.65230.2.3";
+/// 32-byte SHA-256 hash of the runtime version string.  In enclave-os-mini
+/// this covers the Wasmtime engine version; in enclave-os-virtual it covers
+/// the containerd version.  Reserved for future use in Mini.
+///
+/// Aligned with enclave-os-virtual OID 2.4 (Runtime Version Hash).
+pub const RUNTIME_VERSION_HASH_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 2, 4];
+/// Runtime Version Hash (dotted-string).
+pub const RUNTIME_VERSION_HASH_OID_STR: &str = "1.3.6.1.4.1.65230.2.4";
 
-/// Attestation Servers Hash — `1.3.6.1.4.1.65230.2.4`
+/// Combined Workloads Hash — `1.3.6.1.4.1.65230.2.5`
+///
+/// 32-byte SHA-256 hash of all workload code hashes (sorted by name,
+/// concatenated).  In enclave-os-mini this covers WASM app bytecode;
+/// in enclave-os-virtual it covers OCI container image digests.
+///
+/// Aligned with enclave-os-virtual OID 2.5 (Combined Workloads Hash).
+pub const COMBINED_WORKLOADS_HASH_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 2, 5];
+/// Combined Workloads Hash (dotted-string).
+pub const COMBINED_WORKLOADS_HASH_OID_STR: &str = "1.3.6.1.4.1.65230.2.5";
+
+/// Attestation Servers Hash — `1.3.6.1.4.1.65230.2.7`
 ///
 /// 32-byte SHA-256 hash of the canonical attestation server URL list
 /// trusted by the enclave for remote attestation verification.  The hash
 /// is computed over the sorted, newline-joined URL strings.
-pub const ATTESTATION_SERVERS_HASH_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 2, 4];
+///
+/// Aligned with enclave-os-virtual OID 2.7 (Attestation Servers Hash).
+pub const ATTESTATION_SERVERS_HASH_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 2, 7];
 /// Attestation Servers Hash (dotted-string).
-pub const ATTESTATION_SERVERS_HASH_OID_STR: &str = "1.3.6.1.4.1.65230.2.4";
+pub const ATTESTATION_SERVERS_HASH_OID_STR: &str = "1.3.6.1.4.1.65230.2.7";
+
+// ---- Backward-compatible aliases ----------------------------------------
+
+/// Alias for [`COMBINED_WORKLOADS_HASH_OID`] (was `WASM_APPS_HASH_OID`
+/// at `2.3`; now lives at `2.5`).
+pub const WASM_APPS_HASH_OID: &[u64] = COMBINED_WORKLOADS_HASH_OID;
+/// Alias for [`COMBINED_WORKLOADS_HASH_OID_STR`].
+pub const WASM_APPS_HASH_OID_STR: &str = COMBINED_WORKLOADS_HASH_OID_STR;
 
 // =========================================================================
 //  Per-app certificate OIDs

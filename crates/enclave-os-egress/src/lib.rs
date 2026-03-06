@@ -23,7 +23,7 @@
 //! - Registers config Merkle leaves: `egress.ca_bundle`, `egress.attestation_servers`
 //! - Registers custom X.509 OIDs:
 //!   - `1.3.6.1.4.1.65230.2.1` — CA bundle SHA-256 hash
-//!   - `1.3.6.1.4.1.65230.2.4` — attestation servers SHA-256 hash
+//!   - `1.3.6.1.4.1.65230.2.7` — attestation servers SHA-256 hash
 //!   so clients can verify the egress trust anchors and attestation
 //!   server configuration without a full Merkle audit.
 //!
