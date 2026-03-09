@@ -16,17 +16,16 @@ sgx = []
 # Cryptographic primitives (ring) — used by quote::compute_report_data_hash
 crypto = ["dep:ring"]
 # JWT verification & encoding (ECDSA P-256 / ES256)
-jwt = ["crypto", "dep:base64", "dep:serde_json"]
+jwt = ["crypto", "dep:base64"]
 
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
 
 # Optional: only pulled in when the `jwt` feature is enabled
 ring       = { version = "0.17", optional = true }
 base64     = { version = "0.21", default-features = false, features = ["alloc"], optional = true }
-serde_json = { version = "1", default-features = false, features = ["alloc"], optional = true }
 
 [dev-dependencies]
-serde_json = "1"
 ring = "0.17"
 base64 = "0.21"

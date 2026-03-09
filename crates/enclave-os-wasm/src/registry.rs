@@ -50,7 +50,7 @@ use wasmtime::component::{Component, Func, Val};
 
 use crate::engine::WasmEngine;
 use enclave_os_common::types::AEAD_KEY_SIZE;
-use crate::protocol::{ExportedFunc, WasmParam, WasmResult, WasmValue};
+use crate::protocol::{AppPermissions, ExportedFunc, FunctionPolicy, WasmParam, WasmResult, WasmValue};
 use crate::wasi::AppContext;
 
 // ---------------------------------------------------------------------------
@@ -86,6 +86,10 @@ pub struct LoadedApp {
     /// Key: function path (e.g. `"process"` or `"my-api/transform"`).
     /// Value: `(param_count, result_count)`.
     exports: BTreeMap<String, (usize, usize)>,
+    /// Optional per-app permission policy.
+    pub permissions: Option<AppPermissions>,
+    /// SHA-256 hash of the permissions JSON (if any).
+    pub permissions_hash: Option<[u8; 32]>,
 }
 
 impl LoadedApp {
@@ -138,6 +142,9 @@ impl AppRegistry {
     /// If `encryption_key` is `Some`, the caller supplies the AES-256 key
     /// (BYOK). Otherwise a random key is generated via RDRAND.
     ///
+    /// If `permissions` is `Some`, its SHA-256 hash is computed for OID
+    /// attestation and the policy is stored for per-function enforcement.
+    ///
     /// Returns an error if `name` is already taken or deserialization fails.
     pub fn load_app(
         &mut self,
@@ -145,6 +152,7 @@ impl AppRegistry {
         hostname: &str,
         wasm_bytes: &[u8],
         encryption_key: Option<[u8; AEAD_KEY_SIZE]>,
+        permissions: Option<AppPermissions>,
     ) -> Result<(), String> {
         if self.apps.contains_key(name) {
             return Err(format!("app '{}' is already loaded", name));
@@ -193,6 +201,26 @@ impl AppRegistry {
             ));
         }
 
+        // ── Permissions hash ────────────────────────────────────────────
+        let permissions_hash = permissions.as_ref().map(|p| {
+            let canonical = serde_json::to_vec(p)
+                .expect("AppPermissions must be serialisable");
+            let h = digest::digest(&digest::SHA256, &canonical);
+            let mut out = [0u8; 32];
+            out.copy_from_slice(h.as_ref());
+            out
+        });
+
+        // Validate permissions version
+        if let Some(ref p) = permissions {
+            if p.version != 1 {
+                return Err(format!(
+                    "unsupported permissions version: {} (expected 1)",
+                    p.version,
+                ));
+            }
+        }
+
         self.apps.insert(
             name.to_string(),
             LoadedApp {
@@ -203,6 +231,8 @@ impl AppRegistry {
                 key_source,
                 component,
                 exports,
+                permissions,
+                permissions_hash,
             },
         );
 
@@ -224,6 +254,7 @@ impl AppRegistry {
                 code_hash: enclave_os_common::hex::hex_encode(&app.code_hash),
                 key_source: app.key_source.clone(),
                 exports: app.exported_funcs(),
+                permissions_hash: app.permissions_hash.map(|h| enclave_os_common::hex::hex_encode(&h)),
             })
             .collect()
     }
@@ -256,6 +287,16 @@ impl AppRegistry {
             .iter()
             .map(|(name, app)| (name.as_str(), &app.code_hash, app.key_source.as_str()))
             .collect()
+    }
+
+    /// Get the permissions hash for an app (for OID 3.5 attestation).
+    pub fn app_permissions_hash(&self, name: &str) -> Option<&[u8; 32]> {
+        self.apps.get(name).and_then(|app| app.permissions_hash.as_ref())
+    }
+
+    /// Get the permissions policy for an app (for call-time enforcement).
+    pub fn app_permissions(&self, name: &str) -> Option<&AppPermissions> {
+        self.apps.get(name).and_then(|app| app.permissions.as_ref())
     }
 
     /// Call an exported function on a loaded app.

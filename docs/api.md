@@ -37,7 +37,7 @@ See [vault.md](vault.md) for vault-specific details and
 |-----------|------|------|-------------|
 | `wasm_load` | Bearer | Manager | Load a WASM component |
 | `wasm_unload` | Bearer | Manager | Unload a WASM component |
-| `wasm_call` | Bearer | Any authenticated | Call an exported function |
+| `wasm_call` | App-level or none | Per-function | Call an exported function |
 | `wasm_list` | Bearer | Monitoring+ | List loaded WASM apps |
 
 ### Vault
@@ -211,7 +211,20 @@ Load (or replace) a WASM component.  Requires **Manager** role.
     "name": "my-app",
     "bytes": [0, 97, 115, 109, ...],
     "hostname": "my-app.example.com",
-    "encryption_key": "hex-encoded-32-byte-aes-key"
+    "encryption_key": "hex-encoded-32-byte-aes-key",
+    "permissions": {
+      "version": 1,
+      "oidc": {
+        "issuer": "https://auth.app-owner.com",
+        "jwks_uri": "https://auth.app-owner.com/.well-known/jwks.json",
+        "audience": "my-app"
+      },
+      "default_policy": "public",
+      "functions": {
+        "transfer": { "policy": "role", "roles": ["finance-admin"] },
+        "admin/reset": { "policy": "role", "roles": ["super-admin"] }
+      }
+    }
   }
 }
 ```
@@ -222,6 +235,7 @@ Load (or replace) a WASM component.  Requires **Manager** role.
 | `bytes` | byte[] | yes | Raw WASM component bytecode |
 | `hostname` | string | no | SNI hostname for per-app TLS certificate (defaults to `name`) |
 | `encryption_key` | string | no | Hex-encoded 32-byte AES-256 key for per-app KV encryption. If omitted, a random key is generated inside the enclave via RDRAND |
+| `permissions` | AppPermissions | no | Per-function access policy with app-developer OIDC. If omitted, all functions are public (no auth) |
 
 **Response** (success)
 
@@ -235,7 +249,8 @@ Load (or replace) a WASM component.  Requires **Manager** role.
     "key_source": "generated",
     "exports": [
       { "name": "process", "param_count": 1, "result_count": 1 }
-    ]
+    ],
+    "permissions_hash": "e5f6a7b8..."
   }
 }
 ```
@@ -277,14 +292,18 @@ Unload a WASM component by name.  Requires **Manager** role.
 
 ### wasm_call
 
-Call an exported function on a loaded WASM component.  Requires a valid
-OIDC token (any authenticated user) — no specific role needed.
+Call an exported function on a loaded WASM component.
 
-**Request**
+When the app has a `permissions` policy, access is controlled per-function
+using the app developer's own OIDC provider and roles.  When the app has
+no permissions, all functions are callable without authentication.
+
+See [App Permissions](#app-permissions) for the full model.
+
+**Request** (app with no permissions — public)
 
 ```json
 {
-  "auth": "<token>",
   "wasm_call": {
     "app": "my-app",
     "function": "process",
@@ -292,6 +311,22 @@ OIDC token (any authenticated user) — no specific role needed.
       { "type": "string", "value": "hello" },
       { "type": "u32", "value": 42 }
     ]
+  }
+}
+```
+
+**Request** (app with permissions — app-level auth)
+
+```json
+{
+  "wasm_call": {
+    "app": "my-app",
+    "function": "transfer",
+    "params": [
+      { "type": "string", "value": "from-account" },
+      { "type": "u64", "value": 1000 }
+    ],
+    "app_auth": "eyJhbGciOiJSUzI1NiIs..."
   }
 }
 ```
@@ -358,6 +393,109 @@ List all loaded WASM components.  Requires **Monitoring+** role.
 | `code_hash` | string | SHA-256 of WASM component bytecode (hex) |
 | `key_source` | string | `"generated"` or `"byok:<fingerprint>"` |
 | `exports` | array | Discovered exported function signatures |
+| `permissions_hash` | string? | SHA-256 of the permissions JSON (hex), or absent if no permissions |
+
+---
+
+## App Permissions
+
+WASM app developers can define per-function access control via a
+`permissions` object supplied at load time.  This allows the app developer
+to bring their own OIDC provider — the enclave verifies caller tokens
+against the app's JWKS, not the platform's.
+
+### Behaviour
+
+| App has permissions? | Auth on `wasm_call` |
+|---------------------|---------------------|
+| No | **Public** — no authentication required |
+| Yes | Enforced per-function using the app's OIDC provider |
+
+### Permission Schema
+
+```json
+{
+  "version": 1,
+  "oidc": {
+    "issuer": "https://auth.app-owner.com",
+    "jwks_uri": "https://auth.app-owner.com/.well-known/jwks.json",
+    "audience": "my-app",
+    "roles_claim": "roles"
+  },
+  "default_policy": "public",
+  "default_roles": [],
+  "functions": {
+    "get-balance": { "policy": "authenticated" },
+    "transfer":    { "policy": "role", "roles": ["finance-admin"] },
+    "admin/reset": { "policy": "role", "roles": ["super-admin"] },
+    "public/info": { "policy": "public" }
+  }
+}
+```
+
+**Top-level fields**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `version` | u32 | yes | Schema version (must be `1`) |
+| `oidc` | AppOidcConfig | yes | App developer's OIDC provider |
+| `default_policy` | string | no | Policy for unlisted functions: `"public"` (default), `"authenticated"`, or `"role"` |
+| `default_roles` | string[] | no | Roles required when `default_policy` is `"role"` |
+| `functions` | map | no | Per-function policy overrides |
+
+**AppOidcConfig fields**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `issuer` | string | yes | OIDC issuer URL |
+| `jwks_uri` | string | yes | JWKS endpoint for token signature verification |
+| `audience` | string | yes | Expected `aud` claim in app user tokens |
+| `roles_claim` | string | no | Claim path for roles (default: `"roles"`) |
+
+**FunctionPermission fields**
+
+| Field | Type | Required | Description |
+|-------|------|----------|-------------|
+| `policy` | string | yes | `"public"`, `"authenticated"`, or `"role"` |
+| `roles` | string[] | no | Required roles (when policy is `"role"`; caller needs at least one) |
+
+### Policy types
+
+| Policy | `app_auth` required? | Behaviour |
+|--------|---------------------|-----------|
+| `public` | No | Anyone can call, no token needed |
+| `authenticated` | Yes | Valid token from the app's OIDC provider, any role |
+| `role` | Yes | Valid token with at least one of the specified roles |
+
+### Token delivery
+
+The app-level token is passed in the `app_auth` field inside the
+`wasm_call` object (not the top-level `"auth"` field, which is reserved
+for the platform OIDC):
+
+```json
+{
+  "wasm_call": {
+    "app": "my-app",
+    "function": "transfer",
+    "params": [...],
+    "app_auth": "eyJhbGciOiJSUzI1NiIs..."
+  }
+}
+```
+
+### Attestation
+
+The SHA-256 hash of the permissions JSON is included in the per-app
+RA-TLS certificate as OID `1.3.6.1.4.1.65230.3.5` (App Permissions
+Hash).  Clients connecting via the app's SNI hostname can verify exactly
+which permission policy is active — without trusting the host.
+
+| Per-app OID | Value |
+|-------------|-------|
+| `3.2` | Code hash (WASM bytecode SHA-256) |
+| `3.4` | Key source (`"generated"` or `"byok:<fingerprint>"`) |
+| `3.5` | Permissions hash (SHA-256 of permissions JSON) |
 
 ---
 

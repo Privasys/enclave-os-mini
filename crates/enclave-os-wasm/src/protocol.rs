@@ -19,6 +19,7 @@
 //! ```
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::vec::Vec;
 
 // ---------------------------------------------------------------------------
@@ -94,6 +95,17 @@ pub struct WasmLoad {
     /// read across app reloads.
     #[serde(default)]
     pub encryption_key: Option<String>,
+    /// Optional per-app permission policy.
+    ///
+    /// When present, the enclave enforces per-function access control on
+    /// `wasm_call` requests using the app developer's own OIDC provider.
+    /// The SHA-256 hash of the serialised permissions JSON is embedded in
+    /// the per-app RA-TLS certificate as OID `1.3.6.1.4.1.65230.3.5`.
+    ///
+    /// When absent, all exported functions are callable without
+    /// authentication.
+    #[serde(default)]
+    pub permissions: Option<AppPermissions>,
 }
 
 /// Unload a WASM app by name.
@@ -167,6 +179,14 @@ pub struct WasmCall {
     /// An empty vec means no parameters.
     #[serde(default)]
     pub params: Vec<WasmParam>,
+    /// App-level OIDC bearer token.
+    ///
+    /// When the app has a `permissions` policy, this token is verified
+    /// against the app developer's OIDC provider (not the platform's).
+    /// The field is separate from the top-level `"auth"` to avoid
+    /// collision with the platform auth layer.
+    #[serde(default)]
+    pub app_auth: Option<String>,
 }
 
 /// A typed parameter passed to a WASM function.
@@ -276,6 +296,10 @@ pub struct AppInfo {
     pub key_source: String,
     /// Exported function signatures discovered from the component.
     pub exports: Vec<ExportedFunc>,
+    /// SHA-256 hash of the permissions JSON (hex), or `null` if no
+    /// permissions policy is configured (all functions are public).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub permissions_hash: Option<String>,
 }
 
 /// An exported function signature discovered from a WASM component.
@@ -287,4 +311,83 @@ pub struct ExportedFunc {
     pub param_count: usize,
     /// Number of return values.
     pub result_count: usize,
+}
+
+// ---------------------------------------------------------------------------
+//  Per-app permission policy
+// ---------------------------------------------------------------------------
+
+/// Per-app permission policy supplied by the app developer.
+///
+/// Allows the app developer to bring their own OIDC provider and define
+/// per-function access control.  The enclave enforces these rules at
+/// `wasm_call` time.
+///
+/// The SHA-256 hash of the canonical JSON serialisation is included in
+/// the per-app RA-TLS certificate (OID `1.3.6.1.4.1.65230.3.5`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppPermissions {
+    /// Schema version (must be `1`).
+    pub version: u32,
+    /// App developer's OIDC provider configuration for token verification.
+    pub oidc: AppOidcConfig,
+    /// Default policy for functions not listed in `functions`.
+    ///
+    /// - `"public"` — no authentication required
+    /// - `"authenticated"` — valid OIDC token required (any role)
+    /// - `"role"` — requires `default_roles`
+    #[serde(default = "default_policy")]
+    pub default_policy: FunctionPolicy,
+    /// Roles required when `default_policy` is `Role`.
+    #[serde(default)]
+    pub default_roles: Vec<String>,
+    /// Per-function policy overrides.  Key is the exported function name
+    /// (e.g. `"process"` or `"my-api/transform"`).
+    #[serde(default)]
+    pub functions: BTreeMap<String, FunctionPermission>,
+}
+
+/// OIDC provider configuration for an app's own identity provider.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppOidcConfig {
+    /// OIDC issuer URL (e.g. `https://auth.app-owner.com`).
+    pub issuer: String,
+    /// JWKS endpoint for token signature verification.
+    pub jwks_uri: String,
+    /// Expected `aud` claim in app user tokens.
+    pub audience: String,
+    /// Claim path for roles (default: `"roles"`).
+    #[serde(default = "default_roles_claim")]
+    pub roles_claim: String,
+}
+
+/// Access policy for a single exported function.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionPermission {
+    /// The policy type.
+    pub policy: FunctionPolicy,
+    /// Roles required when `policy` is `Role`.  Caller must have at
+    /// least one of these roles.
+    #[serde(default)]
+    pub roles: Vec<String>,
+}
+
+/// Access policy type.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FunctionPolicy {
+    /// No authentication required — anyone can call.
+    Public,
+    /// A valid OIDC token is required but no specific role.
+    Authenticated,
+    /// A valid OIDC token with at least one of the specified roles.
+    Role,
+}
+
+fn default_policy() -> FunctionPolicy {
+    FunctionPolicy::Public
+}
+
+fn default_roles_claim() -> String {
+    "roles".into()
 }

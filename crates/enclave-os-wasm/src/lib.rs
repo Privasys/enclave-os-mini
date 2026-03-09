@@ -83,7 +83,7 @@ use enclave_os_common::modules::{AppIdentity, ConfigEntry, ConfigLeaf, EnclaveMo
 use enclave_os_common::protocol::{Request, Response};
 use enclave_os_common::types::AEAD_KEY_SIZE;
 
-use crate::protocol::{WasmCall, WasmEnvelope, WasmManagementResult, WasmResult};
+use crate::protocol::{AppPermissions, FunctionPolicy, WasmCall, WasmEnvelope, WasmManagementResult, WasmResult};
 use crate::registry::AppRegistry;
 
 // ---------------------------------------------------------------------------
@@ -134,19 +134,25 @@ impl WasmModule {
     /// Each app gets its own AES-256 encryption key for KV store data.
     /// If `encryption_key` is `Some`, the caller supplies the key
     /// (BYOK). Otherwise a random key is generated inside the enclave.
+    ///
+    /// If `permissions` is `Some`, per-function access control is
+    /// enforced on `wasm_call` using the app developer's own OIDC
+    /// provider. The SHA-256 hash of the permissions JSON is included
+    /// in the per-app RA-TLS certificate as OID 3.5.
     pub fn load_app(
         &self,
         name: &str,
         hostname: &str,
         wasm_bytes: &[u8],
         encryption_key: Option<[u8; AEAD_KEY_SIZE]>,
+        permissions: Option<AppPermissions>,
     ) -> Result<(), String> {
         // Load into the registry (compile + introspect + per-app key)
-        let (code_hash, key_source) = {
+        let (code_hash, key_source, permissions_hash) = {
             let mut reg = self.registry
                 .lock()
                 .map_err(|_| String::from("registry lock poisoned"))?;
-            reg.load_app(name, hostname, wasm_bytes, encryption_key)?;
+            reg.load_app(name, hostname, wasm_bytes, encryption_key, permissions)?;
 
             let hash = reg.app_code_hash(name)
                 .copied()
@@ -154,24 +160,33 @@ impl WasmModule {
             let ks = reg.app_key_source(name)
                 .unwrap_or("generated")
                 .to_string();
-            (hash, ks)
+            let ph = reg.app_permissions_hash(name).copied();
+            (hash, ks, ph)
         };
 
         // Register per-app identity with the global CertStore
+        let mut config = vec![
+            ConfigEntry {
+                key: format!("wasm.{}.code_hash", name),
+                value: code_hash.to_vec(),
+                oid: Some(enclave_os_common::oids::APP_CODE_HASH_OID),
+            },
+            ConfigEntry {
+                key: format!("wasm.{}.key_source", name),
+                value: key_source.as_bytes().to_vec(),
+                oid: Some(enclave_os_common::oids::APP_KEY_SOURCE_OID),
+            },
+        ];
+        if let Some(ph) = permissions_hash {
+            config.push(ConfigEntry {
+                key: format!("wasm.{}.permissions_hash", name),
+                value: ph.to_vec(),
+                oid: Some(enclave_os_common::oids::APP_PERMISSIONS_HASH_OID),
+            });
+        }
         let identity = AppIdentity {
             hostname: hostname.to_string(),
-            config: vec![
-                ConfigEntry {
-                    key: format!("wasm.{}.code_hash", name),
-                    value: code_hash.to_vec(),
-                    oid: Some(enclave_os_common::oids::APP_CODE_HASH_OID),
-                },
-                ConfigEntry {
-                    key: format!("wasm.{}.key_source", name),
-                    value: key_source.as_bytes().to_vec(),
-                    oid: Some(enclave_os_common::oids::APP_KEY_SOURCE_OID),
-                },
-            ],
+            config,
         };
         enclave_os_common::ocall::cert_store_register(identity);
 
@@ -214,6 +229,86 @@ impl WasmModule {
             }
         };
         registry.call(&call.app, &call.function, &call.params)
+    }
+
+    /// Enforce per-app permission policy on a `wasm_call`.
+    ///
+    /// Returns `Some(Response)` with an error if the call is denied,
+    /// or `None` if the call is permitted.
+    ///
+    /// **Logic**:
+    /// - App has no permissions → call is public (no auth needed).
+    /// - App has permissions → look up the function's policy:
+    ///   - `public` → allow without auth.
+    ///   - `authenticated` → require a valid token from the app's OIDC.
+    ///   - `role` → require a valid token with at least one matching role.
+    ///
+    /// The app-level bearer token is taken from `call.app_auth`.
+    fn check_app_permissions(&self, call: &WasmCall) -> Option<Response> {
+        // Look up the app's permissions policy.
+        let registry = self.registry.lock().ok()?;
+        let permissions = match registry.app_permissions(&call.app) {
+            Some(p) => p.clone(),
+            None => return None, // No permissions → public access.
+        };
+        drop(registry); // Release lock before potentially slow token verification.
+
+        // Determine the effective policy for this function.
+        let (policy, required_roles) = match permissions.functions.get(&call.function) {
+            Some(fp) => (&fp.policy, &fp.roles),
+            None => (&permissions.default_policy, &permissions.default_roles),
+        };
+
+        // Public → no auth needed.
+        if *policy == FunctionPolicy::Public {
+            return None;
+        }
+
+        // The app-level bearer token is in the wasm_call's `app_auth` field.
+        let token_str = match call.app_auth.as_deref() {
+            Some(t) => t,
+            None => {
+                let err = WasmResult::Error {
+                    message: format!(
+                        "authentication required: function '{}' on app '{}' requires a valid token from {}",
+                        call.function, call.app, permissions.oidc.issuer,
+                    ),
+                };
+                return Some(Response::Data(serialize_or_error(&err)));
+            }
+        };
+
+        // Verify the token against the app's OIDC provider.
+        let caller_roles = match verify_app_token(token_str, &permissions.oidc) {
+            Ok(roles) => roles,
+            Err(e) => {
+                let err = WasmResult::Error {
+                    message: format!("app OIDC auth failed: {e}"),
+                };
+                return Some(Response::Data(serialize_or_error(&err)));
+            }
+        };
+
+        // Authenticated → token is valid, no role check needed.
+        if *policy == FunctionPolicy::Authenticated {
+            return None;
+        }
+
+        // Role → check intersection.
+        if !required_roles.is_empty() {
+            let has_role = caller_roles.iter().any(|r| required_roles.contains(r));
+            if !has_role {
+                let err = WasmResult::Error {
+                    message: format!(
+                        "access denied: function '{}' on app '{}' requires one of {:?}",
+                        call.function, call.app, required_roles,
+                    ),
+                };
+                return Some(Response::Data(serialize_or_error(&err)));
+            }
+        }
+
+        None // Permitted.
     }
 
     /// Compute the combined hash of all loaded apps' code hashes.
@@ -260,10 +355,13 @@ impl EnclaveModule for WasmModule {
     /// - `wasm_unload` — unload an app by name
     /// - `wasm_list`   — list all loaded apps
     ///
-    /// **OIDC role requirements** (when OIDC is configured):
+    /// **Platform OIDC role requirements** (when OIDC is configured):
     /// - `wasm_load`, `wasm_unload`: requires **manager** role
-    /// - `wasm_call`: requires any valid OIDC token (no specific role)
     /// - `wasm_list`: requires **monitoring** role (manager also works)
+    ///
+    /// **App-level permissions** (when the app has a `permissions` policy):
+    /// - `wasm_call`: enforced per-function using the app developer's own
+    ///   OIDC provider.  If the app has no permissions, calls are public.
     ///
     /// Returns `None` if the payload doesn't match any WASM envelope
     /// (letting other modules handle the request).
@@ -279,15 +377,9 @@ impl EnclaveModule for WasmModule {
             Err(_) => return None, // Not a WASM request — decline.
         };
 
-        // ── OIDC role gate ──────────────────────────────────────────────
-        // Determine the required role for the operation being attempted.
-        //
-        // - wasm_load / wasm_unload: Manager (platform operator lifecycle)
-        // - wasm_call: any authenticated user (app customers)
-        // - wasm_list: Monitoring+ (read-only introspection)
+        // ── Platform OIDC role gate (load/unload/list) ──────────────
         let needs_manager = envelope.wasm_load.is_some()
             || envelope.wasm_unload.is_some();
-        let needs_auth_only = envelope.wasm_call.is_some();
         let needs_monitoring = envelope.wasm_list.is_some();
 
         if needs_manager {
@@ -301,15 +393,6 @@ impl EnclaveModule for WasmModule {
             } else if enclave_os_common::oidc::is_oidc_configured() {
                 let err = serde_json::to_vec(&WasmManagementResult::Error {
                     message: String::from("OIDC authentication required (manager role)"),
-                }).unwrap_or_default();
-                return Some(Response::Data(err));
-            }
-        } else if needs_auth_only {
-            // wasm_call: any authenticated user can call WASM apps.
-            // No specific role required, but a valid token is mandatory.
-            if ctx.oidc_claims.is_none() && enclave_os_common::oidc::is_oidc_configured() {
-                let err = serde_json::to_vec(&WasmResult::Error {
-                    message: String::from("OIDC authentication required"),
                 }).unwrap_or_default();
                 return Some(Response::Data(err));
             }
@@ -329,9 +412,12 @@ impl EnclaveModule for WasmModule {
             }
         }
 
-        // 1. wasm_call — execute a function
-        if let Some(call) = envelope.wasm_call {
-            let result = self.dispatch_call(&call);
+        // 1. wasm_call — execute a function (app-level permissions)
+        if let Some(ref call) = envelope.wasm_call {
+            if let Some(err_response) = self.check_app_permissions(call) {
+                return Some(err_response);
+            }
+            let result = self.dispatch_call(call);
             return Some(Response::Data(serialize_or_error(&result)));
         }
 
@@ -368,7 +454,7 @@ impl EnclaveModule for WasmModule {
                 None => None,
             };
 
-            let mgmt_result = match self.load_app(&load.name, &hostname, &load.bytes, encryption_key) {
+            let mgmt_result = match self.load_app(&load.name, &hostname, &load.bytes, encryption_key, load.permissions) {
                 Ok(()) => {
                     // Return the loaded app's info
                     let apps = self.list_apps();
@@ -464,4 +550,142 @@ fn serialize_or_error<T: serde::Serialize>(value: &T) -> Vec<u8> {
             serde_json::to_vec(&fallback).unwrap_or_default()
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+//  App-level OIDC token verification
+// ---------------------------------------------------------------------------
+
+/// Verify a JWT against an app developer's OIDC provider.
+///
+/// Returns the list of role strings from the token.  Does **not** use the
+/// platform's OIDC config — uses the app's own `AppOidcConfig`.
+fn verify_app_token(
+    token: &str,
+    oidc: &crate::protocol::AppOidcConfig,
+) -> Result<Vec<String>, String> {
+    // Decode JWT claims (header.payload.signature)
+    let parts: Vec<&str> = token.splitn(3, '.').collect();
+    if parts.len() != 3 {
+        return Err("malformed JWT: expected 3 dot-separated parts".into());
+    }
+
+    // Decode payload (base64url → JSON)
+    let payload_bytes = base64_url_decode(parts[1])
+        .map_err(|e| format!("JWT payload base64: {e}"))?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload_bytes)
+        .map_err(|e| format!("JWT payload JSON: {e}"))?;
+
+    // Validate issuer
+    let iss = claims.get("iss")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "JWT missing 'iss' claim".to_string())?;
+    if iss != oidc.issuer {
+        return Err(format!("JWT issuer '{}' != expected '{}'", iss, oidc.issuer));
+    }
+
+    // Validate audience
+    let aud_ok = match claims.get("aud") {
+        Some(serde_json::Value::String(s)) => s == &oidc.audience,
+        Some(serde_json::Value::Array(arr)) => arr.iter().any(|v| v.as_str() == Some(&oidc.audience)),
+        _ => false,
+    };
+    if !aud_ok {
+        return Err(format!("JWT audience does not contain '{}'", oidc.audience));
+    }
+
+    // Validate expiry
+    if let Some(exp) = claims.get("exp").and_then(|v| v.as_u64()) {
+        let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
+        if now > exp {
+            return Err("JWT token expired".into());
+        }
+    }
+
+    // Extract roles from the configured roles_claim path.
+    let mut roles = Vec::new();
+    if let Some(val) = claims.get(&oidc.roles_claim) {
+        collect_role_strings(val, &mut roles);
+    }
+    // Also check standard paths for compatibility.
+    if let Some(val) = claims.get("roles") {
+        collect_role_strings(val, &mut roles);
+    }
+    if let Some(ra) = claims.get("realm_access") {
+        if let Some(val) = ra.get("roles") {
+            collect_role_strings(val, &mut roles);
+        }
+    }
+    // Zitadel map format
+    if let Some(val) = claims.get("urn:zitadel:iam:org:project:roles") {
+        collect_role_strings(val, &mut roles);
+    }
+
+    roles.sort();
+    roles.dedup();
+    Ok(roles)
+}
+
+/// Collect role strings from a JSON value (array of strings or Zitadel
+/// map `{ "role": {...} }`).
+fn collect_role_strings(val: &serde_json::Value, out: &mut Vec<String>) {
+    match val {
+        serde_json::Value::Array(arr) => {
+            for item in arr {
+                if let Some(s) = item.as_str() {
+                    out.push(s.to_string());
+                }
+            }
+        }
+        serde_json::Value::Object(map) => {
+            for key in map.keys() {
+                out.push(key.clone());
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Decode base64url (no padding) to bytes.
+fn base64_url_decode(input: &str) -> Result<Vec<u8>, String> {
+    let standard: String = input.chars().map(|c| match c {
+        '-' => '+',
+        '_' => '/',
+        c => c,
+    }).collect();
+
+    let padded = match standard.len() % 4 {
+        2 => format!("{}==", standard),
+        3 => format!("{}=", standard),
+        _ => standard,
+    };
+
+    // Use ring's base64 or a simple inline decoder
+    let mut result = Vec::new();
+    let chars: Vec<u8> = padded.bytes().collect();
+    for chunk in chars.chunks(4) {
+        if chunk.len() != 4 {
+            return Err("invalid base64 length".into());
+        }
+        let vals: Result<Vec<u8>, String> = chunk.iter().map(|&b| {
+            match b {
+                b'A'..=b'Z' => Ok(b - b'A'),
+                b'a'..=b'z' => Ok(b - b'a' + 26),
+                b'0'..=b'9' => Ok(b - b'0' + 52),
+                b'+' => Ok(62),
+                b'/' => Ok(63),
+                b'=' => Ok(0),
+                _ => Err(format!("invalid base64 char: {}", b as char)),
+            }
+        }).collect();
+        let vals = vals?;
+        result.push((vals[0] << 2) | (vals[1] >> 4));
+        if chunk[2] != b'=' {
+            result.push((vals[1] << 4) | (vals[2] >> 2));
+        }
+        if chunk[3] != b'=' {
+            result.push((vals[2] << 6) | vals[3]);
+        }
+    }
+    Ok(result)
 }
