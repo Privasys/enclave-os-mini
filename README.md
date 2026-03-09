@@ -13,7 +13,7 @@ single SGX enclave.
 | **HTTPS Egress** | Outbound HTTPS from inside the enclave (TLS terminated in enclave, network I/O via host RPC) |
 | **Sealed Key-Value Store** | Encrypted KV database — keys HMAC'd, values AES-256-GCM'd — master key sealed to MRENCLAVE |
 | **WASM Runtime** | Execute WebAssembly apps inside SGX with WASI and Enclave OS SDK interfaces |
-| **JWT-Authenticated Vault** | Store and retrieve secrets gated by ES256 JWT verification |
+| **OIDC-Authenticated Vault** | Store and retrieve secrets gated by OIDC RBAC with dual-path GetSecret (OIDC owner + RA-TLS TEE) |
 | **Sealed Config** | All persistent state stored as a single MRENCLAVE-bound blob |
 | **Config Attestation** | Merkle root + per-module OIDs over all config inputs in every RA-TLS certificate |
 

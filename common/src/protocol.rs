@@ -30,8 +30,18 @@ pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
 /// into its own request type.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Request {
-    /// Ping / health check.
-    Ping,
+    /// Liveness probe — always succeeds, no auth required.
+    /// Aligned with Enclave OS Virtual's `GET /healthz`.
+    Healthz,
+    /// Readiness probe — returns whether the enclave is ready to serve.
+    /// Requires Monitoring+ role.
+    Readyz,
+    /// Status — returns enabled modules + per-module state.
+    /// Requires Monitoring+ role.
+    Status,
+    /// Metrics — lightweight counters: connections, frames, calls, etc.
+    /// Requires Monitoring+ role.
+    Metrics,
     /// Arbitrary application-defined payload.
     ///
     /// Module-specific protocols are JSON-encoded inside this variant.
@@ -43,8 +53,17 @@ pub enum Request {
 /// Response from the enclave.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum Response {
-    /// Pong reply.
-    Pong,
+    /// Healthz reply — always `{"status":"ok"}`.
+    Healthz { status: String },
+    /// Readyz reply.
+    Readyz {
+        status: String,
+        modules: usize,
+    },
+    /// Status reply with per-module info.
+    StatusReport(Vec<ModuleStatus>),
+    /// Metrics reply with enclave counters.
+    MetricsReport(EnclaveMetrics),
     /// Application data reply.
     ///
     /// Module-specific responses are JSON-encoded inside this variant.
@@ -53,6 +72,34 @@ pub enum Response {
     Ok,
     /// Error with human-readable message.
     Error(Vec<u8>),
+}
+
+/// Per-module status entry returned by `Status`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ModuleStatus {
+    /// Module name (e.g. "wasm", "vault", "kvstore").
+    pub name: String,
+    /// Module-specific status details (JSON value).
+    pub details: serde_json::Value,
+}
+
+/// Enclave-level metrics counters.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct EnclaveMetrics {
+    /// Total TLS connections served.
+    pub connections_total: u64,
+    /// Total application frames processed.
+    pub frames_total: u64,
+    /// Total WASM calls executed (0 if WASM not enabled).
+    pub wasm_calls_total: u64,
+    /// Total secrets stored (0 if vault not enabled).
+    pub secrets_stored_total: u64,
+    /// Total secrets retrieved (0 if vault not enabled).
+    pub secrets_retrieved_total: u64,
+    /// Total attestation verifications performed.
+    pub attestation_verifications_total: u64,
+    /// Enclave uptime in seconds.
+    pub uptime_seconds: u64,
 }
 
 /// Encode a length-delimited frame: [u32 BE length][payload].
@@ -109,11 +156,11 @@ mod tests {
     }
 
     #[test]
-    fn test_request_ping_serde() {
-        let req = Request::Ping;
+    fn test_request_healthz_serde() {
+        let req = Request::Healthz;
         let json = serde_json::to_vec(&req).unwrap();
         let back: Request = serde_json::from_slice(&json).unwrap();
-        assert!(matches!(back, Request::Ping));
+        assert!(matches!(back, Request::Healthz));
     }
 
     #[test]
@@ -136,11 +183,11 @@ mod tests {
     }
 
     #[test]
-    fn test_response_pong_serde() {
-        let resp = Response::Pong;
+    fn test_response_healthz_serde() {
+        let resp = Response::Healthz { status: "ok" };
         let json = serde_json::to_vec(&resp).unwrap();
         let back: Response = serde_json::from_slice(&json).unwrap();
-        assert!(matches!(back, Response::Pong));
+        assert!(matches!(back, Response::Healthz { .. }));
     }
 
     #[test]

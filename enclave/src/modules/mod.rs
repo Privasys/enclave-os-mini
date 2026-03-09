@@ -81,3 +81,21 @@ pub fn dispatch(req: &Request, ctx: &RequestContext) -> Option<Response> {
     }
     None
 }
+
+/// Return the number of registered modules.
+pub fn module_count() -> usize {
+    MODULES.lock().unwrap().len()
+}
+
+/// Collect module statuses for the /status endpoint.
+pub fn collect_module_statuses() -> Vec<enclave_os_common::protocol::ModuleStatus> {
+    MODULES
+        .lock()
+        .unwrap()
+        .iter()
+        .map(|m| enclave_os_common::protocol::ModuleStatus {
+            name: m.name().to_string(),
+            details: serde_json::json!({ "status": "ok" }),
+        })
+        .collect()
+}

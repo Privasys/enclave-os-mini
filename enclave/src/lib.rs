@@ -98,6 +98,19 @@ pub struct EnclaveState {
 
 static ENCLAVE_STATE: OnceLock<Mutex<EnclaveState>> = OnceLock::new();
 
+/// Global OIDC configuration (set by `ecall_run` if `oidc` is in config).
+static OIDC_CONFIG: OnceLock<enclave_os_common::oidc::OidcConfig> = OnceLock::new();
+
+/// Set the global OIDC configuration.
+pub fn set_oidc_config(config: enclave_os_common::oidc::OidcConfig) {
+    let _ = OIDC_CONFIG.set(config);
+}
+
+/// Get the global OIDC configuration, if configured.
+pub fn oidc_config() -> Option<&'static enclave_os_common::oidc::OidcConfig> {
+    OIDC_CONFIG.get()
+}
+
 /// Get a reference to the global enclave state.
 pub fn state() -> &'static Mutex<EnclaveState> {
     ENCLAVE_STATE.get().expect("Enclave not initialised")

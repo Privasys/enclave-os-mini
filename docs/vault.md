@@ -1,15 +1,22 @@
-# Vault — Secret Store for Remote Enclaves
+# Vault — OIDC-Authenticated Secret Store
 
 ## Purpose
 
 The vault module (`enclave-os-vault`) provides policy-gated secret storage
-inside an SGX enclave.  It is designed to hold secrets **from other enclaves
-running on other machines** — for example, a TDX VM in one data centre
-storing an encryption key in an SGX vault in another.
+inside an SGX enclave.  Secrets are sealed to the enclave's code identity
+(MRENCLAVE) and protected by OIDC-based access control.
 
-The core guarantee: a secret stored in the vault can only be retrieved by a
-remote TEE whose attestation evidence matches the policy set by the secret
-owner at creation time.
+The vault currently supports two retrieval paths:
+
+1. **OIDC owner** — the secret creator retrieves their own secrets using
+   their OIDC bearer token.
+2. **Mutual RA-TLS** — a remote TEE retrieves secrets by presenting
+   attestation evidence that matches the secret's access policy.
+
+This makes the vault well-suited for holding secrets on behalf of enclaves
+running on other machines (e.g. a TDX VM storing an encryption key in an
+SGX vault), but the architecture is generic and designed to be extended
+with additional retrieval and policy mechanisms in the future.
 
 ---
 
@@ -20,61 +27,67 @@ is critical.
 
 ### Secret Owner (= Creator)
 
-The owner is the entity that creates, deletes, and manages a secret's access
-policy.
+The owner is the entity that creates, deletes, manages, and lists secrets.
 
-- Authenticates via **ES256 JWTs** signed with their P-256 private key
-- The vault verifies JWTs using the owner's public key (configured at vault
-  startup)
-- The SHA-256 hash of the owner's public key is stored in each
-  `SecretRecord`, so only the original creator can delete or update a
-  secret's policy
-- Operations: `StoreSecret`, `DeleteSecret`, `UpdateSecretPolicy`
+- Authenticates via **OIDC bearer token** (Zitadel or any OIDC provider)
+- Must hold the **`enclave-os-mini:secret-owner`** role
+- The owner's OIDC `sub` (subject) claim is stored in each `SecretRecord`,
+  so only the original creator can delete, update, or list their secrets
+- Operations: `StoreSecret`, `DeleteSecret`, `UpdateSecretPolicy`,
+  `ListSecrets`
 
-In most cases the Secret Onwer will be a remote TEE application (SGX enclave, TDX VM, or SEV-SNP VM).
-When it needs to retrieve the secret, it will need to:
+The Secret Owner can always retrieve their own secrets via the OIDC path
+(no RA-TLS required).
 
-- Authenticates via **mutual RA-TLS** — the remote TEE presents its own
-  RA-TLS certificate during the mTLS handshake.  The vault extracts the
-  SGX/TDX quote and OID claims directly from the peer certificate's X.509
-  extensions.
-- The vault parses the quote from the peer cert, extracts the measurement
-  (MRENCLAVE or MRTD), and checks it against the secret's policy whitelist
+In production, the Secret Owner is typically a remote TEE application
+(SGX enclave, TDX VM, or SEV-SNP VM).  When it needs to let **other TEEs**
+retrieve the secret, those TEEs use the RA-TLS path (see below).
+
+### Remote TEE (GetSecret via RA-TLS)
+
+A remote TEE that needs to retrieve a secret authenticates via
+**mutual RA-TLS**:
+
+- Presents its own RA-TLS certificate during the mTLS handshake
+- The vault extracts the SGX/TDX quote and OID claims directly from the
+  peer certificate's X.509 extensions
+- The vault parses the quote, extracts the measurement (MRENCLAVE or MRTD),
+  and checks it against the secret's policy whitelist
 - OID claims are extracted from the peer cert's X.509 extensions and checked
   against the policy's `required_oids`
-- Operation: `GetSecret`
+- Operation: `GetSecret` (RA-TLS path)
 
-### Manager (Bearer Token Issuer)
+### Secret Manager (Bearer Token Issuer)
 
-The manager is a **separate actor** whose sole role is to issue bearer tokens
-at `GetSecret` time as defence-in-depth.  The manager:
+The secret manager is a **separate actor** whose sole role is to issue
+bearer tokens at `GetSecret` time as defence-in-depth.
 
-- **Cannot** read, write, or delete a secret, and **Cannot** update policies
-- **Only** signs ES256 JWTs (bearer tokens) that the remote TEE presents
-  alongside its attestation evidence
-- The bearer token payload is `{ "name": "<secret-name>" }`, binding the
-  token to a specific secret
-- The vault verifies the bearer token's signature against the
-  `manager_pubkey` stored in the secret's policy
+- Authenticates via **OIDC bearer token**
+- Must hold the **`enclave-os-mini:secret-manager`** role
+- **Cannot** read, write, or delete secrets, and **cannot** update policies
+- **Only** provides a bearer token that the remote TEE presents alongside
+  its attestation evidence
+- The vault verifies the bearer token's OIDC `sub` against the
+  `manager_sub` stored in the secret's policy
 
-This is optional: if a secret's policy has no `manager_pubkey`, no bearer
+This is optional: if a secret's policy has no `manager_sub`, no bearer
 token is required.
 
-#### Why a Manager?
+#### Why a Secret Manager?
 
 Remote attestation proves what code is running, but if the attestation
-infrastructure itself is compromised (e.g. a firmware bug allows forged
-quotes), an attacker could present a fake measurement.  Requiring a fresh
-bearer token from the manager means the attacker needs **two independent
-things** — a valid quote **and** a signed token from the manager — to
-retrieve the secret.
+infrastructure is compromised (e.g. a firmware bug allows forged quotes),
+an attacker could present a fake measurement.  Requiring a fresh bearer
+token from the secret manager means the attacker needs **two independent
+things** — a valid quote **and** a token from the manager — to retrieve
+the secret.
 
 ```
  Threat model:
 
-   RA compromised alone         → blocked (no manager JWT)
-   Manager compromised alone    → blocked (no valid quote)
-   Both compromised             → secret exposed (defence-in-depth breached)
+   RA compromised alone              → blocked (no manager token)
+   Manager compromised alone          → blocked (no valid quote)
+   Both compromised                   → secret exposed (defence-in-depth breached)
 ```
 
 ---
@@ -82,27 +95,27 @@ retrieve the secret.
 ## Architecture
 
 ```
-                         RA-TLS
-  Secret Owner     ──────────────────►  ┌───────────────────────────┐
-  (ES256 JWT)                           │     enclave-os-vault      │
-                                        │     (SGX enclave)         │
-                                        │                           │
-  Remote TEE       ══════════════════►  │  ┌─────────────────────┐  │
-  (mutual RA-TLS                        │  │   SecretPolicy      │  │
-   + manager JWT)                       │  │  ─────────────      │  │
-                                        │  │  MRENCLAVE list     │  │
-  The remote TEE presents its           │  │  MRTD list          │  │
-  own RA-TLS cert; the vault            │  │  Manager pubkey     │  │
-  extracts the SGX/TDX quote            │  │  OID requirements   │  │
-  and OID claims from the               │  │  TTL                │  │
-  peer certificate.                     │  └─────────────────────┘  │
-                                        │             │             │
-                                        │             ▼             │
-                                        │  ┌─────────────────────┐  │
-                                        │  │  enclave-os-kvstore │  │
-                                        │  │  (sealed storage)   │  │
-                                        │  └─────────────────────┘  │
-                                        └───────────────────────────┘
+                            OIDC + RA-TLS
+  Secret Owner          ──────────────────►  ┌───────────────────────────┐
+  (OIDC: secret-owner)                       │     enclave-os-vault      │
+                                             │     (SGX enclave)         │
+                                             │                           │
+  Remote TEE            ══════════════════►  │  ┌─────────────────────┐  │
+  (mutual RA-TLS                             │  │   SecretPolicy      │  │
+   + manager token?)                         │  │  ─────────────      │  │
+                                             │  │  MRENCLAVE list     │  │
+  The remote TEE presents its                │  │  MRTD list          │  │
+  own RA-TLS cert; the vault                 │  │  Manager sub        │  │
+  extracts the SGX/TDX quote                 │  │  OID requirements   │  │
+  and OID claims from the                    │  │  TTL                │  │
+  peer certificate.                          │  └─────────────────────┘  │
+                                             │             │             │
+                                             │             ▼             │
+                                             │  ┌─────────────────────┐  │
+                                             │  │  enclave-os-kvstore │  │
+                                             │  │  (sealed storage)   │  │
+                                             │  └─────────────────────┘  │
+                                             └───────────────────────────┘
 ```
 
 ### Multi-Instance Deployment
@@ -130,20 +143,27 @@ share.  No single vault ever holds the complete secret.
 
 ---
 
-## Mutual RA-TLS
+## GetSecret Dual-Path Auth
 
-The vault uses **mutual RA-TLS** for `GetSecret`: both sides of the TLS
-connection present attestation certificates.
+`GetSecret` supports two authentication paths:
 
-### Why Mutual?
+### Path 1 — OIDC Owner
 
-In standard RA-TLS the *server* presents an attested certificate so clients
-can verify the enclave.  But when a remote TEE fetches a secret the vault
-also needs to verify *the caller*.  Mutual RA-TLS achieves this: the remote
-TEE presents its own RA-TLS client certificate during the TLS handshake,
-and the vault extracts attestation evidence directly from the peer cert.
+The secret owner retrieves their own secrets using their OIDC token.  No
+RA-TLS required.  The vault checks that `ctx.oidc_claims.sub` matches the
+secret's `owner_sub`.
 
-### How It Works
+### Path 2 — RA-TLS TEE
+
+A remote TEE retrieves secrets via mutual RA-TLS.  The vault:
+
+1. Requires a TLS client certificate (mutual RA-TLS)
+2. Extracts the attestation quote from the peer cert
+3. Verifies the quote via attestation server(s)
+4. Checks the measurement against the policy whitelist
+5. Verifies bidirectional challenge-response binding (if nonce present)
+6. Checks the optional bearer token from the secret manager
+7. Checks required OID claims
 
 ```
  Remote TEE                                    Vault Enclave
@@ -184,40 +204,28 @@ and the vault extracts attestation evidence directly from the peer cert.
 The RA-TLS server is configured with a **permissive client certificate
 verifier** — it *offers* client auth to every connection but does not
 *require* it.  This allows browsers and non-TEE clients to connect for
-other modules (WASM, KV store, etc.) without presenting a certificate.
+other modules (WASM, healthz, etc.) without presenting a certificate.
 
-The vault module itself enforces the requirement: if `peer_cert_der` is
-absent in the `RequestContext`, `GetSecret` returns an error.
-
-### What Changed
-
-Previously, `GetSecret` accepted attestation evidence and OID claims as
-JSON fields in the request body.  This was a **self-reported attestation**
-model — the caller could claim to be any enclave.  With mutual RA-TLS the
-attestation is extracted from the cryptographically-bound peer certificate,
-which eliminates the possibility of spoofed attestation data.
-
-| Before (self-reported) | After (mutual RA-TLS) |
-|------------------------|----------------------|
-| `GetSecret { name, bearer_token?, attestation_evidence, oid_claims? }` | `GetSecret { name, bearer_token? }` |
-| Attestation in JSON body — caller can forge | Attestation in peer cert — cryptographically bound |
-| No TLS-layer identity verification | Peer cert binds TEE identity to TLS session |
+The vault module itself enforces the requirement per-path: OIDC owner path
+needs a valid OIDC token, RA-TLS path needs a peer certificate.
 
 ---
 
 ## Protocol
 
 All requests arrive as JSON inside the enclave-os length-delimited framing
-(`4-byte big-endian length || payload`).
+(`4-byte big-endian length || payload`).  OIDC tokens are passed in the
+JSON `"auth"` field (stripped by the auth layer before reaching the vault).
 
 ### Requests
 
-| Request | Auth | Description |
-|---------|------|-------------|
-| `StoreSecret { jwt }` | ES256 JWT (owner key) | Store a secret. JWT payload: `{ name, secret (base64url), policy }` |
-| `GetSecret { name, bearer_token? }` | Mutual RA-TLS + optional manager JWT | Retrieve a secret. Attestation evidence is extracted from the peer's RA-TLS certificate (mutual TLS). |
-| `DeleteSecret { jwt }` | ES256 JWT (owner key) | Delete a secret. JWT payload: `{ name }` |
-| `UpdateSecretPolicy { jwt }` | ES256 JWT (owner key) | Update a secret's policy. JWT payload: `{ name, policy }` |
+| Request | Auth | Role | Description |
+|---------|------|------|-------------|
+| `StoreSecret { name, secret, policy }` | OIDC | secret-owner | Store a secret. `secret` is base64url-encoded. |
+| `GetSecret { name, bearer_token? }` | OIDC owner **or** mutual RA-TLS | — | Retrieve a secret. |
+| `DeleteSecret { name }` | OIDC | secret-owner | Delete a secret (owner only). |
+| `UpdateSecretPolicy { name, policy }` | OIDC | secret-owner | Update a secret's policy (owner only). |
+| `ListSecrets` | OIDC | secret-owner | List all secrets owned by the caller (metadata only). |
 
 ### Responses
 
@@ -227,6 +235,7 @@ All requests arrive as JSON inside the enclave-os length-delimited framing
 | `SecretValue { secret, expires_at }` | Secret data returned (typically a Shamir share). |
 | `SecretDeleted` | Secret removed. |
 | `PolicyUpdated` | Policy replaced. |
+| `SecretList { secrets }` | List of `{ name, expires_at }` entries for the caller's secrets. |
 | `Error(String)` | Human-readable error message. |
 
 ---
@@ -234,81 +243,98 @@ All requests arrive as JSON inside the enclave-os length-delimited framing
 ## Access Policy
 
 Each secret carries a `SecretPolicy` that is evaluated on every `GetSecret`
-request.
+request via the RA-TLS path.  (OIDC owner path bypasses policy evaluation.)
 
 | Field | Type | Description |
 |-------|------|-------------|
 | `allowed_mrenclave` | `Vec<String>` | SGX MRENCLAVE values (hex) allowed to retrieve the secret. |
 | `allowed_mrtd` | `Vec<String>` | TDX MRTD values (hex) allowed to retrieve the secret. |
-| `manager_pubkey` | `Option<String>` | Hex-encoded uncompressed P-256 public key (65 bytes: `04 \|\| x \|\| y`) of the manager. When set, `GetSecret` requires a bearer token signed by this key. |
+| `manager_sub` | `Option<String>` | OIDC `sub` of the secret manager. When set, `GetSecret` via RA-TLS requires a bearer token whose OIDC `sub` matches and who has the `secret-manager` role. |
 | `required_oids` | `Vec<OidRequirement>` | OID/value pairs the caller's RA-TLS certificate must contain. |
 | `ttl_seconds` | `u64` | Time-to-live in seconds. Capped at 90 days, defaults to 30 days. |
 
-### Policy Evaluation Order
+### Policy Evaluation Order (RA-TLS path)
 
 1. **Mutual RA-TLS** — the vault requires the caller to present a TLS client
    certificate.  If no peer certificate is present the request is rejected.
 2. **Attestation extraction** — the vault parses the peer certificate's X.509
-   extensions to extract the SGX/TDX quote (OID `1.2.840.113741.1.13.1.0` or
-   `1.2.840.113741.1.5.5.1.6`) and any Privasys OID claims.
+   extensions to extract the SGX/TDX quote and Privasys OID claims.
 3. **Expiry** — the secret's `expires_at` timestamp is checked.
-4. **Attestation identity** — the extracted quote is parsed and its
+4. **Attestation server verification** — the quote is forwarded to the
+   configured attestation servers for cryptographic verification (signature
+   chain, TCB status, platform identity).
+5. **Attestation identity** — the extracted quote is parsed and its
    measurement (MRENCLAVE or MRTD) is checked against the whitelist.
-4b. **Bidirectional challenge-response** — when a `client_challenge_nonce`
-   is present (challenge mode), the vault extracts `report_data` from the
-   client's quote, computes the expected binding
-   `SHA-512(SHA-256(client_pubkey) || nonce)`, and verifies they match.
-   This proves the client generated its certificate specifically for this
-   connection, preventing replay of previously captured client certificates.
-5. **Manager bearer token** — if `manager_pubkey` is set, the bearer token
-   must be a valid ES256 JWT signed by the manager, with
-   `{ "name": "<secret-name>" }` matching the requested secret.
-6. **OID claims** — each `required_oids` entry must have a matching claim
-   extracted from the peer certificate (case-insensitive).
+5b. **Bidirectional challenge-response** — when a `client_challenge_nonce`
+   is present, the vault verifies the client's report_data binding.
+6. **Manager bearer token** — if `manager_sub` is set, the bearer token
+   must be a valid OIDC JWT whose `sub` matches the policy's `manager_sub`
+   and the holder must have the `secret-manager` role.
+7. **OID claims** — each `required_oids` entry must have a matching claim
+   extracted from the peer certificate.
 
 ---
 
-## JWT Authentication
+## OIDC Authentication
 
-### Owner JWTs (Store / Delete / UpdatePolicy)
+### OIDC Roles
 
-The secret owner signs JWTs with their P-256 private key.  The vault is
-configured at startup with the owner's public key:
+| Role | Claim value | Operations |
+|------|------------|------------|
+| `secret-owner` | `enclave-os-mini:secret-owner` | Store, Delete, Update, List, Get (own secrets) |
+| `secret-manager` | `enclave-os-mini:secret-manager` | Issue bearer tokens for RA-TLS GetSecret |
 
-```rust
-let vault = VaultModule::new(owner_pubkey_hex)?;
-```
+### Token Delivery
 
-The first `StoreSecret` call stores the SHA-256 hash of the owner's public
-key inside the `SecretRecord`.  Subsequent `DeleteSecret` and
-`UpdateSecretPolicy` calls verify that the JWT signer matches the stored
-hash — only the original creator can modify or remove a secret.
-
-### Manager Bearer Tokens (GetSecret)
-
-When a policy includes `manager_pubkey`, the `GetSecret` caller must provide
-a bearer token: an ES256 JWT signed by the manager's private key.
+Since enclave-os-mini uses a frame protocol (not HTTP), the OIDC bearer
+token is passed inside the JSON envelope as an `"auth"` field:
 
 ```json
-// Bearer token JWT payload
-{ "name": "customer-123-dek" }
+{
+  "auth": "eyJhbGciOiJSUzI1NiIs...",
+  "StoreSecret": {
+    "name": "customer-123-dek",
+    "secret": "base64url-encoded-bytes",
+    "policy": { "allowed_mrenclave": ["abcd1234..."], "ttl_seconds": 604800 }
+  }
+}
 ```
 
-The vault:
-1. Hex-decodes the `manager_pubkey` from the stored policy
-2. Creates a `JwtVerifier` from the manager's public key bytes
-3. Verifies the bearer token's signature
-4. Checks that `claims.name` matches the requested secret name
+The auth layer strips `"auth"`, verifies it via JWKS, and populates
+`OidcClaims` in the `RequestContext`.  The vault reads `ctx.oidc_claims.sub`
+for ownership checks and `ctx.oidc_claims.roles` for role verification.
 
-The manager's key is entirely separate from the owner's key.
+### Owner Identity
+
+The OIDC `sub` claim uniquely identifies the secret owner.  No more
+`OpenVault` / `CloseVault` ceremony — the OIDC subject *is* the vault
+namespace.  KV keys use the format `secret:{owner_sub}:{name}` for
+namespace isolation between owners.
 
 ---
 
 ## Storage
 
 Secrets are persisted using `enclave-os-kvstore`, which seals data with an
-**MRENCLAVE-bound key** (AES-256-GCM).  The KV key is the secret name
-(UTF-8 bytes).  The value is a JSON-serialised `SecretRecord`:
+**MRENCLAVE-bound key** (AES-256-GCM).  The KV store uses HMAC-SHA256 for
+key encryption, so keys are opaque on the host — no prefix or suffix
+queries are possible.
+
+### KV Key Layout
+
+| Key | Value | Purpose |
+|-----|-------|---------|
+| `secret:{owner_sub}:{name}` | JSON `SecretRecord` | The actual secret data |
+| `lookup:{name}` | `owner_sub` (UTF-8) | Reverse index for RA-TLS GetSecret (name → owner) |
+| `index:{owner_sub}` | JSON `Vec<String>` | Owner index for ListSecrets (owner → [name, ...]) |
+
+The reverse lookup index (`lookup:`) enables the RA-TLS GetSecret path
+where the caller knows the secret name but not the owner's OIDC subject.
+The owner index (`index:`) enables ListSecrets without scanning all keys.
+
+Both indexes are maintained atomically with secret creation and deletion.
+
+### SecretRecord
 
 ```rust
 struct SecretRecord {
@@ -316,7 +342,7 @@ struct SecretRecord {
     policy: SecretPolicy,     // access control
     created_at: u64,          // Unix timestamp
     expires_at: u64,          // Unix timestamp
-    owner_pubkey_hash: String, // SHA-256(owner public key), hex
+    owner_sub: String,        // OIDC subject of the secret owner
 }
 ```
 
@@ -351,8 +377,8 @@ provides vault client libraries with built-in Shamir Secret Sharing:
 | Rust | `rust/vault/` | `vault_client` |
 | Go | `go/vault/` | `enclave-os-mini/clients/go/vault` |
 
-Both clients handle Shamir splitting/reconstruction, ES256 JWT signing (for
-the owner), and RA-TLS transport to the vault enclaves.
+Both clients handle Shamir splitting/reconstruction, OIDC token management,
+and RA-TLS transport to the vault enclaves.
 
 ### Example (Rust)
 
@@ -366,11 +392,12 @@ let client = VaultClient::new(VaultClientConfig {
         VaultEndpoint { host: "vault3.example.com".into(), port: 443 },
     ],
     threshold: 2,
-    signing_key_pkcs8: std::fs::read("owner-key.p8").unwrap(),
+    // OIDC bearer token (secret-owner role)
+    oidc_token: Some("eyJhbGciOi...".into()),
     ca_cert_pem: Some("vault-ca.pem".into()),
     vault_policy: None,
     // Mutual RA-TLS: the client's own RA-TLS certificate + private key.
-    // Required for GetSecret — the vault extracts attestation from this cert.
+    // Required for GetSecret via RA-TLS path.
     client_cert_der: Some(vec![my_ratls_cert_der]),
     client_key_pkcs8: Some(my_ratls_key_pkcs8),
 }).unwrap();
@@ -378,16 +405,19 @@ let client = VaultClient::new(VaultClientConfig {
 // Store — secret owner Shamir-splits and distributes
 let policy = SecretPolicy::new()
     .allow_mrenclave("abcd1234...")     // remote TEE's measurement
-    .manager_pubkey("04aabb...")         // optional: manager's P-256 pubkey
+    .manager_sub("manager-oidc-sub")    // optional: secret manager's OIDC sub
     .ttl(86400 * 7);                    // 7 days
 client.store_secret("customer-123-dek", &secret_bytes, &policy).unwrap();
 
-// Retrieve — remote TEE collects shares via mutual RA-TLS and reconstructs.
-// The TEE's attestation evidence (quote + OIDs) is extracted from its
-// RA-TLS client certificate — no attestation data in the request body.
-let reconstructed = client.get_secret(
+// Retrieve (OIDC owner path) — owner collects shares and reconstructs.
+let reconstructed = client.get_secret_oidc("customer-123-dek").unwrap();
+
+// Retrieve (RA-TLS TEE path) — remote TEE collects shares via mutual
+// RA-TLS and reconstructs.  The TEE's attestation evidence is extracted
+// from its RA-TLS client certificate.
+let reconstructed = client.get_secret_ratls(
     "customer-123-dek",
-    Some(&manager_signed_jwt),  // bearer token (if manager_pubkey set)
+    Some(&manager_bearer_token),  // bearer token (if manager_sub set)
 ).unwrap();
 ```
 
@@ -398,5 +428,5 @@ let reconstructed = client.get_secret(
 | File | Description |
 |------|-------------|
 | [`src/lib.rs`](../crates/enclave-os-vault/src/lib.rs) | `VaultModule` — request dispatch and handlers |
-| [`src/types.rs`](../crates/enclave-os-vault/src/types.rs) | Wire types, `SecretPolicy`, `SecretRecord`, JWT claims |
+| [`src/types.rs`](../crates/enclave-os-vault/src/types.rs) | Wire types, `SecretPolicy`, `SecretRecord` |
 | [`src/quote.rs`](../crates/enclave-os-vault/src/quote.rs) | SGX v3 / TDX v4 quote parsing and policy matching |

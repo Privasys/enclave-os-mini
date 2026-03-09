@@ -1,11 +1,20 @@
 // Copyright (c) Privasys. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
-//! Vault-specific types: wire protocol, access policies, persisted records,
-//! and JWT claims.
+//! Vault-specific types: wire protocol, access policies, and persisted records.
 //!
 //! The vault protocol is carried inside [`Request::Data`] /
 //! [`Response::Data`] — it never leaks into the shared protocol crate.
+//!
+//! ## OIDC-based auth model
+//!
+//! Secret ownership is tied to the OIDC `sub` claim (the caller's unique
+//! identity from Zitadel or any OIDC provider).  The `"auth"` bearer token
+//! in the JSON envelope is verified by the enclave's auth layer before
+//! reaching the vault; the vault reads `ctx.oidc_claims.sub` for ownership.
+//!
+//! No more `OpenVault` / `CloseVault` — the OIDC subject *is* the vault
+//! namespace.
 
 use std::string::String;
 use std::vec::Vec;
@@ -27,60 +36,67 @@ pub const DEFAULT_SECRET_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
 // ---------------------------------------------------------------------------
 
 /// Vault-specific request, JSON-encoded inside `Request::Data`.
+///
+/// All mutating operations require the caller's OIDC token (via the JSON
+/// `"auth"` field) with the **secret-owner** role.  `GetSecret` supports
+/// a dual-path: OIDC owner *or* RA-TLS TEE with optional bearer token.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum VaultRequest {
     /// Store a named secret with an access policy.
     ///
-    /// JWT payload (signed by secret owner):
-    /// ```json
-    /// {
-    ///   "name": "customer-123-dek",
-    ///   "secret": "<base64url-encoded secret>",
-    ///   "policy": { ... }
-    /// }
-    /// ```
-    StoreSecret { jwt: Vec<u8> },
+    /// Requires OIDC **secret-owner** role.  The caller's `sub` becomes
+    /// the secret owner.
+    StoreSecret {
+        /// Human-readable secret name (e.g. `"customer-123-dek"`).
+        name: String,
+        /// Base64url-encoded secret bytes.
+        secret: String,
+        /// Access policy for this secret.
+        policy: SecretPolicy,
+    },
 
-    /// Open a top-level vault for a secret owner by registering their
-    /// hex-encoded uncompressed P-256 public key.  Returns a `kid` that
-    /// clients will put in the JWT header when later storing/deleting
-    /// secrets.
-    OpenVault { pubkey_hex: String },
-
-    /// Retrieve a named secret.  Authorised by the caller's mutual RA-TLS
-    /// client certificate (which contains the SGX/TDX quote and OID
-    /// extensions) + optional bearer token.
+    /// Retrieve a named secret.
+    ///
+    /// **Dual-path auth:**
+    /// - **OIDC owner path**: caller's `sub` matches the stored owner.
+    ///   No RA-TLS required.
+    /// - **RA-TLS TEE path**: mutual RA-TLS client certificate with
+    ///   matching measurements + optional bearer token from the secret
+    ///   manager.
     GetSecret {
         /// Secret name.
         name: String,
-        /// Optional bearer token (raw bytes).
+        /// Optional bearer token (raw bytes) for defence-in-depth when
+        /// using the RA-TLS path.
         #[serde(default)]
         bearer_token: Option<Vec<u8>>,
     },
 
-    /// Delete a named secret.  Only the secret owner (JWT signer) can delete.
+    /// Delete a named secret.
     ///
-    /// JWT payload: `{ "name": "customer-123-dek" }`
-    DeleteSecret { jwt: Vec<u8> },
+    /// Requires OIDC **secret-owner** role.  Only the original owner
+    /// (matching `sub`) can delete.
+    DeleteSecret {
+        /// Name of the secret to delete.
+        name: String,
+    },
 
-    /// Update the access policy for an existing named secret.
+    /// Update the access policy for an existing secret.
     ///
-    /// JWT payload:
-    /// ```json
-    /// {
-    ///   "name": "customer-123-dek",
-    ///   "policy": { ... }
-    /// }
-    /// ```
-    UpdateSecretPolicy { jwt: Vec<u8> },
+    /// Requires OIDC **secret-owner** role.  Only the original owner
+    /// (matching `sub`) can update.
+    UpdateSecretPolicy {
+        /// Name of the secret whose policy should be updated.
+        name: String,
+        /// New access policy.
+        policy: SecretPolicy,
+    },
 
-    /// Close (unregister) a vault owner.  Requires a JWT signed by the
-    /// owner whose `kid` header matches the registered vault.
+    /// List all secrets owned by the caller.
     ///
-    /// **All secrets owned by this key are deleted.**
-    ///
-    /// JWT payload: `{}` (empty — the `kid` header identifies the vault).
-    CloseVault { jwt: Vec<u8> },
+    /// Requires OIDC **secret-owner** role.  Returns metadata only
+    /// (name + expires_at), never the secret values.
+    ListSecrets,
 }
 
 /// Vault-specific response, JSON-encoded inside `Response::Data`.
@@ -104,15 +120,22 @@ pub enum VaultResponse {
     SecretDeleted,
     /// Secret policy updated successfully.
     PolicyUpdated,
-    /// Vault opened successfully; contains the generated `kid` for the owner.
-    VaultOpened { kid: String },
-    /// Vault closed (owner key unregistered, all owned secrets deleted).
-    VaultClosed {
-        /// Number of secrets that were deleted.
-        secrets_deleted: usize,
+    /// List of secrets owned by the caller.
+    SecretList {
+        /// Metadata for each owned secret.
+        secrets: Vec<SecretListEntry>,
     },
     /// Error with human-readable message.
     Error(String),
+}
+
+/// Metadata for a single secret in a list response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretListEntry {
+    /// Secret name.
+    pub name: String,
+    /// Unix timestamp when this secret expires.
+    pub expires_at: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -124,9 +147,9 @@ pub enum VaultResponse {
 /// The key is a dotted OID string (e.g. `"1.3.6.1.4.1.65230.2.1"`)
 /// and the value is the expected hex-encoded extension bytes.
 ///
-/// When a caller requests a secret, the vault checks that every
-/// `OidRequirement` in the policy has a matching `OidClaim` from the
-/// caller.
+/// When a caller requests a secret via the RA-TLS path, the vault checks
+/// that every `OidRequirement` in the policy has a matching `OidClaim`
+/// from the caller.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OidRequirement {
     /// Dotted OID string (e.g. `"1.3.6.1.4.1.65230.2.1"`).
@@ -152,8 +175,10 @@ pub struct OidClaim {
 /// Access policy for a vault secret.
 ///
 /// Defines which TEE measurements (MRENCLAVE for SGX, MRTD for TDX) are
-/// allowed to retrieve the secret, whether a bearer token is required,
-/// and which RA-TLS X.509 OID extensions must match.
+/// allowed to retrieve the secret via the **RA-TLS path**, and optional
+/// defence-in-depth via a bearer token from the secret manager.
+///
+/// The OIDC owner can always retrieve their own secrets without RA-TLS.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretPolicy {
     /// SGX MRENCLAVE values (hex-encoded, 64 chars each) allowed to retrieve.
@@ -162,17 +187,18 @@ pub struct SecretPolicy {
     /// TDX MRTD values (hex-encoded, 96 chars each) allowed to retrieve.
     #[serde(default)]
     pub allowed_mrtd: Vec<String>,
-    /// Hex-encoded uncompressed P-256 public key (65 bytes: `04 || x || y`)
-    /// of the manager authorised to issue bearer tokens for this secret.
+    /// OIDC `sub` of the secret manager authorised to issue bearer tokens
+    /// for this secret.
     ///
-    /// If present, `GetSecret` requires a valid ES256 JWT signed by this
-    /// key.  The JWT payload must contain `{ "name": "<secret-name>" }`.
+    /// If present, `GetSecret` via the RA-TLS path requires a valid bearer
+    /// token whose OIDC `sub` matches this value and who has the
+    /// `secret-manager` role.
     ///
     /// This provides defense-in-depth: even if remote attestation is
-    /// compromised, the attacker still needs a fresh bearer token from the
-    /// manager.
+    /// compromised, the attacker still needs a fresh bearer token from
+    /// the secret manager.
     #[serde(default)]
-    pub manager_pubkey: Option<String>,
+    pub manager_sub: Option<String>,
     /// Required X.509 OID extensions from the caller's RA-TLS certificate.
     /// Each entry must have a matching claim from the caller.  Empty means
     /// no OID checks.
@@ -191,8 +217,8 @@ pub struct SecretPolicy {
 
 /// A named secret with its metadata, stored in the sealed KV store.
 ///
-/// The KV key is the secret name (UTF-8 bytes).  The value is a
-/// JSON-serialized `SecretRecord`.
+/// The KV key is `"secret:{owner_sub}:{name}"` (UTF-8 bytes).
+/// The value is a JSON-serialized `SecretRecord`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecretRecord {
     /// The plaintext secret bytes (encrypted at rest by the KV store layer).
@@ -203,47 +229,19 @@ pub struct SecretRecord {
     pub created_at: u64,
     /// Unix timestamp (seconds) when the secret expires.
     pub expires_at: u64,
-    /// SHA-256 hash (hex) of the secret owner's public key.
-    /// Used to verify that only the original owner can delete/update.
-    pub owner_pubkey_hash: String,
+    /// OIDC `sub` of the secret owner.
+    pub owner_sub: String,
 }
 
 // ---------------------------------------------------------------------------
-//  JWT claim types
+//  Bearer token claims (for RA-TLS path defence-in-depth)
 // ---------------------------------------------------------------------------
 
-/// JWT payload for `StoreSecret`.
-#[derive(Debug, Deserialize)]
-pub struct StoreSecretClaims {
-    /// Human-readable secret name (e.g. `"customer-123-dek"`).
-    pub name: String,
-    /// Base64url-encoded secret bytes.
-    pub secret: String,
-    /// Access policy for this secret.
-    pub policy: SecretPolicy,
-}
-
-/// JWT payload for `DeleteSecret`.
-#[derive(Debug, Deserialize)]
-pub struct DeleteSecretClaims {
-    /// Name of the secret to delete.
-    pub name: String,
-}
-
-/// JWT payload for `UpdateSecretPolicy`.
-#[derive(Debug, Deserialize)]
-pub struct UpdateSecretPolicyClaims {
-    /// Name of the secret whose policy should be updated.
-    pub name: String,
-    /// New access policy.
-    pub policy: SecretPolicy,
-}
-
-/// JWT payload for bearer tokens issued by the manager.
+/// JWT payload for bearer tokens issued by the secret manager.
 ///
-/// The manager signs this with their ES256 private key.  The vault
-/// verifies the signature against the `manager_pubkey` stored in the
-/// secret's policy, then checks the `name` matches the requested secret.
+/// The secret manager signs this via their OIDC provider.  The vault
+/// verifies the bearer token's `sub` against the `manager_sub` stored
+/// in the secret's policy.
 #[derive(Debug, Deserialize)]
 pub struct BearerTokenClaims {
     /// Name of the secret this token authorises access to.

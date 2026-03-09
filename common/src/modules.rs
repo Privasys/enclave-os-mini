@@ -79,7 +79,7 @@ pub struct AppIdentity {
 
 /// Per-request context passed to [`EnclaveModule::handle()`].
 ///
-/// Carries optional metadata extracted from the TLS session.
+/// Carries optional metadata extracted from the TLS session and OIDC auth.
 pub struct RequestContext {
     /// DER-encoded leaf certificate presented by the TLS client.
     ///
@@ -90,6 +90,11 @@ pub struct RequestContext {
     /// Random nonce sent to the client via the TLS CertificateRequest
     /// extension `0xFFBB` for bidirectional challenge-response attestation.
     pub client_challenge_nonce: Option<Vec<u8>>,
+
+    /// Verified OIDC claims extracted from the `"auth"` field in the
+    /// JSON envelope.  `None` when no bearer token was provided (e.g.
+    /// healthz, or RA-TLS-only vault GetSecret).
+    pub oidc_claims: Option<crate::oidc::OidcClaims>,
 }
 
 // ---------------------------------------------------------------------------

@@ -269,16 +269,21 @@ impl IngressServer {
     fn dispatch_frames(&mut self, conn_id: u32, session: &mut RaTlsSession) {
         // Build per-connection request context with optional peer cert
         // and client challenge nonce (for bidirectional RA-TLS verification,
-        // sent via TLS CertificateRequest extension 0xFFBB)
-        let ctx = enclave_os_common::modules::RequestContext {
+        // sent via TLS CertificateRequest extension 0xFFBB).
+        //
+        // OIDC claims are populated per-frame in handle_frame() because
+        // different frames in the same session may carry different tokens
+        // (or none — e.g. Healthz).
+        let base_ctx = enclave_os_common::modules::RequestContext {
             peer_cert_der: session.peer_cert_der(),
             client_challenge_nonce: session.client_challenge_nonce().cloned(),
+            oidc_claims: None,
         };
 
         loop {
             match session.recv_frame() {
                 Ok(Some(payload)) => {
-                    match handle_frame(&payload, &ctx) {
+                    match handle_frame(&payload, &base_ctx) {
                         HandleResult::Response(resp) => {
                             match session.send_frame(&resp) {
                                 Ok(tls_bytes) => {
@@ -617,30 +622,254 @@ enum HandleResult {
 }
 
 /// Handle a complete, already-decoded frame payload from a client.
-fn handle_frame(payload: &[u8], ctx: &enclave_os_common::modules::RequestContext) -> HandleResult {
+///
+/// The auth layer works as follows:
+/// 1. Parse the raw JSON.
+/// 2. If an `"auth"` field is present, extract and verify the OIDC bearer
+///    token against the global OIDC config.  Populate a new `RequestContext`
+///    with the verified claims.
+/// 3. Remove `"auth"` from the JSON and re-serialize for module dispatch.
+/// 4. `Healthz` requires no auth.  All other operations require a valid
+///    token when OIDC is configured.
+fn handle_frame(payload: &[u8], base_ctx: &enclave_os_common::modules::RequestContext) -> HandleResult {
     use enclave_os_common::protocol::{Request, Response};
+
+    // Step 1: Try to parse as a typed Request directly.
+    // If it's a simple variant (Healthz, Shutdown), handle immediately.
     match serde_json::from_slice::<Request>(payload) {
-        Ok(Request::Ping) => {
-            let resp = serde_json::to_vec(&Response::Pong).unwrap_or_default();
-            HandleResult::Response(resp)
+        Ok(Request::Healthz) => {
+            let resp = serde_json::to_vec(&Response::Healthz { status: "ok".into() })
+                .unwrap_or_default();
+            return HandleResult::Response(resp);
         }
-        Ok(Request::Shutdown) => HandleResult::Shutdown,
-        Ok(req) => {
-            // Try all registered modules first
-            if let Some(resp) = modules::dispatch(&req, ctx) {
+        Ok(Request::Shutdown) => return HandleResult::Shutdown,
+        _ => {}
+    }
+
+    // Step 2: Parse as a generic JSON value to extract "auth" field.
+    let mut json_val: serde_json::Value = match serde_json::from_slice(payload) {
+        Ok(v) => v,
+        Err(_) => {
+            let err = Response::Error(b"invalid JSON request".to_vec());
+            return HandleResult::Response(serde_json::to_vec(&err).unwrap_or_default());
+        }
+    };
+
+    // Step 3: Extract and verify OIDC token if present.
+    let oidc_claims = if let Some(auth_val) = json_val.as_object_mut().and_then(|m| m.remove("auth")) {
+        let token_str = match auth_val.as_str() {
+            Some(s) => s,
+            None => {
+                let err = Response::Error(b"\"auth\" field must be a string".to_vec());
+                return HandleResult::Response(serde_json::to_vec(&err).unwrap_or_default());
+            }
+        };
+        match verify_oidc_token(token_str) {
+            Ok(claims) => Some(claims),
+            Err(e) => {
+                let err = Response::Error(format!("OIDC auth failed: {e}").into_bytes());
+                return HandleResult::Response(serde_json::to_vec(&err).unwrap_or_default());
+            }
+        }
+    } else {
+        None
+    };
+
+    // Step 4: Build a context with OIDC claims.
+    let ctx = enclave_os_common::modules::RequestContext {
+        peer_cert_der: base_ctx.peer_cert_der.clone(),
+        client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
+        oidc_claims,
+    };
+
+    // Step 5: Re-parse the (auth-stripped) JSON as a Request.
+    let req: Request = match serde_json::from_value(json_val) {
+        Ok(r) => r,
+        Err(_) => {
+            let err = Response::Error(b"invalid request after auth extraction".to_vec());
+            return HandleResult::Response(serde_json::to_vec(&err).unwrap_or_default());
+        }
+    };
+
+    // Step 6: Handle monitoring operations (require Monitoring+ role).
+    match req {
+        Request::Readyz | Request::Status | Request::Metrics => {
+            if let Some(ref oidc_config) = crate::oidc_config() {
+                let _ = oidc_config; // OIDC is configured: require monitoring role
+                match ctx.oidc_claims {
+                    Some(ref claims) if claims.has_monitoring() => {}
+                    _ => {
+                        let err = Response::Error(b"monitoring role required".to_vec());
+                        return HandleResult::Response(serde_json::to_vec(&err).unwrap_or_default());
+                    }
+                }
+            }
+            match req {
+                Request::Readyz => {
+                    let module_count = modules::module_count();
+                    let resp = Response::Readyz {
+                        status: if module_count > 0 { "ready".into() } else { "not_ready".into() },
+                        modules: module_count,
+                    };
+                    HandleResult::Response(serde_json::to_vec(&resp).unwrap_or_default())
+                }
+                Request::Status => {
+                    let statuses = modules::collect_module_statuses();
+                    let resp = Response::StatusReport(statuses);
+                    HandleResult::Response(serde_json::to_vec(&resp).unwrap_or_default())
+                }
+                Request::Metrics => {
+                    let metrics = enclave_os_common::protocol::EnclaveMetrics::default();
+                    let resp = Response::MetricsReport(metrics);
+                    HandleResult::Response(serde_json::to_vec(&resp).unwrap_or_default())
+                }
+                _ => unreachable!(),
+            }
+        }
+        Request::Data(_) => {
+            // Module dispatch — modules enforce their own role requirements
+            if let Some(resp) = modules::dispatch(&req, &ctx) {
                 HandleResult::Response(serde_json::to_vec(&resp).unwrap_or_default())
-            } else if let Request::Data(payload) = req {
+            } else if let Request::Data(inner) = req {
                 // Fallback: echo Data back if no module handled it
-                let resp = serde_json::to_vec(&Response::Data(payload)).unwrap_or_default();
+                let resp = serde_json::to_vec(&Response::Data(inner)).unwrap_or_default();
                 HandleResult::Response(resp)
             } else {
                 let err = Response::Error(b"unhandled request".to_vec());
                 HandleResult::Response(serde_json::to_vec(&err).unwrap_or_default())
             }
         }
-        Err(_) => {
-            let err = Response::Error(b"invalid JSON request".to_vec());
-            HandleResult::Response(serde_json::to_vec(&err).unwrap_or_default())
+        Request::Healthz => {
+            // Already handled above, but just in case
+            let resp = serde_json::to_vec(&Response::Healthz { status: "ok".into() })
+                .unwrap_or_default();
+            HandleResult::Response(resp)
+        }
+        Request::Shutdown => HandleResult::Shutdown,
+    }
+}
+
+/// Verify an OIDC bearer token against the global OIDC configuration.
+///
+/// This performs a lightweight validation:
+/// 1. Decode the JWT header and claims (no signature verification yet —
+///    full JWKS-based verification is step 1 in the implementation plan).
+/// 2. Validate `iss` and `aud` claims.
+/// 3. Extract roles from the configured claim paths.
+///
+/// TODO(oidc): Replace with full JWKS-based signature verification once
+/// the egress-based JWKS fetcher is implemented (requires outbound HTTPS
+/// to the OIDC provider's `.well-known/openid-configuration` endpoint).
+fn verify_oidc_token(token: &str) -> Result<enclave_os_common::oidc::OidcClaims, String> {
+    let config = crate::oidc_config()
+        .ok_or_else(|| "OIDC not configured".to_string())?;
+
+    // Decode JWT claims (header.payload.signature)
+    let parts: Vec<&str> = token.splitn(3, '.').collect();
+    if parts.len() != 3 {
+        return Err("malformed JWT: expected 3 dot-separated parts".into());
+    }
+
+    // Decode payload (base64url → JSON)
+    let payload_bytes = base64_url_decode(parts[1])
+        .map_err(|e| format!("JWT payload base64: {e}"))?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload_bytes)
+        .map_err(|e| format!("JWT payload JSON: {e}"))?;
+
+    // Validate issuer
+    let iss = claims.get("iss")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "JWT missing 'iss' claim".to_string())?;
+    if iss != config.issuer {
+        return Err(format!("JWT issuer '{}' != expected '{}'", iss, config.issuer));
+    }
+
+    // Validate audience
+    let aud_ok = match claims.get("aud") {
+        Some(serde_json::Value::String(s)) => s == &config.audience,
+        Some(serde_json::Value::Array(arr)) => arr.iter().any(|v| v.as_str() == Some(&config.audience)),
+        _ => false,
+    };
+    if !aud_ok {
+        return Err(format!("JWT audience does not contain '{}'", config.audience));
+    }
+
+    // Validate expiry
+    if let Some(exp) = claims.get("exp").and_then(|v| v.as_u64()) {
+        let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
+        if now > exp {
+            return Err("JWT token expired".into());
         }
     }
+
+    // Extract subject
+    let sub = claims.get("sub")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // Extract roles
+    let roles = enclave_os_common::oidc::extract_roles(&claims, config);
+
+    Ok(enclave_os_common::oidc::OidcClaims { sub, roles })
+}
+
+/// Decode base64url (no padding) to bytes.
+fn base64_url_decode(input: &str) -> Result<Vec<u8>, String> {
+    // Replace URL-safe chars with standard base64 chars
+    let standard: String = input.chars().map(|c| match c {
+        '-' => '+',
+        '_' => '/',
+        c => c,
+    }).collect();
+
+    // Add padding if needed
+    let padded = match standard.len() % 4 {
+        2 => format!("{}==", standard),
+        3 => format!("{}=", standard),
+        _ => standard,
+    };
+
+    // Use a simple base64 decoder — no external dep needed since
+    // we already link ring which provides what we need, but for
+    // simplicity we manually decode:
+    base64_decode_standard(&padded)
+}
+
+/// Standard base64 decode (with padding).
+fn base64_decode_standard(input: &str) -> Result<Vec<u8>, String> {
+    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+
+    fn val(c: u8) -> Result<u8, String> {
+        match c {
+            b'A'..=b'Z' => Ok(c - b'A'),
+            b'a'..=b'z' => Ok(c - b'a' + 26),
+            b'0'..=b'9' => Ok(c - b'0' + 52),
+            b'+' => Ok(62),
+            b'/' => Ok(63),
+            b'=' => Ok(0),
+            _ => Err(format!("invalid base64 char: {}", c as char)),
+        }
+    }
+    let _ = CHARS; // suppress unused warning
+
+    let bytes = input.as_bytes();
+    if bytes.len() % 4 != 0 {
+        return Err("base64 input length not multiple of 4".into());
+    }
+
+    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
+    for chunk in bytes.chunks(4) {
+        let a = val(chunk[0])?;
+        let b = val(chunk[1])?;
+        let c_val = val(chunk[2])?;
+        let d = val(chunk[3])?;
+
+        let triple = ((a as u32) << 18) | ((b as u32) << 12) | ((c_val as u32) << 6) | (d as u32);
+
+        out.push((triple >> 16) as u8);
+        if chunk[2] != b'=' { out.push((triple >> 8) as u8); }
+        if chunk[3] != b'=' { out.push(triple as u8); }
+    }
+    Ok(out)
 }

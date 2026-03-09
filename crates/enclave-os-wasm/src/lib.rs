@@ -260,9 +260,14 @@ impl EnclaveModule for WasmModule {
     /// - `wasm_unload` — unload an app by name
     /// - `wasm_list`   — list all loaded apps
     ///
+    /// **OIDC role requirements** (when OIDC is configured):
+    /// - `wasm_load`, `wasm_unload`: requires **manager** role
+    /// - `wasm_call`: requires any valid OIDC token (no specific role)
+    /// - `wasm_list`: requires **monitoring** role (manager also works)
+    ///
     /// Returns `None` if the payload doesn't match any WASM envelope
     /// (letting other modules handle the request).
-    fn handle(&self, req: &Request, _ctx: &RequestContext) -> Option<Response> {
+    fn handle(&self, req: &Request, ctx: &RequestContext) -> Option<Response> {
         let data = match req {
             Request::Data(d) => d,
             _ => return None,
@@ -273,6 +278,56 @@ impl EnclaveModule for WasmModule {
             Ok(e) => e,
             Err(_) => return None, // Not a WASM request — decline.
         };
+
+        // ── OIDC role gate ──────────────────────────────────────────────
+        // Determine the required role for the operation being attempted.
+        //
+        // - wasm_load / wasm_unload: Manager (platform operator lifecycle)
+        // - wasm_call: any authenticated user (app customers)
+        // - wasm_list: Monitoring+ (read-only introspection)
+        let needs_manager = envelope.wasm_load.is_some()
+            || envelope.wasm_unload.is_some();
+        let needs_auth_only = envelope.wasm_call.is_some();
+        let needs_monitoring = envelope.wasm_list.is_some();
+
+        if needs_manager {
+            if let Some(ref claims) = ctx.oidc_claims {
+                if !claims.has_manager() {
+                    let err = serde_json::to_vec(&WasmManagementResult::Error {
+                        message: String::from("manager role required"),
+                    }).unwrap_or_default();
+                    return Some(Response::Data(err));
+                }
+            } else if enclave_os_common::oidc::is_oidc_configured() {
+                let err = serde_json::to_vec(&WasmManagementResult::Error {
+                    message: String::from("OIDC authentication required (manager role)"),
+                }).unwrap_or_default();
+                return Some(Response::Data(err));
+            }
+        } else if needs_auth_only {
+            // wasm_call: any authenticated user can call WASM apps.
+            // No specific role required, but a valid token is mandatory.
+            if ctx.oidc_claims.is_none() && enclave_os_common::oidc::is_oidc_configured() {
+                let err = serde_json::to_vec(&WasmResult::Error {
+                    message: String::from("OIDC authentication required"),
+                }).unwrap_or_default();
+                return Some(Response::Data(err));
+            }
+        } else if needs_monitoring {
+            if let Some(ref claims) = ctx.oidc_claims {
+                if !claims.has_monitoring() {
+                    let err = serde_json::to_vec(&WasmManagementResult::Error {
+                        message: String::from("monitoring role required"),
+                    }).unwrap_or_default();
+                    return Some(Response::Data(err));
+                }
+            } else if enclave_os_common::oidc::is_oidc_configured() {
+                let err = serde_json::to_vec(&WasmManagementResult::Error {
+                    message: String::from("OIDC authentication required (monitoring role)"),
+                }).unwrap_or_default();
+                return Some(Response::Data(err));
+            }
+        }
 
         // 1. wasm_call — execute a function
         if let Some(call) = envelope.wasm_call {

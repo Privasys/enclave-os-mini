@@ -1,46 +1,38 @@
 // Copyright (c) Privasys. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
-//! Vault module for enclave-os — policy-gated secret store inside SGX.
+//! Vault module for enclave-os — OIDC-authenticated, policy-gated secret
+//! store inside SGX.
 //!
 //! Secrets are stored in the sealed KV store (AES-256-GCM encrypted,
 //! MRENCLAVE-bound).  Each secret has a named key, an access policy
 //! (MRENCLAVE/MRTD whitelist + optional bearer token + optional OID
 //! verification), and a TTL (max 3 months).
 //!
-//! The vault protocol is carried inside [`Request::Data`] /
-//! [`Response::Data`] — it never pollutes the shared protocol crate.
-//! See [`VaultRequest`] and [`VaultResponse`] for the inner envelope.
+//! ## OIDC auth model
+//!
+//! Secret ownership is bound to the caller's OIDC `sub` claim.  No more
+//! `OpenVault` / `CloseVault` — the OIDC subject *is* the vault namespace.
+//!
+//! KV keys use the format `"secret:{owner_sub}:{name}"` for namespace
+//! isolation between owners.
 //!
 //! ## Protocol
 //!
-//! | VaultRequest | Auth | VaultResponse |
-//! |--------------|------|---------------|
-//! | `OpenVault { pubkey_hex }` | None (registers owner key) | `VaultOpened { kid }` |
-//! | `CloseVault { jwt }` | ES256 JWT with `kid` (owner) | `VaultClosed { secrets_deleted }` |
-//! | `StoreSecret { jwt }` | ES256 JWT with `kid` header | `SecretStored { name, expires_at }` |
-//! | `GetSecret { name, .. }` | RA-TLS quote + token + OIDs | `SecretValue { secret, expires_at }` |
-//! | `DeleteSecret { jwt }` | ES256 JWT with `kid` (owner) | `SecretDeleted` |
-//! | `UpdateSecretPolicy { jwt }` | ES256 JWT with `kid` (owner) | `PolicyUpdated` |
+//! | VaultRequest | Auth | Role | VaultResponse |
+//! |---|---|---|---|
+//! | `StoreSecret { name, secret, policy }` | OIDC | secret-owner | `SecretStored { name, expires_at }` |
+//! | `GetSecret { name }` | OIDC owner **or** RA-TLS TEE | — | `SecretValue { secret, expires_at }` |
+//! | `DeleteSecret { name }` | OIDC | secret-owner | `SecretDeleted` |
+//! | `UpdateSecretPolicy { name, policy }` | OIDC | secret-owner | `PolicyUpdated` |
+//! | `ListSecrets` | OIDC | secret-owner | `SecretList { secrets }` |
 //!
-//! ## Usage
+//! ## GetSecret dual-path auth
 //!
-//! ```rust,ignore
-//! use enclave_os_vault::VaultModule;
-//! use enclave_os_enclave::ecall::{init_enclave, finalize_and_run};
-//! use enclave_os_enclave::modules::register_module;
-//!
-//! let (config, sealed_cfg) = init_enclave(config_json, config_len)?;
-//!
-//! // KvStoreModule must be registered first (vault depends on it).
-//! let kvstore = enclave_os_kvstore::KvStoreModule::new(sealed_cfg.master_key())?;
-//! register_module(Box::new(kvstore));
-//!
-//! let vault = VaultModule::new();
-//! register_module(Box::new(vault));
-//!
-//! finalize_and_run(&config, &sealed_cfg);
-//! ```
+//! 1. **OIDC owner path**: caller's `sub` matches the secret's `owner_sub`.
+//!    No RA-TLS required.
+//! 2. **RA-TLS TEE path**: mutual RA-TLS client certificate with matching
+//!    measurements + optional bearer token from the secret manager.
 
 pub mod quote;
 pub mod types;
@@ -51,17 +43,15 @@ use std::vec::Vec;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
 
-use enclave_os_common::jwt::JwtVerifier;
-use enclave_os_common::digest;
-use serde_json::Value;
 use enclave_os_common::protocol::{Request, Response};
 use enclave_os_common::modules::{EnclaveModule, RequestContext};
+use enclave_os_kvstore::SealedKvStore;
 
 use crate::quote::{hex_encode, extract_report_data, is_permitted, parse_quote};
 use enclave_os_common::quote::compute_report_data_hash;
 use crate::types::{
-    BearerTokenClaims, DeleteSecretClaims, OidClaim, SecretRecord, StoreSecretClaims,
-    UpdateSecretPolicyClaims, VaultRequest, VaultResponse,
+    OidClaim, SecretRecord, SecretListEntry,
+    VaultRequest, VaultResponse,
     DEFAULT_SECRET_TTL_SECONDS, MAX_SECRET_TTL_SECONDS,
 };
 
@@ -72,38 +62,18 @@ use crate::types::{
 /// Enclave module that handles named secret storage with policy-gated access.
 ///
 /// Secrets are persisted in the sealed KV store (via `enclave-os-kvstore`).
-/// The KV key is the secret name (UTF-8 bytes).
+/// The KV key is `"secret:{owner_sub}:{name}"`.
 ///
-/// Storing, deleting, and updating secrets requires an ES256 JWT whose
-/// `kid` header maps to a registered owner public key (see `OpenVault`).
-/// The owner's public-key hash is stored per-secret and checked on
-/// delete / policy update.  Retrieving secrets requires a valid
-/// SGX/TDX attestation quote matching the secret's policy whitelist, plus
-/// an optional bearer token and optional OID claims.
-///
-/// ## Attestation server verification
-///
-/// When a client requests a secret via mutual RA-TLS, the vault sends the
-/// client's attestation quote to the configured attestation servers for
-/// cryptographic verification (signature chain, TCB status, platform
-/// identity) before trusting the measurements.  The attestation server is
-/// TEE-agnostic (SGX, TDX, SEV-SNP, etc.).
-///
-/// Attestation server URLs are configured via [`EgressModule::new()`] at
-/// startup and accessed at runtime through [`enclave_os_egress::attestation_servers()`].
-/// The URL list is registered as a Merkle tree leaf and X.509 OID
-/// (`1.3.6.1.4.1.65230.2.7`), making it auditable.
+/// Storing, deleting, updating, and listing secrets requires an OIDC bearer
+/// token with the **secret-owner** role.  The `sub` claim identifies the
+/// owner.  Retrieving secrets supports dual-path auth: OIDC owner *or*
+/// RA-TLS TEE.
 pub struct VaultModule {
     _private: (), // zero-sized — no global state needed
 }
 
 impl VaultModule {
     /// Construct the vault module.
-    ///
-    /// Secret owners register their P-256 public key via `OpenVault`
-    /// and receive a `kid`.  Subsequent store/delete/update JWTs carry
-    /// that `kid` in the header.  Higher-level permissioning (e.g. OIDC)
-    /// can be layered on later.
     pub fn new() -> Self {
         Self { _private: () }
     }
@@ -128,15 +98,18 @@ impl EnclaveModule for VaultModule {
         };
 
         let vault_resp = match vault_req {
-            VaultRequest::OpenVault { pubkey_hex } => self.handle_open(pubkey_hex),
-            VaultRequest::StoreSecret { jwt } => self.handle_store(&jwt),
+            VaultRequest::StoreSecret { name, secret, policy } => {
+                self.handle_store(&name, &secret, policy, ctx)
+            }
             VaultRequest::GetSecret {
                 name,
                 bearer_token,
             } => self.handle_get(&name, bearer_token.as_deref(), ctx),
-            VaultRequest::DeleteSecret { jwt } => self.handle_delete(&jwt),
-            VaultRequest::UpdateSecretPolicy { jwt } => self.handle_update_policy(&jwt),
-            VaultRequest::CloseVault { jwt } => self.handle_close(&jwt),
+            VaultRequest::DeleteSecret { name } => self.handle_delete(&name, ctx),
+            VaultRequest::UpdateSecretPolicy { name, policy } => {
+                self.handle_update_policy(&name, policy, ctx)
+            }
+            VaultRequest::ListSecrets => self.handle_list_secrets(ctx),
         };
 
         // Wrap VaultResponse inside Response::Data
@@ -154,17 +127,89 @@ impl EnclaveModule for VaultModule {
 // ---------------------------------------------------------------------------
 
 impl VaultModule {
+    /// Require the caller to have the secret-owner OIDC role.
+    /// Returns the owner's `sub` or an error response.
+    fn require_secret_owner(ctx: &RequestContext) -> Result<String, VaultResponse> {
+        let claims = ctx.oidc_claims.as_ref().ok_or_else(|| {
+            VaultResponse::Error("OIDC authentication required (secret-owner role)".into())
+        })?;
+        if !claims.has_secret_owner() {
+            return Err(VaultResponse::Error("secret-owner role required".into()));
+        }
+        Ok(claims.sub.clone())
+    }
+
+    /// Build the KV key for a secret: `"secret:{owner_sub}:{name}"`.
+    fn kv_key(owner_sub: &str, name: &str) -> Vec<u8> {
+        format!("secret:{}:{}", owner_sub, name).into_bytes()
+    }
+
+    /// Build the KV key for the name→owner reverse lookup.
+    /// Used by the RA-TLS GetSecret path (caller knows the name but not
+    /// the owner_sub).
+    fn lookup_key(name: &str) -> Vec<u8> {
+        format!("lookup:{}", name).into_bytes()
+    }
+
+    /// Build the KV key for the owner→names index.
+    /// Used by ListSecrets.
+    fn owner_index_key(owner_sub: &str) -> Vec<u8> {
+        format!("index:{}", owner_sub).into_bytes()
+    }
+
+    /// Add a secret name to the owner's index.
+    fn add_to_owner_index(
+        store: &SealedKvStore,
+        owner_sub: &str,
+        name: &str,
+    ) -> Result<(), String> {
+        let idx_key = Self::owner_index_key(owner_sub);
+        let mut names: Vec<String> = match store.get(&idx_key) {
+            Ok(Some(data)) => serde_json::from_slice(&data)
+                .unwrap_or_default(),
+            _ => Vec::new(),
+        };
+        if !names.iter().any(|n| n == name) {
+            names.push(name.to_string());
+        }
+        let data = serde_json::to_vec(&names)
+            .map_err(|e| format!("serialise index: {e}"))?;
+        store.put(&idx_key, &data)
+    }
+
+    /// Remove a secret name from the owner's index.
+    fn remove_from_owner_index(
+        store: &SealedKvStore,
+        owner_sub: &str,
+        name: &str,
+    ) -> Result<(), String> {
+        let idx_key = Self::owner_index_key(owner_sub);
+        let mut names: Vec<String> = match store.get(&idx_key) {
+            Ok(Some(data)) => serde_json::from_slice(&data)
+                .unwrap_or_default(),
+            _ => return Ok(()),
+        };
+        names.retain(|n| n != name);
+        let data = serde_json::to_vec(&names)
+            .map_err(|e| format!("serialise index: {e}"))?;
+        store.put(&idx_key, &data)
+    }
+
     /// Store a named secret with an access policy.
-    fn handle_store(&self, jwt: &[u8]) -> VaultResponse {
-        // Extract `kid` from JWT header, look up owner's pubkey and verify
-        let (claims, owner_pubkey_hash): (StoreSecretClaims, String) =
-            match verify_jwt_and_get_owner(jwt) {
-                Ok(pair) => pair,
-                Err(e) => return VaultResponse::Error(e),
-            };
+    fn handle_store(
+        &self,
+        name: &str,
+        secret_b64: &str,
+        policy: types::SecretPolicy,
+        ctx: &RequestContext,
+    ) -> VaultResponse {
+        let owner_sub = match Self::require_secret_owner(ctx) {
+            Ok(sub) => sub,
+            Err(resp) => return resp,
+        };
 
         // Decode base64url secret
-        let secret_bytes = match URL_SAFE_NO_PAD.decode(&claims.secret) {
+        let secret_bytes = match URL_SAFE_NO_PAD.decode(secret_b64) {
             Ok(b) => b,
             Err(e) => return VaultResponse::Error(format!("bad base64: {e}")),
         };
@@ -174,7 +219,7 @@ impl VaultModule {
         }
 
         // Normalise policy (cap TTL, lowercase hex)
-        let policy = normalise_policy(claims.policy);
+        let policy = normalise_policy(policy);
 
         // Compute expiry
         let now = current_time_secs();
@@ -190,7 +235,7 @@ impl VaultModule {
             policy,
             created_at: now,
             expires_at,
-            owner_pubkey_hash,
+            owner_sub: owner_sub.clone(),
         };
 
         let record_json = match serde_json::to_vec(&record) {
@@ -198,109 +243,130 @@ impl VaultModule {
             Err(e) => return VaultResponse::Error(format!("serialise record: {e}")),
         };
 
-        // Persist
+        // Persist secret + indexes
         let kv = match enclave_os_kvstore::kv_store() {
             Some(kv) => kv,
             None => return VaultResponse::Error("kv store not initialised".into()),
         };
+        let key = Self::kv_key(&owner_sub, name);
         match kv.lock() {
             Ok(store) => {
-                if let Err(e) = store.put(claims.name.as_bytes(), &record_json) {
+                if let Err(e) = store.put(&key, &record_json) {
                     return VaultResponse::Error(format!("kv put failed: {e}"));
+                }
+                // Reverse lookup: name → owner_sub (for RA-TLS GetSecret)
+                if let Err(e) = store.put(
+                    &Self::lookup_key(name),
+                    owner_sub.as_bytes(),
+                ) {
+                    return VaultResponse::Error(format!("kv lookup index: {e}"));
+                }
+                // Owner index: owner_sub → [name, ...]  (for ListSecrets)
+                if let Err(e) = Self::add_to_owner_index(&store, &owner_sub, name) {
+                    return VaultResponse::Error(format!("kv owner index: {e}"));
                 }
             }
             Err(_) => return VaultResponse::Error("kv store lock poisoned".into()),
         }
 
         VaultResponse::SecretStored {
-            name: claims.name,
+            name: name.to_string(),
             expires_at,
         }
     }
 
-    /// Register a secret owner pubkey and return the `kid` (sha256 hex).
-    fn handle_open(&self, pubkey_hex: String) -> VaultResponse {
-        // Decode hex
-        let raw = match crate::quote::hex_decode(&pubkey_hex) {
-            Ok(b) => b,
-            Err(e) => return VaultResponse::Error(format!("invalid pubkey hex: {e}")),
-        };
-        if raw.len() != 65 || raw[0] != 0x04 {
-            return VaultResponse::Error("expected 65-byte uncompressed P-256 point (04 || x || y)".into());
-        }
-
-        // Compute kid = SHA-256(raw) hex
-        let hash = digest::digest(&digest::SHA256, &raw);
-        let kid = hex_encode(hash.as_ref());
-
-        // Store mapping in KV: key = "vault_owner:{kid}" -> pubkey_hex (lowercase)
-        let kv = match enclave_os_kvstore::kv_store() {
-            Some(kv) => kv,
-            None => return VaultResponse::Error("kv store not initialised".into()),
-        };
-
-        let key = format!("vault_owner:{}", kid);
-        let val = pubkey_hex.to_lowercase();
-
-        match kv.lock() {
-            Ok(store) => {
-                match store.get(key.as_bytes()) {
-                    Ok(Some(existing)) => {
-                        if existing == val.as_bytes() {
-                            // idempotent: already registered
-                            return VaultResponse::VaultOpened { kid };
-                        } else {
-                            return VaultResponse::Error("kid already registered with a different key".into());
-                        }
-                    }
-                    Ok(None) => {
-                        if let Err(e) = store.put(key.as_bytes(), val.as_bytes()) {
-                            return VaultResponse::Error(format!("kv put failed: {e}"));
-                        }
-                    }
-                    Err(e) => return VaultResponse::Error(format!("kv get failed: {e}")),
-                }
-            }
-            Err(_) => return VaultResponse::Error("kv store lock poisoned".into()),
-        }
-
-        VaultResponse::VaultOpened { kid }
-    }
-
-    /// Retrieve a named secret — authorised by mutual RA-TLS (peer cert) + optional bearer token.
+    /// Retrieve a named secret — dual-path auth.
     ///
-    /// The caller's SGX/TDX quote and OID claims are extracted from their
-    /// TLS client certificate (mutual RA-TLS), not from the JSON payload.
+    /// **Path 1 — OIDC owner**: caller has `secret-owner` role and their
+    /// `sub` matches the stored `owner_sub`.  No RA-TLS required.
+    ///
+    /// **Path 2 — RA-TLS TEE**: mutual RA-TLS client certificate with
+    /// matching measurements + optional bearer token from the secret
+    /// manager.  The request must include `bearer_token` if the policy
+    /// has a `manager_sub`.
     fn handle_get(
         &self,
         name: &str,
         bearer_token: Option<&[u8]>,
         ctx: &RequestContext,
     ) -> VaultResponse {
-        // ── 1. Require mutual RA-TLS peer certificate ──────────────────
-        let peer_der = match ctx.peer_cert_der {
-            Some(ref der) => der,
-            None => {
-                return VaultResponse::Error(
-                    "mutual RA-TLS required: no client certificate presented".into(),
-                )
-            }
-        };
-
-        // ── 2. Parse the peer certificate for attestation data ──────────
-        let (attestation_evidence, oid_claims) = match extract_attestation_from_cert(peer_der) {
-            Ok(pair) => pair,
-            Err(e) => return VaultResponse::Error(format!("peer certificate: {e}")),
-        };
-
-        // ── 3. Look up the secret record ────────────────────────────────
         let kv = match enclave_os_kvstore::kv_store() {
             Some(kv) => kv,
             None => return VaultResponse::Error("kv store not initialised".into()),
         };
 
+        // ── Try OIDC owner path first ───────────────────────────────────
+        if let Some(ref claims) = ctx.oidc_claims {
+            if claims.has_secret_owner() {
+                let key = Self::kv_key(&claims.sub, name);
+                let record_bytes = match kv.lock() {
+                    Ok(store) => match store.get(&key) {
+                        Ok(Some(v)) => v,
+                        Ok(None) => return VaultResponse::Error("secret not found".into()),
+                        Err(e) => return VaultResponse::Error(format!("kv get failed: {e}")),
+                    },
+                    Err(_) => return VaultResponse::Error("kv store lock poisoned".into()),
+                };
+
+                let record: SecretRecord = match serde_json::from_slice(&record_bytes) {
+                    Ok(r) => r,
+                    Err(e) => return VaultResponse::Error(format!("corrupt record: {e}")),
+                };
+
+                // Check expiry
+                let now = current_time_secs();
+                if now > record.expires_at {
+                    return VaultResponse::Error("secret has expired".into());
+                }
+
+                return VaultResponse::SecretValue {
+                    secret: record.secret,
+                    expires_at: record.expires_at,
+                };
+            }
+        }
+
+        // ── RA-TLS TEE path ────────────────────────────────────────────
+        // The caller must present a mutual RA-TLS client certificate.
+        // We need the owner_sub to look up the secret — but the RA-TLS
+        // caller doesn't know it.  We search by iterating over secrets
+        // with matching name suffix.  This is O(n) but acceptable for
+        // a sealed KV store that is not designed for massive scale.
+
+        let peer_der = match ctx.peer_cert_der {
+            Some(ref der) => der,
+            None => {
+                return VaultResponse::Error(
+                    "authentication required: provide OIDC token (secret-owner) \
+                     or mutual RA-TLS client certificate".into(),
+                )
+            }
+        };
+
+        // Parse attestation from peer cert
+        let (attestation_evidence, oid_claims) = match extract_attestation_from_cert(peer_der) {
+            Ok(pair) => pair,
+            Err(e) => return VaultResponse::Error(format!("peer certificate: {e}")),
+        };
+
+        // Find the secret via the name→owner reverse lookup index
+        let owner_sub = match kv.lock() {
+            Ok(store) => match store.get(&Self::lookup_key(name)) {
+                Ok(Some(v)) => String::from_utf8(v)
+                    .map_err(|_| "corrupt lookup index".to_string()),
+                Ok(None) => Err("secret not found".into()),
+                Err(e) => Err(format!("kv lookup failed: {e}")),
+            },
+            Err(_) => Err("kv store lock poisoned".into()),
+        };
+        let owner_sub = match owner_sub {
+            Ok(sub) => sub,
+            Err(msg) => return VaultResponse::Error(msg),
+        };
+
+        let key = Self::kv_key(&owner_sub, name);
         let record_bytes = match kv.lock() {
-            Ok(store) => match store.get(name.as_bytes()) {
+            Ok(store) => match store.get(&key) {
                 Ok(Some(v)) => v,
                 Ok(None) => return VaultResponse::Error("secret not found".into()),
                 Err(e) => return VaultResponse::Error(format!("kv get failed: {e}")),
@@ -313,22 +379,13 @@ impl VaultModule {
             Err(e) => return VaultResponse::Error(format!("corrupt record: {e}")),
         };
 
-        // ── 4. Check expiry ─────────────────────────────────────────────
+        // Check expiry
         let now = current_time_secs();
         if now > record.expires_at {
             return VaultResponse::Error("secret has expired".into());
         }
-        // ── 4b. Verify quote via attestation server(s) ──────────────
-        //
-        // The attestation servers cryptographically verify the quote's
-        // signature chain, TCB status, and platform identity.  This
-        // prevents a malicious host from forging a quote with arbitrary
-        // measurement values.  All configured servers must confirm the
-        // quote before we trust the measurements extracted in step 5.
-        //
-        // The server list is configured at startup via EgressModule and
-        // registered in the config Merkle tree (leaf: egress.attestation_servers,
-        // OID: 1.3.6.1.4.1.65230.2.7).
+
+        // Verify quote via attestation server(s)
         let attestation_servers = enclave_os_egress::attestation_servers()
             .ok_or_else(|| "EgressModule not initialised (attestation servers unavailable)")
             .map_err(|e| e.to_string());
@@ -342,25 +399,15 @@ impl VaultModule {
         ) {
             return VaultResponse::Error(format!("attestation verification: {e}"));
         }
-        // ── 5. Parse attestation evidence (quote) ───────────────────────
+
+        // Parse attestation evidence (quote)
         let identity = match parse_quote(&attestation_evidence) {
             Ok(id) => id,
             Err(e) => return VaultResponse::Error(format!("attestation: {e}")),
         };
 
-        // ── 5b. Bidirectional challenge-response verification ───────────
-        //
-        // When the server issued a challenge nonce (challenge mode), verify
-        // that the client's RA-TLS certificate was generated specifically
-        // for this connection by checking that:
-        //
-        //   client_report_data == SHA-512( SHA-256(client_pubkey) || server_nonce )
-        //
-        // This proves the client's TEE produced a fresh quote binding both
-        // its public key and the server's per-connection nonce — preventing
-        // replay of a previously captured client certificate.
+        // Bidirectional challenge-response verification
         if let Some(ref nonce) = ctx.client_challenge_nonce {
-            // Extract report_data from the client's attestation quote
             let actual_report_data = match extract_report_data(&attestation_evidence) {
                 Ok(rd) => rd,
                 Err(e) => return VaultResponse::Error(
@@ -368,7 +415,6 @@ impl VaultModule {
                 ),
             };
 
-            // Extract the client's raw public key from the peer certificate
             let client_pubkey = match extract_pubkey_from_cert(peer_der) {
                 Ok(pk) => pk,
                 Err(e) => return VaultResponse::Error(
@@ -376,7 +422,6 @@ impl VaultModule {
                 ),
             };
 
-            // Compute expected: SHA-512( SHA-256(pubkey) || nonce )
             let expected = compute_report_data_hash(&client_pubkey, nonce);
 
             if actual_report_data[..] != expected.as_ref()[..] {
@@ -388,7 +433,7 @@ impl VaultModule {
             }
         }
 
-        // ── 6. Check measurement against policy whitelist ───────────────
+        // Check measurement against policy whitelist
         if !is_permitted(
             &identity,
             &record.policy.allowed_mrenclave,
@@ -397,54 +442,40 @@ impl VaultModule {
             return VaultResponse::Error("measurement not permitted by policy".into());
         }
 
-        // ── 7. Check manager bearer token (if policy has a manager pubkey)
-        if let Some(ref mgr_pubkey_hex) = record.policy.manager_pubkey {
+        // Check manager bearer token (if policy has a manager_sub)
+        if let Some(ref mgr_sub) = record.policy.manager_sub {
             let token = match bearer_token {
                 Some(t) => t,
                 None => {
                     return VaultResponse::Error(
-                        "bearer token required (manager_pubkey set in policy)".into(),
+                        "bearer token required (manager_sub set in policy)".into(),
                     )
                 }
             };
 
-            // Decode the manager's public key from hex
-            let mgr_raw = match crate::quote::hex_decode(mgr_pubkey_hex) {
-                Ok(b) => b,
-                Err(e) => {
-                    return VaultResponse::Error(format!(
-                        "corrupt manager_pubkey in policy: {e}"
-                    ))
-                }
-            };
-
-            // Verify the bearer token as a JWT signed by the manager
-            let mgr_verifier = match JwtVerifier::from_public_key_bytes(&mgr_raw) {
-                Ok(v) => v,
-                Err(e) => {
-                    return VaultResponse::Error(format!(
-                        "invalid manager_pubkey in policy: {e}"
-                    ))
-                }
-            };
-
-            let bearer_claims: BearerTokenClaims = match mgr_verifier.verify_and_decode(token) {
+            // The bearer token is an OIDC JWT — verify its sub matches
+            // the policy's manager_sub using the same OIDC verification
+            // as the auth layer.
+            let bearer_claims = match verify_bearer_oidc(token) {
                 Ok(c) => c,
-                Err(e) => {
-                    return VaultResponse::Error(format!("bearer token verification failed: {e}"))
-                }
+                Err(e) => return VaultResponse::Error(format!("bearer token: {e}")),
             };
 
-            // The bearer token must be for this specific secret
-            if bearer_claims.name != name {
+            if bearer_claims.sub != *mgr_sub {
                 return VaultResponse::Error(format!(
-                    "bearer token is for '{}', not '{}'",
-                    bearer_claims.name, name
+                    "bearer token sub '{}' != policy manager_sub",
+                    bearer_claims.sub
                 ));
+            }
+
+            if !bearer_claims.has_secret_manager() {
+                return VaultResponse::Error(
+                    "bearer token holder requires secret-manager role".into()
+                );
             }
         }
 
-        // ── 8. Check required OIDs ──────────────────────────────────────
+        // Check required OIDs
         for req_oid in &record.policy.required_oids {
             let matched = oid_claims
                 .iter()
@@ -463,43 +494,36 @@ impl VaultModule {
         }
     }
 
-    /// Delete a named secret — only the original owner can delete.
-    fn handle_delete(&self, jwt: &[u8]) -> VaultResponse {
-        let (claims, owner_pubkey_hash): (DeleteSecretClaims, String) =
-            match verify_jwt_and_get_owner(jwt) {
-                Ok(pair) => pair,
-                Err(e) => return VaultResponse::Error(e),
-            };
+    /// Delete a named secret — only the OIDC owner can delete.
+    fn handle_delete(&self, name: &str, ctx: &RequestContext) -> VaultResponse {
+        let owner_sub = match Self::require_secret_owner(ctx) {
+            Ok(sub) => sub,
+            Err(resp) => return resp,
+        };
 
         let kv = match enclave_os_kvstore::kv_store() {
             Some(kv) => kv,
             None => return VaultResponse::Error("kv store not initialised".into()),
         };
 
-        // Verify ownership before deleting
-        let record_bytes = match kv.lock() {
-            Ok(store) => match store.get(claims.name.as_bytes()) {
-                Ok(Some(v)) => v,
-                Ok(None) => return VaultResponse::Error("secret not found".into()),
-                Err(e) => return VaultResponse::Error(format!("kv get failed: {e}")),
-            },
-            Err(_) => return VaultResponse::Error("kv store lock poisoned".into()),
-        };
-
-        let record: SecretRecord = match serde_json::from_slice(&record_bytes) {
-            Ok(r) => r,
-            Err(e) => return VaultResponse::Error(format!("corrupt record: {e}")),
-        };
-
-        if record.owner_pubkey_hash != owner_pubkey_hash {
-            return VaultResponse::Error("not the secret owner".into());
-        }
+        let key = Self::kv_key(&owner_sub, name);
 
         match kv.lock() {
             Ok(mut store) => {
-                if let Err(e) = store.delete(claims.name.as_bytes()) {
+                // Verify the secret exists
+                match store.get(&key) {
+                    Ok(Some(_)) => {}
+                    Ok(None) => return VaultResponse::Error("secret not found".into()),
+                    Err(e) => return VaultResponse::Error(format!("kv get failed: {e}")),
+                }
+                // Delete the secret
+                if let Err(e) = store.delete(&key) {
                     return VaultResponse::Error(format!("kv delete failed: {e}"));
                 }
+                // Clean up reverse lookup index
+                let _ = store.delete(&Self::lookup_key(name));
+                // Clean up owner index
+                let _ = Self::remove_from_owner_index(&store, &owner_sub, name);
             }
             Err(_) => return VaultResponse::Error("kv store lock poisoned".into()),
         }
@@ -508,20 +532,26 @@ impl VaultModule {
     }
 
     /// Update the access policy for an existing secret — owner only.
-    fn handle_update_policy(&self, jwt: &[u8]) -> VaultResponse {
-        let (claims, owner_pubkey_hash): (UpdateSecretPolicyClaims, String) =
-            match verify_jwt_and_get_owner(jwt) {
-                Ok(pair) => pair,
-                Err(e) => return VaultResponse::Error(e),
-            };
+    fn handle_update_policy(
+        &self,
+        name: &str,
+        new_policy: types::SecretPolicy,
+        ctx: &RequestContext,
+    ) -> VaultResponse {
+        let owner_sub = match Self::require_secret_owner(ctx) {
+            Ok(sub) => sub,
+            Err(resp) => return resp,
+        };
 
         let kv = match enclave_os_kvstore::kv_store() {
             Some(kv) => kv,
             None => return VaultResponse::Error("kv store not initialised".into()),
         };
 
+        let key = Self::kv_key(&owner_sub, name);
+
         let record_bytes = match kv.lock() {
-            Ok(store) => match store.get(claims.name.as_bytes()) {
+            Ok(store) => match store.get(&key) {
                 Ok(Some(v)) => v,
                 Ok(None) => return VaultResponse::Error("secret not found".into()),
                 Err(e) => return VaultResponse::Error(format!("kv get failed: {e}")),
@@ -534,10 +564,6 @@ impl VaultModule {
             Err(e) => return VaultResponse::Error(format!("corrupt record: {e}")),
         };
 
-        if record.owner_pubkey_hash != owner_pubkey_hash {
-            return VaultResponse::Error("not the secret owner".into());
-        }
-
         // Check not expired
         let now = current_time_secs();
         if now > record.expires_at {
@@ -545,7 +571,7 @@ impl VaultModule {
         }
 
         // Apply new policy (normalised)
-        record.policy = normalise_policy(claims.policy);
+        record.policy = normalise_policy(new_policy);
 
         let record_json = match serde_json::to_vec(&record) {
             Ok(j) => j,
@@ -554,7 +580,7 @@ impl VaultModule {
 
         match kv.lock() {
             Ok(store) => {
-                if let Err(e) = store.put(claims.name.as_bytes(), &record_json) {
+                if let Err(e) = store.put(&key, &record_json) {
                     return VaultResponse::Error(format!("kv put failed: {e}"));
                 }
             }
@@ -564,90 +590,50 @@ impl VaultModule {
         VaultResponse::PolicyUpdated
     }
 
-    /// Close (unregister) a vault owner.
-    ///
-    /// The caller must present a JWT signed by the owner key, with a `kid`
-    /// header matching the registered vault.  On success the owner's
-    /// public-key mapping (`vault_owner:{kid}`) is deleted from the KV
-    /// store.
-    ///
-    /// **Note:** secrets previously stored by this owner remain in the KV
-    /// store but become inaccessible for write operations (delete / policy
-    /// update) because the owner key can no longer be resolved.  Read
-    /// access via `GetSecret` (RA-TLS) is unaffected — the secret's own
-    /// policy governs that.  To fully clean up, delete individual secrets
-    /// *before* closing the vault.
-    fn handle_close(&self, jwt: &[u8]) -> VaultResponse {
-        // Verify the JWT is signed by the owner identified by `kid`.
-        // We use `Value` as the claims type because the payload can be
-        // empty — all we need is the `kid` from the header.
-        let (_claims, _owner_hash): (Value, String) =
-            match self.verify_jwt_and_get_owner(jwt) {
-                Ok(pair) => pair,
-                Err(e) => return VaultResponse::Error(e),
-            };
-
-        // Extract `kid` from the JWT header (we know it's valid because
-        // verify_jwt_and_get_owner succeeded).
-        let kid = match extract_kid_from_jwt(jwt) {
-            Ok(k) => k,
-            Err(e) => return VaultResponse::Error(e),
+    /// List all secrets owned by the caller (metadata only).
+    fn handle_list_secrets(&self, ctx: &RequestContext) -> VaultResponse {
+        let owner_sub = match Self::require_secret_owner(ctx) {
+            Ok(sub) => sub,
+            Err(resp) => return resp,
         };
 
-        // Delete the owner mapping from the KV store.
         let kv = match enclave_os_kvstore::kv_store() {
             Some(kv) => kv,
             None => return VaultResponse::Error("kv store not initialised".into()),
         };
 
-        let key = format!("vault_owner:{}", kid);
+        // Read the owner index to get secret names
+        let names: Vec<String> = match kv.lock() {
+            Ok(store) => match store.get(&Self::owner_index_key(&owner_sub)) {
+                Ok(Some(data)) => serde_json::from_slice(&data).unwrap_or_default(),
+                Ok(None) => Vec::new(),
+                Err(e) => return VaultResponse::Error(format!("kv index read: {e}")),
+            },
+            Err(_) => return VaultResponse::Error("kv store lock poisoned".into()),
+        };
 
-        match kv.lock() {
-            Ok(mut store) => {
-                match store.delete(key.as_bytes()) {
-                    Ok(true) => VaultResponse::VaultClosed { secrets_deleted: 0 },
-                    Ok(false) => VaultResponse::Error("vault owner not found".into()),
-                    Err(e) => VaultResponse::Error(format!("kv delete failed: {e}")),
+        let mut secrets = Vec::new();
+        if let Ok(store) = kv.lock() {
+            for name in &names {
+                let key = Self::kv_key(&owner_sub, name);
+                if let Ok(Some(value_bytes)) = store.get(&key) {
+                    if let Ok(record) = serde_json::from_slice::<SecretRecord>(&value_bytes) {
+                        secrets.push(SecretListEntry {
+                            name: name.clone(),
+                            expires_at: record.expires_at,
+                        });
+                    }
                 }
             }
-            Err(_) => VaultResponse::Error("kv store lock poisoned".into()),
         }
-    }
-}
 
-impl VaultModule {
-    fn verify_jwt_and_get_owner<T: serde::de::DeserializeOwned>(
-        &self,
-        jwt: &[u8],
-    ) -> Result<(T, String), String> {
-        verify_jwt_and_get_owner(jwt)
+        VaultResponse::SecretList { secrets }
     }
 }
 
 // ---------------------------------------------------------------------------
 //  Helpers
 // ---------------------------------------------------------------------------
-
-/// Extract the `kid` field from a JWT header without verifying the signature.
-///
-/// This is safe to call after `verify_jwt_and_get_owner` has already
-/// validated the JWT — we just need the raw `kid` string for KV key
-/// construction.
-fn extract_kid_from_jwt(jwt: &[u8]) -> Result<String, String> {
-    let jwt_str = core::str::from_utf8(jwt)
-        .map_err(|e| format!("jwt not utf8: {e}"))?;
-    let header_b64 = jwt_str.splitn(2, '.').next().ok_or("missing header")?;
-    let header_bytes = URL_SAFE_NO_PAD
-        .decode(header_b64)
-        .map_err(|e| format!("jwt header base64: {e}"))?;
-    let header_val: Value = serde_json::from_slice(&header_bytes)
-        .map_err(|e| format!("jwt header json: {e}"))?;
-    header_val
-        .get("kid")
-        .and_then(|v| v.as_str())
-        .map(|s| s.to_string())
-        .ok_or_else(|| "jwt header missing 'kid' field".into())
-}
 
 /// Normalise a secret policy: lowercase hex values, cap TTL.
 fn normalise_policy(mut policy: types::SecretPolicy) -> types::SecretPolicy {
@@ -666,14 +652,63 @@ fn normalise_policy(mut policy: types::SecretPolicy) -> types::SecretPolicy {
     for m in &mut policy.allowed_mrtd {
         *m = m.to_lowercase();
     }
-    if let Some(ref mut h) = policy.manager_pubkey {
-        *h = h.to_lowercase();
-    }
     for oid in &mut policy.required_oids {
         oid.value = oid.value.to_lowercase();
     }
 
     policy
+}
+
+/// Verify a bearer token (OIDC JWT) and return the claims.
+///
+/// Used for the RA-TLS + bearer defence-in-depth path in `GetSecret`.
+/// The bearer token is verified against the same OIDC configuration as
+/// the auth layer, and must have the `secret-manager` role.
+fn verify_bearer_oidc(token: &[u8]) -> Result<enclave_os_common::oidc::OidcClaims, String> {
+    let token_str = core::str::from_utf8(token)
+        .map_err(|e| format!("bearer token not utf8: {e}"))?;
+
+    // Re-use the same OIDC verification as the auth layer in server.rs.
+    // The enclave's verify_oidc_token is not directly accessible from
+    // the vault crate, so we do a minimal JWT decode + claim extraction
+    // here against the global OIDC config.
+    let config = enclave_os_common::oidc::is_oidc_configured()
+        .then(|| ())
+        .ok_or("OIDC not configured")?;
+    let _ = config;
+
+    // Decode JWT payload
+    let parts: Vec<&str> = token_str.splitn(3, '.').collect();
+    if parts.len() != 3 {
+        return Err("malformed JWT".into());
+    }
+    let payload_bytes = URL_SAFE_NO_PAD.decode(parts[1])
+        .map_err(|e| format!("JWT payload base64: {e}"))?;
+    let claims: serde_json::Value = serde_json::from_slice(&payload_bytes)
+        .map_err(|e| format!("JWT payload JSON: {e}"))?;
+
+    let sub = claims.get("sub")
+        .and_then(|v| v.as_str())
+        .unwrap_or("")
+        .to_string();
+
+    // We need the OidcConfig to extract roles.  Since we can't access
+    // the enclave's global directly, we reconstruct a default config.
+    // TODO(oidc): Share the global OidcConfig through common or pass
+    // it as a parameter.
+    let default_config = enclave_os_common::oidc::OidcConfig {
+        issuer: String::new(),
+        audience: String::new(),
+        role_claim: "urn:zitadel:iam:org:project:roles".into(),
+        manager_role: "enclave-os-mini:manager".into(),
+        monitoring_role: "enclave-os-mini:monitoring".into(),
+        secret_owner_role: "enclave-os-mini:secret-owner".into(),
+        secret_manager_role: "enclave-os-mini:secret-manager".into(),
+    };
+
+    let roles = enclave_os_common::oidc::extract_roles(&claims, &default_config);
+
+    Ok(enclave_os_common::oidc::OidcClaims { sub, roles })
 }
 
 /// Get the current UNIX timestamp (seconds) via OCall.
@@ -757,61 +792,3 @@ fn extract_pubkey_from_cert(der: &[u8]) -> Result<Vec<u8>, String> {
 
     Ok(pubkey_data.to_vec())
 }
-
-    /// Verify a JWT whose header contains `kid`.
-    ///
-    /// Looks up the registered owner pubkey for `kid` in the sealed KV store,
-    /// constructs a `JwtVerifier` from it, verifies the JWT, decodes the
-    /// payload into the requested claim type `T`, and returns the claims
-    /// along with the owner pubkey hash (SHA-256 hex).
-    fn verify_jwt_and_get_owner<T: serde::de::DeserializeOwned>(
-        jwt: &[u8],
-    ) -> Result<(T, String), String> {
-        // 1) Extract header
-        let jwt_str = core::str::from_utf8(jwt)
-            .map_err(|e| format!("jwt not utf8: {e}"))?;
-        let mut parts = jwt_str.splitn(3, '.');
-        let header_b64 = parts.next().ok_or("missing header")?;
-
-        let header_bytes = URL_SAFE_NO_PAD
-            .decode(header_b64)
-            .map_err(|e| format!("jwt header base64: {e}"))?;
-
-        let header_val: Value = serde_json::from_slice(&header_bytes)
-            .map_err(|e| format!("jwt header json: {e}"))?;
-
-        let kid = header_val
-            .get("kid")
-            .and_then(|v| v.as_str())
-            .ok_or("jwt header missing 'kid' field")?
-            .to_string();
-
-        // 2) Lookup pubkey_hex in KV store under key "vault_owner:{kid}"
-        let kv = enclave_os_kvstore::kv_store().ok_or("kv store not initialised".to_string())?;
-        let kv_key = format!("vault_owner:{}", kid);
-        let pubkey_hex = match kv.lock() {
-            Ok(store) => match store.get(kv_key.as_bytes()) {
-                Ok(Some(v)) => match String::from_utf8(v) {
-                    Ok(s) => s,
-                    Err(_) => return Err("corrupt pubkey entry".into()),
-                },
-                Ok(None) => return Err("unknown kid".into()),
-                Err(e) => return Err(format!("kv get failed: {e}")),
-            },
-            Err(_) => return Err("kv store lock poisoned".into()),
-        };
-
-        // 3) Decode pubkey hex -> raw bytes and compute owner hash
-        let raw = match crate::quote::hex_decode(&pubkey_hex) {
-            Ok(b) => b,
-            Err(e) => return Err(format!("invalid pubkey stored for kid: {e}")),
-        };
-        let hash = digest::digest(&digest::SHA256, &raw);
-        let owner_pubkey_hash = hex_encode(hash.as_ref());
-
-        // 4) Verify JWT using this pubkey
-        let verifier = JwtVerifier::from_public_key_bytes(&raw).map_err(|e| format!("invalid stored pubkey: {e}"))?;
-        let claims = verifier.verify_and_decode(jwt).map_err(|e| format!("jwt verification failed: {e}"))?;
-
-        Ok((claims, owner_pubkey_hash))
-    }

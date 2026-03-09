@@ -404,6 +404,18 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
         Err(code) => return code,
     };
 
+    // ── OIDC configuration (global, used by auth layer) ──────────────
+    if let Some(ref oidc) = config.oidc {
+        enclave_log_info!(
+            "OIDC enabled: issuer={}, audience={}",
+            oidc.issuer, oidc.audience
+        );
+        crate::set_oidc_config(oidc.clone());
+        enclave_os_common::oidc::set_oidc_configured();
+    } else {
+        enclave_log_info!("OIDC not configured — auth layer disabled");
+    }
+
     let mut _module_count: u32 = 0;
 
     // ── Egress module (outbound HTTPS + attestation server URLs) ─────
@@ -526,6 +538,9 @@ pub struct EnclaveConfig {
     pub ca_cert_hex: Option<String>,
     /// Hex-encoded PKCS#8 of the intermediary CA private key.
     pub ca_key_hex: Option<String>,
+    /// OIDC provider configuration.  When present, all operations except
+    /// `Healthz` require a valid bearer token in the JSON `"auth"` field.
+    pub oidc: Option<enclave_os_common::oidc::OidcConfig>,
     /// Module-specific configuration (catch-all for unknown JSON fields).
     #[serde(flatten)]
     pub extra: serde_json::Map<String, serde_json::Value>,
