@@ -49,7 +49,7 @@ cargo fetch --locked --manifest-path enclave/Cargo.toml
 echo "==> Configuring CMake build..."
 cmake -S "${SRC}" -B "${BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
-    -DENABLE_VAULT=ON \
+    -DENABLE_WASM=ON \
     -DCMAKE_C_COMPILER=gcc \
     -DCMAKE_CXX_COMPILER=g++
 

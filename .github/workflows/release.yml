@@ -22,8 +22,8 @@ on:
       - "v*"
   workflow_dispatch:
     inputs:
-      enable_vault:
-        description: "Enable vault module"
+      enable_wasm:
+        description: "Enable WASM runtime module"
         type: boolean
         default: true
 
