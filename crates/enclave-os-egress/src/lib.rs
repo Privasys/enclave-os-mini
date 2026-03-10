@@ -18,14 +18,14 @@
 //! ## Responsibilities
 //!
 //! - Owns the egress root CA store (loaded from operator-provided PEM bundle)
-//! - Owns the attestation server URL list (passed at startup, used by vault
-//!   and other modules for remote quote verification)
-//! - Registers config Merkle leaves: `egress.ca_bundle`, `egress.attestation_servers`
-//! - Registers custom X.509 OIDs:
+//! - Registers a config Merkle leaf: `egress.ca_bundle`
+//! - Registers a custom X.509 OID:
 //!   - `1.3.6.1.4.1.65230.2.1` — CA bundle SHA-256 hash
-//!   - `1.3.6.1.4.1.65230.2.7` — attestation servers SHA-256 hash
-//!   so clients can verify the egress trust anchors and attestation
-//!   server configuration without a full Merkle audit.
+//!   so clients can verify the egress trust anchors without a full Merkle audit.
+//!
+//! Attestation servers and their bearer tokens are managed centrally by
+//! the enclave core (see [`enclave_os_common::attestation_servers`]). The
+//! egress module reads from that store during quote verification.
 //!
 //! ## Usage
 //!
@@ -44,11 +44,7 @@
 //!     .and_then(|v| v.as_str())
 //!     .and_then(|hex| hex_decode(hex));
 //!
-//! // Load attestation server URLs from config
-//! let attestation_servers = config.extra.get("attestation_servers")
-//!     .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok());
-//!
-//! let (egress, cert_count) = EgressModule::new(pem, attestation_servers)?;
+//! let (egress, cert_count) = EgressModule::new(pem)?;
 //! register_module(Box::new(egress));
 //!
 //! finalize_and_run(&config, &sealed_cfg);
@@ -92,21 +88,6 @@ pub fn root_store() -> Option<&'static RootCertStore> {
 }
 
 // ---------------------------------------------------------------------------
-//  Global attestation server list
-// ---------------------------------------------------------------------------
-
-static ATTESTATION_SERVERS: OnceLock<Vec<String>> = OnceLock::new();
-
-/// Get the configured attestation server URLs.
-///
-/// Returns `None` before `EgressModule::new()` is called.
-/// Returns `Some(&[])` when no attestation servers were configured
-/// (attestation server verification disabled).
-pub fn attestation_servers() -> Option<&'static Vec<String>> {
-    ATTESTATION_SERVERS.get()
-}
-
-// ---------------------------------------------------------------------------
 //  EgressModule
 // ---------------------------------------------------------------------------
 
@@ -115,53 +96,24 @@ pub struct EgressModule {
     ca_pem: Option<Vec<u8>>,
     /// SHA-256 hash of the PEM bytes (used as OID value).
     ca_hash: Option<[u8; 32]>,
-    /// Canonical attestation server URL list (kept for config leaf hashing).
-    attestation_servers_canonical: Option<Vec<u8>>,
-    /// SHA-256 hash of the canonical URL list (used as OID value).
-    attestation_servers_hash: Option<[u8; 32]>,
 }
 
 impl EgressModule {
-    /// Construct the egress module, parsing and loading the CA bundle and
-    /// attestation server list.
+    /// Construct the egress module, parsing and loading the CA bundle.
     ///
-    /// Both the CA bundle and the attestation server URLs are registered
-    /// as Merkle tree leaves and individual X.509 OIDs in RA-TLS
-    /// certificates, making them auditable by remote verifiers.
+    /// The CA bundle is registered as a Merkle tree leaf and an individual
+    /// X.509 OID in RA-TLS certificates, making it auditable by remote
+    /// verifiers.
     ///
     /// Returns `(module, cert_count)`.  `cert_count` is 0 when `pem` is
     /// `None` (egress disabled).
-    pub fn new(
-        pem: Option<Vec<u8>>,
-        attestation_server_urls: Option<Vec<String>>,
-    ) -> Result<(Self, usize), String> {
+    pub fn new(pem: Option<Vec<u8>>) -> Result<(Self, usize), String> {
         let ca_hash = pem.as_ref().map(|p| {
             let d = digest::digest(&digest::SHA256, p);
             let mut h = [0u8; 32];
             h.copy_from_slice(d.as_ref());
             h
         });
-
-        // Build canonical form: sorted, newline-joined.
-        let (as_canonical, as_hash) = match attestation_server_urls {
-            Some(ref urls) if !urls.is_empty() => {
-                let mut sorted = urls.clone();
-                sorted.sort();
-                let canonical = sorted.join("\n");
-                let d = digest::digest(&digest::SHA256, canonical.as_bytes());
-                let mut h = [0u8; 32];
-                h.copy_from_slice(d.as_ref());
-                (Some(canonical.into_bytes()), Some(h))
-            }
-            _ => (None, None),
-        };
-
-        // Store the server list globally for vault and other consumers.
-        if let Some(ref urls) = attestation_server_urls {
-            let _ = ATTESTATION_SERVERS.set(urls.clone());
-        } else {
-            let _ = ATTESTATION_SERVERS.set(Vec::new());
-        }
 
         let cert_count = if let Some(ref pem_bytes) = pem {
             let mut store = RootCertStore::empty();
@@ -184,7 +136,7 @@ impl EgressModule {
             0
         };
 
-        Ok((Self { ca_pem: pem, ca_hash, attestation_servers_canonical: as_canonical, attestation_servers_hash: as_hash }, cert_count))
+        Ok((Self { ca_pem: pem, ca_hash }, cert_count))
     }
 }
 
@@ -194,22 +146,14 @@ impl EnclaveModule for EgressModule {
     }
 
     fn handle(&self, _req: &Request, _ctx: &RequestContext) -> Option<Response> {
-        // Egress is an internal service — not a direct request handler.
-        // Other modules call client::https_get / https_post directly.
-        None
+        None // Egress has no module-level management operations.
     }
 
     fn config_leaves(&self) -> Vec<ConfigLeaf> {
-        vec![
-            ConfigLeaf {
-                name: "egress.ca_bundle".into(),
-                data: self.ca_pem.clone(),
-            },
-            ConfigLeaf {
-                name: "egress.attestation_servers".into(),
-                data: self.attestation_servers_canonical.clone(),
-            },
-        ]
+        vec![ConfigLeaf {
+            name: "egress.ca_bundle".into(),
+            data: self.ca_pem.clone(),
+        }]
     }
 
     fn custom_oids(&self) -> Vec<ModuleOid> {
@@ -217,12 +161,6 @@ impl EnclaveModule for EgressModule {
         if let Some(hash) = self.ca_hash {
             oids.push(ModuleOid {
                 oid: EGRESS_CA_HASH_OID,
-                value: hash.to_vec(),
-            });
-        }
-        if let Some(hash) = self.attestation_servers_hash {
-            oids.push(ModuleOid {
-                oid: ATTESTATION_SERVERS_HASH_OID,
                 value: hash.to_vec(),
             });
         }

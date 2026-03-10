@@ -42,6 +42,17 @@ pub enum Request {
     /// Metrics — lightweight counters: connections, frames, calls, etc.
     /// Requires Monitoring+ role.
     Metrics,
+    /// Update the attestation server list (URLs and optional bearer tokens).
+    ///
+    /// This is a core operation — handled at the same level as Readyz, Status
+    /// and Metrics.  Requires the **Manager** role when OIDC is configured.
+    ///
+    /// Changes are immediately reflected in the attestation servers OID
+    /// (`1.3.6.1.4.1.65230.2.7`) of subsequent RA-TLS certificates.
+    SetAttestationServers {
+        /// New set of attestation server endpoints.
+        servers: Vec<AttestationServer>,
+    },
     /// Arbitrary application-defined payload.
     ///
     /// Module-specific protocols are JSON-encoded inside this variant.
@@ -70,6 +81,13 @@ pub enum Response {
     Data(Vec<u8>),
     /// Acknowledgement.
     Ok,
+    /// Attestation servers updated successfully.
+    AttestationServersUpdated {
+        /// Number of attestation servers now configured.
+        server_count: usize,
+        /// Hex-encoded SHA-256 hash of the new canonical server URL list.
+        hash: String,
+    },
     /// Error with human-readable message.
     Error(Vec<u8>),
 }
@@ -81,6 +99,22 @@ pub struct ModuleStatus {
     pub name: String,
     /// Module-specific status details (JSON value).
     pub details: serde_json::Value,
+}
+
+/// An attestation server endpoint with an optional bearer token.
+///
+/// Used by the management API to configure per-server authentication
+/// credentials on the egress module.  The URL is the verification
+/// endpoint (e.g. `https://as.privasys.org/`); the token is a
+/// long-lived OIDC bearer token that the enclave presents when
+/// submitting quotes for verification.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AttestationServer {
+    /// Attestation server verification URL.
+    pub url: String,
+    /// Optional OIDC bearer token for authenticated servers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token: Option<String>,
 }
 
 /// Enclave-level metrics counters.

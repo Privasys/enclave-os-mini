@@ -144,6 +144,10 @@ pub fn generate_ratls_certificate(
     if let Some(root) = crate::config_merkle_root() {
         extensions.push((CONFIG_MERKLE_ROOT_OID, root.to_vec()));
     }
+    // Core OID: attestation servers hash (queried fresh — reflects runtime updates)
+    if let Some(h) = enclave_os_common::attestation_servers::hash() {
+        extensions.push((enclave_os_common::oids::ATTESTATION_SERVERS_HASH_OID, h.to_vec()));
+    }
     for oid in &crate::modules::collect_module_oids() {
         extensions.push((oid.oid, oid.value.clone()));
     }

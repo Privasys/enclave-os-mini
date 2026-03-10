@@ -245,6 +245,10 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
         // Core leaf (fixed order — append-only, never reorder)
         tree.push("core.ca_cert", Some(sealed_cfg.ca_cert_der.as_slice()));
 
+        // Core leaf: attestation servers (canonical URL list)
+        let as_canonical = enclave_os_common::attestation_servers::canonical_form();
+        tree.push("core.attestation_servers", as_canonical.as_deref());
+
         // Module leaves (collected from all registered modules)
         for leaf in crate::modules::collect_module_config_leaves() {
             tree.push(leaf.name, leaf.data.as_deref());
@@ -418,7 +422,31 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
 
     let mut _module_count: u32 = 0;
 
-    // ── Egress module (outbound HTTPS + attestation server URLs) ─────
+    // ── Core attestation servers ─────────────────────────────────────
+    // Format: [{"url": "https://…", "token": "…"}, …]
+    {
+        use enclave_os_common::protocol::AttestationServer;
+
+        let servers: Vec<AttestationServer> = config
+            .extra
+            .get("attestation_servers")
+            .map(|v| serde_json::from_value(v.clone()).unwrap_or_default())
+            .unwrap_or_default();
+
+        let (count, hash) = enclave_os_common::attestation_servers::init(servers);
+        if count > 0 {
+            let hash_hex = hash
+                .map(|h| hex_encode(&h))
+                .unwrap_or_default();
+            enclave_log_info!(
+                "Attestation servers: {} configured, hash={}",
+                count,
+                hash_hex,
+            );
+        }
+    }
+
+    // ── Egress module (outbound HTTPS) ───────────────────────────────
     #[cfg(feature = "egress")]
     {
         let egress_pem = config
@@ -427,15 +455,7 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
             .and_then(|v| v.as_str())
             .and_then(|hex| hex_decode(hex));
 
-        let attestation_servers: Option<Vec<String>> = config
-            .extra
-            .get("attestation_servers")
-            .and_then(|v| serde_json::from_value(v.clone()).ok());
-
-        let (egress, cert_count) = match enclave_os_egress::EgressModule::new(
-            egress_pem,
-            attestation_servers,
-        ) {
+        let (egress, cert_count) = match enclave_os_egress::EgressModule::new(egress_pem) {
             Ok(pair) => pair,
             Err(e) => {
                 enclave_log_error!("EgressModule init failed: {}", e);

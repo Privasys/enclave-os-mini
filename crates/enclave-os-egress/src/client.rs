@@ -184,14 +184,13 @@ pub struct RaTlsPolicy {
     ///
     /// The default is an empty `Vec` (no remote verification).  Callers
     /// who want attestation server verification can populate this from
-    /// the globally configured list via [`crate::attestation_servers()`].
+    /// the core attestation server config via
+    /// [`enclave_os_common::attestation_servers::server_urls()`].
     ///
     /// # Example
     ///
     /// ```rust,ignore
-    /// let servers = enclave_os_egress::attestation_servers()
-    ///     .cloned()
-    ///     .unwrap_or_default();
+    /// let servers = enclave_os_common::attestation_servers::server_urls();
     ///
     /// let policy = RaTlsPolicy {
     ///     // ... other fields ...
@@ -225,17 +224,24 @@ pub fn https_get(
 /// Perform an HTTPS POST request.
 ///
 /// See [`https_get`] for details on the `ratls` parameter.
+///
+/// When `authorization` is `Some`, the value is sent verbatim as the
+/// `Authorization` header (e.g. `"Bearer eyJ..."` for OIDC tokens).
 pub fn https_post(
     url: &str,
     body: &[u8],
     content_type: &str,
     root_store: &RootCertStore,
     ratls: Option<&RaTlsPolicy>,
+    authorization: Option<&str>,
 ) -> Result<Vec<u8>, i32> {
     let (host, port, path) = parse_url(url).map_err(|_| -1)?;
+    let auth_line = authorization
+        .map(|a| format!("Authorization: {}\r\n", a))
+        .unwrap_or_default();
     let request = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n",
-        path, host, content_type, body.len()
+        "POST {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}\r\n",
+        path, host, content_type, body.len(), auth_line
     );
     let mut full_request = request.into_bytes();
     full_request.extend_from_slice(body);

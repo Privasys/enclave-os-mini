@@ -386,16 +386,10 @@ impl VaultModule {
         }
 
         // Verify quote via attestation server(s)
-        let attestation_servers = enclave_os_egress::attestation_servers()
-            .ok_or_else(|| "EgressModule not initialised (attestation servers unavailable)")
-            .map_err(|e| e.to_string());
-        let attestation_servers = match attestation_servers {
-            Ok(servers) => servers,
-            Err(e) => return VaultResponse::Error(format!("attestation verification: {e}")),
-        };
+        let servers = enclave_os_common::attestation_servers::server_urls();
         if let Err(e) = enclave_os_egress::attestation::verify_quote(
             &attestation_evidence,
-            attestation_servers,
+            &servers,
         ) {
             return VaultResponse::Error(format!("attestation verification: {e}"));
         }

@@ -47,11 +47,13 @@
 //!
 //! ## Configuration
 //!
-//! Attestation server URLs are passed to [`EgressModule::new()`] at
-//! startup and registered as a config Merkle leaf (`egress.attestation_servers`)
-//! with a dedicated X.509 OID (`1.3.6.1.4.1.65230.2.7`), making the
+//! Attestation server URLs and bearer tokens are managed centrally by
+//! the enclave core (see [`enclave_os_common::attestation_servers`]).
+//! The URL list is hashed into the config Merkle tree and exposed via
+//! a dedicated X.509 OID (`1.3.6.1.4.1.65230.2.7`), making the
 //! configuration auditable by remote verifiers.  Other modules (e.g. the
-//! vault) access the configured servers via [`crate::attestation_servers()`].
+//! vault) access the configured servers via
+//! [`enclave_os_common::attestation_servers::server_urls()`].
 
 use std::string::String;
 
@@ -135,9 +137,8 @@ pub struct VerifyResponse {
 /// use enclave_os_egress::attestation;
 ///
 /// // Use the globally configured attestation servers
-/// let servers = enclave_os_egress::attestation_servers()
-///     .expect("EgressModule not initialised");
-/// attestation::verify_quote(&raw_quote_bytes, servers)?;
+/// let servers = enclave_os_common::attestation_servers::server_urls();
+/// attestation::verify_quote(&raw_quote_bytes, &servers)?;
 /// ```
 pub fn verify_quote(
     evidence: &[u8],
@@ -165,12 +166,20 @@ pub fn verify_quote(
     let body = format!(r#"{{"quote":"{}"}}"#, quote_b64);
 
     for server_url in attestation_servers {
+        // Look up an optional bearer token from core attestation server config.
+        let token = enclave_os_common::attestation_servers::token_for(server_url);
+        let auth_header = token.as_deref().map(|t| {
+            // Allocate the full header value; the client sends it verbatim.
+            format!("Bearer {}", t)
+        });
+
         let response_bytes = client::https_post(
             server_url,
             body.as_bytes(),
             "application/json",
             store,
             None, // Standard HTTPS — the attestation server is not behind RA-TLS.
+            auth_header.as_deref(),
         )
         .map_err(|code| {
             format!(

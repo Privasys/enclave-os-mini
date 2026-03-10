@@ -537,7 +537,6 @@ impl EnclaveModule for WasmModule {
     fn enrich_metrics(&self, metrics: &mut enclave_os_common::protocol::EnclaveMetrics) {
         if let Ok(m) = self.metrics.lock() {
             metrics.wasm_app_metrics = m.to_app_metrics();
-            // Best-effort persist; no logging inside SGX.
             let _ = m.save();
         }
     }

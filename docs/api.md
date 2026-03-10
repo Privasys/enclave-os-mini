@@ -29,6 +29,7 @@ See [vault.md](vault.md) for vault-specific details and
 | `Readyz` | Bearer | Monitoring+ | Readiness probe |
 | `Status` | Bearer | Monitoring+ | Per-module status |
 | `Metrics` | Bearer | Monitoring+ | Enclave counters + WASM fuel metrics |
+| `SetAttestationServers` | Bearer | Manager | Update attestation servers (URLs + tokens) |
 | `Shutdown` | — | — | Graceful shutdown (internal) |
 
 ### WASM
@@ -39,6 +40,12 @@ See [vault.md](vault.md) for vault-specific details and
 | `wasm_unload` | Bearer | Manager | Unload a WASM component |
 | `wasm_call` | App-level or none | Per-function | Call an exported function |
 | `wasm_list` | Bearer | Monitoring+ | List loaded WASM apps |
+
+### Egress
+
+The egress module provides outbound HTTPS from inside the enclave.  It
+has no module-level management operations — attestation server management
+is handled at the core level (see `SetAttestationServers` above).
 
 ### Vault
 
@@ -232,6 +239,65 @@ Returns enclave-level counters.
 Each `Metrics` call also persists the current fuel counters to the sealed
 KV store (key `wasm:metrics:snapshot`).  On enclave restart, previously-
 snapshotted metrics are automatically loaded and merged.
+
+---
+
+### SetAttestationServers
+
+Update the attestation server list (URLs and optional bearer tokens).
+This is a **core** operation — it is handled at the same level as Readyz,
+Status, and Metrics, not inside a module.
+
+Changes take effect immediately: the attestation servers hash OID
+(`1.3.6.1.4.1.65230.2.7`) in subsequent RA-TLS certificates will
+reflect the new canonical URL list.
+
+The enclave sends bearer tokens as `Authorization: Bearer <token>` when
+verifying quotes against authenticated attestation servers.
+
+**Role:** Manager
+
+**Request:**
+
+```json
+{
+  "auth": "eyJhbGciOiJSUzI1NiIs...",
+  "SetAttestationServers": {
+    "servers": [
+      { "url": "https://as.privasys.org/", "token": "eyJhbGciOiJSUzI1NiIs..." },
+      { "url": "https://as.customer.com/" }
+    ]
+  }
+}
+```
+
+**Response:**
+
+```json
+{
+  "AttestationServersUpdated": {
+    "server_count": 2,
+    "hash": "a1b2c3d4..."
+  }
+}
+```
+
+| Field          | Type   | Description                                      |
+|----------------|--------|--------------------------------------------------|
+| `server_count` | int    | Number of attestation servers now configured      |
+| `hash`         | string | Hex-encoded SHA-256 of the canonical URL list     |
+
+**Startup configuration:**
+
+Attestation servers can also be configured at startup via
+`--attestation-servers`:
+
+```json
+"attestation_servers": [
+  { "url": "https://as.privasys.org/", "token": "eyJ..." },
+  { "url": "https://as.customer.com/" }
+]
+```
 
 ---
 

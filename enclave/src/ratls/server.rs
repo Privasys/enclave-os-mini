@@ -727,6 +727,28 @@ fn handle_frame(payload: &[u8], base_ctx: &enclave_os_common::modules::RequestCo
                 _ => unreachable!(),
             }
         }
+        Request::SetAttestationServers { servers } => {
+            // Require Manager role when OIDC is configured.
+            if let Some(ref oidc_config) = crate::oidc_config() {
+                let _ = oidc_config;
+                match ctx.oidc_claims {
+                    Some(ref claims) if claims.has_manager() => {}
+                    _ => {
+                        let err = Response::Error(b"manager role required".to_vec());
+                        return HandleResult::Response(serde_json::to_vec(&err).unwrap_or_default());
+                    }
+                }
+            }
+            let (count, hash) = enclave_os_common::attestation_servers::set(servers);
+            let hash_hex = hash
+                .map(|h| enclave_os_common::hex::hex_encode(&h))
+                .unwrap_or_default();
+            let resp = Response::AttestationServersUpdated {
+                server_count: count,
+                hash: hash_hex,
+            };
+            HandleResult::Response(serde_json::to_vec(&resp).unwrap_or_default())
+        }
         Request::Data(_) => {
             // Module dispatch — modules enforce their own role requirements
             if let Some(resp) = modules::dispatch(&req, &ctx) {
