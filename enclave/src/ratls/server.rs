@@ -656,7 +656,10 @@ fn handle_frame(payload: &[u8], base_ctx: &enclave_os_common::modules::RequestCo
     };
 
     // Step 3: Extract and verify OIDC token if present.
-    let oidc_claims = if let Some(auth_val) = json_val.as_object_mut().and_then(|m| m.remove("auth")) {
+    // Also preserve the raw JWT string — needed for OIDC bootstrap
+    // (SetAttestationServers passes it to Zitadel AddKey).
+    #[allow(unused_variables)]
+    let (oidc_claims, raw_auth_token) = if let Some(auth_val) = json_val.as_object_mut().and_then(|m| m.remove("auth")) {
         let token_str = match auth_val.as_str() {
             Some(s) => s,
             None => {
@@ -664,15 +667,16 @@ fn handle_frame(payload: &[u8], base_ctx: &enclave_os_common::modules::RequestCo
                 return HandleResult::Response(serde_json::to_vec(&err).unwrap_or_default());
             }
         };
+        let raw = token_str.to_string();
         match verify_oidc_token(token_str) {
-            Ok(claims) => Some(claims),
+            Ok(claims) => (Some(claims), Some(raw)),
             Err(e) => {
                 let err = Response::Error(format!("OIDC auth failed: {e}").into_bytes());
                 return HandleResult::Response(serde_json::to_vec(&err).unwrap_or_default());
             }
         }
     } else {
-        None
+        (None, None)
     };
 
     // Step 4: Build a context with OIDC claims.
@@ -739,7 +743,67 @@ fn handle_frame(payload: &[u8], base_ctx: &enclave_os_common::modules::RequestCo
                     }
                 }
             }
+
+            // Collect servers that need OIDC bootstrap before we move `servers`.
+            let bootstrap_configs: Vec<(String, enclave_os_common::protocol::OidcBootstrap)> =
+                servers
+                    .iter()
+                    .filter_map(|s| {
+                        s.oidc_bootstrap
+                            .as_ref()
+                            .map(|b| (s.url.clone(), b.clone()))
+                    })
+                    .collect();
+
             let (count, hash) = enclave_os_common::attestation_servers::set(servers);
+
+            // OIDC bootstrap: for each server with oidc_bootstrap config,
+            // generate a keypair, register with Zitadel, and obtain a token.
+            #[cfg(feature = "egress")]
+            if !bootstrap_configs.is_empty() {
+                let manager_jwt = match raw_auth_token.as_deref() {
+                    Some(jwt) => jwt,
+                    None => {
+                        let err = Response::Error(
+                            b"OIDC bootstrap requires an auth token (manager JWT)".to_vec(),
+                        );
+                        return HandleResult::Response(serde_json::to_vec(&err).unwrap_or_default());
+                    }
+                };
+
+                for (url, config) in &bootstrap_configs {
+                    match enclave_os_egress::oidc_bootstrap::bootstrap(config, manager_jwt) {
+                        Ok(result) => {
+                            enclave_os_common::attestation_servers::set_oidc_state(
+                                url,
+                                config.clone(),
+                                result.key_id,
+                                result.private_key_der,
+                                result.access_token,
+                                result.expires_in,
+                            );
+                            enclave_log_info!(
+                                "OIDC bootstrap succeeded for {} (key registered, token expires in {}s)",
+                                url,
+                                result.expires_in,
+                            );
+                        }
+                        Err(e) => {
+                            enclave_log_error!(
+                                "OIDC bootstrap failed for {}: {}",
+                                url, e
+                            );
+                            let err = Response::Error(
+                                format!("OIDC bootstrap failed for {url}: {e}").into_bytes(),
+                            );
+                            return HandleResult::Response(
+                                serde_json::to_vec(&err).unwrap_or_default(),
+                            );
+                        }
+                    }
+                }
+            }
+
             let hash_hex = hash
                 .map(|h| enclave_os_common::hex::hex_encode(&h))
                 .unwrap_or_default();

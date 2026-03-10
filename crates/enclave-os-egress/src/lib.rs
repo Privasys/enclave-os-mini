@@ -52,6 +52,7 @@
 
 pub mod client;
 pub mod attestation;
+pub mod oidc_bootstrap;
 
 // Re-export RA-TLS verification types for convenience.
 pub use client::{

@@ -166,6 +166,28 @@ pub fn verify_quote(
     let body = format!(r#"{{"quote":"{}"}}"#, quote_b64);
 
     for server_url in attestation_servers {
+        // Check if the OIDC-bootstrapped token needs lazy refresh.
+        if let Some((config, key_id, private_key_der)) =
+            enclave_os_common::attestation_servers::needs_oidc_refresh(server_url)
+        {
+            match crate::oidc_bootstrap::refresh(&config, &key_id, &private_key_der) {
+                Ok((new_token, expires_in)) => {
+                    enclave_os_common::attestation_servers::update_oidc_token(
+                        server_url,
+                        new_token,
+                        expires_in,
+                    );
+                }
+                Err(e) => {
+                    // Log but don't fail — the existing token may still work.
+                    enclave_os_common::ocall::log(
+                        4,
+                        &format!("OIDC token refresh failed for {}: {}", server_url, e),
+                    );
+                }
+            }
+        }
+
         // Look up an optional bearer token from core attestation server config.
         let token = enclave_os_common::attestation_servers::token_for(server_url);
         let auth_header = token.as_deref().map(|t| {

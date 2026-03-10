@@ -71,6 +71,16 @@ struct Cli {
     #[arg(long, value_delimiter = ',')]
     attestation_servers: Option<Vec<String>>,
 
+    /// OIDC issuer URL (e.g. https://auth.privasys.org).
+    /// When set (together with --oidc-audience), enables OIDC-based RBAC.
+    #[arg(long)]
+    oidc_issuer: Option<String>,
+
+    /// OIDC audience claim (e.g. the Zitadel project ID).
+    /// Required when --oidc-issuer is set.
+    #[arg(long)]
+    oidc_audience: Option<String>,
+
     /// Enable debug logging
     #[arg(short, long)]
     debug: bool,
@@ -218,6 +228,19 @@ fn main() -> Result<()> {
         info!("Attestation servers: {:?}", servers);
         config["attestation_servers"] = serde_json::to_value(servers)
             .map_err(|e| anyhow::anyhow!("Failed to serialise attestation servers: {}", e))?;
+    }
+
+    // OIDC configuration
+    if let Some(ref issuer) = cli.oidc_issuer {
+        let audience = cli.oidc_audience.as_deref()
+            .ok_or_else(|| anyhow::anyhow!("--oidc-audience is required when --oidc-issuer is set"))?;
+        info!("OIDC enabled: issuer={}, audience={}", issuer, audience);
+        config["oidc"] = serde_json::json!({
+            "issuer": issuer,
+            "audience": audience,
+        });
+    } else if cli.oidc_audience.is_some() {
+        anyhow::bail!("--oidc-issuer is required when --oidc-audience is set");
     }
 
     let config_bytes = serde_json::to_vec(&config)?;
