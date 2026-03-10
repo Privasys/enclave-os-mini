@@ -106,6 +106,13 @@ pub struct WasmLoad {
     /// authentication.
     #[serde(default)]
     pub permissions: Option<AppPermissions>,
+    /// Maximum fuel budget per call for this app.
+    ///
+    /// Each `wasm_call` invocation starts with this many fuel units.
+    /// When the budget is exhausted, the WASM instance traps.
+    /// Defaults to 10 000 000 (~a few hundred ms of compute) when absent.
+    #[serde(default)]
+    pub max_fuel: Option<u64>,
 }
 
 /// Unload a WASM app by name.
@@ -300,6 +307,8 @@ pub struct AppInfo {
     /// permissions policy is configured (all functions are public).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub permissions_hash: Option<String>,
+    /// Maximum fuel budget per call for this app.
+    pub max_fuel: u64,
 }
 
 /// An exported function signature discovered from a WASM component.

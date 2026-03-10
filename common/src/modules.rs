@@ -125,4 +125,11 @@ pub trait EnclaveModule: Send + Sync {
     fn app_identities(&self) -> Vec<AppIdentity> {
         Vec::new()
     }
+
+    /// Enrich enclave-level metrics with module-specific data.
+    ///
+    /// Called by the `Metrics` handler.  Modules can fill in their
+    /// own fields (e.g. WASM fuel counters) and perform side-effects
+    /// like snapshotting metrics to the sealed KV store.
+    fn enrich_metrics(&self, _metrics: &mut crate::protocol::EnclaveMetrics) {}
 }

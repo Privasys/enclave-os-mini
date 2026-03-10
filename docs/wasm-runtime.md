@@ -184,7 +184,7 @@ trait and provides:
 |----------------|----------------|
 | Wire protocol | `WasmEnvelope` — JSON discriminator for `wasm_load`, `wasm_call`, `wasm_list`, `wasm_unload` |
 | App registry | `WasmRegistry` — stores loaded apps, handles export introspection |
-| Execution | Fresh `Store` + `Instance` per call (stateless), 10M fuel budget |
+| Execution | Fresh `Store` + `Instance` per call (stateless), per-app fuel budget |
 | File system | `SealedKvStore` — AES-256-GCM encrypted, per-app isolated (`app:<name>/fs:<path>`) |
 | Attestation | Per-app config leaves + OIDs via `EnclaveModule` trait methods |
 
@@ -366,12 +366,47 @@ across calls and enclave restarts (same MRENCLAVE required to unseal).
 
 ### Fuel Metering
 
-Each call gets a budget of **10 million fuel units** (~a few hundred
-milliseconds of compute).  Instructions consume fuel; when the budget is
+Each call gets a fuel budget that limits computation.  The default is
+**10 million fuel units** (~a few hundred ms of compute).  Managers can
+set a custom `max_fuel` per app at load time.  When the budget is
 exhausted, the WASM instance traps.
 
 This prevents infinite loops and ensures fair resource sharing when multiple
 apps are loaded.
+
+#### Fuel Metrics
+
+The runtime tracks cumulative fuel consumption **per app** and **per
+function**.  Counters are i64 to accommodate large cumulative values.
+
+| Counter | Scope | Description |
+|---------|-------|-------------|
+| `calls_total` | App | Total calls (successful + errored) |
+| `fuel_consumed_total` | App | Sum of fuel consumed across all calls |
+| `errors_total` | App | Calls that returned an error |
+| `calls` | Function | Calls to this specific export |
+| `fuel_consumed` | Function | Fuel consumed by this export |
+| `errors` | Function | Error count for this export |
+| `fuel_min` | Function | Minimum fuel consumed in a single call |
+| `fuel_max` | Function | Maximum fuel consumed in a single call |
+
+Retrieve counters via the core `Metrics` API (Monitoring+ role) — they
+appear in the `wasm_app_metrics` array of the `MetricsReport`.
+
+#### Metric Persistence
+
+Every `Metrics` call automatically persists the current counters to the
+sealed KV store under the key `wasm:metrics:snapshot` (AES-256-GCM
+encrypted, same sealing as app data).
+
+On enclave startup, previously-snapshotted metrics are automatically loaded
+and additively merged with the in-memory counters.  This means counters
+survive enclave restarts as long as the operator polls `Metrics` before
+shutdown.
+
+When an app is unloaded via `wasm_unload`, its counters are removed from
+the in-memory store.  The next `Metrics` call will persist the
+remaining apps' counters (effectively garbage-collecting the old app).
 
 ### Memory Limits
 
@@ -380,4 +415,4 @@ apps are loaded.
 | Linear memory per instance | 4 MiB |
 | Code memory pool (shared) | 16 MiB |
 | Memory guard pages | 64 KiB |
-| Fuel budget per call | 10,000,000 |
+| Default fuel budget per call | 10,000,000 (configurable via `max_fuel`) |

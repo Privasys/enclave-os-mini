@@ -28,7 +28,7 @@ See [vault.md](vault.md) for vault-specific details and
 | `Healthz` | None | — | Liveness probe |
 | `Readyz` | Bearer | Monitoring+ | Readiness probe |
 | `Status` | Bearer | Monitoring+ | Per-module status |
-| `Metrics` | Bearer | Monitoring+ | Enclave counters |
+| `Metrics` | Bearer | Monitoring+ | Enclave counters + WASM fuel metrics |
 | `Shutdown` | — | — | Graceful shutdown (internal) |
 
 ### WASM
@@ -176,7 +176,25 @@ Returns enclave-level counters.
     "secrets_stored_total": 12,
     "secrets_retrieved_total": 5,
     "attestation_verifications_total": 23,
-    "uptime_seconds": 86400
+    "uptime_seconds": 86400,
+    "wasm_app_metrics": [
+      {
+        "name": "my-app",
+        "calls_total": 142,
+        "fuel_consumed_total": 8523410,
+        "errors_total": 3,
+        "functions": [
+          {
+            "name": "process",
+            "calls": 140,
+            "fuel_consumed": 8500000,
+            "errors": 1,
+            "fuel_min": 50000,
+            "fuel_max": 75000
+          }
+        ]
+      }
+    ]
   }
 }
 ```
@@ -190,6 +208,30 @@ Returns enclave-level counters.
 | `secrets_retrieved_total` | u64 | Total secrets retrieved |
 | `attestation_verifications_total` | u64 | Total attestation verifications |
 | `uptime_seconds` | u64 | Enclave uptime in seconds |
+| `wasm_app_metrics` | array | Per-app WASM fuel metrics (omitted when empty) |
+
+**`wasm_app_metrics` fields:**
+
+| WasmAppMetrics field | Type | Description |
+|----------------------|------|-------------|
+| `name` | string | App identifier |
+| `calls_total` | i64 | Total successful + errored calls |
+| `fuel_consumed_total` | i64 | Total fuel consumed across all calls |
+| `errors_total` | i64 | Total calls that returned an error |
+| `functions` | array | Per-function breakdown |
+
+| WasmFunctionMetrics field | Type | Description |
+|---------------------------|------|-------------|
+| `name` | string | Exported function name |
+| `calls` | i64 | Number of calls to this function |
+| `fuel_consumed` | i64 | Total fuel consumed by this function |
+| `errors` | i64 | Calls that returned an error |
+| `fuel_min` | i64 | Minimum fuel consumed in a single call |
+| `fuel_max` | i64 | Maximum fuel consumed in a single call |
+
+Each `Metrics` call also persists the current fuel counters to the sealed
+KV store (key `wasm:metrics:snapshot`).  On enclave restart, previously-
+snapshotted metrics are automatically loaded and merged.
 
 ---
 
@@ -212,6 +254,7 @@ Load (or replace) a WASM component.  Requires **Manager** role.
     "bytes": [0, 97, 115, 109, ...],
     "hostname": "my-app.example.com",
     "encryption_key": "hex-encoded-32-byte-aes-key",
+    "max_fuel": 20000000,
     "permissions": {
       "version": 1,
       "oidc": {
@@ -235,6 +278,7 @@ Load (or replace) a WASM component.  Requires **Manager** role.
 | `bytes` | byte[] | yes | Raw WASM component bytecode |
 | `hostname` | string | no | SNI hostname for per-app TLS certificate (defaults to `name`) |
 | `encryption_key` | string | no | Hex-encoded 32-byte AES-256 key for per-app KV encryption. If omitted, a random key is generated inside the enclave via RDRAND |
+| `max_fuel` | u64 | no | Maximum fuel budget per call. Defaults to 10 000 000 (~a few hundred ms of compute) |
 | `permissions` | AppPermissions | no | Per-function access policy with app-developer OIDC. If omitted, all functions are public (no auth) |
 
 **Response** (success)
@@ -250,7 +294,8 @@ Load (or replace) a WASM component.  Requires **Manager** role.
     "exports": [
       { "name": "process", "param_count": 1, "result_count": 1 }
     ],
-    "permissions_hash": "e5f6a7b8..."
+    "permissions_hash": "e5f6a7b8...",
+    "max_fuel": 20000000
   }
 }
 ```
@@ -380,7 +425,8 @@ List all loaded WASM components.  Requires **Monitoring+** role.
       "exports": [
         { "name": "process", "param_count": 1, "result_count": 1 },
         { "name": "init", "param_count": 0, "result_count": 0 }
-      ]
+      ],
+      "max_fuel": 10000000
     }
   ]
 }
@@ -394,6 +440,9 @@ List all loaded WASM components.  Requires **Monitoring+** role.
 | `key_source` | string | `"generated"` or `"byok:<fingerprint>"` |
 | `exports` | array | Discovered exported function signatures |
 | `permissions_hash` | string? | SHA-256 of the permissions JSON (hex), or absent if no permissions |
+| `max_fuel` | u64 | Fuel budget per call for this app |
+
+
 
 ---
 

@@ -719,7 +719,8 @@ fn handle_frame(payload: &[u8], base_ctx: &enclave_os_common::modules::RequestCo
                     HandleResult::Response(serde_json::to_vec(&resp).unwrap_or_default())
                 }
                 Request::Metrics => {
-                    let metrics = enclave_os_common::protocol::EnclaveMetrics::default();
+                    let mut metrics = enclave_os_common::protocol::EnclaveMetrics::default();
+                    modules::enrich_metrics(&mut metrics);
                     let resp = Response::MetricsReport(metrics);
                     HandleResult::Response(serde_json::to_vec(&resp).unwrap_or_default())
                 }

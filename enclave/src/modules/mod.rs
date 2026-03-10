@@ -87,6 +87,13 @@ pub fn module_count() -> usize {
     MODULES.lock().unwrap().len()
 }
 
+/// Let every module enrich the enclave-level metrics.
+pub fn enrich_metrics(metrics: &mut enclave_os_common::protocol::EnclaveMetrics) {
+    for module in MODULES.lock().unwrap().iter() {
+        module.enrich_metrics(metrics);
+    }
+}
+
 /// Collect module statuses for the /status endpoint.
 pub fn collect_module_statuses() -> Vec<enclave_os_common::protocol::ModuleStatus> {
     MODULES

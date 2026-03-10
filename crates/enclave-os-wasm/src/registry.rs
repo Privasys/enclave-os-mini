@@ -90,6 +90,8 @@ pub struct LoadedApp {
     pub permissions: Option<AppPermissions>,
     /// SHA-256 hash of the permissions JSON (if any).
     pub permissions_hash: Option<[u8; 32]>,
+    /// Maximum fuel budget per `wasm_call` for this app.
+    pub max_fuel: u64,
 }
 
 impl LoadedApp {
@@ -153,6 +155,7 @@ impl AppRegistry {
         wasm_bytes: &[u8],
         encryption_key: Option<[u8; AEAD_KEY_SIZE]>,
         permissions: Option<AppPermissions>,
+        max_fuel: u64,
     ) -> Result<(), String> {
         if self.apps.contains_key(name) {
             return Err(format!("app '{}' is already loaded", name));
@@ -233,6 +236,7 @@ impl AppRegistry {
                 exports,
                 permissions,
                 permissions_hash,
+                max_fuel,
             },
         );
 
@@ -255,6 +259,7 @@ impl AppRegistry {
                 key_source: app.key_source.clone(),
                 exports: app.exported_funcs(),
                 permissions_hash: app.permissions_hash.map(|h| enclave_os_common::hex::hex_encode(&h)),
+                max_fuel: app.max_fuel,
             })
             .collect()
     }
@@ -305,6 +310,9 @@ impl AppRegistry {
     /// (stateless execution model).  The instance is discarded after the
     /// call completes.
     ///
+    /// Returns the [`WasmResult`] and the fuel consumed (0 on error
+    /// before execution starts).
+    ///
     /// [`Store`]: wasmtime::Store
     /// [`Instance`]: wasmtime::component::Instance
     pub fn call(
@@ -312,38 +320,41 @@ impl AppRegistry {
         app_name: &str,
         function: &str,
         params: &[WasmParam],
-    ) -> WasmResult {
+    ) -> (WasmResult, i64) {
         // ── Look up app ────────────────────────────────────────────
         let app = match self.apps.get(app_name) {
             Some(a) => a,
             None => {
-                return WasmResult::Error {
+                return (WasmResult::Error {
                     message: format!("unknown app: '{}'", app_name),
-                };
+                }, 0);
             }
         };
 
         // ── Verify function exists ─────────────────────────────────
         if !app.exports.contains_key(function) {
-            return WasmResult::Error {
+            return (WasmResult::Error {
                 message: format!(
                     "app '{}' has no export '{}'. Available: [{}]",
                     app_name,
                     function,
                     app.exports.keys().cloned().collect::<Vec<_>>().join(", "),
                 ),
-            };
+            }, 0);
         }
 
         // ── Instantiate ────────────────────────────────────────────
-        let (mut store, instance) = match self.engine.instantiate(app_name, app.encryption_key, &app.component) {
+        let (mut store, instance) = match self.engine.instantiate(app_name, app.encryption_key, app.max_fuel, &app.component) {
             Ok(pair) => pair,
             Err(e) => {
-                return WasmResult::Error {
+                return (WasmResult::Error {
                     message: format!("instantiation failed: {}", e),
-                };
+                }, 0);
             }
         };
+
+        // Record fuel before execution for delta calculation.
+        let fuel_before = store.get_fuel().unwrap_or(0) as i64;
 
         // ── Resolve the exported function ──────────────────────────
         // Functions can be at the root or under an exported instance.
@@ -356,12 +367,12 @@ impl AppRegistry {
             let iface_idx = match app.component.get_export_index(None, iface_name) {
                 Some(idx) => idx,
                 None => {
-                    return WasmResult::Error {
+                    return (WasmResult::Error {
                         message: format!(
                             "interface '{}' not found in app '{}'",
                             iface_name, app_name,
                         ),
-                    };
+                    }, 0);
                 }
             };
             match instance.get_func(&mut store, &iface_idx) {
@@ -375,21 +386,21 @@ impl AppRegistry {
                         Some(func_idx) => match instance.get_func(&mut store, &func_idx) {
                             Some(f) => f,
                             None => {
-                                return WasmResult::Error {
+                                return (WasmResult::Error {
                                     message: format!(
                                         "function '{}' not found in interface '{}' of app '{}'",
                                         func_name, iface_name, app_name,
                                     ),
-                                };
+                                }, 0);
                             }
                         },
                         None => {
-                            return WasmResult::Error {
+                            return (WasmResult::Error {
                                 message: format!(
                                     "function '{}' not found in interface '{}' of app '{}'",
                                     func_name, iface_name, app_name,
                                 ),
-                            };
+                            }, 0);
                         }
                     }
                 }
@@ -402,21 +413,21 @@ impl AppRegistry {
                         Some(func_idx) => match instance.get_func(&mut store, &func_idx) {
                             Some(f) => f,
                             None => {
-                                return WasmResult::Error {
+                                return (WasmResult::Error {
                                     message: format!(
                                         "function '{}' not callable in interface '{}' of app '{}'",
                                         func_name, iface_name, app_name,
                                     ),
-                                };
+                                }, 0);
                             }
                         },
                         None => {
-                            return WasmResult::Error {
+                            return (WasmResult::Error {
                                 message: format!(
                                     "function '{}' not found in interface '{}' of app '{}'",
                                     func_name, iface_name, app_name,
                                 ),
-                            };
+                            }, 0);
                         }
                     }
                 }
@@ -426,12 +437,12 @@ impl AppRegistry {
             match instance.get_func(&mut store, function) {
                 Some(f) => f,
                 None => {
-                    return WasmResult::Error {
+                    return (WasmResult::Error {
                         message: format!(
                             "function '{}' not found at root of app '{}'",
                             function, app_name,
                         ),
-                    };
+                    }, 0);
                 }
             }
         };
@@ -462,22 +473,26 @@ impl AppRegistry {
         // Flush any remaining partial lines from the guest's stdout/stderr.
         store.data_mut().flush_logs();
 
+        // Calculate fuel consumed.
+        let fuel_after = store.get_fuel().unwrap_or(0) as i64;
+        let fuel_consumed = fuel_before - fuel_after;
+
         //  Check deferred errors 
         if let Some(e) = call_err {
-            return WasmResult::Error {
+            return (WasmResult::Error {
                 message: format!("call failed: {}", e),
-            };
+            }, fuel_consumed);
         }
         if let Some(e) = post_err {
-            return WasmResult::Error {
+            return (WasmResult::Error {
                 message: format!("post_return failed: {}", e),
-            };
+            }, fuel_consumed);
         }
 
         //  Marshal results 
         let returns: Vec<WasmValue> = results.iter().map(val_to_wasm_value).collect();
 
-        WasmResult::Ok { returns }
+        (WasmResult::Ok { returns }, fuel_consumed)
     }
 }
 

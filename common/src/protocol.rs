@@ -100,6 +100,41 @@ pub struct EnclaveMetrics {
     pub attestation_verifications_total: u64,
     /// Enclave uptime in seconds.
     pub uptime_seconds: u64,
+    /// Per-app WASM fuel metering metrics (empty if WASM not enabled).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub wasm_app_metrics: Vec<WasmAppMetrics>,
+}
+
+/// Aggregated fuel metrics for a single WASM app.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WasmAppMetrics {
+    /// App identifier.
+    pub name: String,
+    /// Total number of calls across all functions.
+    pub calls_total: i64,
+    /// Total fuel consumed across all functions.
+    pub fuel_consumed_total: i64,
+    /// Number of calls that resulted in an error.
+    pub errors_total: i64,
+    /// Per-function breakdown.
+    pub functions: Vec<WasmFunctionMetrics>,
+}
+
+/// Fuel metrics for a single exported function within a WASM app.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WasmFunctionMetrics {
+    /// Function name (e.g. `"process"` or `"my-api/transform"`).
+    pub name: String,
+    /// Number of times this function was called.
+    pub calls: i64,
+    /// Total fuel consumed by this function across all calls.
+    pub fuel_consumed: i64,
+    /// Number of calls that resulted in an error.
+    pub errors: i64,
+    /// Minimum fuel consumed in a single call (0 if never called).
+    pub fuel_min: i64,
+    /// Maximum fuel consumed in a single call.
+    pub fuel_max: i64,
 }
 
 /// Encode a length-delimited frame: [u32 BE length][payload].

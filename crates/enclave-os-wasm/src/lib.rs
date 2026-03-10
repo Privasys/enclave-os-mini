@@ -68,6 +68,7 @@
 
 pub mod enclave_sdk;
 pub mod engine;
+pub mod metrics;
 pub mod protocol;
 pub mod registry;
 #[cfg(target_vendor = "teaclave")]
@@ -84,6 +85,7 @@ use enclave_os_common::protocol::{Request, Response};
 use enclave_os_common::types::AEAD_KEY_SIZE;
 
 use crate::protocol::{AppPermissions, FunctionPolicy, WasmCall, WasmEnvelope, WasmManagementResult, WasmResult};
+use crate::metrics::WasmMetricsStore;
 use crate::registry::AppRegistry;
 
 // ---------------------------------------------------------------------------
@@ -99,10 +101,12 @@ pub use enclave_os_common::oids::WASM_APPS_HASH_OID;
 
 /// The WASM module: Component Model runtime inside SGX.
 ///
-/// Owns the [`AppRegistry`] which contains all loaded WASM apps.
-/// Requests matching the `wasm_call` envelope are dispatched here.
+/// Owns the [`AppRegistry`] which contains all loaded WASM apps,
+/// and the [`WasmMetricsStore`] which tracks per-app/per-function
+/// fuel consumption from wasmtime's fuel metering.
 pub struct WasmModule {
     registry: Mutex<AppRegistry>,
+    metrics: Mutex<WasmMetricsStore>,
 }
 
 impl WasmModule {
@@ -116,8 +120,18 @@ impl WasmModule {
     pub fn new() -> Result<Self, String> {
         let engine = crate::engine::WasmEngine::new()?;
         let registry = AppRegistry::new(engine);
+
+        // Try to restore metrics from a previous snapshot in the KV store.
+        let mut metrics_store = WasmMetricsStore::new();
+        match metrics_store.load() {
+            Ok(true) => { /* restored from KV */ }
+            Ok(false) => { /* no snapshot — fresh start */ }
+            Err(_) => { /* KV not ready or corrupt — start fresh */ }
+        }
+
         Ok(Self {
             registry: Mutex::new(registry),
+            metrics: Mutex::new(metrics_store),
         })
     }
 
@@ -146,13 +160,14 @@ impl WasmModule {
         wasm_bytes: &[u8],
         encryption_key: Option<[u8; AEAD_KEY_SIZE]>,
         permissions: Option<AppPermissions>,
+        max_fuel: u64,
     ) -> Result<(), String> {
         // Load into the registry (compile + introspect + per-app key)
         let (code_hash, key_source, permissions_hash) = {
             let mut reg = self.registry
                 .lock()
                 .map_err(|_| String::from("registry lock poisoned"))?;
-            reg.load_app(name, hostname, wasm_bytes, encryption_key, permissions)?;
+            reg.load_app(name, hostname, wasm_bytes, encryption_key, permissions, max_fuel)?;
 
             let hash = reg.app_code_hash(name)
                 .copied()
@@ -218,17 +233,37 @@ impl WasmModule {
             .unwrap_or_default()
     }
 
-    /// Dispatch a parsed `WasmCall` to the appropriate app.
+    /// Dispatch a parsed `WasmCall` to the appropriate app and record metrics.
     fn dispatch_call(&self, call: &WasmCall) -> WasmResult {
-        let registry = match self.registry.lock() {
-            Ok(r) => r,
-            Err(_) => {
-                return WasmResult::Error {
-                    message: String::from("registry lock poisoned"),
-                };
-            }
+        let (result, fuel_consumed) = {
+            let registry = match self.registry.lock() {
+                Ok(r) => r,
+                Err(_) => {
+                    return WasmResult::Error {
+                        message: String::from("registry lock poisoned"),
+                    };
+                }
+            };
+            registry.call(&call.app, &call.function, &call.params)
         };
-        registry.call(&call.app, &call.function, &call.params)
+
+        // Record fuel metrics.
+        if let Ok(mut m) = self.metrics.lock() {
+            match &result {
+                WasmResult::Ok { .. } => {
+                    m.record_call(&call.app, &call.function, fuel_consumed);
+                }
+                WasmResult::Error { .. } => {
+                    if fuel_consumed > 0 {
+                        // Execution started but failed (e.g. fuel exhaustion, trap).
+                        m.record_call(&call.app, &call.function, fuel_consumed);
+                    }
+                    m.record_error(&call.app, &call.function);
+                }
+            }
+        }
+
+        result
     }
 
     /// Enforce per-app permission policy on a `wasm_call`.
@@ -349,11 +384,11 @@ impl EnclaveModule for WasmModule {
 
     /// Handle a client request.
     ///
-    /// Expects the `Request::Data` payload to be JSON containing one of:
-    /// - `wasm_call`   — call an exported function on a loaded app
-    /// - `wasm_load`   — load (or replace) a WASM app from raw bytes
-    /// - `wasm_unload` — unload an app by name
-    /// - `wasm_list`   — list all loaded apps
+    /// Recognises `Request::Data` containing a `WasmEnvelope` with one of:
+    ///   - `wasm_call`    — call an exported function on a loaded app
+    ///   - `wasm_load`    — load (or replace) a WASM app from raw bytes
+    ///   - `wasm_unload`  — unload an app by name
+    ///   - `wasm_list`    — list all loaded apps
     ///
     /// **Platform OIDC role requirements** (when OIDC is configured):
     /// - `wasm_load`, `wasm_unload`: requires **manager** role
@@ -363,7 +398,7 @@ impl EnclaveModule for WasmModule {
     /// - `wasm_call`: enforced per-function using the app developer's own
     ///   OIDC provider.  If the app has no permissions, calls are public.
     ///
-    /// Returns `None` if the payload doesn't match any WASM envelope
+    /// Returns `None` if the payload doesn't match any recognised request
     /// (letting other modules handle the request).
     fn handle(&self, req: &Request, ctx: &RequestContext) -> Option<Response> {
         let data = match req {
@@ -454,7 +489,9 @@ impl EnclaveModule for WasmModule {
                 None => None,
             };
 
-            let mgmt_result = match self.load_app(&load.name, &hostname, &load.bytes, encryption_key, load.permissions) {
+            let max_fuel = load.max_fuel.unwrap_or(10_000_000);
+
+            let mgmt_result = match self.load_app(&load.name, &hostname, &load.bytes, encryption_key, load.permissions, max_fuel) {
                 Ok(()) => {
                     // Return the loaded app's info
                     let apps = self.list_apps();
@@ -472,6 +509,10 @@ impl EnclaveModule for WasmModule {
 
         // 3. wasm_unload — remove an app
         if let Some(unload) = envelope.wasm_unload {
+            // Also remove its metrics counters.
+            if let Ok(mut m) = self.metrics.lock() {
+                m.remove_app(&unload.name);
+            }
             let mgmt_result = if self.unload_app(&unload.name) {
                 WasmManagementResult::Unloaded { name: unload.name }
             } else {
@@ -489,6 +530,16 @@ impl EnclaveModule for WasmModule {
 
         // No recognised field — decline so other modules can try.
         None
+    }
+
+    /// Enrich the core `Metrics` response with per-app fuel-metering data
+    /// and persist a snapshot to the sealed KV store.
+    fn enrich_metrics(&self, metrics: &mut enclave_os_common::protocol::EnclaveMetrics) {
+        if let Ok(m) = self.metrics.lock() {
+            metrics.wasm_app_metrics = m.to_app_metrics();
+            // Best-effort persist; no logging inside SGX.
+            let _ = m.save();
+        }
     }
 
     /// Config Merkle leaves for attestation.

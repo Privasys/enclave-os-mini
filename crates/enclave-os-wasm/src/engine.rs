@@ -145,14 +145,14 @@ impl WasmEngine {
     /// Each app instance gets its own store, which encapsulates all
     /// wasm-visible state (memories, tables, globals, app context).
     /// The `app_name` is used to namespace all KV store operations.
-    pub fn new_store(&self, app_name: &str, master_key: [u8; AEAD_KEY_SIZE]) -> Store<AppContext> {
+    /// `fuel` sets the per-call fuel budget.
+    pub fn new_store(&self, app_name: &str, master_key: [u8; AEAD_KEY_SIZE], fuel: u64) -> Store<AppContext> {
         let host = AppContext::with_app(app_name, master_key);
         let mut store = Store::new(&self.engine, host);
 
-        // ── Fuel / resource limits ─────────────────────────────────
+        // ── Fuel / resource limits ─────────────────────────────
         // Fuel limits prevent infinite loops from hanging the enclave.
-        // 10M instructions ≈ a few hundred ms of compute.
-        store.set_fuel(10_000_000).ok();
+        store.set_fuel(fuel).ok();
 
         store
     }
@@ -164,9 +164,10 @@ impl WasmEngine {
         &self,
         app_name: &str,
         master_key: [u8; AEAD_KEY_SIZE],
+        fuel: u64,
         component: &Component,
     ) -> Result<(Store<AppContext>, wasmtime::component::Instance), String> {
-        let mut store = self.new_store(app_name, master_key);
+        let mut store = self.new_store(app_name, master_key, fuel);
         let instance = self.linker.instantiate(&mut store, component).map_err(|e| {
             format!("WASM instantiation failed: {}", e)
         })?;
