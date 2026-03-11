@@ -519,6 +519,65 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
 
     enclave_log_info!("All modules registered ({} module(s))", _module_count);
 
+    // ── OIDC bootstrap at startup ────────────────────────────────────
+    // If a manager token was provided, run OIDC bootstrap for each
+    // attestation server that has an oidc_bootstrap configuration.
+    // This must happen AFTER the egress module is initialised (it needs
+    // the CA root store for outbound HTTPS to Zitadel).
+    #[cfg(feature = "egress")]
+    {
+        if let Some(manager_jwt) = config.extra.get("manager_token").and_then(|v| v.as_str()) {
+            use enclave_os_common::attestation_servers;
+            use enclave_os_common::protocol::OidcBootstrap;
+
+            let servers: Vec<enclave_os_common::protocol::AttestationServer> = config
+                .extra
+                .get("attestation_servers")
+                .map(|v| serde_json::from_value(v.clone()).unwrap_or_default())
+                .unwrap_or_default();
+
+            let bootstrap_configs: Vec<(String, OidcBootstrap)> = servers
+                .iter()
+                .filter_map(|s| {
+                    s.oidc_bootstrap
+                        .as_ref()
+                        .map(|b| (s.url.clone(), b.clone()))
+                })
+                .collect();
+
+            for (url, cfg) in &bootstrap_configs {
+                match enclave_os_egress::oidc_bootstrap::bootstrap(cfg, manager_jwt) {
+                    Ok(result) => {
+                        attestation_servers::set_oidc_state(
+                            url,
+                            cfg.clone(),
+                            result.key_id,
+                            result.private_key_der,
+                            result.access_token,
+                            result.expires_in,
+                        );
+                        enclave_log_info!(
+                            "OIDC bootstrap OK for {} (token expires in {}s)",
+                            url,
+                            result.expires_in,
+                        );
+                    }
+                    Err(e) => {
+                        enclave_log_error!("OIDC bootstrap FAILED for {}: {}", url, e);
+                        return -40;
+                    }
+                }
+            }
+
+            if !bootstrap_configs.is_empty() {
+                enclave_log_info!(
+                    "OIDC bootstrap complete: {} server(s) provisioned",
+                    bootstrap_configs.len(),
+                );
+            }
+        }
+    }
+
     finalize_and_run(&config, &sealed_cfg)
 }
 
