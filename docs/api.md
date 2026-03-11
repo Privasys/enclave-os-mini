@@ -244,7 +244,8 @@ snapshotted metrics are automatically loaded and merged.
 
 ### SetAttestationServers
 
-Update the attestation server list (URLs and optional bearer tokens).
+Update the attestation server list (URLs, optional bearer tokens, and
+optional OIDC bootstrap configuration).
 This is a **core** operation — it is handled at the same level as Readyz,
 Status, and Metrics, not inside a module.
 
@@ -264,12 +265,45 @@ verifying quotes against authenticated attestation servers.
   "auth": "eyJhbGciOiJSUzI1NiIs...",
   "SetAttestationServers": {
     "servers": [
-      { "url": "https://as.privasys.org/", "token": "eyJhbGciOiJSUzI1NiIs..." },
-      { "url": "https://as.customer.com/" }
+      {
+        "url": "https://as.privasys.org/",
+        "oidc_bootstrap": {
+          "issuer": "https://auth.privasys.org",
+          "service_account_id": "363552322535555076",
+          "project_id": "363481202289541124"
+        }
+      },
+      { "url": "https://as.customer.com/", "token": "eyJhbGciOiJSUzI1NiIs..." }
     ]
   }
 }
 ```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `url` | string | Attestation server URL |
+| `token` | string? | Pre-existing bearer token (optional, mutually exclusive with `oidc_bootstrap`) |
+| `oidc_bootstrap` | object? | OIDC bootstrap config (optional, see below) |
+
+**OIDC bootstrap** (`oidc_bootstrap`):
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `issuer` | string | OIDC issuer URL |
+| `service_account_id` | string | Service account user ID on the OIDC provider |
+| `project_id` | string? | OIDC project ID for audience-scoped tokens |
+
+When `oidc_bootstrap` is present and the request includes an `auth` token
+with `enclave-os-mini:manager` + `ORG_USER_MANAGER` roles, the enclave:
+
+1. Generates an ECDSA P-256 keypair inside the enclave.
+2. Registers the public key with the OIDC provider's key registration API
+   (e.g. Zitadel `POST /v2/users/{service_account_id}/keys`) using the
+   manager JWT.
+3. Exchanges a signed JWT assertion (ES256, jwt-bearer grant) for an
+   access token scoped to the project audience.
+4. Stores the token and keypair — subsequent attestation calls use the
+   token automatically, with lazy refresh at 75% of token lifetime.
 
 **Response:**
 
@@ -289,15 +323,28 @@ verifying quotes against authenticated attestation servers.
 
 **Startup configuration:**
 
-Attestation servers can also be configured at startup via
-`--attestation-servers`:
+Attestation servers can also be configured at startup via CLI flags.
+When `--manager-token` is provided alongside `--oidc-service-account-id`,
+the enclave runs OIDC bootstrap at startup for each attestation server.
 
-```json
-"attestation_servers": [
-  { "url": "https://as.privasys.org/", "token": "eyJ..." },
-  { "url": "https://as.customer.com/" }
-]
+```bash
+./enclave-os-host \
+  --attestation-servers https://as.privasys.org/verify \
+  --oidc-issuer https://auth.privasys.org \
+  --oidc-audience 363481202289541124 \
+  --manager-token "eyJhbGciOiJSUzI1NiIs..." \
+  --oidc-service-account-id 363552322535555076 \
+  --oidc-project-id 363481202289541124
 ```
+
+| CLI Flag | Description |
+|----------|-------------|
+| `--attestation-servers` | Comma-separated list of attestation server URLs |
+| `--manager-token` | Manager JWT for OIDC bootstrap at startup |
+| `--oidc-service-account-id` | Service account user ID for key registration |
+| `--oidc-project-id` | (optional) OIDC project ID for audience-scoped tokens |
+| `--oidc-issuer` | OIDC issuer URL |
+| `--oidc-audience` | OIDC audience claim (project ID) |
 
 ---
 

@@ -76,28 +76,28 @@ struct Cli {
     #[arg(long)]
     oidc_issuer: Option<String>,
 
-    /// OIDC audience claim (e.g. the Zitadel project ID).
+    /// OIDC audience claim (e.g. the OIDC project ID).
     /// Required when --oidc-issuer is set.
     #[arg(long)]
     oidc_audience: Option<String>,
 
     /// Manager JWT for OIDC bootstrap at startup.
     /// When set together with --oidc-service-account-id, the enclave
-    /// generates a keypair, registers the public key in Zitadel using
-    /// this token, and self-provisions a bearer token for each
-    /// attestation server that has OIDC bootstrap enabled.
+    /// generates a keypair, registers the public key with the OIDC
+    /// provider using this token, and self-provisions a bearer token
+    /// for each attestation server that has OIDC bootstrap enabled.
     #[arg(long)]
     manager_token: Option<String>,
 
-    /// Zitadel service-account user ID for OIDC bootstrap.
+    /// Service-account user ID for OIDC bootstrap.
     /// The enclave registers its public key under this user via
-    /// the Zitadel AddKey API.
+    /// the OIDC provider's key registration API.
     #[arg(long)]
     oidc_service_account_id: Option<String>,
 
-    /// Zitadel project ID for audience-scoped tokens (optional).
-    /// When set, the jwt-bearer grant requests
-    /// `urn:zitadel:iam:org:project:id:{ID}:aud` scope.
+    /// OIDC project ID for audience-scoped tokens (optional).
+    /// When set, the jwt-bearer grant requests an audience scope
+    /// for this project.
     #[arg(long)]
     oidc_project_id: Option<String>,
 

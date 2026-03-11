@@ -1,14 +1,20 @@
 // Copyright (c) Privasys. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
-//! OIDC bootstrap: self-provision bearer tokens via the Zitadel jwt-bearer grant.
+//! OIDC bootstrap: self-provision bearer tokens via the jwt-bearer grant.
 //!
-//! Called during `SetAttestationServers` for servers that have an
-//! [`OidcBootstrap`] configuration.  The flow:
+//! The current implementation targets **Zitadel** as the OIDC provider
+//! (key registration via `POST /v2/users/{id}/keys`, Zitadel-specific
+//! audience scopes).  The jwt-bearer token exchange itself is standard
+//! RFC 7523 and would work with any compliant provider.
 //!
-//! 1. Generate an RSA-2048 keypair inside the enclave.
-//! 2. Register the public key with Zitadel using the manager's JWT.
-//! 3. Build a JWT assertion signed with the private key.
+//! Called at startup (via `--manager-token`) or at runtime (via
+//! `SetAttestationServers`) for servers that have an [`OidcBootstrap`]
+//! configuration.  The flow:
+//!
+//! 1. Generate an ECDSA P-256 keypair inside the enclave.
+//! 2. Register the public key with the OIDC provider using the manager's JWT.
+//! 3. Build a JWT assertion (ES256) signed with the private key.
 //! 4. Exchange the assertion for an access token (jwt-bearer grant).
 //! 5. Return the token + metadata so callers can cache and refresh.
 //!
@@ -172,8 +178,19 @@ fn register_public_key(
     // Extract the SubjectPublicKeyInfo (DER) from the key pair.
     let spki_der = key_pair.public_key().as_ref();
 
-    // Zitadel expects the public key as base64(DER) in the `publicKey` field.
-    let pub_key_b64 = base64_encode(spki_der);
+    // Zitadel expects the publicKey field to be base64(PEM).
+    // 1. PEM-encode the SPKI DER bytes.
+    let spki_b64 = base64_encode(spki_der);
+    let mut pem = String::from("-----BEGIN PUBLIC KEY-----\n");
+    for (i, ch) in spki_b64.chars().enumerate() {
+        if i > 0 && i % 64 == 0 {
+            pem.push('\n');
+        }
+        pem.push(ch);
+    }
+    pem.push_str("\n-----END PUBLIC KEY-----\n");
+    // 2. Base64-encode the PEM string itself.
+    let pub_key_b64 = base64_encode(pem.as_bytes());
 
     let url = format!(
         "{}/v2/users/{}/keys",

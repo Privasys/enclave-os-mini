@@ -18,7 +18,7 @@
 //! ## OIDC Bootstrap
 //!
 //! When a server has an [`OidcBootstrap`] configuration, the enclave
-//! self-provisions its token via the Zitadel jwt-bearer grant.  Tokens
+//! self-provisions its token via the OIDC jwt-bearer grant.  Tokens
 //! are lazily refreshed at 75 % of their lifetime.
 
 use std::sync::RwLock;
@@ -36,7 +36,7 @@ use crate::protocol::{AttestationServer, OidcBootstrap};
 struct OidcState {
     /// OIDC bootstrap config (issuer, service_account_id, project_id).
     config: OidcBootstrap,
-    /// Zitadel key ID (returned by AddKey).
+    /// Key ID returned by the OIDC provider's key registration API.
     key_id: String,
     /// DER-encoded PKCS#8 private key for building refresh assertions.
     private_key_der: Vec<u8>,

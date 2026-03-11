@@ -107,9 +107,9 @@ pub struct ModuleStatus {
 /// self-provision its own bearer token instead of relying on a
 /// statically provided one.  The flow:
 ///
-/// 1. Generate an RSA-2048 keypair inside the enclave.
-/// 2. Register the public key with Zitadel (`POST /v2/users/{service_account_id}/keys`)
-///    using the manager's JWT (passed via the `"auth"` field of the request).
+/// 1. Generate an ECDSA P-256 keypair inside the enclave.
+/// 2. Register the public key with the OIDC provider's key registration
+///    API using the manager's JWT (passed via the `"auth"` field).
 /// 3. Build a JWT assertion signed with the private key and exchange it
 ///    for an access token via the `jwt-bearer` OIDC grant.
 /// 4. Store the token; lazily refresh at 75 % of its lifetime.
@@ -117,9 +117,9 @@ pub struct ModuleStatus {
 pub struct OidcBootstrap {
     /// OIDC issuer URL (e.g. `https://auth.privasys.org`).
     pub issuer: String,
-    /// Zitadel service-account user ID that will own the registered key.
+    /// Service-account user ID that will own the registered key.
     pub service_account_id: String,
-    /// Zitadel project ID — used as `aud` when requesting scoped tokens.
+    /// OIDC project ID — used as `aud` when requesting scoped tokens.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
 }
@@ -143,7 +143,7 @@ pub struct AttestationServer {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
     /// Optional OIDC bootstrap config — when set the enclave will
-    /// self-provision a bearer token via the Zitadel jwt-bearer grant.
+    /// self-provision a bearer token via the OIDC jwt-bearer grant.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oidc_bootstrap: Option<OidcBootstrap>,
 }
