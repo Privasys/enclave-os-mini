@@ -175,12 +175,17 @@ fn register_public_key(
             .to_string()
     })?;
 
-    // Extract the SubjectPublicKeyInfo (DER) from the key pair.
-    let spki_der = key_pair.public_key().as_ref();
+    // ring returns the raw uncompressed EC point (65 bytes: 04 || X || Y).
+    // Zitadel expects a SubjectPublicKeyInfo (SPKI) in PEM format, so we
+    // need to wrap the raw point in the fixed ASN.1 SPKI header for P-256.
+    let raw_point = key_pair.public_key().as_ref();
+    let mut spki_der = Vec::with_capacity(ECDSA_P256_SPKI_HEADER.len() + raw_point.len());
+    spki_der.extend_from_slice(&ECDSA_P256_SPKI_HEADER);
+    spki_der.extend_from_slice(raw_point);
 
     // Zitadel expects the publicKey field to be base64(PEM).
     // 1. PEM-encode the SPKI DER bytes.
-    let spki_b64 = base64_encode(spki_der);
+    let spki_b64 = base64_encode(&spki_der);
     let mut pem = String::from("-----BEGIN PUBLIC KEY-----\n");
     for (i, ch) in spki_b64.chars().enumerate() {
         if i > 0 && i % 64 == 0 {
@@ -356,6 +361,26 @@ fn url_encode(input: &str) -> String {
 }
 
 const HEX: [u8; 16] = *b"0123456789ABCDEF";
+
+/// Fixed ASN.1 SubjectPublicKeyInfo header for ECDSA P-256.
+///
+/// The raw EC public key from `ring` is a 65-byte uncompressed point
+/// (0x04 || X || Y).  PKIX/SPKI wraps it in:
+///
+/// ```text
+/// SEQUENCE {              -- 30 59 (89 bytes total)
+///   SEQUENCE {            -- 30 13 (19 bytes) AlgorithmIdentifier
+///     OID ecPublicKey     -- 06 07 2a8648ce3d0201
+///     OID prime256v1      -- 06 08 2a8648ce3d030107
+///   }
+///   BIT STRING (66 B)    -- 03 42 00 <65 bytes>
+/// }
+/// ```
+const ECDSA_P256_SPKI_HEADER: [u8; 26] = [
+    0x30, 0x59, 0x30, 0x13, 0x06, 0x07, 0x2a, 0x86, 0x48, 0xce,
+    0x3d, 0x02, 0x01, 0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d,
+    0x03, 0x01, 0x07, 0x03, 0x42, 0x00,
+];
 
 /// Return an ISO-8601 date ~12 months from now for the Zitadel key expiration.
 ///
