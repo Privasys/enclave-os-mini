@@ -6,9 +6,14 @@
 //! Uses rustls for TLS and a minimal HTTP/1.1 implementation. Network I/O
 //! flows through OCALLs to the host, but the TLS termination happens inside
 //! the enclave, so the host never sees plaintext.
+//!
+//! The single public entry point is [`https_fetch`], which returns an
+//! [`HttpResponse`] (status + headers + body) and supports all HTTP methods,
+//! custom headers, and optional RA-TLS verification.
 
+use std::io::{Read, Write};
 use std::string::String;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::vec::Vec;
 
 use core::mem;
@@ -43,6 +48,50 @@ pub use enclave_os_common::oids::{
     WASM_APPS_HASH_OID_STR as OID_WASM_APPS_HASH,
     ATTESTATION_SERVERS_HASH_OID_STR as OID_ATTESTATION_SERVERS_HASH,
 };
+
+// =========================================================================
+//  Constants
+// =========================================================================
+
+/// Maximum HTTP response body size (2 MiB).
+///
+/// Prevents a single response from dominating the enclave heap. Applied
+/// both during the read loop (to stop reading early) and after HTTP parsing
+/// (to truncate if Content-Length exceeded the cap).
+pub const MAX_RESPONSE_BODY: usize = 2 * 1024 * 1024;
+
+// =========================================================================
+//  Mozilla root CA store (for general-purpose HTTPS egress)
+// =========================================================================
+
+static MOZILLA_ROOT_STORE: OnceLock<RootCertStore> = OnceLock::new();
+
+/// Returns a shared reference to the Mozilla root CA store.
+///
+/// The store is lazily initialized from `webpki-roots` on first call
+/// (~150 root CAs). Subsequent calls return the cached reference.
+pub fn mozilla_root_store() -> &'static RootCertStore {
+    MOZILLA_ROOT_STORE.get_or_init(|| {
+        let mut store = RootCertStore::empty();
+        store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        store
+    })
+}
+
+// =========================================================================
+//  Full HTTP response type
+// =========================================================================
+
+/// A parsed HTTP response with status code, headers, and body.
+#[derive(Debug, Clone)]
+pub struct HttpResponse {
+    /// HTTP status code (e.g. 200, 404, 500).
+    pub status: u16,
+    /// Response headers as `(name, value)` pairs.
+    pub headers: Vec<(String, String)>,
+    /// Response body (truncated to [`MAX_RESPONSE_BODY`] bytes).
+    pub body: Vec<u8>,
+}
 
 // =========================================================================
 //  RA-TLS verification types
@@ -116,8 +165,8 @@ pub struct ExpectedOid {
 
 /// RA-TLS verification policy.
 ///
-/// Pass to [`https_get`] / [`https_post`] to verify the remote server's
-/// RA-TLS certificate after standard chain validation.
+/// Pass to [`https_fetch`] to verify the
+/// remote server's RA-TLS certificate after standard chain validation.
 ///
 /// ## What is verified
 ///
@@ -200,120 +249,159 @@ pub struct RaTlsPolicy {
     pub attestation_servers: Vec<String>,
 }
 
-/// Perform an HTTPS GET request.
+/// Perform a full HTTPS request with any method, custom headers, and
+/// optional body. Returns the complete [`HttpResponse`] (status, headers,
+/// body).
 ///
-/// Requires a `RootCertStore` containing trusted root CAs.
+/// ## Parameters
 ///
-/// When `ratls` is `Some`, the server's certificate is additionally verified
-/// against the given [`RaTlsPolicy`] (quote presence, measurement registers,
-/// and — for TDX — ReportData binding). The TLS handshake is rejected if
-/// any check fails.
-pub fn https_get(
+/// | Param | Description |
+/// |-------|-------------|
+/// | `method` | HTTP method string (`"GET"`, `"POST"`, `"PUT"`, `"DELETE"`, `"PATCH"`, `"HEAD"`, `"OPTIONS"`). |
+/// | `url` | Full URL (`https://host[:port]/path`). Only `https://` is supported. |
+/// | `headers` | Custom request headers as `(name, value)` pairs. `Host` and `Connection: close` are always added. |
+/// | `body` | Optional request body. `Content-Length` is added automatically unless already present in `headers`. |
+/// | `root_store` | Trusted root CAs for TLS certificate validation. |
+/// | `ratls` | Optional RA-TLS policy for attestation verification. |
+///
+/// ## Example
+///
+/// ```rust,ignore
+/// use enclave_os_egress::client::{https_fetch, mozilla_root_store};
+///
+/// let resp = https_fetch(
+///     "GET",
+///     "https://example.com/api/data",
+///     &[("Accept".into(), "application/json".into())],
+///     None,
+///     mozilla_root_store(),
+///     None,
+/// )?;
+/// assert_eq!(resp.status, 200);
+/// ```
+pub fn https_fetch(
+    method: &str,
     url: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
     root_store: &RootCertStore,
     ratls: Option<&RaTlsPolicy>,
-) -> Result<Vec<u8>, i32> {
-    let (host, port, path) = parse_url(url).map_err(|_| -1)?;
-    let request = format!(
-        "GET {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nAccept: */*\r\n\r\n",
-        path, host
+) -> Result<HttpResponse, String> {
+    let (host, port, path) = parse_url(url)?;
+
+    // Build HTTP/1.1 request.
+    let mut request = format!(
+        "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
+        method, path, host
     );
-    https_request(&host, port, request.as_bytes(), root_store, ratls)
+    for (k, v) in headers {
+        request.push_str(&format!("{}: {}\r\n", k, v));
+    }
+    if let Some(b) = body {
+        if !headers.iter().any(|(k, _)| k.eq_ignore_ascii_case("content-length")) {
+            request.push_str(&format!("Content-Length: {}\r\n", b.len()));
+        }
+    }
+    request.push_str("\r\n");
+
+    let mut request_bytes = request.into_bytes();
+    if let Some(b) = body {
+        request_bytes.extend_from_slice(b);
+    }
+
+    https_request_inner(&host, port, &request_bytes, root_store, ratls)
 }
 
-/// Perform an HTTPS POST request.
-///
-/// See [`https_get`] for details on the `ratls` parameter.
-///
-/// When `authorization` is `Some`, the value is sent verbatim as the
-/// `Authorization` header (e.g. `"Bearer eyJ..."` for OIDC tokens).
-pub fn https_post(
-    url: &str,
-    body: &[u8],
-    content_type: &str,
-    root_store: &RootCertStore,
-    ratls: Option<&RaTlsPolicy>,
-    authorization: Option<&str>,
-) -> Result<Vec<u8>, i32> {
-    let (host, port, path) = parse_url(url).map_err(|_| -1)?;
-    let auth_line = authorization
-        .map(|a| format!("Authorization: {}\r\n", a))
-        .unwrap_or_default();
-    let request = format!(
-        "POST {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}\r\n",
-        path, host, content_type, body.len(), auth_line
-    );
-    let mut full_request = request.into_bytes();
-    full_request.extend_from_slice(body);
-    https_request(&host, port, &full_request, root_store, ratls)
-}
-
-/// Internal: perform an HTTPS request and return the response body.
-fn https_request(
+/// Internal: perform an HTTPS request and return the full parsed response.
+fn https_request_inner(
     host: &str,
     port: u16,
     request: &[u8],
     root_store: &RootCertStore,
     ratls: Option<&RaTlsPolicy>,
-) -> Result<Vec<u8>, i32> {
-    // Build TLS client config — with RA-TLS verification when a policy is provided
-    let tls_config = build_client_config(root_store, ratls).map_err(|_| -1)?;
+) -> Result<HttpResponse, String> {
+    let tls_config = build_client_config(root_store, ratls)
+        .map_err(|e| e.to_string())?;
 
-    // Connect to the remote server via OCALL
-    let fd = ocall::net_tcp_connect(host, port)?;
+    let fd = ocall::net_tcp_connect(host, port)
+        .map_err(|e| format!("TCP connect failed: {}", e))?;
 
-    // Create TLS client connection
     let server_name = ServerName::try_from(host.to_string())
-        .map_err(|_| -1i32)?;
+        .map_err(|_| "invalid server name".to_string())?;
     let mut tls_conn = ClientConnection::new(tls_config, server_name.to_owned())
-        .map_err(|_| -1i32)?;
+        .map_err(|e| format!("TLS init failed: {}", e))?;
 
-    // Perform TLS handshake
-    tls_handshake(fd, &mut tls_conn)?;
+    tls_handshake(fd, &mut tls_conn)
+        .map_err(|_| "TLS handshake failed".to_string())?;
 
-    // Send the HTTP request through TLS
+    // Send the HTTP request.
     {
         let mut writer = tls_conn.writer();
-        use std::io::Write;
-        writer.write_all(request).map_err(|_| -1i32)?;
+        writer.write_all(request).map_err(|e| format!("write failed: {}", e))?;
     }
-    flush_tls(fd, &mut tls_conn)?;
+    flush_tls(fd, &mut tls_conn).map_err(|_| "flush failed".to_string())?;
 
-    // Read the complete response
+    // Read the complete response with cursor-based multi-record TLS
+    // reads and drain-all-plaintext inner loop.
     let mut response_data = Vec::new();
+    let mut net_buf = vec![0u8; 16384];
+    let mut app_buf = vec![0u8; 16384];
+    let mut body_limit_hit = false;
+
     loop {
-        // Read from network into TLS
-        let mut net_buf = vec![0u8; 16384];
         match ocall::net_recv(fd, &mut net_buf) {
-            Ok(0) => break, // Connection closed
+            Ok(0) => break,
             Ok(n) => {
+                // A single net_recv may contain multiple TLS records.
+                // Use a cursor to feed them all to rustls.
                 let mut cursor = std::io::Cursor::new(&net_buf[..n]);
-                tls_conn.read_tls(&mut cursor).map_err(|_| -1i32)?;
-                tls_conn.process_new_packets().map_err(|_| -1i32)?;
+                while (cursor.position() as usize) < n {
+                    match tls_conn.read_tls(&mut cursor) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            tls_conn.process_new_packets()
+                                .map_err(|e| format!("TLS error: {:?}", e))?;
+                        }
+                        Err(e) => return Err(format!("read_tls error: {:?}", e)),
+                    }
+                }
+
+                // Drain ALL available application data. A single
+                // process_new_packets() call can produce multiple
+                // plaintext chunks.
+                loop {
+                    match tls_conn.reader().read(&mut app_buf) {
+                        Ok(0) => break,
+                        Ok(m) => {
+                            response_data.extend_from_slice(&app_buf[..m]);
+                            if response_data.len() > MAX_RESPONSE_BODY + 16384 {
+                                body_limit_hit = true;
+                                break;
+                            }
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                        Err(_) => break,
+                    }
+                }
+                if body_limit_hit {
+                    break;
+                }
             }
             Err(_) => break,
         }
-
-        // Read decrypted data
-        let mut app_buf = vec![0u8; 16384];
-        let mut reader = tls_conn.reader();
-        use std::io::Read;
-        match reader.read(&mut app_buf) {
-            Ok(0) => break,
-            Ok(n) => response_data.extend_from_slice(&app_buf[..n]),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
-            Err(_) => break,
-        }
     }
 
-    // Close
+    // Close.
     tls_conn.send_close_notify();
     let _ = flush_tls(fd, &mut tls_conn);
     ocall::net_close(fd);
 
-    // Parse HTTP response – extract body after \r\n\r\n
-    let body = extract_http_body(&response_data);
-    Ok(body)
+    // Parse HTTP response.
+    let (status, headers, mut body) = parse_http_response(&response_data)?;
+    if body.len() > MAX_RESPONSE_BODY {
+        body.truncate(MAX_RESPONSE_BODY);
+    }
+    Ok(HttpResponse { status, headers, body })
 }
 
 /// Build a rustls `ClientConfig` using the provided root CAs.
@@ -369,26 +457,43 @@ fn build_client_config(
     Ok(Arc::new(config))
 }
 
-/// Perform the TLS handshake.
+/// Perform the TLS handshake with cursor-based multi-record reads.
 fn tls_handshake(fd: i32, tls_conn: &mut ClientConnection) -> Result<(), i32> {
     loop {
+        // Flush any pending outbound TLS data (e.g. ClientHello, Finished).
+        flush_tls(fd, tls_conn)?;
+
+        // In TLS 1.3 the handshake completes as soon as the client Finished
+        // is flushed — there is nothing more to receive. Checking *after*
+        // flush avoids a blocking recv on an idle socket.
         if !tls_conn.is_handshaking() {
-            flush_tls(fd, tls_conn)?;
             return Ok(());
         }
 
-        flush_tls(fd, tls_conn)?;
-
+        // Read the next chunk of TLS handshake data from the server.
         let mut buf = vec![0u8; 16384];
         match ocall::net_recv(fd, &mut buf) {
             Ok(n) if n > 0 => {
+                // A single recv may contain multiple TLS records; drain
+                // them all via cursor.
                 let mut cursor = std::io::Cursor::new(&buf[..n]);
-                tls_conn.read_tls(&mut cursor).map_err(|_| -1i32)?;
-                tls_conn.process_new_packets().map_err(|_| -1i32)?;
+                while (cursor.position() as usize) < n {
+                    match tls_conn.read_tls(&mut cursor) {
+                        Ok(0) => break,
+                        Ok(_) => {
+                            tls_conn.process_new_packets().map_err(|_| -1i32)?;
+                        }
+                        Err(_) => return Err(-1i32),
+                    }
+                }
             }
-            _ => {
-                // Brief retry for non-blocking
-                continue;
+            Ok(_) => {
+                // EOF — server closed before handshake completed.
+                return Err(-1i32);
+            }
+            Err(_) => {
+                // Read error.
+                return Err(-1i32);
             }
         }
     }
@@ -417,19 +522,13 @@ fn flush_tls(fd: i32, tls_conn: &mut ClientConnection) -> Result<(), i32> {
     Ok(())
 }
 
-/// Parse a URL into (host, port, path).
-fn parse_url(url: &str) -> Result<(String, u16, String), &'static str> {
+/// Parse a URL into (host, port, path). Only `https://` is supported.
+fn parse_url(url: &str) -> Result<(String, u16, String), String> {
     let url = url.trim();
 
-    let (scheme, rest) = if let Some(rest) = url.strip_prefix("https://") {
-        ("https", rest)
-    } else if let Some(rest) = url.strip_prefix("http://") {
-        ("http", rest)
-    } else {
-        return Err("Unsupported scheme");
-    };
-
-    let default_port: u16 = if scheme == "https" { 443 } else { 80 };
+    let rest = url
+        .strip_prefix("https://")
+        .ok_or_else(|| "only https:// URLs are supported".to_string())?;
 
     let (host_port, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
@@ -438,26 +537,51 @@ fn parse_url(url: &str) -> Result<(String, u16, String), &'static str> {
 
     let (host, port) = match host_port.rfind(':') {
         Some(i) => {
-            let port_str = &host_port[i + 1..];
-            let port: u16 = port_str.parse().map_err(|_| "Invalid port")?;
+            let port: u16 = host_port[i + 1..]
+                .parse()
+                .map_err(|_| "invalid port".to_string())?;
             (&host_port[..i], port)
         }
-        None => (host_port, default_port),
+        None => (host_port, 443u16),
     };
 
     Ok((String::from(host), port, String::from(path)))
 }
 
-/// Extract the HTTP body from a raw HTTP response.
-fn extract_http_body(response: &[u8]) -> Vec<u8> {
-    // Find \r\n\r\n separator
-    for i in 0..response.len().saturating_sub(3) {
-        if &response[i..i + 4] == b"\r\n\r\n" {
-            return response[i + 4..].to_vec();
+/// Parse a raw HTTP response into (status, headers, body).
+fn parse_http_response(
+    data: &[u8],
+) -> Result<(u16, Vec<(String, String)>, Vec<u8>), String> {
+    let sep = data
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or("invalid HTTP response: no header terminator")?;
+
+    let header_bytes = &data[..sep];
+    let body = data[sep + 4..].to_vec();
+
+    let header_str = std::str::from_utf8(header_bytes)
+        .map_err(|_| "invalid HTTP response: non-UTF-8 headers")?;
+
+    let mut lines = header_str.lines();
+    let status_line = lines.next().ok_or("empty HTTP response")?;
+
+    // Parse "HTTP/1.1 200 OK"
+    let status: u16 = status_line
+        .split_whitespace()
+        .nth(1)
+        .ok_or("invalid status line")?
+        .parse()
+        .map_err(|_| "invalid status code")?;
+
+    let mut headers = Vec::new();
+    for line in lines {
+        if let Some((key, value)) = line.split_once(':') {
+            headers.push((key.trim().to_string(), value.trim().to_string()));
         }
     }
-    // No separator found — return entire response
-    response.to_vec()
+
+    Ok((status, headers, body))
 }
 
 // =========================================================================

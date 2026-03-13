@@ -15,6 +15,7 @@ name = "enclave_os_wasm"
 # Shared types, module trait, OCall vtable, hex utils
 enclave-os-common = { path = "../../common" }
 enclave-os-kvstore = { path = "../enclave-os-kvstore" }
+enclave-os-egress = { path = "../enclave-os-egress" }
 
 # Wasmtime with SGX support (Privasys fork, `sgx` branch).
 #
@@ -50,10 +51,6 @@ wasmtime = { git = "https://github.com/Privasys/wasmtime", branch = "sgx", defau
 
 # Crypto (SHA-256 for WASM code hashing, RNG for WASI random)
 ring = "0.17"
-
-# TLS inside enclave for Enclave OS SDK HTTPS egress
-rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
-webpki-roots = "0.26"
 
 # Serialization for WasmCall / WasmResult protocol
 serde = { version = "1", features = ["derive"] }

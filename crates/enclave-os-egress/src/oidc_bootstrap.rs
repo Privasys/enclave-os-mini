@@ -18,7 +18,7 @@
 //! 4. Exchange the assertion for an access token (jwt-bearer grant).
 //! 5. Return the token + metadata so callers can cache and refresh.
 //!
-//! All outbound HTTPS goes through [`crate::client::https_post`] which
+//! All outbound HTTPS goes through [`crate::client::https_fetch`] which
 //! terminates TLS inside the enclave — the host never sees plaintext.
 
 use std::string::String;
@@ -211,28 +211,33 @@ fn register_public_key(
 
     let auth_header = format!("Bearer {}", manager_jwt);
 
-    let response_bytes = client::https_post(
+    let headers = vec![
+        ("Content-Type".to_string(), "application/json".to_string()),
+        ("Authorization".to_string(), auth_header),
+    ];
+
+    let resp = client::https_fetch(
+        "POST",
         &url,
-        body.as_bytes(),
-        "application/json",
+        &headers,
+        Some(body.as_bytes()),
         store,
         None, // Standard HTTPS, not RA-TLS
-        Some(&auth_header),
     )
-    .map_err(|code| {
-        format!("Zitadel AddKey request failed (error code {code})")
+    .map_err(|e| {
+        format!("Zitadel AddKey request failed: {e}")
     })?;
 
-    let resp: AddKeyResponse =
-        serde_json::from_slice(&response_bytes).map_err(|e| {
-            let body_str = String::from_utf8_lossy(&response_bytes);
+    let parsed: AddKeyResponse =
+        serde_json::from_slice(&resp.body).map_err(|e| {
+            let body_str = String::from_utf8_lossy(&resp.body);
             format!("invalid JSON from Zitadel AddKey: {e} — body: {body_str}")
         })?;
 
-    resp.key_id()
+    parsed.key_id()
         .map(|s| s.to_string())
         .ok_or_else(|| {
-            let body_str = String::from_utf8_lossy(&response_bytes);
+            let body_str = String::from_utf8_lossy(&resp.body);
             format!("Zitadel AddKey returned no keyId — body: {body_str}")
         })
 }
@@ -303,21 +308,25 @@ fn exchange_jwt_bearer(
         url_encode(&assertion),
     );
 
-    let response_bytes = client::https_post(
+    let headers = vec![
+        ("Content-Type".to_string(), "application/x-www-form-urlencoded".to_string()),
+    ];
+
+    let resp = client::https_fetch(
+        "POST",
         &token_url,
-        form_body.as_bytes(),
-        "application/x-www-form-urlencoded",
+        &headers,
+        Some(form_body.as_bytes()),
         store,
-        None,
-        None, // No auth header — the assertion carries the identity
+        None, // No RA-TLS — the assertion carries the identity
     )
-    .map_err(|code| {
-        format!("Zitadel token exchange failed (error code {code})")
+    .map_err(|e| {
+        format!("Zitadel token exchange failed: {e}")
     })?;
 
     let token_resp: TokenResponse =
-        serde_json::from_slice(&response_bytes).map_err(|e| {
-            let body_str = String::from_utf8_lossy(&response_bytes);
+        serde_json::from_slice(&resp.body).map_err(|e| {
+            let body_str = String::from_utf8_lossy(&resp.body);
             format!("invalid JSON from Zitadel token endpoint: {e} — body: {body_str}")
         })?;
 

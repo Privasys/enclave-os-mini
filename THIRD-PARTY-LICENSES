@@ -262,6 +262,11 @@ You may choose either license.
 - Repository: https://github.com/rust-random/getrandom
 - Usage: OS random number generation
 
+### httparse
+
+- Repository: https://github.com/seanmonstar/httparse
+- Usage: HTTP/1.1 request parsing for the enclave server
+
 ### MIT License
 
 ```

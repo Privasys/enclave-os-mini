@@ -151,6 +151,8 @@ Clients verify: **MRENCLAVE** (code identity) + **Config Merkle Root** (config i
 | rcgen | Apache 2.0 / MIT | X.509 certificate generation |
 | serde / serde_json | Apache 2.0 / MIT | Serialization |
 | getrandom | Apache 2.0 / MIT | RDRAND hardware RNG (enclave-wide via sgx_read_rand shim) |
+| httparse | Apache 2.0 / MIT | HTTP/1.1 request parsing |
+| webpki-roots | MPL 2.0 | Mozilla root CA bundle for HTTPS egress |
 
 Full dependency list and license texts in [THIRD-PARTY-LICENSES](THIRD-PARTY-LICENSES).
 

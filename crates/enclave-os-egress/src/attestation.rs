@@ -195,23 +195,30 @@ pub fn verify_quote(
             format!("Bearer {}", t)
         });
 
-        let response_bytes = client::https_post(
+        let mut headers = vec![
+            ("Content-Type".to_string(), "application/json".to_string()),
+        ];
+        if let Some(auth) = auth_header.as_deref() {
+            headers.push(("Authorization".to_string(), auth.to_string()));
+        }
+
+        let resp = client::https_fetch(
+            "POST",
             server_url,
-            body.as_bytes(),
-            "application/json",
+            &headers,
+            Some(body.as_bytes()),
             store,
             None, // Standard HTTPS — the attestation server is not behind RA-TLS.
-            auth_header.as_deref(),
         )
-        .map_err(|code| {
+        .map_err(|e| {
             format!(
-                "attestation server request to {} failed (error code {})",
-                server_url, code
+                "attestation server request to {} failed: {}",
+                server_url, e
             )
         })?;
 
         let result: VerifyResponse =
-            serde_json::from_slice(&response_bytes).map_err(|e| {
+            serde_json::from_slice(&resp.body).map_err(|e| {
                 format!(
                     "invalid JSON response from attestation server {}: {}",
                     server_url, e

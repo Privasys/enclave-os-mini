@@ -10,10 +10,9 @@
 //!
 //! When connecting to a server that serves RA-TLS certificates (e.g. another
 //! enclave-os instance or a Caddy RA-TLS reverse proxy), callers can pass an
-//! [`RaTlsPolicy`] to [`client::https_get`] / [`client::https_post`]. The
-//! policy specifies the expected TEE type and measurement registers; the
-//! egress client will verify the attestation quote during the TLS handshake
-//! and reject the connection if any check fails.
+//! [`RaTlsPolicy`] to [`client::https_fetch`]. The policy specifies the expected TEE type and
+//! measurement registers; the egress client will verify the attestation
+//! quote during the TLS handshake and reject the connection if any check fails.
 //!
 //! ## Responsibilities
 //!
@@ -56,9 +55,12 @@ pub mod oidc_bootstrap;
 
 // Re-export RA-TLS verification types for convenience.
 pub use client::{
-    ExpectedOid, RaTlsPolicy, ReportDataBinding, TeeType,
+    ExpectedOid, HttpResponse, RaTlsPolicy, ReportDataBinding, TeeType,
     OID_CONFIG_MERKLE_ROOT, OID_EGRESS_CA_HASH, OID_WASM_APPS_HASH,
     OID_ATTESTATION_SERVERS_HASH,
+    MAX_RESPONSE_BODY,
+    https_fetch,
+    mozilla_root_store,
 };
 
 use std::sync::OnceLock;
