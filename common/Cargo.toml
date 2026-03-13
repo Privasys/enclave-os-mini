@@ -21,6 +21,7 @@ jwt = ["crypto", "dep:base64"]
 [dependencies]
 serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
 serde_json = { version = "1", default-features = false, features = ["alloc"] }
+httparse = { version = "1", default-features = false }
 
 # Optional: only pulled in when the `jwt` feature is enabled
 ring       = { version = "0.17", optional = true }

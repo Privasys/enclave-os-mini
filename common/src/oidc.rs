@@ -323,4 +323,148 @@ mod tests {
         let roles = extract_roles(&claims, &config);
         assert!(roles.is_empty());
     }
+
+    // -- Role hierarchy: manager implies monitoring --------------------------
+
+    #[test]
+    fn manager_implies_monitoring() {
+        let claims = OidcClaims { sub: "svc".into(), roles: vec![OidcRole::Manager] };
+        assert!(claims.has_manager());
+        assert!(claims.has_monitoring(), "manager must imply monitoring");
+    }
+
+    #[test]
+    fn monitoring_does_not_imply_manager() {
+        let claims = OidcClaims { sub: "svc".into(), roles: vec![OidcRole::Monitoring] };
+        assert!(claims.has_monitoring());
+        assert!(!claims.has_manager(), "monitoring must not imply manager");
+    }
+
+    #[test]
+    fn manager_does_not_imply_secret_owner() {
+        let claims = OidcClaims { sub: "svc".into(), roles: vec![OidcRole::Manager] };
+        assert!(!claims.has_secret_owner());
+        assert!(!claims.has_secret_manager());
+    }
+
+    #[test]
+    fn secret_roles_are_independent() {
+        let claims = OidcClaims {
+            sub: "svc".into(),
+            roles: vec![OidcRole::SecretOwner, OidcRole::SecretManager],
+        };
+        assert!(claims.has_secret_owner());
+        assert!(claims.has_secret_manager());
+        assert!(!claims.has_manager());
+        assert!(!claims.has_monitoring());
+    }
+
+    // -- Multiple roles ------------------------------------------------------
+
+    #[test]
+    fn all_four_roles() {
+        let claims = OidcClaims {
+            sub: "admin".into(),
+            roles: vec![
+                OidcRole::Manager,
+                OidcRole::Monitoring,
+                OidcRole::SecretOwner,
+                OidcRole::SecretManager,
+            ],
+        };
+        assert!(claims.has_manager());
+        assert!(claims.has_monitoring());
+        assert!(claims.has_secret_owner());
+        assert!(claims.has_secret_manager());
+    }
+
+    #[test]
+    fn empty_roles() {
+        let claims = OidcClaims { sub: "nobody".into(), roles: vec![] };
+        assert!(!claims.has_manager());
+        assert!(!claims.has_monitoring());
+        assert!(!claims.has_secret_owner());
+        assert!(!claims.has_secret_manager());
+    }
+
+    // -- extract_roles: Zitadel map format -----------------------------------
+
+    #[test]
+    fn zitadel_all_roles() {
+        let config = test_config();
+        let claims = json!({
+            "urn:zitadel:iam:org:project:roles": {
+                "enclave-os-mini:manager": { "org": "1" },
+                "enclave-os-mini:monitoring": { "org": "1" },
+                "enclave-os-mini:secret-owner": { "org": "1" },
+                "enclave-os-mini:secret-manager": { "org": "1" }
+            }
+        });
+        let roles = extract_roles(&claims, &config);
+        assert_eq!(roles.len(), 4);
+    }
+
+    #[test]
+    fn zitadel_unknown_roles_ignored() {
+        let config = test_config();
+        let claims = json!({
+            "urn:zitadel:iam:org:project:roles": {
+                "some-other-app:admin": { "org": "1" },
+                "enclave-os-mini:manager": { "org": "1" }
+            }
+        });
+        let roles = extract_roles(&claims, &config);
+        assert_eq!(roles, vec![OidcRole::Manager]);
+    }
+
+    // -- extract_roles: duplicate role claim paths ---------------------------
+
+    #[test]
+    fn duplicate_roles_across_paths_deduplicated() {
+        let config = test_config();
+        let claims = json!({
+            "urn:zitadel:iam:org:project:roles": {
+                "enclave-os-mini:manager": { "org": "1" }
+            },
+            "roles": ["enclave-os-mini:manager"]
+        });
+        let roles = extract_roles(&claims, &config);
+        assert_eq!(roles.len(), 1);
+        assert_eq!(roles[0], OidcRole::Manager);
+    }
+
+    // -- extract_roles: custom role_claim config -----------------------------
+
+    #[test]
+    fn custom_role_claim_path() {
+        let mut config = test_config();
+        config.role_claim = "custom_roles".into();
+        config.manager_role = "admin".into();
+        let claims = json!({
+            "custom_roles": ["admin"]
+        });
+        let roles = extract_roles(&claims, &config);
+        assert_eq!(roles, vec![OidcRole::Manager]);
+    }
+
+    // -- collect_role_strings: edge cases ------------------------------------
+
+    #[test]
+    fn collect_from_non_string_array_items() {
+        let mut out = Vec::new();
+        let val = json!([42, "valid", null, true]);
+        collect_role_strings(&val, &mut out);
+        assert_eq!(out, vec!["valid"]);
+    }
+
+    #[test]
+    fn collect_from_scalar_is_noop() {
+        let mut out = Vec::new();
+        collect_role_strings(&json!("single-string"), &mut out);
+        assert!(out.is_empty());
+        collect_role_strings(&json!(42), &mut out);
+        assert!(out.is_empty());
+        collect_role_strings(&json!(null), &mut out);
+        assert!(out.is_empty());
+    }
 }

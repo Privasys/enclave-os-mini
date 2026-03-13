@@ -409,7 +409,17 @@ impl EnclaveModule for WasmModule {
         // Try to parse the envelope.
         let envelope: WasmEnvelope = match serde_json::from_slice(data) {
             Ok(e) => e,
-            Err(_) => return None, // Not a WASM request — decline.
+            Err(e) => {
+                // Log if the payload looks like a WASM envelope but failed to parse.
+                if data.len() > 10 && (data.starts_with(b"{\"wasm_") || data.starts_with(b"{ \"wasm_")) {
+                    enclave_os_common::enclave_log_error!(
+                        "WasmModule: envelope parse failed ({} bytes): {}",
+                        data.len(),
+                        e
+                    );
+                }
+                return None; // Not a WASM request — decline.
+            }
         };
 
         // ── Platform OIDC role gate (load/unload/list) ──────────────

@@ -10,6 +10,13 @@
 //! ([`enclave_os_egress`]), but exposed via a
 //! Component Model interface so WASM apps never need their own TLS.
 //!
+//! ## Typed bindings
+//!
+//! Uses wasmtime's `func_wrap` API instead of the dynamic `func_new` / `Val`
+//! API. This maps Component Model `list<u8>` directly to `Vec<u8>` via the
+//! canonical ABI — no per-byte `Val::U8` wrapping (which previously caused
+//! a ~24× memory amplification and OOM on large HTTPS responses).
+//!
 //! ## Security properties
 //!
 //! - Host **never** sees request or response plaintext
@@ -18,7 +25,7 @@
 //! - Certificate validation inside SGX enclave
 
 use std::string::String;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::vec::Vec;
 use std::io::{Read, Write};
 
@@ -26,10 +33,33 @@ use rustls::crypto::ring::default_provider;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore};
 
-use wasmtime::component::{Linker, Val};
+use wasmtime::component::Linker;
 use wasmtime::StoreContextMut;
 
 use super::AppContext;
+
+/// Maximum HTTP response body size (2 MiB).
+///
+/// With typed bindings (`func_wrap`) there is no per-byte `Val` overhead,
+/// so this cap exists purely as a safety net to prevent a single response
+/// from dominating the enclave heap.
+const MAX_RESPONSE_BODY: usize = 2 * 1024 * 1024;
+
+/// Shared TLS client configuration (Mozilla root CAs, TLS 1.3/1.2).
+///
+/// Building a `RootCertStore` with ~150 root CAs is expensive;
+/// caching the `ClientConfig` saves ~200 KiB + CPU per fetch call.
+static TLS_CLIENT_CONFIG: LazyLock<Arc<ClientConfig>> = LazyLock::new(|| {
+    let mut root_store = RootCertStore::empty();
+    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+
+    let config = ClientConfig::builder_with_provider(Arc::new(default_provider()))
+        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+        .expect("TLS config")
+        .with_root_certificates(root_store)
+        .with_no_client_auth();
+    Arc::new(config)
+});
 
 // =========================================================================
 //  privasys:enclave-os/https@0.1.0
@@ -44,23 +74,21 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     //      -> result<tuple<u16, list<tuple<string,string>>, list<u8>>, string>
     //
     //   method: 0=GET, 1=POST, 2=PUT, 3=DELETE, 4=PATCH, 5=HEAD, 6=OPTIONS
-    inst.func_new(
+    //
+    // Uses `func_wrap` (typed bindings) so `list<u8>` maps to `Vec<u8>`
+    // directly via the canonical ABI — no per-byte `Val::U8` wrapping.
+    inst.func_wrap(
         "fetch",
         |_store: StoreContextMut<'_, AppContext>,
-         _func_type: wasmtime::component::types::ComponentFunc,
-         params: &[Val],
-         results: &mut [Val]| {
-            let method = match &params[0] {
-                Val::U32(v) => *v,
-                _ => {
-                    results[0] = err_result("invalid method parameter");
-                    return Ok(());
-                }
-            };
-            let url = val_to_string(&params[1]);
-            let headers = extract_headers(&params[2]);
-            let body = extract_optional_body(&params[3]);
-
+         (method, url, headers, body): (
+            u32,
+            String,
+            Vec<(String, String)>,
+            Option<Vec<u8>>,
+        )|
+         -> wasmtime::Result<(
+            Result<(u16, Vec<(String, String)>, Vec<u8>), String>,
+        )> {
             let method_str = match method {
                 0 => "GET",
                 1 => "POST",
@@ -69,50 +97,10 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
                 4 => "PATCH",
                 5 => "HEAD",
                 6 => "OPTIONS",
-                _ => {
-                    results[0] = err_result("unsupported HTTP method");
-                    return Ok(());
-                }
+                _ => return Ok((Err("unsupported HTTP method".into()),)),
             };
 
-            match do_https_fetch(method_str, &url, &headers, body.as_deref()) {
-                Ok((status, resp_headers, resp_body)) => {
-                    // Build result: tuple<u16, list<tuple<string,string>>, list<u8>>
-                    let status_val = Val::U16(status);
-
-                    let headers_val = Val::List(
-                        resp_headers
-                            .iter()
-                            .map(|(k, v)| {
-                                Val::Tuple(
-                                    vec![
-                                        Val::String(k.clone().into()),
-                                        Val::String(v.clone().into()),
-                                    ]
-                                    .into(),
-                                )
-                            })
-                            .collect::<Vec<_>>()
-                            .into(),
-                    );
-
-                    let body_val = Val::List(
-                        resp_body
-                            .iter()
-                            .map(|b| Val::U8(*b))
-                            .collect::<Vec<_>>()
-                            .into(),
-                    );
-
-                    results[0] = Val::Result(Ok(Some(Box::new(Val::Tuple(
-                        vec![status_val, headers_val, body_val].into(),
-                    )))));
-                }
-                Err(e) => {
-                    results[0] = err_result(&e);
-                }
-            }
-            Ok(())
+            Ok((do_https_fetch(method_str, &url, &headers, body.as_deref()),))
         },
     )?;
 
@@ -151,16 +139,8 @@ fn do_https_fetch(
         request_bytes.extend_from_slice(b);
     }
 
-    // Build TLS config with Mozilla root CAs.
-    let mut root_store = RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
-
-    let tls_config = ClientConfig::builder_with_provider(Arc::new(default_provider()))
-        .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
-        .map_err(|_| "TLS config error")?
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
-    let tls_config = Arc::new(tls_config);
+    // Reuse cached TLS config (Mozilla root CAs).
+    let tls_config = TLS_CLIENT_CONFIG.clone();
 
     // TCP connect via OCALL.
     let fd = enclave_os_common::ocall::net_tcp_connect(&host, port)
@@ -182,16 +162,15 @@ fn do_https_fetch(
     }
     flush_tls(fd, &mut tls_conn).map_err(|_| "flush failed")?;
 
-    // Read response.
+    // Read response (capped at MAX_RESPONSE_BODY to prevent OOM).
     let mut response_data = Vec::new();
+    let mut net_buf = vec![0u8; 16384];
+    let mut app_buf = vec![0u8; 16384];
+    let mut body_limit_hit = false;
     loop {
-        let mut net_buf = vec![0u8; 16384];
         match enclave_os_common::ocall::net_recv(fd, &mut net_buf) {
             Ok(0) => break,
             Ok(n) => {
-                // Feed ALL received bytes to rustls.  read_tls may only
-                // consume part of the cursor (its internal deframer buffer
-                // is ~4 KiB), so we loop until every byte is ingested.
                 let mut cursor = std::io::Cursor::new(&net_buf[..n]);
                 while (cursor.position() as usize) < n {
                     match tls_conn.read_tls(&mut cursor) {
@@ -207,13 +186,23 @@ fn do_https_fetch(
 
                 // Drain all available application data.
                 loop {
-                    let mut app_buf = vec![0u8; 16384];
                     match tls_conn.reader().read(&mut app_buf) {
                         Ok(0) => break,
-                        Ok(m) => response_data.extend_from_slice(&app_buf[..m]),
+                        Ok(m) => {
+                            response_data.extend_from_slice(&app_buf[..m]);
+                            if response_data.len() > MAX_RESPONSE_BODY + 16384 {
+                                // Stop reading to keep memory bounded; we'll
+                                // truncate the body below after header parsing.
+                                body_limit_hit = true;
+                                break;
+                            }
+                        }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                         Err(_) => break,
                     }
+                }
+                if body_limit_hit {
+                    break;
                 }
             }
             Err(_) => break,
@@ -225,8 +214,12 @@ fn do_https_fetch(
     let _ = flush_tls(fd, &mut tls_conn);
     enclave_os_common::ocall::net_close(fd);
 
-    // Parse HTTP response.
-    parse_http_response(&response_data)
+    // Parse HTTP response (body truncated to MAX_RESPONSE_BODY).
+    let (status, resp_headers, mut resp_body) = parse_http_response(&response_data)?;
+    if resp_body.len() > MAX_RESPONSE_BODY {
+        resp_body.truncate(MAX_RESPONSE_BODY);
+    }
+    Ok((status, resp_headers, resp_body))
 }
 
 // =========================================================================
@@ -361,54 +354,4 @@ fn parse_http_response(
     Ok((status, headers, body))
 }
 
-// =========================================================================
-//  Val helpers
-// =========================================================================
 
-fn val_to_string(val: &Val) -> String {
-    match val {
-        Val::String(s) => s.to_string(),
-        _ => String::new(),
-    }
-}
-
-fn extract_headers(val: &Val) -> Vec<(String, String)> {
-    let mut out = Vec::new();
-    if let Val::List(items) = val {
-        for item in items.iter() {
-            if let Val::Tuple(parts) = item {
-                if parts.len() == 2 {
-                    let k = val_to_string(&parts[0]);
-                    let v = val_to_string(&parts[1]);
-                    out.push((k, v));
-                }
-            }
-        }
-    }
-    out
-}
-
-fn extract_optional_body(val: &Val) -> Option<Vec<u8>> {
-    match val {
-        Val::Option(Some(inner)) => {
-            if let Val::List(items) = inner.as_ref() {
-                Some(
-                    items
-                        .iter()
-                        .filter_map(|v| match v {
-                            Val::U8(b) => Some(*b),
-                            _ => None,
-                        })
-                        .collect(),
-                )
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
-}
-
-fn err_result(msg: &str) -> Val {
-    Val::Result(Err(Some(Box::new(Val::String(msg.into())))))
-}

@@ -1,27 +1,33 @@
 // Copyright (c) Privasys. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
-//! Simple wire protocol for communication over RA-TLS connections.
+//! Minimal HTTP/1.1 wire protocol for communication over RA-TLS connections.
 //!
-//! Frame format:
-//!   [4 bytes: payload length (big-endian u32)] [payload ...]
+//! The enclave speaks a strict subset of HTTP/1.1 so that clients can use
+//! standard tools (`curl`, any HTTP library) without a custom framing layer.
 //!
-//! This is intentionally minimal – the enclave OS only needs
-//! length-delimited framing on top of TLS.
+//! Supported methods: GET, POST, PUT.
+//! Authentication: `Authorization: Bearer <token>` header.
+//! Body encoding: `Content-Length` only (no chunked transfer-encoding).
 
 #[cfg(feature = "sgx")]
+use alloc::string::String;
+#[cfg(feature = "sgx")]
 use alloc::vec::Vec;
+#[cfg(feature = "sgx")]
+use alloc::format;
+#[cfg(not(feature = "sgx"))]
+use std::string::String;
 #[cfg(not(feature = "sgx"))]
 use std::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 
-/// Maximum single frame payload: 16 MiB.
-///
-/// The WASM management protocol double-encodes payloads (inner JSON
-/// inside Request::Data byte vector), which inflates the wire size
-/// significantly for large WASM artifacts.
-pub const MAX_FRAME_SIZE: u32 = 16 * 1024 * 1024;
+/// Maximum HTTP request body: 16 MiB.
+pub const MAX_BODY_SIZE: usize = 16 * 1024 * 1024;
+
+/// Maximum HTTP header section: 8 KiB (enforced via header count).
+pub const MAX_HEADERS: usize = 32;
 
 /// A simple request type for the RA-TLS ingress server.
 ///
@@ -202,30 +208,152 @@ pub struct WasmFunctionMetrics {
     pub fuel_max: i64,
 }
 
-/// Encode a length-delimited frame: [u32 BE length][payload].
-pub fn encode_frame(payload: &[u8]) -> Vec<u8> {
-    let len = payload.len() as u32;
-    let mut frame = Vec::with_capacity(4 + payload.len());
-    frame.extend_from_slice(&len.to_be_bytes());
-    frame.extend_from_slice(payload);
-    frame
+// =========================================================================
+//  HTTP/1.1 wire protocol (powered by httparse)
+// =========================================================================
+
+/// HTTP method (strict subset).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HttpMethod {
+    Get,
+    Post,
+    Put,
 }
 
-/// Try to decode a frame from a buffer. Returns `Some((payload, consumed))`
-/// if a complete frame is available, `None` otherwise.
-pub fn decode_frame(buf: &[u8]) -> Option<(Vec<u8>, usize)> {
-    if buf.len() < 4 {
-        return None;
+/// A parsed HTTP/1.1 request.
+#[derive(Debug, Clone)]
+pub struct HttpRequest {
+    pub method: HttpMethod,
+    pub path: String,
+    /// Bearer token value (without the `"Bearer "` prefix), if present.
+    pub authorization: Option<String>,
+    /// Request body (empty for GET).
+    pub body: Vec<u8>,
+    /// Whether the client sent `Connection: close`.
+    pub connection_close: bool,
+}
+
+/// Errors that can occur while parsing an HTTP request.
+#[derive(Debug)]
+pub enum HttpParseError {
+    /// Not enough data yet — caller should buffer more bytes.
+    Incomplete,
+    /// Too many headers.
+    TooManyHeaders,
+    /// Body exceeds [`MAX_BODY_SIZE`].
+    BodyTooLarge,
+    /// HTTP method is not GET, POST, or PUT.
+    UnsupportedMethod,
+    /// `Content-Length` header has a non-numeric value.
+    InvalidContentLength,
+    /// httparse reported a malformed request.
+    Malformed,
+}
+
+/// Try to parse an HTTP/1.1 request from a byte buffer.
+///
+/// Returns `Ok((request, consumed))` where `consumed` is the number of
+/// bytes consumed from the front of `buf`, or `Err(Incomplete)` if the
+/// buffer does not yet contain a complete request.
+pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseError> {
+    let mut headers = [httparse::EMPTY_HEADER; MAX_HEADERS];
+    let mut req = httparse::Request::new(&mut headers);
+
+    let header_len = match req.parse(buf) {
+        Ok(httparse::Status::Complete(len)) => len,
+        Ok(httparse::Status::Partial) => return Err(HttpParseError::Incomplete),
+        Err(_) => return Err(HttpParseError::Malformed),
+    };
+
+    let method = match req.method.unwrap_or("") {
+        "GET" => HttpMethod::Get,
+        "POST" => HttpMethod::Post,
+        "PUT" => HttpMethod::Put,
+        _ => return Err(HttpParseError::UnsupportedMethod),
+    };
+
+    let path = req.path.unwrap_or("/").to_string();
+
+    // Extract relevant headers
+    let mut content_length: Option<usize> = None;
+    let mut authorization: Option<String> = None;
+    let mut connection_close = false;
+
+    for h in req.headers.iter() {
+        if h.name.eq_ignore_ascii_case("content-length") {
+            let val = core::str::from_utf8(h.value)
+                .map_err(|_| HttpParseError::InvalidContentLength)?;
+            content_length = Some(
+                val.trim().parse().map_err(|_| HttpParseError::InvalidContentLength)?,
+            );
+        } else if h.name.eq_ignore_ascii_case("authorization") {
+            if let Ok(val) = core::str::from_utf8(h.value) {
+                if let Some(token) = val.strip_prefix("Bearer ") {
+                    authorization = Some(token.to_string());
+                }
+            }
+        } else if h.name.eq_ignore_ascii_case("connection") {
+            if let Ok(val) = core::str::from_utf8(h.value) {
+                connection_close = val.eq_ignore_ascii_case("close");
+            }
+        }
+        // All other headers are silently ignored.
     }
-    let len = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
-    if len as u32 > MAX_FRAME_SIZE {
-        return None; // reject oversized
+
+    // Body
+    let body_len = content_length.unwrap_or(0);
+
+    if body_len > MAX_BODY_SIZE {
+        return Err(HttpParseError::BodyTooLarge);
     }
-    if buf.len() < 4 + len {
-        return None;
+
+    let total = header_len + body_len;
+
+    if buf.len() < total {
+        return Err(HttpParseError::Incomplete);
     }
-    let payload = buf[4..4 + len].to_vec();
-    Some((payload, 4 + len))
+
+    let body = buf[header_len..total].to_vec();
+
+    Ok((
+        HttpRequest {
+            method,
+            path,
+            authorization,
+            body,
+            connection_close,
+        },
+        total,
+    ))
+}
+
+/// Format a minimal HTTP/1.1 response.
+///
+/// The response always includes `Content-Type: application/json` and
+/// `Content-Length`.  `Connection: close` is added when `close` is true.
+pub fn format_http_response(status: u16, body: &[u8], close: bool) -> Vec<u8> {
+    let reason = match status {
+        200 => "OK",
+        400 => "Bad Request",
+        401 => "Unauthorized",
+        403 => "Forbidden",
+        404 => "Not Found",
+        405 => "Method Not Allowed",
+        413 => "Payload Too Large",
+        500 => "Internal Server Error",
+        _ => "Unknown",
+    };
+
+    let conn_header = if close { "Connection: close\r\n" } else { "" };
+
+    let header = format!(
+        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}\r\n",
+        status, reason, body.len(), conn_header,
+    );
+
+    let mut resp = header.into_bytes();
+    resp.extend_from_slice(body);
+    resp
 }
 
 // ---------------------------------------------------------------------------
@@ -236,24 +364,7 @@ pub fn decode_frame(buf: &[u8]) -> Option<(Vec<u8>, usize)> {
 mod tests {
     use super::*;
 
-    #[test]
-    fn test_frame_roundtrip() {
-        let data = b"hello world";
-        let frame = encode_frame(data);
-        let (decoded, consumed) = decode_frame(&frame).unwrap();
-        assert_eq!(decoded, data);
-        assert_eq!(consumed, frame.len());
-    }
-
-    #[test]
-    fn test_decode_incomplete_frame() {
-        assert!(decode_frame(&[0, 0, 0, 10, 1, 2]).is_none());
-    }
-
-    #[test]
-    fn test_decode_too_short() {
-        assert!(decode_frame(&[0, 0]).is_none());
-    }
+    // ── Request / Response serde tests ──────────────────────────────
 
     #[test]
     fn test_request_healthz_serde() {
@@ -284,7 +395,7 @@ mod tests {
 
     #[test]
     fn test_response_healthz_serde() {
-        let resp = Response::Healthz { status: "ok" };
+        let resp = Response::Healthz { status: "ok".into() };
         let json = serde_json::to_vec(&resp).unwrap();
         let back: Response = serde_json::from_slice(&json).unwrap();
         assert!(matches!(back, Response::Healthz { .. }));
@@ -301,17 +412,117 @@ mod tests {
         }
     }
 
+    // ── HTTP parser tests ───────────────────────────────────────────
+
     #[test]
-    fn test_data_frame_roundtrip() {
-        let req = Request::Data(b"hello vault".to_vec());
-        let payload = serde_json::to_vec(&req).unwrap();
-        let frame = encode_frame(&payload);
-        let (decoded_payload, consumed) = decode_frame(&frame).unwrap();
-        assert_eq!(consumed, frame.len());
-        let decoded: Request = serde_json::from_slice(&decoded_payload).unwrap();
-        match decoded {
-            Request::Data(d) => assert_eq!(d, b"hello vault"),
-            _ => panic!("expected Data"),
-        }
+    fn test_parse_get_request() {
+        let raw = b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n";
+        let (req, consumed) = parse_http_request(raw).unwrap();
+        assert_eq!(req.method, HttpMethod::Get);
+        assert_eq!(req.path, "/healthz");
+        assert!(req.body.is_empty());
+        assert!(req.authorization.is_none());
+        assert_eq!(consumed, raw.len());
+    }
+
+    #[test]
+    fn test_parse_post_with_body() {
+        let body = b"{\"command\":\"hello\"}";
+        let raw = format!(
+            "POST /data HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
+            body.len(),
+            core::str::from_utf8(body).unwrap(),
+        );
+        let (req, consumed) = parse_http_request(raw.as_bytes()).unwrap();
+        assert_eq!(req.method, HttpMethod::Post);
+        assert_eq!(req.path, "/data");
+        assert_eq!(req.body, body);
+        assert_eq!(consumed, raw.len());
+    }
+
+    #[test]
+    fn test_parse_authorization_header() {
+        let raw = b"GET /status HTTP/1.1\r\nAuthorization: Bearer tok123\r\n\r\n";
+        let (req, _) = parse_http_request(raw).unwrap();
+        assert_eq!(req.authorization.as_deref(), Some("tok123"));
+    }
+
+    #[test]
+    fn test_parse_connection_close() {
+        let raw = b"GET /healthz HTTP/1.1\r\nConnection: close\r\n\r\n";
+        let (req, _) = parse_http_request(raw).unwrap();
+        assert!(req.connection_close);
+    }
+
+    #[test]
+    fn test_parse_incomplete() {
+        let raw = b"GET /healthz HTTP/1.1\r\n";
+        assert!(matches!(
+            parse_http_request(raw),
+            Err(HttpParseError::Incomplete)
+        ));
+    }
+
+    #[test]
+    fn test_parse_incomplete_body() {
+        let raw = b"POST /data HTTP/1.1\r\nContent-Length: 100\r\n\r\nshort";
+        assert!(matches!(
+            parse_http_request(raw),
+            Err(HttpParseError::Incomplete)
+        ));
+    }
+
+    #[test]
+    fn test_parse_unsupported_method() {
+        let raw = b"DELETE /foo HTTP/1.1\r\n\r\n";
+        assert!(matches!(
+            parse_http_request(raw),
+            Err(HttpParseError::UnsupportedMethod)
+        ));
+    }
+
+    #[test]
+    fn test_format_http_response_200() {
+        let body = b"{\"status\":\"ok\"}";
+        let resp = format_http_response(200, body, false);
+        let resp_str = core::str::from_utf8(&resp).unwrap();
+        assert!(resp_str.starts_with("HTTP/1.1 200 OK\r\n"));
+        assert!(resp_str.contains("Content-Length: 15\r\n"));
+        assert!(resp_str.ends_with("{\"status\":\"ok\"}"));
+        assert!(!resp_str.contains("Connection: close"));
+    }
+
+    #[test]
+    fn test_format_http_response_close() {
+        let body = b"{}";
+        let resp = format_http_response(404, body, true);
+        let resp_str = core::str::from_utf8(&resp).unwrap();
+        assert!(resp_str.starts_with("HTTP/1.1 404 Not Found\r\n"));
+        assert!(resp_str.contains("Connection: close\r\n"));
+    }
+
+    #[test]
+    fn test_parse_multiple_requests_in_buffer() {
+        let r1 = b"GET /healthz HTTP/1.1\r\n\r\n";
+        let r2 = b"GET /status HTTP/1.1\r\n\r\n";
+        let mut buf = Vec::new();
+        buf.extend_from_slice(r1);
+        buf.extend_from_slice(r2);
+
+        let (req1, consumed1) = parse_http_request(&buf).unwrap();
+        assert_eq!(req1.path, "/healthz");
+        assert_eq!(consumed1, r1.len());
+
+        let (req2, consumed2) = parse_http_request(&buf[consumed1..]).unwrap();
+        assert_eq!(req2.path, "/status");
+        assert_eq!(consumed2, r2.len());
+    }
+
+    #[test]
+    fn test_parse_case_insensitive_headers() {
+        let raw = b"POST /data HTTP/1.1\r\ncONTENT-LENGTH: 2\r\nAUTHORIZATION: Bearer abc\r\n\r\nhi";
+        let (req, _) = parse_http_request(raw).unwrap();
+        assert_eq!(req.body, b"hi");
+        assert_eq!(req.authorization.as_deref(), Some("abc"));
     }
 }

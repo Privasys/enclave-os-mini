@@ -20,8 +20,8 @@ use enclave_os_common::protocol;
 ///
 /// The session does NOT own a socket. It operates on raw byte buffers:
 /// - `feed_tls_bytes()`: feed raw TCP bytes (encrypted) into the TLS engine
-/// - `recv_frame()`: extract a decoded application-level frame
-/// - `send_frame()`: encrypt and frame an application response
+/// - `recv_http_request()`: extract a decoded HTTP/1.1 request
+/// - `send_http_response()`: encrypt and emit an HTTP/1.1 response
 /// - `close_notify()`: produce the TLS close_notify alert
 ///
 /// All methods that produce network output return the raw TLS bytes that
@@ -72,7 +72,7 @@ impl RaTlsSession {
     /// After calling this, check:
     /// - `collect_tls_output()` for bytes to send back (handshake msgs,
     ///    encrypted app data, NewSessionTicket, etc.)
-    /// - `recv_frame()` for decrypted application-level frames
+    /// - `recv_http_request()` for decoded HTTP/1.1 requests
     ///
     /// Returns an error on fatal TLS protocol errors.
     pub fn feed_tls_bytes(&mut self, data: &[u8]) -> Result<(), &'static str> {
@@ -144,24 +144,52 @@ impl RaTlsSession {
     //  Application data: read (decrypt)
     // ================================================================
 
-    /// Try to receive a complete length-delimited frame from decrypted
+    /// Try to receive a complete HTTP/1.1 request from decrypted
     /// application data.
     ///
     /// Call this after `feed_tls_bytes()`. Returns:
-    /// - `Ok(Some(payload))` — a complete frame is available
-    /// - `Ok(None)` — more data needed (partial frame or no data yet)
-    /// - `Err` — fatal TLS error
-    pub fn recv_frame(&mut self) -> Result<Option<Vec<u8>>, &'static str> {
+    /// - `Ok(Some(request))` — a complete HTTP request is available
+    /// - `Ok(None)` — more data needed (partial request)
+    /// - `Err` — fatal TLS or parse error
+    pub fn recv_http_request(
+        &mut self,
+    ) -> Result<Option<protocol::HttpRequest>, &'static str> {
         // Drain any available decrypted plaintext into read_buf
         self.drain_plaintext()?;
 
-        // Try to decode a complete frame
-        if let Some((payload, consumed)) = protocol::decode_frame(&self.read_buf) {
-            self.read_buf.drain(..consumed);
-            Ok(Some(payload))
-        } else {
-            Ok(None)
+        match protocol::parse_http_request(&self.read_buf) {
+            Ok((request, consumed)) => {
+                self.read_buf.drain(..consumed);
+                Ok(Some(request))
+            }
+            Err(protocol::HttpParseError::Incomplete) => Ok(None),
+            Err(protocol::HttpParseError::TooManyHeaders) => {
+                Err("HTTP: too many headers")
+            }
+            Err(protocol::HttpParseError::BodyTooLarge) => {
+                Err("HTTP body too large")
+            }
+            Err(_) => Err("malformed HTTP request"),
         }
+    }
+
+    /// Encrypt and send an HTTP/1.1 response.
+    ///
+    /// Returns the raw TLS output bytes to send to the peer.  For large
+    /// responses the TLS layer may produce multiple records; this method
+    /// flushes incrementally so the internal rustls buffer never fills up.
+    pub fn send_http_response(
+        &mut self,
+        status: u16,
+        body: &[u8],
+        close: bool,
+    ) -> Result<Vec<u8>, &'static str> {
+        let response = protocol::format_http_response(status, body, close);
+        let mut all_output = Vec::new();
+        self.write_plaintext_chunked(&response, &mut all_output)?;
+        let final_output = self.collect_tls_output()?;
+        all_output.extend_from_slice(&final_output);
+        Ok(all_output)
     }
 
     /// Drain all available decrypted plaintext from the TLS reader into
@@ -190,19 +218,16 @@ impl RaTlsSession {
     //  Application data: write (encrypt)
     // ================================================================
 
-    /// Encrypt a framed application response.
+    /// Write plaintext into the TLS writer in chunks, flushing TLS
+    /// output records into `output` whenever the internal buffer fills.
     ///
-    /// Encodes `payload` as a length-delimited frame, encrypts it via
-    /// the TLS connection, and returns the raw TLS output bytes to send
-    /// to the peer.
-    pub fn send_frame(&mut self, payload: &[u8]) -> Result<Vec<u8>, &'static str> {
-        let frame = protocol::encode_frame(payload);
-        self.write_plaintext(&frame)?;
-        self.collect_tls_output()
-    }
-
-    /// Write raw plaintext into the TLS writer (will be encrypted).
-    fn write_plaintext(&mut self, data: &[u8]) -> Result<(), &'static str> {
+    /// This prevents the ~64 KB rustls internal buffer from truncating
+    /// large responses.
+    fn write_plaintext_chunked(
+        &mut self,
+        data: &[u8],
+        output: &mut Vec<u8>,
+    ) -> Result<(), &'static str> {
         use std::io::Write;
         let mut offset = 0;
         while offset < data.len() {
@@ -217,10 +242,19 @@ impl RaTlsSession {
                 })?
             };
             if n == 0 {
-                // rustls internal buffer full — flush encrypted records.
-                // The output is collected after this method returns.
-                // For now, just break and trust the caller collects.
-                break;
+                // rustls internal buffer full — flush encrypted records
+                // to make room, then continue writing.
+                let flushed = self.collect_tls_output()?;
+                if flushed.is_empty() {
+                    // No progress possible — should not happen but avoid
+                    // an infinite loop.
+                    enclave_log_error!(
+                        "write_plaintext_chunked: no progress at offset {}/{}",
+                        offset, data.len()
+                    );
+                    return Err("TLS write stalled: no progress");
+                }
+                output.extend_from_slice(&flushed);
             } else {
                 offset += n;
             }

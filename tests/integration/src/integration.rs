@@ -12,36 +12,48 @@ use enclave_os_common::protocol::{self, Request, Response};
 use enclave_os_common::types::*;
 
 #[test]
-fn test_frame_encode_decode_roundtrip() {
-    let payload = b"Hello, enclave!";
-    let frame = protocol::encode_frame(payload);
-
-    // Frame should be 4 bytes length + payload
-    assert_eq!(frame.len(), 4 + payload.len());
-
-    let (decoded, consumed) = protocol::decode_frame(&frame).expect("decode should succeed");
-    assert_eq!(decoded, payload);
-    assert_eq!(consumed, frame.len());
+fn test_parse_http_get_request() {
+    let raw = b"GET /healthz HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    let (req, consumed) = protocol::parse_http_request(raw).unwrap();
+    assert_eq!(req.method, protocol::HttpMethod::Get);
+    assert_eq!(req.path, "/healthz");
+    assert!(req.body.is_empty());
+    assert_eq!(consumed, raw.len());
 }
 
 #[test]
-fn test_frame_incomplete() {
-    // Only 2 bytes – incomplete header
-    assert!(protocol::decode_frame(&[0, 0]).is_none());
+fn test_parse_http_post_with_body() {
+    let body = b"{\"hello\":\"world\"}";
+    let raw = format!(
+        "POST /data HTTP/1.1\r\nContent-Length: {}\r\n\r\n{}",
+        body.len(),
+        core::str::from_utf8(body).unwrap(),
+    );
+    let (req, consumed) = protocol::parse_http_request(raw.as_bytes()).unwrap();
+    assert_eq!(req.method, protocol::HttpMethod::Post);
+    assert_eq!(req.path, "/data");
+    assert_eq!(req.body, body);
+    assert_eq!(consumed, raw.len());
+}
 
-    // Header says 10 bytes but only 5 available
-    let frame = &[0, 0, 0, 10, 1, 2, 3, 4, 5];
-    assert!(protocol::decode_frame(frame).is_none());
+#[test]
+fn test_format_http_response() {
+    let body = b"{\"status\":\"ok\"}";
+    let resp = protocol::format_http_response(200, body, false);
+    let resp_str = core::str::from_utf8(&resp).unwrap();
+    assert!(resp_str.starts_with("HTTP/1.1 200 OK\r\n"));
+    assert!(resp_str.contains("Content-Length: 15\r\n"));
+    assert!(resp_str.ends_with("{\"status\":\"ok\"}"));
 }
 
 #[test]
 fn test_request_serialization() {
-    let req = Request::Ping;
+    let req = Request::Healthz;
     let json = serde_json::to_vec(&req).unwrap();
     let decoded: Request = serde_json::from_slice(&json).unwrap();
     match decoded {
-        Request::Ping => {}
-        _ => panic!("Expected Ping"),
+        Request::Healthz => {}
+        _ => panic!("Expected Healthz"),
     }
 }
 

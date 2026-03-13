@@ -214,6 +214,11 @@ impl IngressServer {
                                 "TLS handshake complete for conn_id={}",
                                 conn_id
                             );
+                            // The client may have sent application data
+                            // (e.g. an HTTP request) in the same TLS
+                            // flight as the handshake Finished message.
+                            // Dispatch any buffered requests now.
+                            self.dispatch_requests(conn_id, &mut session);
                             self.sessions.insert(
                                 conn_id,
                                 SessionState::Established(session),
@@ -232,8 +237,8 @@ impl IngressServer {
             SessionState::Established(mut session) => {
                 match self.process_session_data(conn_id, &mut session, data) {
                     Ok(()) => {
-                        // Dispatch any complete application frames
-                        self.dispatch_frames(conn_id, &mut session);
+                        // Dispatch any complete HTTP requests
+                        self.dispatch_requests(conn_id, &mut session);
                         self.sessions.insert(
                             conn_id,
                             SessionState::Established(session),
@@ -265,15 +270,15 @@ impl IngressServer {
         Ok(())
     }
 
-    /// Process all complete application-level frames from a session.
-    fn dispatch_frames(&mut self, conn_id: u32, session: &mut RaTlsSession) {
+    /// Process all complete HTTP/1.1 requests from a session.
+    fn dispatch_requests(&mut self, conn_id: u32, session: &mut RaTlsSession) {
         // Build per-connection request context with optional peer cert
         // and client challenge nonce (for bidirectional RA-TLS verification,
         // sent via TLS CertificateRequest extension 0xFFBB).
         //
-        // OIDC claims are populated per-frame in handle_frame() because
-        // different frames in the same session may carry different tokens
-        // (or none — e.g. Healthz).
+        // OIDC claims are populated per-request in handle_http_request()
+        // because different requests in the same session may carry
+        // different tokens (or none — e.g. GET /healthz).
         let base_ctx = enclave_os_common::modules::RequestContext {
             peer_cert_der: session.peer_cert_der(),
             client_challenge_nonce: session.client_challenge_nonce().cloned(),
@@ -281,45 +286,61 @@ impl IngressServer {
         };
 
         loop {
-            match session.recv_frame() {
-                Ok(Some(payload)) => {
-                    match handle_frame(&payload, &base_ctx) {
-                        HandleResult::Response(resp) => {
-                            match session.send_frame(&resp) {
-                                Ok(tls_bytes) => {
-                                    if !tls_bytes.is_empty() {
-                                        self.send_to_proxy(conn_id, &tls_bytes);
-                                    }
-                                }
-                                Err(e) => {
-                                    enclave_log_error!(
-                                        "send_frame failed conn_id={}: {}",
-                                        conn_id, e
-                                    );
-                                    self.send_close(conn_id);
-                                    return;
-                                }
+            match session.recv_http_request() {
+                Ok(Some(http_req)) => {
+                    let close = http_req.connection_close;
+                    let result = handle_http_request(&http_req, &base_ctx);
+
+                    // Send HTTP response
+                    let send_close = close || result.shutdown;
+                    match session.send_http_response(
+                        result.status,
+                        &result.body,
+                        send_close,
+                    ) {
+                        Ok(tls_bytes) => {
+                            if !tls_bytes.is_empty() {
+                                self.send_to_proxy(conn_id, &tls_bytes);
                             }
                         }
-                        HandleResult::Shutdown => {
-                            enclave_log_info!(
-                                "Shutdown requested by conn_id={}", conn_id
+                        Err(e) => {
+                            enclave_log_error!(
+                                "send_http_response failed conn_id={}: {}",
+                                conn_id, e
                             );
-                            self.shutdown = true;
-                            self.send_close(conn_id);
-                            return;
-                        }
-                        HandleResult::Close => {
                             self.send_close(conn_id);
                             return;
                         }
                     }
+
+                    if result.shutdown {
+                        enclave_log_info!(
+                            "Shutdown requested by conn_id={}", conn_id
+                        );
+                        self.shutdown = true;
+                        self.send_close(conn_id);
+                        return;
+                    }
+
+                    if close {
+                        self.send_close(conn_id);
+                        return;
+                    }
                 }
-                Ok(None) => break, // no more complete frames
+                Ok(None) => break, // no more complete requests
                 Err(e) => {
                     enclave_log_error!(
-                        "recv_frame error conn_id={}: {}", conn_id, e
+                        "recv_http_request error conn_id={}: {}", conn_id, e
                     );
+                    // Send a 400 Bad Request before closing
+                    let err_body = b"{\"error\":\"malformed request\"}";
+                    if let Ok(tls_bytes) =
+                        session.send_http_response(400, err_body, true)
+                    {
+                        if !tls_bytes.is_empty() {
+                            self.send_to_proxy(conn_id, &tls_bytes);
+                        }
+                    }
                     self.send_close(conn_id);
                     return;
                 }
@@ -463,9 +484,17 @@ impl IngressServer {
     // ====================================================================
 
     /// Send TLS bytes to the TCP proxy via the data channel.
+    ///
+    /// Large payloads are split into chunks to stay under
+    /// `MAX_CHANNEL_PAYLOAD` (1 MiB) — the host-side decoder rejects
+    /// anything larger.
     fn send_to_proxy(&self, conn_id: u32, tls_bytes: &[u8]) {
-        let msg = channel::encode_tcp_data(conn_id, tls_bytes);
-        self.data_tx.send(&msg);
+        // Leave room for the 5-byte channel message header.
+        const CHUNK: usize = channel::MAX_CHANNEL_PAYLOAD;
+        for chunk in tls_bytes.chunks(CHUNK) {
+            let msg = channel::encode_tcp_data(conn_id, chunk);
+            self.data_tx.send(&msg);
+        }
     }
 
     /// Send a TcpClose to the TCP proxy.
@@ -611,228 +640,330 @@ fn build_tls_config(
 }
 
 // ---------------------------------------------------------------------------
-//  Request handling (unchanged)
+//  HTTP request handling
 // ---------------------------------------------------------------------------
 
-enum HandleResult {
-    Response(Vec<u8>),
-    Shutdown,
-    #[allow(dead_code)]
-    Close,
+/// Result of handling an HTTP request.
+struct HttpHandleResult {
+    status: u16,
+    body: Vec<u8>,
+    shutdown: bool,
 }
 
-/// Handle a complete, already-decoded frame payload from a client.
-///
-/// The auth layer works as follows:
-/// 1. Parse the raw JSON.
-/// 2. If an `"auth"` field is present, extract and verify the OIDC bearer
-///    token against the global OIDC config.  Populate a new `RequestContext`
-///    with the verified claims.
-/// 3. Remove `"auth"` from the JSON and re-serialize for module dispatch.
-/// 4. `Healthz` requires no auth.  All other operations require a valid
-///    token when OIDC is configured.
-fn handle_frame(payload: &[u8], base_ctx: &enclave_os_common::modules::RequestContext) -> HandleResult {
-    use enclave_os_common::protocol::{Request, Response};
-
-    // Step 1: Try to parse as a typed Request directly.
-    // If it's a simple variant (Healthz, Shutdown), handle immediately.
-    match serde_json::from_slice::<Request>(payload) {
-        Ok(Request::Healthz) => {
-            let resp = serde_json::to_vec(&Response::Healthz { status: "ok".into() })
-                .unwrap_or_default();
-            return HandleResult::Response(resp);
+impl HttpHandleResult {
+    fn ok(body: Vec<u8>) -> Self {
+        Self { status: 200, body, shutdown: false }
+    }
+    fn err(status: u16, msg: &str) -> Self {
+        Self {
+            status,
+            body: format!("{{\"error\":\"{}\"}}", msg).into_bytes(),
+            shutdown: false,
         }
-        Ok(Request::Shutdown) => return HandleResult::Shutdown,
-        _ => {}
+    }
+    fn shutdown() -> Self {
+        Self { status: 200, body: b"{}".to_vec(), shutdown: true }
+    }
+}
+
+/// Handle a complete HTTP/1.1 request.
+///
+/// Routes are:
+///   GET  /healthz             — liveness probe (no auth)
+///   GET  /readyz              — readiness probe (monitoring+)
+///   GET  /status              — module statuses (monitoring+)
+///   GET  /metrics             — enclave metrics (monitoring+)
+///   PUT  /attestation-servers — update attestation servers (manager)
+///   POST /data                — module dispatch (module-dependent)
+///   POST /shutdown            — graceful shutdown (manager)
+///
+/// Auth is via `Authorization: Bearer <token>` header.
+fn handle_http_request(
+    http_req: &enclave_os_common::protocol::HttpRequest,
+    base_ctx: &enclave_os_common::modules::RequestContext,
+) -> HttpHandleResult {
+    use enclave_os_common::protocol::HttpMethod;
+
+    match (&http_req.method, http_req.path.as_str()) {
+        // ── Healthz (no auth) ───────────────────────────────────────
+        (HttpMethod::Get, "/healthz") => {
+            HttpHandleResult::ok(b"{\"status\":\"ok\"}".to_vec())
+        }
+
+        // ── Readyz (monitoring+) ────────────────────────────────────
+        (HttpMethod::Get, "/readyz") => {
+            if let Some(ctx) = require_monitoring(http_req, base_ctx) {
+                let _ = ctx; // auth passed
+            } else {
+                return monitoring_required_error(http_req);
+            }
+            let module_count = modules::module_count();
+            let status = if module_count > 0 { "ready" } else { "not_ready" };
+            let body = format!(
+                "{{\"status\":\"{}\",\"modules\":{}}}",
+                status, module_count
+            );
+            HttpHandleResult::ok(body.into_bytes())
+        }
+
+        // ── Status (monitoring+) ────────────────────────────────────
+        (HttpMethod::Get, "/status") => {
+            if let Some(ctx) = require_monitoring(http_req, base_ctx) {
+                let _ = ctx;
+            } else {
+                return monitoring_required_error(http_req);
+            }
+            let statuses = modules::collect_module_statuses();
+            let body = serde_json::to_vec(&statuses).unwrap_or_default();
+            HttpHandleResult::ok(body)
+        }
+
+        // ── Metrics (monitoring+) ───────────────────────────────────
+        (HttpMethod::Get, "/metrics") => {
+            if let Some(ctx) = require_monitoring(http_req, base_ctx) {
+                let _ = ctx;
+            } else {
+                return monitoring_required_error(http_req);
+            }
+            let mut metrics = enclave_os_common::protocol::EnclaveMetrics::default();
+            modules::enrich_metrics(&mut metrics);
+            let body = serde_json::to_vec(&metrics).unwrap_or_default();
+            HttpHandleResult::ok(body)
+        }
+
+        // ── SetAttestationServers (manager) ─────────────────────────
+        (HttpMethod::Put, "/attestation-servers") => {
+            handle_set_attestation_servers(http_req, base_ctx)
+        }
+
+        // ── Data / module dispatch ──────────────────────────────────
+        (HttpMethod::Post, "/data") => {
+            handle_data_request_http(http_req, base_ctx)
+        }
+
+        // ── Shutdown (manager) ──────────────────────────────────────
+        (HttpMethod::Post, "/shutdown") => {
+            if let Some(ref oidc_config) = crate::oidc_config() {
+                let _ = oidc_config;
+                match verify_auth_header(http_req) {
+                    Some(claims) if claims.has_manager() => {}
+                    _ => return HttpHandleResult::err(403, "manager role required"),
+                }
+            }
+            HttpHandleResult::shutdown()
+        }
+
+        // ── Method mismatch on known paths ──────────────────────────
+        (_, "/healthz") | (_, "/readyz") | (_, "/status") | (_, "/metrics")
+        | (_, "/attestation-servers") | (_, "/data") | (_, "/shutdown") => {
+            HttpHandleResult::err(405, "method not allowed")
+        }
+
+        // ── Unknown path ────────────────────────────────────────────
+        _ => HttpHandleResult::err(404, "not found"),
+    }
+}
+
+/// Verify the `Authorization: Bearer` header and return OIDC claims.
+fn verify_auth_header(
+    http_req: &enclave_os_common::protocol::HttpRequest,
+) -> Option<enclave_os_common::oidc::OidcClaims> {
+    let token = http_req.authorization.as_deref()?;
+    verify_oidc_token(token).ok()
+}
+
+/// Check monitoring role requirement.  Returns `Some(claims)` if auth
+/// passes (or OIDC is not configured), `None` if auth fails.
+fn require_monitoring(
+    http_req: &enclave_os_common::protocol::HttpRequest,
+    _base_ctx: &enclave_os_common::modules::RequestContext,
+) -> Option<Option<enclave_os_common::oidc::OidcClaims>> {
+    if crate::oidc_config().is_none() {
+        return Some(None); // OIDC not configured, no auth needed
+    }
+    match verify_auth_header(http_req) {
+        Some(claims) if claims.has_monitoring() => Some(Some(claims)),
+        _ => None,
+    }
+}
+
+fn monitoring_required_error(
+    http_req: &enclave_os_common::protocol::HttpRequest,
+) -> HttpHandleResult {
+    if http_req.authorization.is_none() {
+        HttpHandleResult::err(401, "authorization required")
+    } else {
+        HttpHandleResult::err(403, "monitoring role required")
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  SetAttestationServers handler (HTTP)
+// ---------------------------------------------------------------------------
+
+/// Handle `PUT /attestation-servers`.
+///
+/// Request body: `{"servers": [{"url": "...", "token": "...", ...}, ...]}`.
+fn handle_set_attestation_servers(
+    http_req: &enclave_os_common::protocol::HttpRequest,
+    _base_ctx: &enclave_os_common::modules::RequestContext,
+) -> HttpHandleResult {
+    // Require Manager role when OIDC is configured.
+    let raw_auth_token = http_req.authorization.clone();
+    if let Some(ref oidc_config) = crate::oidc_config() {
+        let _ = oidc_config;
+        match verify_auth_header(http_req) {
+            Some(claims) if claims.has_manager() => {}
+            _ => return HttpHandleResult::err(403, "manager role required"),
+        }
     }
 
-    // Step 2: Parse as a generic JSON value to extract "auth" field.
-    let mut json_val: serde_json::Value = match serde_json::from_slice(payload) {
-        Ok(v) => v,
-        Err(_) => {
-            let err = Response::Error(b"invalid JSON request".to_vec());
-            return HandleResult::Response(serde_json::to_vec(&err).unwrap_or_default());
+    // Parse request body
+    #[derive(serde::Deserialize)]
+    struct SetAttestationServersRequest {
+        servers: Vec<enclave_os_common::protocol::AttestationServer>,
+    }
+
+    let parsed: SetAttestationServersRequest = match serde_json::from_slice(&http_req.body) {
+        Ok(p) => p,
+        Err(e) => {
+            return HttpHandleResult::err(
+                400,
+                &format!("invalid request body: {e}"),
+            );
         }
     };
 
-    // Step 3: Extract and verify OIDC token if present.
-    // Also preserve the raw JWT string — needed for OIDC bootstrap
-    // (SetAttestationServers passes it to Zitadel AddKey).
-    #[allow(unused_variables)]
-    let (oidc_claims, raw_auth_token) = if let Some(auth_val) = json_val.as_object_mut().and_then(|m| m.remove("auth")) {
-        let token_str = match auth_val.as_str() {
-            Some(s) => s,
+    let servers = parsed.servers;
+
+    // Collect servers that need OIDC bootstrap before we move `servers`.
+    let bootstrap_configs: Vec<(String, enclave_os_common::protocol::OidcBootstrap)> =
+        servers
+            .iter()
+            .filter_map(|s| {
+                s.oidc_bootstrap
+                    .as_ref()
+                    .map(|b| (s.url.clone(), b.clone()))
+            })
+            .collect();
+
+    let (count, hash) = enclave_os_common::attestation_servers::set(servers);
+
+    // OIDC bootstrap: for each server with oidc_bootstrap config,
+    // generate a keypair, register with Zitadel, and obtain a token.
+    #[cfg(feature = "egress")]
+    if !bootstrap_configs.is_empty() {
+        let manager_jwt = match raw_auth_token.as_deref() {
+            Some(jwt) => jwt,
             None => {
-                let err = Response::Error(b"\"auth\" field must be a string".to_vec());
-                return HandleResult::Response(serde_json::to_vec(&err).unwrap_or_default());
+                return HttpHandleResult::err(
+                    400,
+                    "OIDC bootstrap requires an auth token (manager JWT)",
+                );
             }
         };
-        let raw = token_str.to_string();
-        match verify_oidc_token(token_str) {
-            Ok(claims) => (Some(claims), Some(raw)),
-            Err(e) => {
-                let err = Response::Error(format!("OIDC auth failed: {e}").into_bytes());
-                return HandleResult::Response(serde_json::to_vec(&err).unwrap_or_default());
+
+        for (url, config) in &bootstrap_configs {
+            match enclave_os_egress::oidc_bootstrap::bootstrap(config, manager_jwt) {
+                Ok(result) => {
+                    enclave_os_common::attestation_servers::set_oidc_state(
+                        url,
+                        config.clone(),
+                        result.key_id,
+                        result.private_key_der,
+                        result.access_token,
+                        result.expires_in,
+                    );
+                    enclave_log_info!(
+                        "OIDC bootstrap succeeded for {} (key registered, token expires in {}s)",
+                        url,
+                        result.expires_in,
+                    );
+                }
+                Err(e) => {
+                    enclave_log_error!(
+                        "OIDC bootstrap failed for {}: {}",
+                        url, e
+                    );
+                    return HttpHandleResult::err(
+                        500,
+                        &format!("OIDC bootstrap failed for {url}: {e}"),
+                    );
+                }
             }
         }
+    }
+
+    let hash_hex = hash
+        .map(|h| enclave_os_common::hex::hex_encode(&h))
+        .unwrap_or_default();
+    let body = format!(
+        "{{\"server_count\":{},\"hash\":\"{}\"}}",
+        count, hash_hex
+    );
+    HttpHandleResult::ok(body.into_bytes())
+}
+
+// ---------------------------------------------------------------------------
+//  Data request handling (HTTP)
+// ---------------------------------------------------------------------------
+
+/// Handle `POST /data` — module dispatch.
+///
+/// Auth comes from the `Authorization: Bearer` header (not from the body).
+/// The HTTP body is passed directly to the module as `Request::Data(body)`.
+fn handle_data_request_http(
+    http_req: &enclave_os_common::protocol::HttpRequest,
+    base_ctx: &enclave_os_common::modules::RequestContext,
+) -> HttpHandleResult {
+    use enclave_os_common::protocol::{Request, Response};
+
+    // Extract auth from the Authorization header.
+    let oidc_claims = if crate::oidc_config().is_some() {
+        match verify_auth_header(http_req) {
+            Some(claims) => Some(claims),
+            None if http_req.authorization.is_some() => {
+                return HttpHandleResult::err(401, "invalid or expired token");
+            }
+            None => None,
+        }
     } else {
-        (None, None)
+        None
     };
 
-    // Step 4: Build a context with OIDC claims.
     let ctx = enclave_os_common::modules::RequestContext {
         peer_cert_der: base_ctx.peer_cert_der.clone(),
         client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
         oidc_claims,
     };
 
-    // Step 5: Re-parse the (auth-stripped) JSON as a Request.
-    let req: Request = match serde_json::from_value(json_val) {
-        Ok(r) => r,
-        Err(_) => {
-            let err = Response::Error(b"invalid request after auth extraction".to_vec());
-            return HandleResult::Response(serde_json::to_vec(&err).unwrap_or_default());
-        }
-    };
+    let req = Request::Data(http_req.body.clone());
 
-    // Step 6: Handle monitoring operations (require Monitoring+ role).
-    match req {
-        Request::Readyz | Request::Status | Request::Metrics => {
-            if let Some(ref oidc_config) = crate::oidc_config() {
-                let _ = oidc_config; // OIDC is configured: require monitoring role
-                match ctx.oidc_claims {
-                    Some(ref claims) if claims.has_monitoring() => {}
-                    _ => {
-                        let err = Response::Error(b"monitoring role required".to_vec());
-                        return HandleResult::Response(serde_json::to_vec(&err).unwrap_or_default());
-                    }
-                }
-            }
-            match req {
-                Request::Readyz => {
-                    let module_count = modules::module_count();
-                    let resp = Response::Readyz {
-                        status: if module_count > 0 { "ready".into() } else { "not_ready".into() },
-                        modules: module_count,
-                    };
-                    HandleResult::Response(serde_json::to_vec(&resp).unwrap_or_default())
-                }
-                Request::Status => {
-                    let statuses = modules::collect_module_statuses();
-                    let resp = Response::StatusReport(statuses);
-                    HandleResult::Response(serde_json::to_vec(&resp).unwrap_or_default())
-                }
-                Request::Metrics => {
-                    let mut metrics = enclave_os_common::protocol::EnclaveMetrics::default();
-                    modules::enrich_metrics(&mut metrics);
-                    let resp = Response::MetricsReport(metrics);
-                    HandleResult::Response(serde_json::to_vec(&resp).unwrap_or_default())
-                }
-                _ => unreachable!(),
+    if let Some(resp) = modules::dispatch(&req, &ctx) {
+        match resp {
+            Response::Data(data) => HttpHandleResult::ok(data),
+            Response::Error(msg) => HttpHandleResult {
+                status: 400,
+                body: msg,
+                shutdown: false,
+            },
+            Response::Ok => HttpHandleResult::ok(b"{}".to_vec()),
+            other => {
+                // Serialize any other response variant as JSON
+                HttpHandleResult::ok(
+                    serde_json::to_vec(&other).unwrap_or_default(),
+                )
             }
         }
-        Request::SetAttestationServers { servers } => {
-            // Require Manager role when OIDC is configured.
-            if let Some(ref oidc_config) = crate::oidc_config() {
-                let _ = oidc_config;
-                match ctx.oidc_claims {
-                    Some(ref claims) if claims.has_manager() => {}
-                    _ => {
-                        let err = Response::Error(b"manager role required".to_vec());
-                        return HandleResult::Response(serde_json::to_vec(&err).unwrap_or_default());
-                    }
-                }
-            }
-
-            // Collect servers that need OIDC bootstrap before we move `servers`.
-            let bootstrap_configs: Vec<(String, enclave_os_common::protocol::OidcBootstrap)> =
-                servers
-                    .iter()
-                    .filter_map(|s| {
-                        s.oidc_bootstrap
-                            .as_ref()
-                            .map(|b| (s.url.clone(), b.clone()))
-                    })
-                    .collect();
-
-            let (count, hash) = enclave_os_common::attestation_servers::set(servers);
-
-            // OIDC bootstrap: for each server with oidc_bootstrap config,
-            // generate a keypair, register with Zitadel, and obtain a token.
-            #[cfg(feature = "egress")]
-            if !bootstrap_configs.is_empty() {
-                let manager_jwt = match raw_auth_token.as_deref() {
-                    Some(jwt) => jwt,
-                    None => {
-                        let err = Response::Error(
-                            b"OIDC bootstrap requires an auth token (manager JWT)".to_vec(),
-                        );
-                        return HandleResult::Response(serde_json::to_vec(&err).unwrap_or_default());
-                    }
-                };
-
-                for (url, config) in &bootstrap_configs {
-                    match enclave_os_egress::oidc_bootstrap::bootstrap(config, manager_jwt) {
-                        Ok(result) => {
-                            enclave_os_common::attestation_servers::set_oidc_state(
-                                url,
-                                config.clone(),
-                                result.key_id,
-                                result.private_key_der,
-                                result.access_token,
-                                result.expires_in,
-                            );
-                            enclave_log_info!(
-                                "OIDC bootstrap succeeded for {} (key registered, token expires in {}s)",
-                                url,
-                                result.expires_in,
-                            );
-                        }
-                        Err(e) => {
-                            enclave_log_error!(
-                                "OIDC bootstrap failed for {}: {}",
-                                url, e
-                            );
-                            let err = Response::Error(
-                                format!("OIDC bootstrap failed for {url}: {e}").into_bytes(),
-                            );
-                            return HandleResult::Response(
-                                serde_json::to_vec(&err).unwrap_or_default(),
-                            );
-                        }
-                    }
-                }
-            }
-
-            let hash_hex = hash
-                .map(|h| enclave_os_common::hex::hex_encode(&h))
-                .unwrap_or_default();
-            let resp = Response::AttestationServersUpdated {
-                server_count: count,
-                hash: hash_hex,
-            };
-            HandleResult::Response(serde_json::to_vec(&resp).unwrap_or_default())
-        }
-        Request::Data(_) => {
-            // Module dispatch — modules enforce their own role requirements
-            if let Some(resp) = modules::dispatch(&req, &ctx) {
-                HandleResult::Response(serde_json::to_vec(&resp).unwrap_or_default())
-            } else if let Request::Data(inner) = req {
-                // Fallback: echo Data back if no module handled it
-                let resp = serde_json::to_vec(&Response::Data(inner)).unwrap_or_default();
-                HandleResult::Response(resp)
-            } else {
-                let err = Response::Error(b"unhandled request".to_vec());
-                HandleResult::Response(serde_json::to_vec(&err).unwrap_or_default())
-            }
-        }
-        Request::Healthz => {
-            // Already handled above, but just in case
-            let resp = serde_json::to_vec(&Response::Healthz { status: "ok".into() })
-                .unwrap_or_default();
-            HandleResult::Response(resp)
-        }
-        Request::Shutdown => HandleResult::Shutdown,
+    } else if let Request::Data(inner) = req {
+        // Fallback: echo Data back if no module handled it
+        enclave_log_info!(
+            "No module handled POST /data ({} bytes body), echoing back",
+            inner.len()
+        );
+        HttpHandleResult::ok(inner)
+    } else {
+        HttpHandleResult::err(500, "unhandled request")
     }
 }
 
