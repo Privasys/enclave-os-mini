@@ -224,21 +224,76 @@ pub fn hex_decode(hex: &str) -> Result<Vec<u8>, String> {
 }
 
 // ---------------------------------------------------------------------------
+//  SPKI DER construction
+// ---------------------------------------------------------------------------
+
+/// Pre-encoded ASN.1 `AlgorithmIdentifier` for ECDSA P-256.
+///
+/// ```asn1
+/// AlgorithmIdentifier ::= SEQUENCE {
+///     algorithm   OID 1.2.840.10045.2.1 (ecPublicKey)
+///     parameters  OID 1.2.840.10045.3.1.7 (prime256v1 / secp256r1)
+/// }
+/// ```
+#[rustfmt::skip]
+const P256_ALGO_ID: &[u8] = &[
+    0x30, 0x13,                                                     // SEQUENCE (19)
+    0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,         // OID ecPublicKey
+    0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07,   // OID prime256v1
+];
+
+/// Build the DER-encoded `SubjectPublicKeyInfo` for an ECDSA P-256 key.
+///
+/// `ec_point` must be the 65-byte uncompressed point (`04 || x || y`),
+/// as returned by `ring::signature::KeyPair::public_key().as_ref()` or
+/// extracted from an X.509 certificate's `subjectPublicKey` BIT STRING.
+///
+/// The output is the 91-byte SPKI structure that Go's
+/// `x509.MarshalPKIXPublicKey` produces, making hashes directly
+/// comparable across languages.
+///
+/// ```asn1
+/// SubjectPublicKeyInfo ::= SEQUENCE {
+///     algorithm  AlgorithmIdentifier,
+///     subjectPublicKey BIT STRING
+/// }
+/// ```
+pub fn build_p256_spki_der(ec_point: &[u8]) -> Vec<u8> {
+    let bit_string_len = 1 + ec_point.len(); // unused-bits byte + point
+    let inner_len = P256_ALGO_ID.len() + 3 + ec_point.len(); // algo + BIT STRING header + point
+
+    let mut spki = Vec::with_capacity(2 + inner_len);
+    spki.push(0x30); // SEQUENCE tag
+    spki.push(inner_len as u8);
+    spki.extend_from_slice(P256_ALGO_ID);
+    spki.push(0x03); // BIT STRING tag
+    spki.push(bit_string_len as u8);
+    spki.push(0x00); // unused bits
+    spki.extend_from_slice(ec_point);
+    spki
+}
+
+// ---------------------------------------------------------------------------
 //  ReportData computation (requires `ring`)
 // ---------------------------------------------------------------------------
 
 /// Compute the expected 64-byte `ReportData` binding.
 ///
 /// ```text
-/// report_data = SHA-512( SHA-256(pubkey_bytes) || binding )
+/// report_data = SHA-512( SHA-256(spki_der) || binding )
 /// ```
 ///
-/// Both SGX and TDX use this formula; they differ only in the *pubkey
-/// encoding* (raw EC point vs. full SPKI DER) and the *binding* content
-/// (creation-time, challenge nonce, etc.).
+/// The `spki_der` argument must be the full DER-encoded
+/// `SubjectPublicKeyInfo` (91 bytes for P-256).  Use
+/// [`build_p256_spki_der`] to construct it from a raw EC point.
 ///
-/// Requires the `ring` dependency — gated behind the `jwt` feature in
-/// `enclave-os-common` (which already pulls in `ring`).
+/// Both SGX and TDX use this same formula; they differ only in the
+/// *binding* content (creation-time, challenge nonce, etc.).  The
+/// public key encoding is **always** the full SPKI DER, which matches
+/// the standard "Public Key SHA-256" fingerprint shown by X.509
+/// certificate viewers.
+///
+/// Requires the `ring` dependency — gated behind the `crypto` feature.
 #[cfg(feature = "crypto")]
 pub fn compute_report_data_hash(pubkey_bytes: &[u8], binding: &[u8]) -> ring::digest::Digest {
     let pk_hash = ring::digest::digest(&ring::digest::SHA256, pubkey_bytes);

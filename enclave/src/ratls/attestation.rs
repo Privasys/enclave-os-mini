@@ -6,7 +6,7 @@
 //! Generates X.509 certificates containing SGX quotes:
 //!
 //!   - Reads extension 0xFFBB in ClientHello for the challenge nonce
-//!   - `report_data = SHA-512(SHA-256(DER pubkey) || binding)`
+//!   - `report_data = SHA-512(SHA-256(SPKI_DER) || binding)`
 //!   - SGX quote embedded in a custom X.509 extension at Intel OID
 //!
 //! Two modes:
@@ -93,13 +93,18 @@ impl CaContext {
 /// Compute the 64-byte `report_data` that goes into the SGX quote.
 ///
 /// ```text
-/// report_data = SHA-512( SHA-256(DER_pubkey) || binding )
+/// report_data = SHA-512( SHA-256(SPKI_DER) || binding )
 /// ```
+///
+/// The `spki_der` argument must be the full DER-encoded
+/// `SubjectPublicKeyInfo` (91 bytes for P-256).  This matches the
+/// standard "Public Key SHA-256" fingerprint shown by X.509 certificate
+/// viewers, making browser-side verification straightforward.
 ///
 /// * **Challenge mode**: `binding` = nonce from ClientHello ext 0xFFBB
 /// * **Deterministic mode**: `binding` = creation_time as 8-byte LE
-pub fn compute_report_data(pubkey_der: &[u8], binding: &[u8]) -> [u8; 64] {
-    let pubkey_hash = digest::digest(&digest::SHA256, pubkey_der);
+pub fn compute_report_data(spki_der: &[u8], binding: &[u8]) -> [u8; 64] {
+    let pubkey_hash = digest::digest(&digest::SHA256, spki_der);
     let mut preimage = Vec::with_capacity(32 + binding.len());
     preimage.extend_from_slice(pubkey_hash.as_ref());
     preimage.extend_from_slice(binding);
@@ -273,15 +278,21 @@ fn prepare_attestation(mode: &CertMode) -> Result<AttestationContext, String> {
         &rng,
     )
     .map_err(|_| String::from("Failed to parse generated key"))?;
-    let pubkey_der = signature::KeyPair::public_key(&key_pair).as_ref();
+
+    // Build the full SPKI DER (91 bytes) from the raw EC point (65 bytes).
+    // This matches what Go's x509.MarshalPKIXPublicKey and standard X.509
+    // certificate viewers produce, so SHA-256(SPKI_DER) equals the
+    // "Public Key SHA-256" fingerprint visible in any cert inspector.
+    let raw_ec_point = signature::KeyPair::public_key(&key_pair).as_ref();
+    let spki_der = enclave_os_common::quote::build_p256_spki_der(raw_ec_point);
 
     let (report_data, validity_secs) = match mode {
         CertMode::Challenge { nonce } => (
-            compute_report_data(pubkey_der, nonce),
+            compute_report_data(&spki_der, nonce),
             CHALLENGE_VALIDITY_SECS,
         ),
         CertMode::Deterministic { creation_time } => (
-            compute_report_data(pubkey_der, &creation_time.to_le_bytes()),
+            compute_report_data(&spki_der, &creation_time.to_le_bytes()),
             DETERMINISTIC_VALIDITY_SECS,
         ),
     };

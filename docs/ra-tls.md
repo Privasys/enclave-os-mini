@@ -58,8 +58,11 @@ for up to 24 hours in deterministic mode).  The process:
 1. Generate a fresh **ECDSA P-256 key pair** inside the enclave
 2. Compute `ReportData`:
    ```
-   report_data = SHA-512( SHA-256(leaf_public_key_DER) || binding )
+   report_data = SHA-512( SHA-256(SPKI_DER) || binding )
    ```
+   where `SPKI_DER` is the 91-byte DER-encoded `SubjectPublicKeyInfo` of
+   the leaf public key — the same structure whose SHA-256 appears as
+   "Public Key SHA-256" in standard X.509 certificate viewers.
    - **Challenge mode**: `binding` = nonce from ClientHello extension `0xFFBB`
    - **Deterministic mode**: `binding` = creation timestamp (8 bytes LE)
 3. Create an **SGX report** binding the public key to the enclave identity
@@ -245,8 +248,11 @@ The client sends a random nonce in a TLS ClientHello extension (`0xFFBB`).
 The enclave binds this nonce into the SGX quote's `ReportData`:
 
 ```
-report_data = SHA-512( SHA-256(pubkey) || nonce )
+report_data = SHA-512( SHA-256(SPKI_DER) || nonce )
 ```
+
+Here `SPKI_DER` is the full 91-byte `SubjectPublicKeyInfo` — its SHA-256 is
+the standard public key fingerprint shown by any X.509 viewer.
 
 This proves the certificate was generated **in response to this specific
 connection**.  The certificate is valid for 5 minutes and is never cached.
@@ -258,7 +264,7 @@ connection**.  The certificate is valid for 5 minutes and is never cached.
 When no nonce is present, the enclave uses the creation timestamp as binding:
 
 ```
-report_data = SHA-512( SHA-256(pubkey) || timestamp_le_bytes )
+report_data = SHA-512( SHA-256(SPKI_DER) || timestamp_le_bytes )
 ```
 
 The certificate is cached per hostname for up to 24 hours.
@@ -294,7 +300,7 @@ the client generated its certificate **specifically for this TLS connection**.
 
                                                     2. Generate fresh ECDSA key pair
                                                     3. report_data = SHA-512(
-                                                         SHA-256(server_pubkey) || client_nonce )
+                                                         SHA-256(server_SPKI_DER) || client_nonce )
                                                     4. Get SGX quote with report_data
                                                     5. Generate random server_nonce (32 bytes)
                                                     6. Build cert with:
@@ -310,7 +316,7 @@ the client generated its certificate **specifically for this TLS connection**.
  9. Read server_nonce from CertificateRequestInfo.RATLSChallenge
 10. Generate fresh client ECDSA key pair
 11. client_report_data = SHA-512(
-      SHA-256(client_pubkey) || server_nonce )
+      SHA-256(client_SPKI_DER) || server_nonce )
 12. Get TDX/SGX quote with client_report_data
 13. Build client RA-TLS cert
 
@@ -326,7 +332,7 @@ the client generated its certificate **specifically for this TLS connection**.
                                                    16. Parse SGX/TDX quote from cert
                                                    17. Extract actual report_data
                                                    18. Compute expected = SHA-512(
-                                                         SHA-256(client_pubkey) || stored_nonce )
+                                                         SHA-256(client_SPKI_DER) || stored_nonce )
                                                    19. Verify actual == expected
                                                    20. Check measurement, token, OIDs
 
@@ -339,8 +345,8 @@ handshake:
 
 | Direction | Challenge | Binding |
 |-----------|-----------|----------|
-| Client → Server | `0xFFBB nonce` in ClientHello | `server_report_data = SHA-512(SHA-256(server_pk) \|\| client_nonce)` |
-| Server → Client | `0xFFBB nonce` in CertificateRequest | `client_report_data = SHA-512(SHA-256(client_pk) \|\| server_nonce)` |
+| Client → Server | `0xFFBB nonce` in ClientHello | `server_report_data = SHA-512(SHA-256(server_SPKI_DER) \|\| client_nonce)` |
+| Server → Client | `0xFFBB nonce` in CertificateRequest | `client_report_data = SHA-512(SHA-256(client_SPKI_DER) \|\| server_nonce)` |
 
 **Use case:** Vault `GetSecret` — the strongest possible guarantee that both
 parties generated fresh certificates specifically for this connection.

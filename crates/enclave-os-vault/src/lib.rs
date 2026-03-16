@@ -416,7 +416,10 @@ impl VaultModule {
                 ),
             };
 
-            let expected = compute_report_data_hash(&client_pubkey, nonce);
+            // Build the full SPKI DER (91 bytes) from the raw EC point
+            // (65 bytes) to match the enclave's ReportData computation.
+            let client_spki = enclave_os_common::quote::build_p256_spki_der(&client_pubkey);
+            let expected = compute_report_data_hash(&client_spki, nonce);
 
             if actual_report_data[..] != expected.as_ref()[..] {
                 return VaultResponse::Error(
@@ -767,11 +770,14 @@ fn extract_attestation_from_cert(der: &[u8]) -> Result<(Vec<u8>, Vec<OidClaim>),
 ///
 /// For ECDSA P-256 keys, this returns the 65-byte uncompressed elliptic
 /// curve point (`0x04 || x || y`), which matches the format produced by
-/// `ring::signature::EcdsaKeyPair::public_key().as_ref()`.  This is
-/// critical for report_data computation:
+/// `ring::signature::EcdsaKeyPair::public_key().as_ref()`.
+///
+/// Callers that need to reproduce the ReportData hash should wrap the
+/// result with [`enclave_os_common::quote::build_p256_spki_der`] to get
+/// the 91-byte SPKI DER used in:
 ///
 /// ```text
-/// report_data = SHA-512( SHA-256(pubkey_bytes) || binding )
+/// report_data = SHA-512( SHA-256(SPKI_DER) || binding )
 /// ```
 fn extract_pubkey_from_cert(der: &[u8]) -> Result<Vec<u8>, String> {
     use x509_parser::prelude::{FromDer, X509Certificate};

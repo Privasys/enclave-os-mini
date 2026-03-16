@@ -820,7 +820,7 @@ fn verify_tdx_measurements(quote: &Quote4, policy: &RaTlsPolicy) -> Result<(), S
 ///
 /// | Mode | pubkey | binding |
 /// |------|--------|---------|
-/// | ChallengeResponse | raw EC point (65 B) | client nonce |
+/// | ChallengeResponse | SPKI DER (91 B) | client nonce |
 /// | Deterministic | — | *skipped* (creation_time not in cert) |
 fn verify_sgx_report_data(
     quote: &Quote3,
@@ -829,9 +829,12 @@ fn verify_sgx_report_data(
 ) -> Result<(), String> {
     match &policy.report_data {
         ReportDataBinding::ChallengeResponse { nonce } => {
-            // SGX (enclave-os) uses the raw EC point (65 bytes) — not SPKI DER.
+            // SGX (enclave-os) uses the full SPKI DER (91 bytes for P-256),
+            // matching Go's x509.MarshalPKIXPublicKey and standard X.509
+            // certificate viewers' "Public Key SHA-256" fingerprint.
             let ec_point = cert.public_key().subject_public_key.as_ref();
-            let expected = compute_report_data_hash(ec_point, nonce);
+            let spki_der = enclave_os_common::quote::build_p256_spki_der(ec_point);
+            let expected = compute_report_data_hash(&spki_der, nonce);
             if quote.report_body.report_data.d != expected.as_ref() {
                 return Err("RA-TLS: SGX ReportData mismatch (challenge-response)".into());
             }
@@ -859,7 +862,7 @@ fn verify_tdx_report_data(
     policy: &RaTlsPolicy,
 ) -> Result<(), String> {
     let ec_point = cert.public_key().subject_public_key.as_ref();
-    let spki_der = build_p256_spki_der(ec_point);
+    let spki_der = enclave_os_common::quote::build_p256_spki_der(ec_point);
 
     match &policy.report_data {
         ReportDataBinding::Deterministic => {
@@ -887,51 +890,9 @@ fn verify_tdx_report_data(
     Ok(())
 }
 
-/// `SHA-512( SHA-256(pubkey_bytes) || binding )`
+/// `SHA-512( SHA-256(spki_der) || binding )`
 ///
 /// Re-exported from [`enclave_os_common::quote::compute_report_data_hash`].
 fn compute_report_data_hash(pubkey_bytes: &[u8], binding: &[u8]) -> digest::Digest {
     enclave_os_common::quote::compute_report_data_hash(pubkey_bytes, binding)
-}
-
-/// Build the DER-encoded SubjectPublicKeyInfo for an ECDSA P-256 public key.
-///
-/// This reproduces the exact bytes that Go's `x509.MarshalPKIXPublicKey`
-/// produces for P-256 keys, which is what the Caddy RA-TLS module uses
-/// when computing `SHA-256(DER public key)` for the ReportData.
-///
-/// The `ec_point` must be the 65-byte uncompressed EC point (`04 || x || y`).
-fn build_p256_spki_der(ec_point: &[u8]) -> Vec<u8> {
-    // SubjectPublicKeyInfo ::= SEQUENCE {
-    //   algorithm  AlgorithmIdentifier ::= SEQUENCE {
-    //     algorithm  OID 1.2.840.10045.2.1 (ecPublicKey)
-    //     parameters OID 1.2.840.10045.3.1.7 (prime256v1)
-    //   }
-    //   subjectPublicKey BIT STRING (04 || x || y)
-    // }
-
-    // Pre-encoded AlgorithmIdentifier for ecPublicKey + prime256v1.
-    #[rustfmt::skip]
-    const ALGO: &[u8] = &[
-        0x30, 0x13,                                                 // SEQUENCE (19)
-        0x06, 0x07, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x02, 0x01,     // OID ecPublicKey
-        0x06, 0x08, 0x2a, 0x86, 0x48, 0xce, 0x3d, 0x03, 0x01, 0x07, // OID prime256v1
-    ];
-
-    // BIT STRING header: tag(1) + length(1) + unused-bits(1) = 3 bytes.
-    // Content length = 1 (unused bits) + ec_point.len().
-    let bit_string_len = 1 + ec_point.len(); // 66 for P-256
-
-    // Outer SEQUENCE inner length = ALGO(21) + BIT STRING header(3) + ec_point.
-    let inner_len = ALGO.len() + 3 + ec_point.len(); // 89 for P-256
-
-    let mut spki = Vec::with_capacity(2 + inner_len);
-    spki.push(0x30); // SEQUENCE tag
-    spki.push(inner_len as u8); // length (fits in one byte for P-256)
-    spki.extend_from_slice(ALGO);
-    spki.push(0x03); // BIT STRING tag
-    spki.push(bit_string_len as u8);
-    spki.push(0x00); // unused bits
-    spki.extend_from_slice(ec_point);
-    spki
 }
