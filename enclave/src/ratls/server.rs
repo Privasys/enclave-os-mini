@@ -145,6 +145,10 @@ impl IngressServer {
                     enclave_log_info!("Connection closed conn_id={}", conn_id);
                 }
             }
+
+            ChannelMsgType::DataReady => {
+                // DataReady is an enclave→host signal; ignore if received inbound.
+            }
         }
     }
 
@@ -994,7 +998,7 @@ fn handle_rpc_request(
     http_req: &enclave_os_common::protocol::HttpRequest,
     base_ctx: &enclave_os_common::modules::RequestContext,
 ) -> HttpHandleResult {
-    use enclave_os_common::protocol::{HttpMethod, Request, Response};
+    use enclave_os_common::protocol::{HttpMethod, Request};
 
     // Parse path: /rpc/<app>/<function_or_schema>
     let rest = &path[5..]; // strip "/rpc/"
