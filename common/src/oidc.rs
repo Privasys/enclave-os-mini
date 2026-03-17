@@ -44,9 +44,9 @@ use std::{string::String, vec::Vec};
 use serde::{Deserialize, Serialize};
 
 #[cfg(not(feature = "sgx"))]
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 #[cfg(feature = "sgx")]
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicBool, AtomicPtr, Ordering};
 
 /// Global flag indicating whether OIDC has been configured.
 ///
@@ -54,6 +54,34 @@ use core::sync::atomic::{AtomicBool, Ordering};
 /// is installed. Modules check this via [`is_oidc_configured()`] to decide
 /// whether to enforce token requirements.
 static OIDC_CONFIGURED: AtomicBool = AtomicBool::new(false);
+
+/// Global [`OidcConfig`] pointer, set once at startup.
+///
+/// Any crate that depends on `enclave-os-common` can read the config
+/// without needing access to the enclave crate's local storage.
+static OIDC_CONFIG: AtomicPtr<OidcConfig> = AtomicPtr::new(core::ptr::null_mut());
+
+/// Store the global [`OidcConfig`] and mark OIDC as configured.
+///
+/// Must be called exactly once during enclave init.  Subsequent calls
+/// are silently ignored (first-writer-wins).
+pub fn set_global_oidc_config(config: OidcConfig) {
+    use alloc::boxed::Box;
+
+    let ptr = Box::into_raw(Box::new(config));
+    // Only store if still null (first writer wins).
+    let prev = OIDC_CONFIG.compare_exchange(
+        core::ptr::null_mut(),
+        ptr,
+        Ordering::AcqRel,
+        Ordering::Acquire,
+    );
+    if prev.is_err() {
+        // Another call already set it — free our copy.
+        unsafe { drop(Box::from_raw(ptr)); }
+    }
+    OIDC_CONFIGURED.store(true, Ordering::Release);
+}
 
 /// Mark OIDC as configured (called once at startup).
 pub fn set_oidc_configured() {
@@ -63,6 +91,18 @@ pub fn set_oidc_configured() {
 /// Returns `true` if OIDC has been configured for this enclave.
 pub fn is_oidc_configured() -> bool {
     OIDC_CONFIGURED.load(Ordering::Acquire)
+}
+
+/// Returns a reference to the global [`OidcConfig`], if set.
+pub fn global_oidc_config() -> Option<&'static OidcConfig> {
+    let ptr = OIDC_CONFIG.load(Ordering::Acquire);
+    if ptr.is_null() {
+        None
+    } else {
+        // SAFETY: ptr was created from Box::into_raw in set_global_oidc_config
+        // and is never freed during the enclave's lifetime.
+        Some(unsafe { &*ptr })
+    }
 }
 
 // ---------------------------------------------------------------------------

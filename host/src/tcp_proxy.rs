@@ -45,6 +45,8 @@ pub struct TcpProxy {
     data_rx: SpscConsumer,
     /// Shared shutdown flag.
     shutdown: Arc<AtomicBool>,
+    /// True once the enclave has signalled DataReady.
+    ready: bool,
 }
 
 impl TcpProxy {
@@ -68,6 +70,7 @@ impl TcpProxy {
             data_tx,
             data_rx,
             shutdown,
+            ready: false,
         })
     }
 
@@ -79,14 +82,22 @@ impl TcpProxy {
         while !self.shutdown.load(Ordering::Relaxed) {
             let mut did_work = false;
 
+            // 3 (first). Read from enclave → write to TCP sockets / check DataReady
+            did_work |= self.drain_enclave_output();
+
+            if !self.ready {
+                // Don't accept or read until the enclave signals DataReady
+                if !did_work {
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                continue;
+            }
+
             // 1. Accept new connections
             did_work |= self.accept_connections();
 
             // 2. Read from TCP sockets → send to enclave
             did_work |= self.read_sockets(&mut read_buf);
-
-            // 3. Read from enclave → write to TCP sockets
-            did_work |= self.drain_enclave_output();
 
             // If no work was done, yield briefly to avoid busy-spinning
             if !did_work {
@@ -208,6 +219,10 @@ impl TcpProxy {
                                 "Unexpected TcpNew from enclave for conn_id={}",
                                 conn_id
                             );
+                        }
+                        Some((ChannelMsgType::DataReady, _, _)) => {
+                            info!("Enclave data channel ready — accepting connections");
+                            self.ready = true;
                         }
                         None => {
                             warn!("Failed to decode enclave message");

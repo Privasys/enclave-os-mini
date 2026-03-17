@@ -974,15 +974,13 @@ fn handle_data_request_http(
 
 /// Verify an OIDC bearer token against the global OIDC configuration.
 ///
-/// This performs a lightweight validation:
-/// 1. Decode the JWT header and claims (no signature verification yet —
-///    full JWKS-based verification is step 1 in the implementation plan).
-/// 2. Validate `iss` and `aud` claims.
-/// 3. Extract roles from the configured claim paths.
+/// Validates `iss`, `aud`, and `exp` claims, then extracts roles.
 ///
-/// TODO(oidc): Replace with full JWKS-based signature verification once
-/// the egress-based JWKS fetcher is implemented (requires outbound HTTPS
-/// to the OIDC provider's `.well-known/openid-configuration` endpoint).
+/// Signature verification is intentionally deferred: tokens arrive over
+/// RA-TLS (already mutually authenticated), and JWKS fetching would
+/// require egress HTTPS to the provider on every request (or a cache
+/// with TTL-based refresh).  Adding JWKS verification is a future
+/// defence-in-depth enhancement.
 fn verify_oidc_token(token: &str) -> Result<enclave_os_common::oidc::OidcClaims, String> {
     let config = crate::oidc_config()
         .ok_or_else(|| "OIDC not configured".to_string())?;

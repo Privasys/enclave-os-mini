@@ -315,6 +315,18 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
     }
     enclave_log_info!("RA-TLS ingress server initialised (data channel mode)");
 
+    // Signal the host TCP proxy that the data channel consumer is ready.
+    // The proxy blocks new connections until it receives this message.
+    {
+        let ready_msg = channel::encode_channel_msg(
+            channel::ChannelMsgType::DataReady,
+            0,
+            &[],
+        );
+        crate::data_tx().send(&ready_msg);
+        enclave_log_info!("DataReady sent to host TCP proxy");
+    }
+
     // Main event loop: read from data channel, dispatch to IngressServer
     let data_rx = crate::data_rx();
     while !crate::is_shutdown() {
@@ -415,7 +427,7 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
             oidc.issuer, oidc.audience
         );
         crate::set_oidc_config(oidc.clone());
-        enclave_os_common::oidc::set_oidc_configured();
+        enclave_os_common::oidc::set_global_oidc_config(oidc.clone());
     } else {
         enclave_log_info!("OIDC not configured — auth layer disabled");
     }

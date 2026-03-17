@@ -665,14 +665,8 @@ fn verify_bearer_oidc(token: &[u8]) -> Result<enclave_os_common::oidc::OidcClaim
     let token_str = core::str::from_utf8(token)
         .map_err(|e| format!("bearer token not utf8: {e}"))?;
 
-    // Re-use the same OIDC verification as the auth layer in server.rs.
-    // The enclave's verify_oidc_token is not directly accessible from
-    // the vault crate, so we do a minimal JWT decode + claim extraction
-    // here against the global OIDC config.
-    let config = enclave_os_common::oidc::is_oidc_configured()
-        .then(|| ())
+    let config = enclave_os_common::oidc::global_oidc_config()
         .ok_or("OIDC not configured")?;
-    let _ = config;
 
     // Decode JWT payload
     let parts: Vec<&str> = token_str.splitn(3, '.').collect();
@@ -689,21 +683,7 @@ fn verify_bearer_oidc(token: &[u8]) -> Result<enclave_os_common::oidc::OidcClaim
         .unwrap_or("")
         .to_string();
 
-    // We need the OidcConfig to extract roles.  Since we can't access
-    // the enclave's global directly, we reconstruct a default config.
-    // TODO(oidc): Share the global OidcConfig through common or pass
-    // it as a parameter.
-    let default_config = enclave_os_common::oidc::OidcConfig {
-        issuer: String::new(),
-        audience: String::new(),
-        role_claim: "urn:zitadel:iam:org:project:roles".into(),
-        manager_role: "enclave-os-mini:manager".into(),
-        monitoring_role: "enclave-os-mini:monitoring".into(),
-        secret_owner_role: "enclave-os-mini:secret-owner".into(),
-        secret_manager_role: "enclave-os-mini:secret-manager".into(),
-    };
-
-    let roles = enclave_os_common::oidc::extract_roles(&claims, &default_config);
+    let roles = enclave_os_common::oidc::extract_roles(&claims, config);
 
     Ok(enclave_os_common::oidc::OidcClaims { sub, roles })
 }

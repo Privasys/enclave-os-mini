@@ -31,8 +31,9 @@
 //!
 //! | Type | Value | Payload | Description |
 //! |------|-------|---------|-------------|
-//! | `TcpData`  | 0x02 | raw bytes | TLS bytes to send to client |
-//! | `TcpClose` | 0x03 | (empty)   | Enclave closing connection  |
+//! | `TcpData`    | 0x02 | raw bytes | TLS bytes to send to client            |
+//! | `TcpClose`   | 0x03 | (empty)   | Enclave closing connection             |
+//! | `DataReady`  | 0x04 | (empty)   | Data channel consumer ready — start accepting |
 //!
 //! # Queue layout
 //!
@@ -76,6 +77,12 @@ pub enum ChannelMsgType {
     /// Connection closed (bidirectional).
     /// Payload: empty.
     TcpClose = 0x03,
+
+    /// Enclave data channel is ready (enclave → host).
+    /// Sent once, right before the enclave enters the data channel
+    /// event loop.  The TCP proxy must not accept connections until
+    /// it has received this message.
+    DataReady = 0x04,
 }
 
 impl ChannelMsgType {
@@ -85,6 +92,7 @@ impl ChannelMsgType {
             0x01 => Some(Self::TcpNew),
             0x02 => Some(Self::TcpData),
             0x03 => Some(Self::TcpClose),
+            0x04 => Some(Self::DataReady),
             _ => None,
         }
     }
