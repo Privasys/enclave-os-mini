@@ -66,8 +66,6 @@ static OIDC_CONFIG: AtomicPtr<OidcConfig> = AtomicPtr::new(core::ptr::null_mut()
 /// Must be called exactly once during enclave init.  Subsequent calls
 /// are silently ignored (first-writer-wins).
 pub fn set_global_oidc_config(config: OidcConfig) {
-    use alloc::boxed::Box;
-
     let ptr = Box::into_raw(Box::new(config));
     // Only store if still null (first writer wins).
     let prev = OIDC_CONFIG.compare_exchange(
