@@ -84,6 +84,9 @@ pub struct IngressServer {
 struct CachedConfig {
     config: Arc<ServerConfig>,
     expires_at: u64,
+    /// CertStore generation at the time this config was created.
+    /// Used to detect stale caches after app register/unregister.
+    store_generation: u64,
 }
 
 impl IngressServer {
@@ -456,9 +459,10 @@ impl IngressServer {
         // Deterministic: check per-hostname cache
         let cache_key = sni.clone().unwrap_or_default();
         let now = ocall::get_current_time().unwrap_or(0);
+        let current_gen = cert_store::cert_store().generation();
 
         if let Some(cached) = self.cached_configs.get(&cache_key) {
-            if now < cached.expires_at {
+            if now < cached.expires_at && cached.store_generation == current_gen {
                 return Ok(TlsConfigResult {
                     config: cached.config.clone(),
                     client_challenge_nonce: None,
@@ -472,6 +476,7 @@ impl IngressServer {
         self.cached_configs.insert(cache_key, CachedConfig {
             config: tls_result.config.clone(),
             expires_at: now + attestation::DETERMINISTIC_VALIDITY_SECS,
+            store_generation: current_gen,
         });
         Ok(TlsConfigResult {
             config: tls_result.config,

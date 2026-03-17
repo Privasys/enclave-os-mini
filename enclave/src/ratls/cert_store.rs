@@ -27,6 +27,7 @@
 use std::collections::BTreeMap;
 use std::string::String;
 use std::sync::{Arc, OnceLock, RwLock};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::vec::Vec;
 
 use ring::digest;
@@ -101,6 +102,10 @@ pub struct CertStore {
     ca: Arc<CaContext>,
     /// Hostname → registered app data.
     inner: RwLock<BTreeMap<String, RegisteredApp>>,
+    /// Monotonically increasing generation counter.  Bumped on every
+    /// `register()` / `unregister()` so that consumers (IngressServer
+    /// cert cache) can detect stale entries.
+    generation: AtomicU64,
 }
 
 impl CertStore {
@@ -109,7 +114,14 @@ impl CertStore {
         Self {
             ca,
             inner: RwLock::new(BTreeMap::new()),
+            generation: AtomicU64::new(0),
         }
+    }
+
+    /// Current generation counter.  Changes whenever an app is
+    /// registered or unregistered.
+    pub fn generation(&self) -> u64 {
+        self.generation.load(Ordering::Acquire)
     }
 
     /// Get the CA context (for cert generation).
@@ -127,17 +139,22 @@ impl CertStore {
         if let Ok(mut inner) = self.inner.write() {
             inner.insert(identity.hostname, registered);
         }
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     /// Unregister an app by SNI hostname.
     ///
     /// Returns `true` if the app was found and removed.
     pub fn unregister(&self, hostname: &str) -> bool {
-        if let Ok(mut inner) = self.inner.write() {
+        let removed = if let Ok(mut inner) = self.inner.write() {
             inner.remove(hostname).is_some()
         } else {
             false
+        };
+        if removed {
+            self.generation.fetch_add(1, Ordering::Release);
         }
+        removed
     }
 
     /// Resolve an app by SNI hostname.
