@@ -309,6 +309,11 @@ pub struct AppInfo {
     pub permissions_hash: Option<String>,
     /// Maximum fuel budget per call for this app.
     pub max_fuel: u64,
+    /// Whether the app is currently compiled in enclave memory.
+    ///
+    /// Unloaded apps are still persisted in the sealed KV store and
+    /// will be recompiled on the next `wasm_call`.
+    pub loaded: bool,
 }
 
 /// An exported function signature discovered from a WASM component.

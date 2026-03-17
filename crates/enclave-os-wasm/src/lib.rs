@@ -94,6 +94,28 @@ use crate::registry::AppRegistry;
 
 pub use enclave_os_common::oids::WASM_APPS_HASH_OID;
 
+use crate::registry::AppMeta;
+
+// ---------------------------------------------------------------------------
+//  KV keys for WASM app persistence
+// ---------------------------------------------------------------------------
+
+/// KV key storing the JSON array of all persisted app names.
+const KV_MANIFEST: &[u8] = b"wasm:manifest";
+
+/// Build the KV key for an app's serialised metadata.
+fn kv_meta_key(name: &str) -> Vec<u8> {
+    let mut k = b"wasm:meta:".to_vec();
+    k.extend_from_slice(name.as_bytes());
+    k
+}
+
+/// Build the KV key for an app's raw WASM bytecode.
+fn kv_bytes_key(name: &str) -> Vec<u8> {
+    let mut k = b"wasm:bytes:".to_vec();
+    k.extend_from_slice(name.as_bytes());
+    k
+}
 
 // ---------------------------------------------------------------------------
 //  WasmModule — EnclaveModule implementation
@@ -104,6 +126,10 @@ pub use enclave_os_common::oids::WASM_APPS_HASH_OID;
 /// Owns the [`AppRegistry`] which contains all loaded WASM apps,
 /// and the [`WasmMetricsStore`] which tracks per-app/per-function
 /// fuel consumption from wasmtime's fuel metering.
+///
+/// WASM apps are persisted in the sealed KV store and restored on
+/// startup.  Only the 10 most recently used apps are kept compiled
+/// in memory (LRU eviction) to conserve EPC.
 pub struct WasmModule {
     registry: Mutex<AppRegistry>,
     metrics: Mutex<WasmMetricsStore>,
@@ -113,13 +139,11 @@ impl WasmModule {
     /// Create a new WASM module.
     ///
     /// Initialises wasmtime with SGX-appropriate settings and WASI
-    /// host function bindings.
-    ///
-    /// Call [`load_app()`](Self::load_app) to add WASM apps before
-    /// the enclave enters its event loop.
+    /// host function bindings.  Restores persisted WASM app metadata
+    /// from the sealed KV store (apps are compiled on demand).
     pub fn new() -> Result<Self, String> {
         let engine = crate::engine::WasmEngine::new()?;
-        let registry = AppRegistry::new(engine);
+        let mut registry = AppRegistry::new(engine);
 
         // Try to restore metrics from a previous snapshot in the KV store.
         let mut metrics_store = WasmMetricsStore::new();
@@ -127,6 +151,37 @@ impl WasmModule {
             Ok(true) => { /* restored from KV */ }
             Ok(false) => { /* no snapshot — fresh start */ }
             Err(_) => { /* KV not ready or corrupt — start fresh */ }
+        }
+
+        // Restore persisted WASM app metadata from the KV store.
+        // Apps are NOT compiled here — they will be lazy-loaded on
+        // the first wasm_call.
+        if let Some(kv) = enclave_os_kvstore::kv_store() {
+            if let Ok(kv) = kv.lock() {
+                if let Ok(Some(manifest_bytes)) = kv.get(KV_MANIFEST) {
+                    if let Ok(names) = serde_json::from_slice::<Vec<String>>(&manifest_bytes) {
+                        for name in &names {
+                            if let Ok(Some(meta_bytes)) = kv.get(&kv_meta_key(name)) {
+                                match serde_json::from_slice::<AppMeta>(&meta_bytes) {
+                                    Ok(meta) => {
+                                        enclave_os_common::enclave_log_info!(
+                                            "Restored persisted WASM app: {} (hostname={})",
+                                            meta.name, meta.hostname,
+                                        );
+                                        registry.register_known(meta);
+                                    }
+                                    Err(e) => {
+                                        enclave_os_common::enclave_log_error!(
+                                            "Failed to deserialise metadata for app '{}': {}",
+                                            name, e,
+                                        );
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
 
         Ok(Self {
@@ -163,69 +218,46 @@ impl WasmModule {
         max_fuel: u64,
     ) -> Result<(), String> {
         // Load into the registry (compile + introspect + per-app key)
-        let (code_hash, key_source, permissions_hash) = {
+        let meta = {
             let mut reg = self.registry
                 .lock()
                 .map_err(|_| String::from("registry lock poisoned"))?;
-            reg.load_app(name, hostname, wasm_bytes, encryption_key, permissions, max_fuel)?;
-
-            let hash = reg.app_code_hash(name)
-                .copied()
-                .ok_or_else(|| String::from("app loaded but hash not found"))?;
-            let ks = reg.app_key_source(name)
-                .unwrap_or("generated")
-                .to_string();
-            let ph = reg.app_permissions_hash(name).copied();
-            (hash, ks, ph)
+            reg.load_app(name, hostname, wasm_bytes, encryption_key, permissions, max_fuel)?
         };
+
+        // ── Persist to KV store ────────────────────────────────────
+        self.persist_app_to_kv(name, &meta, wasm_bytes);
 
         // Register per-app identity with the global CertStore
-        let mut config = vec![
-            ConfigEntry {
-                key: format!("wasm.{}.code_hash", name),
-                value: code_hash.to_vec(),
-                oid: Some(enclave_os_common::oids::APP_CODE_HASH_OID),
-            },
-            ConfigEntry {
-                key: format!("wasm.{}.key_source", name),
-                value: key_source.as_bytes().to_vec(),
-                oid: Some(enclave_os_common::oids::APP_KEY_SOURCE_OID),
-            },
-        ];
-        if let Some(ph) = permissions_hash {
-            config.push(ConfigEntry {
-                key: format!("wasm.{}.permissions_hash", name),
-                value: ph.to_vec(),
-                oid: Some(enclave_os_common::oids::APP_PERMISSIONS_HASH_OID),
-            });
-        }
-        let identity = AppIdentity {
-            hostname: hostname.to_string(),
-            config,
-        };
-        enclave_os_common::ocall::cert_store_register(identity);
+        register_app_identity(&meta);
 
         Ok(())
     }
 
     /// Unload a WASM app by name.
     ///
-    /// Removes the app from the registry and unregisters its identity
-    /// from the global [`CertStore`](cert_store::CertStore).
+    /// Removes the app from the registry **and** from the sealed KV
+    /// store, then unregisters its identity from the global
+    /// [`CertStore`](cert_store::CertStore).
     pub fn unload_app(&self, name: &str) -> bool {
         let hostname = self.registry
             .lock()
             .ok()
-            .and_then(|mut r| r.unload_app(name));
+            .and_then(|mut r| r.remove_app(name));
 
         if let Some(ref h) = hostname {
+            self.remove_app_from_kv(name);
             enclave_os_common::ocall::cert_store_unregister(h);
         }
 
         hostname.is_some()
     }
 
-    /// List all loaded apps with metadata.
+    /// List all known apps with metadata.
+    ///
+    /// Includes both compiled (loaded) and evicted apps. The `loaded`
+    /// field on each [`AppInfo`](crate::protocol::AppInfo) indicates
+    /// whether the app is currently compiled in EPC.
     pub fn list_apps(&self) -> Vec<crate::protocol::AppInfo> {
         self.registry
             .lock()
@@ -234,9 +266,19 @@ impl WasmModule {
     }
 
     /// Dispatch a parsed `WasmCall` to the appropriate app and record metrics.
+    ///
+    /// If the app is known but not currently compiled in memory, its
+    /// WASM bytes are loaded from the sealed KV store and compiled
+    /// on the fly (AOT deserialization — very fast).
     fn dispatch_call(&self, call: &WasmCall) -> WasmResult {
+        // Ensure the app is compiled.  This is a no-op when the app
+        // is already in the `loaded` map.
+        if let Err(e) = self.ensure_app_loaded(&call.app) {
+            return WasmResult::Error { message: e };
+        }
+
         let (result, fuel_consumed) = {
-            let registry = match self.registry.lock() {
+            let mut registry = match self.registry.lock() {
                 Ok(r) => r,
                 Err(_) => {
                     return WasmResult::Error {
@@ -346,7 +388,7 @@ impl WasmModule {
         None // Permitted.
     }
 
-    /// Compute the combined hash of all loaded apps' code hashes.
+    /// Compute the combined hash of all known apps' code hashes.
     ///
     /// `SHA-256(app1_name || app1_hash || app2_name || app2_hash || …)`
     /// where apps are sorted by name.
@@ -371,6 +413,114 @@ impl WasmModule {
         out.copy_from_slice(result.as_ref());
         out
     }
+
+    // ── KV persistence helpers ─────────────────────────────────────
+
+    /// Persist an app's metadata and WASM bytes to the sealed KV store
+    /// and update the manifest.
+    fn persist_app_to_kv(&self, name: &str, meta: &AppMeta, wasm_bytes: &[u8]) {
+        let kv = match enclave_os_kvstore::kv_store() {
+            Some(kv) => kv,
+            None => return,
+        };
+        let kv = match kv.lock() {
+            Ok(kv) => kv,
+            Err(_) => return,
+        };
+
+        // Store metadata
+        if let Ok(meta_json) = serde_json::to_vec(meta) {
+            if let Err(e) = kv.put(&kv_meta_key(name), &meta_json) {
+                enclave_os_common::enclave_log_error!(
+                    "KV: failed to persist metadata for app '{}': {}", name, e,
+                );
+            }
+        }
+
+        // Store WASM bytes
+        if let Err(e) = kv.put(&kv_bytes_key(name), wasm_bytes) {
+            enclave_os_common::enclave_log_error!(
+                "KV: failed to persist bytes for app '{}': {}", name, e,
+            );
+        }
+
+        // Update manifest
+        self.update_kv_manifest(&kv);
+    }
+
+    /// Remove an app's metadata and WASM bytes from the sealed KV
+    /// store and update the manifest.
+    fn remove_app_from_kv(&self, name: &str) {
+        let kv = match enclave_os_kvstore::kv_store() {
+            Some(kv) => kv,
+            None => return,
+        };
+        let mut kv = match kv.lock() {
+            Ok(kv) => kv,
+            Err(_) => return,
+        };
+
+        let _ = kv.delete(&kv_meta_key(name));
+        let _ = kv.delete(&kv_bytes_key(name));
+
+        self.update_kv_manifest(&kv);
+    }
+
+    /// Rewrite the KV manifest from the current `known` map.
+    fn update_kv_manifest(&self, kv: &enclave_os_kvstore::SealedKvStore) {
+        let names: Vec<String> = self.registry
+            .lock()
+            .map(|r| {
+                r.all_code_hashes()
+                    .iter()
+                    .map(|(name, _)| name.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        if let Ok(manifest_json) = serde_json::to_vec(&names) {
+            if let Err(e) = kv.put(KV_MANIFEST, &manifest_json) {
+                enclave_os_common::enclave_log_error!(
+                    "KV: failed to update WASM manifest: {}", e,
+                );
+            }
+        }
+    }
+
+    /// Ensure a known app is compiled in memory.
+    ///
+    /// If the app is already loaded this is a no-op.  Otherwise the
+    /// WASM bytes are read from the sealed KV store and passed to
+    /// [`AppRegistry::ensure_loaded()`] for AOT deserialization.
+    fn ensure_app_loaded(&self, name: &str) -> Result<(), String> {
+        // Quick check — no KV access needed if already compiled.
+        {
+            let reg = self.registry.lock()
+                .map_err(|_| String::from("registry lock poisoned"))?;
+            if reg.is_loaded(name) {
+                return Ok(());
+            }
+            if !reg.is_known(name) {
+                return Err(format!("app '{}' is not loaded", name));
+            }
+        }
+
+        // Read WASM bytes from KV
+        let wasm_bytes = {
+            let kv = enclave_os_kvstore::kv_store()
+                .ok_or_else(|| format!("KV store unavailable — cannot lazy-load app '{}'", name))?;
+            let kv = kv.lock()
+                .map_err(|_| String::from("KV store lock poisoned"))?;
+            kv.get(&kv_bytes_key(name))
+                .map_err(|e| format!("KV read failed for app '{}': {}", name, e))?
+                .ok_or_else(|| format!("WASM bytes not found in KV for app '{}'", name))?
+        };
+
+        // Compile and insert into loaded map
+        let mut reg = self.registry.lock()
+            .map_err(|_| String::from("registry lock poisoned"))?;
+        reg.ensure_loaded(name, &wasm_bytes)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -380,6 +530,23 @@ impl WasmModule {
 impl EnclaveModule for WasmModule {
     fn name(&self) -> &str {
         "wasm"
+    }
+
+    /// Return identities for **all** known (persisted) WASM apps so
+    /// that the CertStore registers per-app certificates on startup —
+    /// even before the first `wasm_call` triggers lazy compilation.
+    fn app_identities(&self) -> Vec<AppIdentity> {
+        let registry = match self.registry.lock() {
+            Ok(r) => r,
+            Err(_) => return Vec::new(),
+        };
+
+        registry.all_code_hashes()
+            .iter()
+            .filter_map(|(name, _)| {
+                registry.get_known(name).map(|meta| build_app_identity(meta))
+            })
+            .collect()
     }
 
     /// Handle a client request.
@@ -553,7 +720,7 @@ impl EnclaveModule for WasmModule {
 
     /// Config Merkle leaves for attestation.
     ///
-    /// Each loaded app contributes two leaves:
+    /// Each known app contributes two leaves:
     ///   - `wasm.<app_name>.code_hash` = SHA-256 of the WASM bytecode
     ///   - `wasm.<app_name>.key_source` = `"generated"` or `"byok:<fingerprint>"`
     fn config_leaves(&self) -> Vec<ConfigLeaf> {
@@ -582,7 +749,7 @@ impl EnclaveModule for WasmModule {
     fn custom_oids(&self) -> Vec<ModuleOid> {
         let combined = self.combined_apps_hash();
 
-        // Only include the OID if at least one app is loaded.
+        // Only include the OID if at least one app is known.
         if combined == [0u8; 32] {
             return Vec::new();
         }
@@ -597,6 +764,38 @@ impl EnclaveModule for WasmModule {
 // ---------------------------------------------------------------------------
 //  Helpers
 // ---------------------------------------------------------------------------
+
+/// Build an [`AppIdentity`] from persisted metadata for CertStore registration.
+fn build_app_identity(meta: &AppMeta) -> AppIdentity {
+    let mut config = vec![
+        ConfigEntry {
+            key: format!("wasm.{}.code_hash", meta.name),
+            value: meta.code_hash.to_vec(),
+            oid: Some(enclave_os_common::oids::APP_CODE_HASH_OID),
+        },
+        ConfigEntry {
+            key: format!("wasm.{}.key_source", meta.name),
+            value: meta.key_source.as_bytes().to_vec(),
+            oid: Some(enclave_os_common::oids::APP_KEY_SOURCE_OID),
+        },
+    ];
+    if let Some(ph) = meta.permissions_hash {
+        config.push(ConfigEntry {
+            key: format!("wasm.{}.permissions_hash", meta.name),
+            value: ph.to_vec(),
+            oid: Some(enclave_os_common::oids::APP_PERMISSIONS_HASH_OID),
+        });
+    }
+    AppIdentity {
+        hostname: meta.hostname.clone(),
+        config,
+    }
+}
+
+/// Register an app's identity with the global CertStore.
+fn register_app_identity(meta: &AppMeta) {
+    enclave_os_common::ocall::cert_store_register(build_app_identity(meta));
+}
 
 /// Serialize any `Serialize` value to JSON bytes, falling back to an error
 /// JSON blob if serialization itself fails.

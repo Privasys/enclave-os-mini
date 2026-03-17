@@ -46,12 +46,41 @@ use std::vec::Vec;
 
 use ring::digest;
 use ring::rand::{SecureRandom, SystemRandom};
+use serde::{Serialize, Deserialize};
 use wasmtime::component::{Component, Func, Val};
 
 use crate::engine::WasmEngine;
 use enclave_os_common::types::AEAD_KEY_SIZE;
 use crate::protocol::{AppPermissions, ExportedFunc, FunctionPolicy, WasmParam, WasmResult, WasmValue};
 use crate::wasi::AppContext;
+
+/// Maximum number of compiled WASM components kept in memory.
+///
+/// Enclave Page Cache (EPC) is limited, so we cap the number of
+/// simultaneously compiled apps and evict the least-recently-used
+/// when the limit is reached.  Apps evicted from memory remain
+/// persisted in the sealed KV store and are reloaded on demand.
+const MAX_LOADED_APPS: usize = 10;
+
+// ---------------------------------------------------------------------------
+//  Persisted app metadata
+// ---------------------------------------------------------------------------
+
+/// Serialisable metadata for a WASM app persisted in the sealed KV store.
+///
+/// This is compact enough to keep in memory for *all* known apps,
+/// even when the compiled component is evicted to save EPC.
+#[derive(Clone, Serialize, Deserialize)]
+pub struct AppMeta {
+    pub name: String,
+    pub hostname: String,
+    pub code_hash: [u8; 32],
+    pub encryption_key: [u8; AEAD_KEY_SIZE],
+    pub key_source: String,
+    pub permissions: Option<AppPermissions>,
+    pub permissions_hash: Option<[u8; 32]>,
+    pub max_fuel: u64,
+}
 
 // ---------------------------------------------------------------------------
 //  LoadedApp
@@ -112,13 +141,23 @@ impl LoadedApp {
 //  AppRegistry
 // ---------------------------------------------------------------------------
 
-/// Registry of loaded WASM apps.
+/// Registry of WASM apps with LRU-managed compiled components.
 ///
-/// Maintains a name→app mapping and provides load / call / unload
-/// operations.  The engine is shared across all apps.
+/// Two-tier architecture:
+/// - **`known`**: Metadata for *all* persisted apps. Always in memory.
+/// - **`loaded`**: Compiled components for recently-used apps (max
+///   [`MAX_LOADED_APPS`]).  Evicted apps stay in `known` and are
+///   recompiled on demand from KV-stored bytes.
 pub struct AppRegistry {
     engine: WasmEngine,
-    apps: BTreeMap<String, LoadedApp>,
+    /// All known apps (metadata only). Always in memory.
+    known: BTreeMap<String, AppMeta>,
+    /// Currently compiled apps (LRU-managed).
+    loaded: BTreeMap<String, LoadedApp>,
+    /// LRU tracking: name → monotonic counter. Higher = more recent.
+    lru: BTreeMap<String, u64>,
+    /// Monotonic counter incremented on each access.
+    lru_counter: u64,
 }
 
 impl AppRegistry {
@@ -126,7 +165,10 @@ impl AppRegistry {
     pub fn new(engine: WasmEngine) -> Self {
         Self {
             engine,
-            apps: BTreeMap::new(),
+            known: BTreeMap::new(),
+            loaded: BTreeMap::new(),
+            lru: BTreeMap::new(),
+            lru_counter: 0,
         }
     }
 
@@ -156,8 +198,8 @@ impl AppRegistry {
         encryption_key: Option<[u8; AEAD_KEY_SIZE]>,
         permissions: Option<AppPermissions>,
         max_fuel: u64,
-    ) -> Result<(), String> {
-        if self.apps.contains_key(name) {
+    ) -> Result<AppMeta, String> {
+        if self.known.contains_key(name) {
             return Err(format!("app '{}' is already loaded", name));
         }
 
@@ -224,7 +266,19 @@ impl AppRegistry {
             }
         }
 
-        self.apps.insert(
+        let meta = AppMeta {
+            name: name.to_string(),
+            hostname: hostname.to_string(),
+            code_hash,
+            encryption_key: app_key,
+            key_source: key_source.clone(),
+            permissions: permissions.clone(),
+            permissions_hash,
+            max_fuel,
+        };
+        self.known.insert(name.to_string(), meta.clone());
+
+        self.loaded.insert(
             name.to_string(),
             LoadedApp {
                 name: name.to_string(),
@@ -239,94 +293,172 @@ impl AppRegistry {
                 max_fuel,
             },
         );
+        self.touch(name);
+        self.evict_if_needed();
 
+        Ok(meta)
+    }
+
+    /// Register metadata for a persisted app without compiling it.
+    ///
+    /// Used during startup to restore app identities from the sealed
+    /// KV store.  The component stays uncompiled until the first
+    /// `wasm_call` triggers [`ensure_loaded()`](Self::ensure_loaded).
+    pub fn register_known(&mut self, meta: AppMeta) {
+        self.known.insert(meta.name.clone(), meta);
+    }
+
+    /// Compile a known-but-unloaded app from its WASM bytes.
+    ///
+    /// If the app is already compiled, this just refreshes its LRU
+    /// position.  Otherwise it deserialises the AOT component, inserts
+    /// it into the `loaded` map, and evicts the least-recently-used
+    /// app if the cache is full.
+    pub fn ensure_loaded(&mut self, name: &str, wasm_bytes: &[u8]) -> Result<(), String> {
+        if self.loaded.contains_key(name) {
+            self.touch(name);
+            return Ok(());
+        }
+
+        let meta = self.known.get(name)
+            .ok_or_else(|| format!("unknown app: '{}'", name))?
+            .clone();
+
+        let component = self.engine.deserialize(wasm_bytes)?;
+        let discovered = self.engine.discover_exports(&component);
+        let mut exports = BTreeMap::new();
+        for (func_name, params, results) in &discovered {
+            exports.insert(func_name.clone(), (*params, *results));
+        }
+
+        self.loaded.insert(name.to_string(), LoadedApp {
+            name: meta.name,
+            hostname: meta.hostname,
+            code_hash: meta.code_hash,
+            encryption_key: meta.encryption_key,
+            key_source: meta.key_source,
+            component,
+            exports,
+            permissions: meta.permissions,
+            permissions_hash: meta.permissions_hash,
+            max_fuel: meta.max_fuel,
+        });
+        self.touch(name);
+        self.evict_if_needed();
         Ok(())
     }
 
-    /// Unload an app by name. Returns the hostname if found.
-    pub fn unload_app(&mut self, name: &str) -> Option<String> {
-        self.apps.remove(name).map(|app| app.hostname)
+    /// Remove an app from both `known` and `loaded` maps.
+    ///
+    /// Returns the hostname if found.
+    pub fn remove_app(&mut self, name: &str) -> Option<String> {
+        self.loaded.remove(name);
+        self.lru.remove(name);
+        self.known.remove(name).map(|m| m.hostname)
     }
 
-    /// List all loaded apps with their metadata.
+    /// List all known apps with their metadata.
+    ///
+    /// Apps that are currently compiled in memory have their exports
+    /// populated; evicted apps show an empty export list.
     pub fn list_apps(&self) -> Vec<crate::protocol::AppInfo> {
-        self.apps
+        self.known
             .values()
-            .map(|app| crate::protocol::AppInfo {
-                name: app.name.clone(),
-                hostname: app.hostname.clone(),
-                code_hash: enclave_os_common::hex::hex_encode(&app.code_hash),
-                key_source: app.key_source.clone(),
-                exports: app.exported_funcs(),
-                permissions_hash: app.permissions_hash.map(|h| enclave_os_common::hex::hex_encode(&h)),
-                max_fuel: app.max_fuel,
+            .map(|meta| {
+                let exports = self.loaded.get(&meta.name)
+                    .map(|app| app.exported_funcs())
+                    .unwrap_or_default();
+                crate::protocol::AppInfo {
+                    name: meta.name.clone(),
+                    hostname: meta.hostname.clone(),
+                    code_hash: enclave_os_common::hex::hex_encode(&meta.code_hash),
+                    key_source: meta.key_source.clone(),
+                    exports,
+                    permissions_hash: meta.permissions_hash.map(|h| enclave_os_common::hex::hex_encode(&h)),
+                    max_fuel: meta.max_fuel,
+                    loaded: self.loaded.contains_key(&meta.name),
+                }
             })
             .collect()
     }
 
-    /// Get the code hash for an app (for attestation).
+    /// Get the code hash for a known app (for attestation).
     pub fn app_code_hash(&self, name: &str) -> Option<&[u8; 32]> {
-        self.apps.get(name).map(|app| &app.code_hash)
+        self.known.get(name).map(|m| &m.code_hash)
     }
 
-    /// Get the key-source string for an app.
+    /// Get the key-source string for a known app.
     ///
     /// Returns `"generated"` or `"byok:<fingerprint>"`.
     pub fn app_key_source(&self, name: &str) -> Option<&str> {
-        self.apps.get(name).map(|app| app.key_source.as_str())
+        self.known.get(name).map(|m| m.key_source.as_str())
     }
 
-    /// Get all loaded apps' code hashes (sorted by name).
+    /// Get all known apps' code hashes (sorted by name).
     pub fn all_code_hashes(&self) -> Vec<(&str, &[u8; 32])> {
-        self.apps
+        self.known
             .iter()
-            .map(|(name, app)| (name.as_str(), &app.code_hash))
+            .map(|(name, meta)| (name.as_str(), &meta.code_hash))
             .collect()
     }
 
-    /// Get all loaded apps' attestation metadata (sorted by name).
+    /// Get all known apps' attestation metadata (sorted by name).
     ///
-    /// Returns `(name, code_hash, key_source)` for each loaded app.
+    /// Returns `(name, code_hash, key_source)` for each known app.
     pub fn all_app_metadata(&self) -> Vec<(&str, &[u8; 32], &str)> {
-        self.apps
+        self.known
             .iter()
-            .map(|(name, app)| (name.as_str(), &app.code_hash, app.key_source.as_str()))
+            .map(|(name, meta)| (name.as_str(), &meta.code_hash, meta.key_source.as_str()))
             .collect()
     }
 
-    /// Get the permissions hash for an app (for OID 3.5 attestation).
+    /// Get the permissions hash for a known app (for OID 3.5 attestation).
     pub fn app_permissions_hash(&self, name: &str) -> Option<&[u8; 32]> {
-        self.apps.get(name).and_then(|app| app.permissions_hash.as_ref())
+        self.known.get(name).and_then(|m| m.permissions_hash.as_ref())
     }
 
-    /// Get the permissions policy for an app (for call-time enforcement).
+    /// Get the permissions policy for a known app (for call-time enforcement).
     pub fn app_permissions(&self, name: &str) -> Option<&AppPermissions> {
-        self.apps.get(name).and_then(|app| app.permissions.as_ref())
+        self.known.get(name).and_then(|m| m.permissions.as_ref())
+    }
+
+    /// Whether an app is known (persisted) but not necessarily compiled.
+    pub fn is_known(&self, name: &str) -> bool {
+        self.known.contains_key(name)
+    }
+
+    /// Whether an app is currently compiled in memory.
+    pub fn is_loaded(&self, name: &str) -> bool {
+        self.loaded.contains_key(name)
+    }
+
+    /// Get metadata for a known app.
+    pub fn get_known(&self, name: &str) -> Option<&AppMeta> {
+        self.known.get(name)
     }
 
     /// Call an exported function on a loaded app.
     ///
-    /// This creates a fresh [`Store`] + [`Instance`] for each call
-    /// (stateless execution model).  The instance is discarded after the
-    /// call completes.
+    /// The app **must** already be in the `loaded` map (call
+    /// [`ensure_loaded()`](Self::ensure_loaded) first).  Touches the
+    /// LRU counter so the app is less likely to be evicted.
     ///
     /// Returns the [`WasmResult`] and the fuel consumed (0 on error
     /// before execution starts).
-    ///
-    /// [`Store`]: wasmtime::Store
-    /// [`Instance`]: wasmtime::component::Instance
     pub fn call(
-        &self,
+        &mut self,
         app_name: &str,
         function: &str,
         params: &[WasmParam],
     ) -> (WasmResult, i64) {
+        self.touch(app_name);
+
         // ── Look up app ────────────────────────────────────────────
-        let app = match self.apps.get(app_name) {
+        let app = match self.loaded.get(app_name) {
             Some(a) => a,
             None => {
                 return (WasmResult::Error {
-                    message: format!("unknown app: '{}'", app_name),
+                    message: format!("app '{}' is not loaded", app_name),
                 }, 0);
             }
         };
@@ -493,6 +625,31 @@ impl AppRegistry {
         let returns: Vec<WasmValue> = results.iter().map(val_to_wasm_value).collect();
 
         (WasmResult::Ok { returns }, fuel_consumed)
+    }
+
+    // ── LRU helpers ────────────────────────────────────────────────
+
+    /// Mark an app as recently used.
+    fn touch(&mut self, name: &str) {
+        self.lru_counter += 1;
+        self.lru.insert(name.to_string(), self.lru_counter);
+    }
+
+    /// Evict the least-recently-used compiled app if over the limit.
+    fn evict_if_needed(&mut self) {
+        while self.loaded.len() > MAX_LOADED_APPS {
+            let oldest = self.lru.iter()
+                .filter(|(name, _)| self.loaded.contains_key(name.as_str()))
+                .min_by_key(|(_, &counter)| counter)
+                .map(|(name, _)| name.clone());
+
+            if let Some(name) = oldest {
+                self.loaded.remove(&name);
+                self.lru.remove(&name);
+            } else {
+                break;
+            }
+        }
     }
 }
 
