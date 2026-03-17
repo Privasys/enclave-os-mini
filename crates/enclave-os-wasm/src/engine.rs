@@ -217,4 +217,142 @@ impl WasmEngine {
 
         exports
     }
+
+    /// Discover exported functions with **full WIT type information**.
+    ///
+    /// Unlike [`discover_exports()`](Self::discover_exports) which only
+    /// returns counts, this method extracts the complete type signature
+    /// for every parameter and return value.  The result is an
+    /// [`AppSchema`](crate::protocol::AppSchema) suitable for serving
+    /// via `wasm_schema` and generating protobuf descriptors.
+    pub fn discover_exports_typed(
+        &self,
+        app_name: &str,
+        hostname: &str,
+        component: &Component,
+    ) -> crate::protocol::AppSchema {
+        use wasmtime::component::types::ComponentItem;
+
+        let ty = component.component_type();
+        let mut functions = Vec::new();
+        let mut interfaces = Vec::new();
+
+        for (name, item) in ty.exports(&self.engine) {
+            match item {
+                ComponentItem::ComponentFunc(func_ty) => {
+                    functions.push(func_type_to_schema(&name, &func_ty));
+                }
+                ComponentItem::ComponentInstance(inst_ty) => {
+                    let mut iface_fns = Vec::new();
+                    for (func_name, nested) in inst_ty.exports(&self.engine) {
+                        if let ComponentItem::ComponentFunc(func_ty) = nested {
+                            iface_fns.push(func_type_to_schema(&func_name, &func_ty));
+                        }
+                    }
+                    if !iface_fns.is_empty() {
+                        interfaces.push(crate::protocol::InterfaceSchema {
+                            name: name.to_string(),
+                            functions: iface_fns,
+                        });
+                    }
+                }
+                _ => {}
+            }
+        }
+
+        crate::protocol::AppSchema {
+            name: app_name.to_string(),
+            hostname: hostname.to_string(),
+            functions,
+            interfaces,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  WIT type conversion helpers
+// ---------------------------------------------------------------------------
+
+/// Convert a wasmtime [`ComponentFunc`] type to a [`FunctionSchema`].
+fn func_type_to_schema(
+    name: &str,
+    func_ty: &wasmtime::component::types::ComponentFunc,
+) -> crate::protocol::FunctionSchema {
+    let params = func_ty.params()
+        .map(|(pname, ty)| crate::protocol::ParamSchema {
+            name: pname.to_string(),
+            ty: wit_type_from(&ty),
+        })
+        .collect();
+    let results = func_ty.results()
+        .enumerate()
+        .map(|(i, ty)| crate::protocol::ParamSchema {
+            name: format!("ret{}", i),
+            ty: wit_type_from(&ty),
+        })
+        .collect();
+    crate::protocol::FunctionSchema {
+        name: name.to_string(),
+        params,
+        results,
+    }
+}
+
+/// Convert a wasmtime Component Model [`Type`] to a serialisable [`WitType`].
+fn wit_type_from(ty: &wasmtime::component::types::Type) -> crate::protocol::WitType {
+    use wasmtime::component::types::Type;
+    use crate::protocol::WitType;
+
+    match ty {
+        Type::Bool => WitType::Bool,
+        Type::S8 => WitType::S8,
+        Type::U8 => WitType::U8,
+        Type::S16 => WitType::S16,
+        Type::U16 => WitType::U16,
+        Type::S32 => WitType::S32,
+        Type::U32 => WitType::U32,
+        Type::S64 => WitType::S64,
+        Type::U64 => WitType::U64,
+        Type::Float32 => WitType::Float32,
+        Type::Float64 => WitType::Float64,
+        Type::Char => WitType::Char,
+        Type::String => WitType::String,
+        Type::List(l) => WitType::List {
+            element: Box::new(wit_type_from(&l.ty())),
+        },
+        Type::Record(r) => WitType::Record {
+            fields: r.fields()
+                .map(|f| crate::protocol::FieldSchema {
+                    name: f.name.to_string(),
+                    ty: wit_type_from(&f.ty),
+                })
+                .collect(),
+        },
+        Type::Tuple(t) => WitType::Tuple {
+            elements: t.types().map(|ty| wit_type_from(&ty)).collect(),
+        },
+        Type::Variant(v) => WitType::Variant {
+            cases: v.cases()
+                .map(|c| crate::protocol::CaseSchema {
+                    name: c.name.to_string(),
+                    ty: c.ty.map(|t| wit_type_from(&t)),
+                })
+                .collect(),
+        },
+        Type::Enum(e) => WitType::Enum {
+            names: e.names().map(|n| n.to_string()).collect(),
+        },
+        Type::Option(o) => WitType::Option {
+            inner: Box::new(wit_type_from(&o.ty())),
+        },
+        Type::Result(r) => WitType::Result {
+            ok: r.ok().map(|t| Box::new(wit_type_from(&t))),
+            err: r.err().map(|t| Box::new(wit_type_from(&t))),
+        },
+        Type::Flags(f) => WitType::Flags {
+            names: f.names().map(|n| n.to_string()).collect(),
+        },
+        // Resources — not yet supported in the wire protocol.
+        _ => WitType::String,
+    }
 }

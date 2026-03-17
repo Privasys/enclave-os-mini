@@ -51,6 +51,14 @@ pub struct WasmEnvelope {
     /// List all loaded WASM apps (no payload needed, just `"wasm_list": {}`).
     #[serde(default)]
     pub wasm_list: Option<WasmList>,
+
+    /// Get the full typed API schema for a WASM app.
+    #[serde(default)]
+    pub wasm_schema: Option<WasmSchemaRequest>,
+
+    /// Connect-protocol-style function call (named params as JSON object).
+    #[serde(default)]
+    pub connect_call: Option<ConnectCall>,
 }
 
 // ---------------------------------------------------------------------------
@@ -134,6 +142,40 @@ pub struct WasmUnload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WasmList {}
 
+/// Request the typed API schema for a WASM app.
+///
+/// ```json
+/// { "wasm_schema": { "app": "my-app" } }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WasmSchemaRequest {
+    /// App identifier.
+    pub app: String,
+}
+
+/// Connect-protocol-style function call.
+///
+/// Instead of positional [`WasmParam`] values, the caller sends a JSON
+/// object with named fields.  The enclave uses the function's WIT schema
+/// to convert names to positional parameters.
+///
+/// ```json
+/// { "connect_call": { "app": "my-app", "function": "get", "body": {"key": "hello"} } }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConnectCall {
+    /// App identifier.
+    pub app: String,
+    /// Function name (or qualified `interface/function`).
+    pub function: String,
+    /// Named parameters as a JSON object.
+    #[serde(default)]
+    pub body: serde_json::Value,
+    /// App-level OIDC bearer token (same semantics as [`WasmCall::app_auth`]).
+    #[serde(default)]
+    pub app_auth: Option<String>,
+}
+
 /// Result of a management operation (load / unload / list).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status")]
@@ -167,6 +209,12 @@ pub enum WasmManagementResult {
     Error {
         /// Human-readable error message.
         message: String,
+    },
+    /// App schema response.
+    #[serde(rename = "schema")]
+    Schema {
+        /// Full typed API schema.
+        schema: AppSchema,
     },
 }
 
@@ -404,4 +452,154 @@ fn default_policy() -> FunctionPolicy {
 
 fn default_roles_claim() -> String {
     "roles".into()
+}
+
+// ---------------------------------------------------------------------------
+//  WIT type descriptors & API schema
+// ---------------------------------------------------------------------------
+
+/// Serialisable WIT type descriptor.
+///
+/// Represents the full WIT type system: scalars, strings, lists, records,
+/// variants, options, results, tuples, enums, and flags.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "lowercase")]
+pub enum WitType {
+    Bool,
+    U8,
+    U16,
+    U32,
+    U64,
+    S8,
+    S16,
+    S32,
+    S64,
+    #[serde(rename = "f32")]
+    Float32,
+    #[serde(rename = "f64")]
+    Float64,
+    Char,
+    String,
+    List {
+        element: Box<WitType>,
+    },
+    Option {
+        inner: Box<WitType>,
+    },
+    Result {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        ok: Option<Box<WitType>>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        err: Option<Box<WitType>>,
+    },
+    Record {
+        fields: Vec<FieldSchema>,
+    },
+    Variant {
+        cases: Vec<CaseSchema>,
+    },
+    Tuple {
+        elements: Vec<WitType>,
+    },
+    Flags {
+        names: Vec<String>,
+    },
+    Enum {
+        names: Vec<String>,
+    },
+}
+
+/// A field within a WIT record type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FieldSchema {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub ty: WitType,
+}
+
+/// A case within a WIT variant type.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CaseSchema {
+    pub name: String,
+    #[serde(rename = "type", skip_serializing_if = "Option::is_none")]
+    pub ty: Option<WitType>,
+}
+
+/// A named + typed parameter or return value.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ParamSchema {
+    pub name: String,
+    #[serde(rename = "type")]
+    pub ty: WitType,
+}
+
+/// Full signature of an exported function.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FunctionSchema {
+    pub name: String,
+    pub params: Vec<ParamSchema>,
+    pub results: Vec<ParamSchema>,
+}
+
+/// An exported interface containing one or more functions.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InterfaceSchema {
+    pub name: String,
+    pub functions: Vec<FunctionSchema>,
+}
+
+/// Complete typed API schema for a WASM app.
+///
+/// Generated from the WIT type information at load time and persisted
+/// in the sealed KV store alongside the app metadata.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppSchema {
+    /// App identifier.
+    pub name: String,
+    /// SNI hostname.
+    pub hostname: String,
+    /// Root-level exported functions (not inside any interface).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub functions: Vec<FunctionSchema>,
+    /// Exported interfaces with their functions.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub interfaces: Vec<InterfaceSchema>,
+}
+
+impl AppSchema {
+    /// Build the exports routing table from the schema.
+    ///
+    /// Returns `(function_name, (param_count, result_count))` pairs
+    /// suitable for the [`LoadedApp`](crate::registry::LoadedApp) exports map.
+    pub fn to_exports_map(&self) -> std::collections::BTreeMap<String, (usize, usize)> {
+        let mut map = std::collections::BTreeMap::new();
+        for f in &self.functions {
+            map.insert(f.name.clone(), (f.params.len(), f.results.len()));
+        }
+        for iface in &self.interfaces {
+            for f in &iface.functions {
+                let qualified = format!("{}/{}", iface.name, f.name);
+                map.insert(qualified, (f.params.len(), f.results.len()));
+            }
+        }
+        map
+    }
+
+    /// Find the schema for a function by name (root or qualified).
+    pub fn find_function(&self, name: &str) -> Option<&FunctionSchema> {
+        // Check root functions first.
+        if let Some(f) = self.functions.iter().find(|f| f.name == name) {
+            return Some(f);
+        }
+        // Check qualified interface/function names.
+        for iface in &self.interfaces {
+            for f in &iface.functions {
+                let qualified = format!("{}/{}", iface.name, f.name);
+                if qualified == name {
+                    return Some(f);
+                }
+            }
+        }
+        None
+    }
 }

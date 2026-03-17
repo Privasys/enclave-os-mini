@@ -758,6 +758,13 @@ fn handle_http_request(
             HttpHandleResult::shutdown()
         }
 
+        // ── Connect-protocol RPC ────────────────────────────────────
+        // POST /rpc/<app>/<function> — named-param call dispatched via WasmEnvelope.
+        // GET  /rpc/<app>/schema    — fetch the app's WIT type schema.
+        (method, path) if path.starts_with("/rpc/") => {
+            handle_rpc_request(method, path, http_req, base_ctx)
+        }
+
         // ── Method mismatch on known paths ──────────────────────────
         (_, "/healthz") | (_, "/readyz") | (_, "/status") | (_, "/metrics")
         | (_, "/attestation-servers") | (_, "/data") | (_, "/shutdown") => {
@@ -969,6 +976,132 @@ fn handle_data_request_http(
         HttpHandleResult::ok(inner)
     } else {
         HttpHandleResult::err(500, "unhandled request")
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Connect-protocol RPC handler
+// ---------------------------------------------------------------------------
+
+/// Handle `/rpc/<app>/<function>` (POST) and `/rpc/<app>/schema` (GET).
+///
+/// Constructs a [`WasmEnvelope`] with a `connect_call` or `wasm_schema`
+/// field and dispatches it via `modules::dispatch` — reusing the existing
+/// WASM module handler pipeline (auth, fuel metering, etc.).
+fn handle_rpc_request(
+    method: &enclave_os_common::protocol::HttpMethod,
+    path: &str,
+    http_req: &enclave_os_common::protocol::HttpRequest,
+    base_ctx: &enclave_os_common::modules::RequestContext,
+) -> HttpHandleResult {
+    use enclave_os_common::protocol::{HttpMethod, Request, Response};
+
+    // Parse path: /rpc/<app>/<function_or_schema>
+    let rest = &path[5..]; // strip "/rpc/"
+    let parts: Vec<&str> = rest.splitn(2, '/').collect();
+    if parts.len() < 2 || parts[0].is_empty() || parts[1].is_empty() {
+        return HttpHandleResult::err(400, "expected /rpc/<app>/<function>");
+    }
+    let app_name = parts[0];
+    let tail = parts[1];
+
+    // Build OIDC claims from auth header (same as /data).
+    let oidc_claims = if crate::oidc_config().is_some() {
+        match verify_auth_header(http_req) {
+            Some(claims) => Some(claims),
+            None if http_req.authorization.is_some() => {
+                return HttpHandleResult::err(401, "invalid or expired token");
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let ctx = enclave_os_common::modules::RequestContext {
+        peer_cert_der: base_ctx.peer_cert_der.clone(),
+        client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
+        oidc_claims,
+    };
+
+    // GET /rpc/<app>/schema → wasm_schema envelope
+    if *method == HttpMethod::Get && tail == "schema" {
+        let envelope = serde_json::json!({
+            "wasm_schema": { "app": app_name }
+        });
+        let body = serde_json::to_vec(&envelope).unwrap_or_default();
+        let req = Request::Data(body);
+        return dispatch_and_respond(req, &ctx);
+    }
+
+    // POST /rpc/<app>/<function> → connect_call envelope
+    if *method != HttpMethod::Post {
+        return HttpHandleResult::err(405, "POST required for /rpc/<app>/<function>");
+    }
+
+    // Parse the request body as a JSON object (the named params).
+    let body_value: serde_json::Value = if http_req.body.is_empty() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        match serde_json::from_slice(&http_req.body) {
+            Ok(v) => v,
+            Err(e) => {
+                return HttpHandleResult::err(
+                    400,
+                    &format!("invalid JSON body: {e}"),
+                );
+            }
+        }
+    };
+
+    // Build app_auth from the body's "app_auth" field if present.
+    let app_auth = body_value.get("app_auth")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
+    // Remove "app_auth" from the body so it doesn't pollute the params.
+    let params_body = if let serde_json::Value::Object(mut map) = body_value {
+        map.remove("app_auth");
+        serde_json::Value::Object(map)
+    } else {
+        body_value
+    };
+
+    let envelope = serde_json::json!({
+        "connect_call": {
+            "app": app_name,
+            "function": tail,
+            "body": params_body,
+            "app_auth": app_auth,
+        }
+    });
+    let body = serde_json::to_vec(&envelope).unwrap_or_default();
+    let req = Request::Data(body);
+    dispatch_and_respond(req, &ctx)
+}
+
+/// Dispatch a `Request::Data` to modules and convert to `HttpHandleResult`.
+fn dispatch_and_respond(
+    req: enclave_os_common::protocol::Request,
+    ctx: &enclave_os_common::modules::RequestContext,
+) -> HttpHandleResult {
+    use enclave_os_common::protocol::Response;
+
+    if let Some(resp) = modules::dispatch(&req, ctx) {
+        match resp {
+            Response::Data(data) => HttpHandleResult::ok(data),
+            Response::Error(msg) => HttpHandleResult {
+                status: 400,
+                body: msg,
+                shutdown: false,
+            },
+            Response::Ok => HttpHandleResult::ok(b"{}".to_vec()),
+            other => HttpHandleResult::ok(
+                serde_json::to_vec(&other).unwrap_or_default(),
+            ),
+        }
+    } else {
+        HttpHandleResult::err(404, "no module handled the request")
     }
 }
 

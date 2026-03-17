@@ -388,6 +388,52 @@ impl WasmModule {
         None // Permitted.
     }
 
+    /// Convert a [`ConnectCall`] (named params as JSON) to a [`WasmCall`]
+    /// (positional [`WasmParam`] values) using the function's schema.
+    fn connect_to_wasm_call(
+        &self,
+        call: &crate::protocol::ConnectCall,
+    ) -> Result<WasmCall, String> {
+        use crate::protocol::{WitType, WasmParam};
+
+        // Look up the function schema from the known map.
+        let registry = self.registry.lock()
+            .map_err(|_| String::from("registry lock poisoned"))?;
+        let meta = registry.get_known(&call.app)
+            .ok_or_else(|| format!("app '{}' is not loaded", call.app))?;
+        let schema = meta.schema.as_ref()
+            .ok_or_else(|| format!("app '{}' has no schema — try reloading it", call.app))?;
+        let func = schema.find_function(&call.function)
+            .ok_or_else(|| format!(
+                "function '{}' not found in app '{}'. Available: [{}]",
+                call.function,
+                call.app,
+                schema.functions.iter().map(|f| f.name.as_str())
+                    .chain(schema.interfaces.iter().flat_map(|i| {
+                        i.functions.iter().map(move |f| f.name.as_str())
+                    }))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+            ))?;
+
+        // Convert named JSON fields to positional WasmParam values.
+        let body = call.body.as_object();
+        let mut params = Vec::with_capacity(func.params.len());
+        for ps in &func.params {
+            let val = body
+                .and_then(|o| o.get(&ps.name))
+                .unwrap_or(&serde_json::Value::Null);
+            params.push(json_to_wasm_param(val, &ps.ty, &ps.name)?);
+        }
+
+        Ok(WasmCall {
+            app: call.app.clone(),
+            function: call.function.clone(),
+            params,
+            app_auth: call.app_auth.clone(),
+        })
+    }
+
     /// Compute the combined hash of all known apps' code hashes.
     ///
     /// `SHA-256(app1_name || app1_hash || app2_name || app2_hash || …)`
@@ -592,7 +638,8 @@ impl EnclaveModule for WasmModule {
         // ── Platform OIDC role gate (load/unload/list) ──────────────
         let needs_manager = envelope.wasm_load.is_some()
             || envelope.wasm_unload.is_some();
-        let needs_monitoring = envelope.wasm_list.is_some();
+        let needs_monitoring = envelope.wasm_list.is_some()
+            || envelope.wasm_schema.is_some();
 
         if needs_manager {
             if let Some(ref claims) = ctx.oidc_claims {
@@ -705,6 +752,50 @@ impl EnclaveModule for WasmModule {
             return Some(Response::Data(serialize_or_error(&mgmt_result)));
         }
 
+        // 5. wasm_schema — typed API schema for a single app
+        if let Some(ref schema_req) = envelope.wasm_schema {
+            let registry = match self.registry.lock() {
+                Ok(r) => r,
+                Err(_) => {
+                    let mgmt_result = WasmManagementResult::Error {
+                        message: String::from("registry lock poisoned"),
+                    };
+                    return Some(Response::Data(serialize_or_error(&mgmt_result)));
+                }
+            };
+            let mgmt_result = match registry.get_known(&schema_req.app) {
+                Some(meta) => match &meta.schema {
+                    Some(s) => WasmManagementResult::Schema { schema: s.clone() },
+                    None => WasmManagementResult::Error {
+                        message: format!(
+                            "app '{}' has no schema — try reloading it",
+                            schema_req.app,
+                        ),
+                    },
+                },
+                None => WasmManagementResult::NotFound { name: schema_req.app.clone() },
+            };
+            return Some(Response::Data(serialize_or_error(&mgmt_result)));
+        }
+
+        // 6. connect_call — named-param function call (Connect protocol)
+        if let Some(ref call) = envelope.connect_call {
+            // Translate to a WasmCall using the function schema.
+            let wasm_call = match self.connect_to_wasm_call(call) {
+                Ok(c) => c,
+                Err(msg) => {
+                    let err = WasmResult::Error { message: msg };
+                    return Some(Response::Data(serialize_or_error(&err)));
+                }
+            };
+            // Re-use the same permission + dispatch path as wasm_call.
+            if let Some(err_response) = self.check_app_permissions(&wasm_call) {
+                return Some(err_response);
+            }
+            let result = self.dispatch_call(&wasm_call);
+            return Some(Response::Data(serialize_or_error(&result)));
+        }
+
         // No recognised field — decline so other modules can try.
         None
     }
@@ -807,6 +898,64 @@ fn serialize_or_error<T: serde::Serialize>(value: &T) -> Vec<u8> {
                 message: format!("result serialization failed: {}", e),
             };
             serde_json::to_vec(&fallback).unwrap_or_default()
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Connect protocol: JSON → WasmParam conversion
+// ---------------------------------------------------------------------------
+
+/// Convert a JSON value to a [`WasmParam`] based on the WIT type descriptor.
+fn json_to_wasm_param(
+    val: &serde_json::Value,
+    ty: &crate::protocol::WitType,
+    name: &str,
+) -> Result<crate::protocol::WasmParam, String> {
+    use crate::protocol::{WitType, WasmParam};
+    match ty {
+        WitType::Bool => val.as_bool()
+            .map(WasmParam::Bool)
+            .ok_or_else(|| format!("param '{}': expected bool", name)),
+        WitType::U8 | WitType::U16 | WitType::U32 => val.as_u64()
+            .map(|n| WasmParam::U32(n as u32))
+            .ok_or_else(|| format!("param '{}': expected unsigned integer", name)),
+        WitType::U64 => val.as_u64()
+            .map(WasmParam::U64)
+            .ok_or_else(|| format!("param '{}': expected u64", name)),
+        WitType::S8 | WitType::S16 | WitType::S32 => val.as_i64()
+            .map(|n| WasmParam::S32(n as i32))
+            .ok_or_else(|| format!("param '{}': expected signed integer", name)),
+        WitType::S64 => val.as_i64()
+            .map(WasmParam::S64)
+            .ok_or_else(|| format!("param '{}': expected s64", name)),
+        WitType::Float32 => val.as_f64()
+            .map(|n| WasmParam::F32(n as f32))
+            .ok_or_else(|| format!("param '{}': expected float", name)),
+        WitType::Float64 => val.as_f64()
+            .map(WasmParam::F64)
+            .ok_or_else(|| format!("param '{}': expected float", name)),
+        WitType::String | WitType::Char => val.as_str()
+            .map(|s| WasmParam::String(s.to_string()))
+            .ok_or_else(|| format!("param '{}': expected string", name)),
+        WitType::List { element } if matches!(element.as_ref(), WitType::U8) => {
+            // list<u8> → Bytes (base64 string or array of numbers)
+            if let Some(s) = val.as_str() {
+                Ok(WasmParam::Bytes(s.as_bytes().to_vec()))
+            } else if let Some(arr) = val.as_array() {
+                let bytes: Result<Vec<u8>, String> = arr.iter()
+                    .map(|v| v.as_u64()
+                        .map(|n| n as u8)
+                        .ok_or_else(|| format!("param '{}': list<u8> element not a u8", name)))
+                    .collect();
+                Ok(WasmParam::Bytes(bytes?))
+            } else {
+                Err(format!("param '{}': expected string or byte array for list<u8>", name))
+            }
+        }
+        _ => {
+            // For unsupported composite types, pass as JSON string.
+            Ok(WasmParam::String(serde_json::to_string(val).unwrap_or_default()))
         }
     }
 }

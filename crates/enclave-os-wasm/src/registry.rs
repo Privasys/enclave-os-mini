@@ -80,6 +80,12 @@ pub struct AppMeta {
     pub permissions: Option<AppPermissions>,
     pub permissions_hash: Option<[u8; 32]>,
     pub max_fuel: u64,
+    /// Full WIT type schema generated at load time.
+    ///
+    /// `None` for apps persisted before schema support was added —
+    /// a fresh schema is generated when the app is next lazy-loaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub schema: Option<crate::protocol::AppSchema>,
 }
 
 // ---------------------------------------------------------------------------
@@ -232,12 +238,9 @@ impl AppRegistry {
                 (k, String::from("generated"))
             }
         };
-        // ── Introspect exports ─────────────────────────────────────
-        let discovered = self.engine.discover_exports(&component);
-        let mut exports = BTreeMap::new();
-        for (func_name, params, results) in &discovered {
-            exports.insert(func_name.clone(), (*params, *results));
-        }
+        // ── Introspect exports (full WIT type schema) ──────────────
+        let schema = self.engine.discover_exports_typed(name, hostname, &component);
+        let exports = schema.to_exports_map();
 
         if exports.is_empty() {
             return Err(format!(
@@ -275,6 +278,7 @@ impl AppRegistry {
             permissions: permissions.clone(),
             permissions_hash,
             max_fuel,
+            schema: Some(schema),
         };
         self.known.insert(name.to_string(), meta.clone());
 
@@ -325,10 +329,23 @@ impl AppRegistry {
             .clone();
 
         let component = self.engine.deserialize(wasm_bytes)?;
-        let discovered = self.engine.discover_exports(&component);
-        let mut exports = BTreeMap::new();
-        for (func_name, params, results) in &discovered {
-            exports.insert(func_name.clone(), (*params, *results));
+
+        // Prefer building exports from the schema (already in AppMeta)
+        // to avoid redundant introspection. Fall back to runtime
+        // discovery for apps persisted before schema support.
+        let (exports, new_schema) = if let Some(ref s) = meta.schema {
+            (s.to_exports_map(), None)
+        } else {
+            let s = self.engine.discover_exports_typed(&meta.name, &meta.hostname, &component);
+            let e = s.to_exports_map();
+            (e, Some(s))
+        };
+
+        // Back-fill schema into the known map for pre-schema apps.
+        if let Some(ref s) = new_schema {
+            if let Some(km) = self.known.get_mut(name) {
+                km.schema = Some(s.clone());
+            }
         }
 
         self.loaded.insert(name.to_string(), LoadedApp {
