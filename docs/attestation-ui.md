@@ -2,7 +2,7 @@
 
 ## Overview
 
-The Attestation tab provides a browser-based interface for performing **Remote Attestation (RA-TLS)** against a deployed WASM application running inside an SGX enclave. It connects to the enclave, retrieves the x.509 certificate, extracts the SGX quote, and displays all platform and workload attestation extensions — allowing users to cryptographically verify what code is running, what configuration it uses, and that the certificate was freshly generated for their request.
+The Attestation tab provides a browser-based interface for performing **Remote Attestation (RA-TLS)** against a deployed WASM application running inside an SGX enclave. It connects to the enclave, retrieves the x.509 certificate, extracts the SGX quote, and displays all platform and workload attestation extensions, allowing users to cryptographically verify what code is running, what configuration it uses, and that the certificate was freshly generated for their request.
 
 ## How It Works
 
@@ -28,7 +28,7 @@ Before connecting, the user provides (or auto-generates) a **32-byte random hex 
 ReportData = SHA-512( SHA-256(public_key_SPKI_DER) ‖ challenge_nonce )
 ```
 
-This proves the certificate was generated **specifically for this request** — not replayed from a previous connection. The UI auto-generates a random nonce and allows the user to regenerate it.
+This proves the certificate was generated **specifically for this request**, not replayed from a previous connection.
 
 **Deterministic mode**: If no challenge is provided, the enclave uses the certificate's `NotBefore` timestamp as the binding, enabling up to 24-hour caching of certificates (useful for high-traffic scenarios).
 
@@ -42,7 +42,7 @@ After attestation, a color-coded banner shows the verification status:
 | **Red** | ✗ Mismatch | Something went wrong — the computed hash doesn't match. This could indicate replay, tampering, or a bug. |
 | **Amber** | Verifying… | Verification is in progress (auto-fires when results arrive in challenge mode). |
 
-The verification runs **entirely in the browser** using the Web Crypto API — no server-side trust required.
+The verification runs **entirely in the browser** using the Web Crypto API. No server-side trust required.
 
 ### 3. TLS Connection Details
 
@@ -62,7 +62,7 @@ Shows the parsed certificate fields with descriptions and copy buttons:
 | Serial Number | Unique identifier assigned by the issuer |
 | Valid From / Valid Until | Certificate validity window |
 | Signature Algorithm | Cryptographic algorithm used (e.g., `ECDSA with SHA-256`) |
-| Public Key SHA-256 | Fingerprint of the subject's public key — used in ReportData binding |
+| Public Key SHA-256 | Fingerprint of the subject's public key used in ReportData binding |
 
 ### 5. SGX Quote
 
@@ -93,13 +93,13 @@ Enclave-wide configuration attestation. These prove the enclave's runtime state:
 
 ### 7. Workload Attestation Extensions (OIDs 3.x)
 
-Per-workload attestation — retrieved via the **SNI-routed** second connection. Displayed in an emerald-accented section:
+Per-workload attestation, retrieved via the **SNI-routed** second connection. Displayed in an emerald-accented section:
 
 | OID | Label | Description |
 |-----|-------|-------------|
 | `1.3.6.1.4.1.65230.3.1` | Workload Config Merkle Root | Merkle root of the specific workload's configuration tree. |
 | `1.3.6.1.4.1.65230.3.2` | Workload Code Hash | SHA-256 hash of the compiled WASM bytecode (`.cwasm`). Compared against the uploaded hash from the database. |
-| `1.3.6.1.4.1.65230.3.4` | Workload Key Source | How the workload's encryption keys are sourced — typically `generated` (hex-encoded UTF-8). |
+| `1.3.6.1.4.1.65230.3.4` | Workload Key Source | How the workload's encryption keys are sourced, typically `generated` (hex-encoded UTF-8). |
 
 The **Workload Code Hash** (OID 3.2) is automatically compared against the CWASM hash stored in the database from the reproducible build. If they match, a green "✓ Verified — matches uploaded CWASM hash" badge is shown. A mismatch shows a red warning.
 
