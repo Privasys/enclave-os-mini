@@ -168,6 +168,9 @@ impl WasmModule {
                                             "Restored persisted WASM app: {} (hostname={})",
                                             meta.name, meta.hostname,
                                         );
+                                        // Register per-app identity with the global CertStore
+                                        // so SNI-based attestation works after restart.
+                                        register_app_identity(&meta);
                                         registry.register_known(meta);
                                     }
                                     Err(e) => {
