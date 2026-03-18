@@ -227,6 +227,11 @@ pub struct HttpRequest {
     pub path: String,
     /// Bearer token value (without the `"Bearer "` prefix), if present.
     pub authorization: Option<String>,
+    /// App-level OIDC bearer token from the `X-App-Auth` header.
+    ///
+    /// Separate from `authorization` (platform OIDC) so that app-level
+    /// permissions can use a different OIDC provider.
+    pub app_auth: Option<String>,
     /// Request body (empty for GET).
     pub body: Vec<u8>,
     /// Whether the client sent `Connection: close`.
@@ -277,6 +282,7 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
     // Extract relevant headers
     let mut content_length: Option<usize> = None;
     let mut authorization: Option<String> = None;
+    let mut app_auth: Option<String> = None;
     let mut connection_close = false;
 
     for h in req.headers.iter() {
@@ -290,6 +296,13 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
             if let Ok(val) = core::str::from_utf8(h.value) {
                 if let Some(token) = val.strip_prefix("Bearer ") {
                     authorization = Some(token.to_string());
+                }
+            }
+        } else if h.name.eq_ignore_ascii_case("x-app-auth") {
+            if let Ok(val) = core::str::from_utf8(h.value) {
+                let val = val.trim();
+                if !val.is_empty() {
+                    app_auth = Some(val.to_string());
                 }
             }
         } else if h.name.eq_ignore_ascii_case("connection") {
@@ -320,6 +333,7 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
             method,
             path,
             authorization,
+            app_auth,
             body,
             connection_close,
         },

@@ -68,6 +68,7 @@
 
 pub mod enclave_sdk;
 pub mod engine;
+pub mod jwks_fetcher;
 pub mod metrics;
 pub mod protocol;
 pub mod registry;
@@ -391,6 +392,73 @@ impl WasmModule {
         None // Permitted.
     }
 
+    /// Enforce per-app permission policy on a `wasm_schema` request.
+    ///
+    /// Returns `Some(Response)` with an error if access is denied,
+    /// or `None` if schema access is permitted.
+    ///
+    /// **Logic**:
+    /// - App has no permissions → schema is public.
+    /// - App has permissions → check `schema_policy`:
+    ///   - `public` → allow without auth.
+    ///   - `authenticated` → require a valid token from the app's OIDC.
+    ///   - `role` → require a valid token with at least one of `schema_roles`.
+    fn check_schema_permissions(&self, req: &WasmSchemaRequest) -> Option<Response> {
+        let registry = self.registry.lock().ok()?;
+        let permissions = match registry.app_permissions(&req.app) {
+            Some(p) => p.clone(),
+            None => return None, // No permissions → schema is public.
+        };
+        drop(registry);
+
+        if permissions.schema_policy == FunctionPolicy::Public {
+            return None;
+        }
+
+        let token_str = match req.app_auth.as_deref() {
+            Some(t) => t,
+            None => {
+                let err = WasmManagementResult::Error {
+                    message: format!(
+                        "authentication required: schema for app '{}' requires a valid token from {}",
+                        req.app, permissions.oidc.issuer,
+                    ),
+                };
+                return Some(Response::Data(serialize_or_error(&err)));
+            }
+        };
+
+        let caller_roles = match verify_app_token(token_str, &permissions.oidc) {
+            Ok(roles) => roles,
+            Err(e) => {
+                let err = WasmManagementResult::Error {
+                    message: format!("app OIDC auth failed: {e}"),
+                };
+                return Some(Response::Data(serialize_or_error(&err)));
+            }
+        };
+
+        if permissions.schema_policy == FunctionPolicy::Authenticated {
+            return None;
+        }
+
+        // Role → check intersection.
+        if !permissions.schema_roles.is_empty() {
+            let has_role = caller_roles.iter().any(|r| permissions.schema_roles.contains(r));
+            if !has_role {
+                let err = WasmManagementResult::Error {
+                    message: format!(
+                        "access denied: schema for app '{}' requires one of {:?}",
+                        req.app, permissions.schema_roles,
+                    ),
+                };
+                return Some(Response::Data(serialize_or_error(&err)));
+            }
+        }
+
+        None // Permitted.
+    }
+
     /// Convert a [`ConnectCall`] (named params as JSON) to a [`WasmCall`]
     /// (positional [`WasmParam`] values) using the function's schema.
     fn connect_to_wasm_call(
@@ -641,8 +709,7 @@ impl EnclaveModule for WasmModule {
         // ── Platform OIDC role gate (load/unload/list) ──────────────
         let needs_manager = envelope.wasm_load.is_some()
             || envelope.wasm_unload.is_some();
-        let needs_monitoring = envelope.wasm_list.is_some()
-            || envelope.wasm_schema.is_some();
+        let needs_monitoring = envelope.wasm_list.is_some();
 
         if needs_manager {
             if let Some(ref claims) = ctx.oidc_claims {
@@ -756,7 +823,17 @@ impl EnclaveModule for WasmModule {
         }
 
         // 5. wasm_schema — typed API schema for a single app
+        //
+        // No platform role required. App-level permissions control
+        // schema visibility: if the app has AppPermissions with a
+        // non-public `schema_policy`, the caller must present a valid
+        // app-level OIDC token. If no AppPermissions, schema is public.
         if let Some(ref schema_req) = envelope.wasm_schema {
+            // App-level schema access control.
+            if let Some(err_response) = self.check_schema_permissions(schema_req) {
+                return Some(err_response);
+            }
+
             let registry = match self.registry.lock() {
                 Ok(r) => r,
                 Err(_) => {
@@ -969,23 +1046,21 @@ fn json_to_wasm_param(
 
 /// Verify a JWT against an app developer's OIDC provider.
 ///
-/// Returns the list of role strings from the token.  Does **not** use the
-/// platform's OIDC config — uses the app's own `AppOidcConfig`.
+/// Performs full JWKS-based ES256 signature verification, then validates
+/// `iss`, `aud`, and `exp` claims.  Returns the list of role strings.
+///
+/// Does **not** use the platform's OIDC config — uses the app's own
+/// `AppOidcConfig`.
 fn verify_app_token(
     token: &str,
     oidc: &crate::protocol::AppOidcConfig,
 ) -> Result<Vec<String>, String> {
-    // Decode JWT claims (header.payload.signature)
-    let parts: Vec<&str> = token.splitn(3, '.').collect();
-    if parts.len() != 3 {
-        return Err("malformed JWT: expected 3 dot-separated parts".into());
-    }
-
-    // Decode payload (base64url → JSON)
-    let payload_bytes = base64_url_decode(parts[1])
-        .map_err(|e| format!("JWT payload base64: {e}"))?;
-    let claims: serde_json::Value = serde_json::from_slice(&payload_bytes)
-        .map_err(|e| format!("JWT payload JSON: {e}"))?;
+    // Verify ES256 signature via JWKS (rejects alg:none, fetches/caches keys)
+    let claims: serde_json::Value = crate::jwks_fetcher::verify_jwt_signature(
+        token,
+        &oidc.issuer,
+        &oidc.jwks_uri,
+    )?;
 
     // Validate issuer
     let iss = claims.get("iss")
@@ -1058,6 +1133,7 @@ fn collect_role_strings(val: &serde_json::Value, out: &mut Vec<String>) {
 }
 
 /// Decode base64url (no padding) to bytes.
+#[allow(dead_code)]
 fn base64_url_decode(input: &str) -> Result<Vec<u8>, String> {
     let standard: String = input.chars().map(|c| match c {
         '-' => '+',

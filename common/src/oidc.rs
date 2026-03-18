@@ -114,6 +114,10 @@ pub struct OidcConfig {
     pub issuer: String,
     /// Expected `aud` claim (e.g. `enclave-os-mini`).
     pub audience: String,
+    /// Optional JWKS URI for token signature verification.
+    /// If empty, auto-discovered from `{issuer}/.well-known/openid-configuration`.
+    #[serde(default)]
+    pub jwks_uri: String,
     /// Role claim path in the token (default: `urn:zitadel:iam:org:project:roles`).
     #[serde(default = "default_role_claim")]
     pub role_claim: String,
@@ -298,6 +302,7 @@ mod tests {
         OidcConfig {
             issuer: "https://auth.privasys.org".into(),
             audience: "enclave-os-mini".into(),
+            jwks_uri: String::new(),
             role_claim: default_role_claim(),
             manager_role: default_manager_role(),
             monitoring_role: default_monitoring_role(),

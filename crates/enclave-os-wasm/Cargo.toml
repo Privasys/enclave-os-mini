@@ -12,8 +12,8 @@ description = "WASM module for enclave-os — WebAssembly Component runtime insi
 name = "enclave_os_wasm"
 
 [dependencies]
-# Shared types, module trait, OCall vtable, hex utils
-enclave-os-common = { path = "../../common" }
+# Shared types, module trait, OCall vtable, hex utils, JWT/JWKS verification
+enclave-os-common = { path = "../../common", features = ["jwt"] }
 enclave-os-kvstore = { path = "../enclave-os-kvstore" }
 enclave-os-egress = { path = "../enclave-os-egress" }
 

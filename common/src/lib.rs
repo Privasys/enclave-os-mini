@@ -24,6 +24,9 @@ pub mod types;
 #[cfg(feature = "jwt")]
 pub mod jwt;
 
+#[cfg(feature = "jwt")]
+pub mod jwks;
+
 pub mod oidc;
 
 #[cfg(feature = "crypto")]

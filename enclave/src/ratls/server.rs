@@ -1030,8 +1030,11 @@ fn handle_rpc_request(
 
     // GET /rpc/<app>/schema → wasm_schema envelope
     if *method == HttpMethod::Get && tail == "schema" {
+        // Pass app_auth from X-App-Auth header so app-level permissions
+        // can gate schema access using the app developer's OIDC provider.
+        let app_auth = http_req.app_auth.as_deref();
         let envelope = serde_json::json!({
-            "wasm_schema": { "app": app_name }
+            "wasm_schema": { "app": app_name, "app_auth": app_auth }
         });
         let body = serde_json::to_vec(&envelope).unwrap_or_default();
         let req = Request::Data(body);
@@ -1111,28 +1114,39 @@ fn dispatch_and_respond(
 
 /// Verify an OIDC bearer token against the global OIDC configuration.
 ///
-/// Validates `iss`, `aud`, and `exp` claims, then extracts roles.
+/// When the `wasm` feature is enabled (which brings in `enclave-os-wasm` and
+/// egress), full ES256 signature verification is performed via JWKS with
+/// automatic key discovery and caching.  The `alg:none` algorithm is
+/// explicitly rejected.
 ///
-/// Signature verification is intentionally deferred: tokens arrive over
-/// RA-TLS (already mutually authenticated), and JWKS fetching would
-/// require egress HTTPS to the provider on every request (or a cache
-/// with TTL-based refresh).  Adding JWKS verification is a future
-/// defence-in-depth enhancement.
+/// When running without egress, falls back to payload-only decoding over the
+/// RA-TLS channel (signature not verified cryptographically).
 fn verify_oidc_token(token: &str) -> Result<enclave_os_common::oidc::OidcClaims, String> {
     let config = crate::oidc_config()
         .ok_or_else(|| "OIDC not configured".to_string())?;
 
-    // Decode JWT claims (header.payload.signature)
-    let parts: Vec<&str> = token.splitn(3, '.').collect();
-    if parts.len() != 3 {
-        return Err("malformed JWT: expected 3 dot-separated parts".into());
-    }
+    // ── Signature verification + payload decode ──────────────────────
+    #[cfg(feature = "wasm")]
+    let claims: serde_json::Value = {
+        enclave_os_wasm::jwks_fetcher::verify_jwt_signature(
+            token,
+            &config.issuer,
+            &config.jwks_uri,
+        )?
+    };
 
-    // Decode payload (base64url → JSON)
-    let payload_bytes = base64_url_decode(parts[1])
-        .map_err(|e| format!("JWT payload base64: {e}"))?;
-    let claims: serde_json::Value = serde_json::from_slice(&payload_bytes)
-        .map_err(|e| format!("JWT payload JSON: {e}"))?;
+    #[cfg(not(feature = "wasm"))]
+    let claims: serde_json::Value = {
+        // Fallback: decode payload without signature check (RA-TLS channel)
+        let parts: Vec<&str> = token.splitn(3, '.').collect();
+        if parts.len() != 3 {
+            return Err("malformed JWT: expected 3 dot-separated parts".into());
+        }
+        let payload_bytes = base64_url_decode(parts[1])
+            .map_err(|e| format!("JWT payload base64: {e}"))?;
+        serde_json::from_slice(&payload_bytes)
+            .map_err(|e| format!("JWT payload JSON: {e}"))?
+    };
 
     // Validate issuer
     let iss = claims.get("iss")
@@ -1173,6 +1187,7 @@ fn verify_oidc_token(token: &str) -> Result<enclave_os_common::oidc::OidcClaims,
 }
 
 /// Decode base64url (no padding) to bytes.
+#[cfg_attr(feature = "wasm", allow(dead_code))]
 fn base64_url_decode(input: &str) -> Result<Vec<u8>, String> {
     // Replace URL-safe chars with standard base64 chars
     let standard: String = input.chars().map(|c| match c {
@@ -1195,6 +1210,7 @@ fn base64_url_decode(input: &str) -> Result<Vec<u8>, String> {
 }
 
 /// Standard base64 decode (with padding).
+#[cfg_attr(feature = "wasm", allow(dead_code))]
 fn base64_decode_standard(input: &str) -> Result<Vec<u8>, String> {
     const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 

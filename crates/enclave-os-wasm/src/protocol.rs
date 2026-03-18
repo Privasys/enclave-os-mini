@@ -151,6 +151,12 @@ pub struct WasmList {}
 pub struct WasmSchemaRequest {
     /// App identifier.
     pub app: String,
+    /// App-level OIDC bearer token (same semantics as [`WasmCall::app_auth`]).
+    ///
+    /// Required when the app has a `permissions` policy with a non-public
+    /// `schema_policy`.
+    #[serde(default)]
+    pub app_auth: Option<String>,
 }
 
 /// Connect-protocol-style function call.
@@ -407,6 +413,15 @@ pub struct AppPermissions {
     /// (e.g. `"process"` or `"my-api/transform"`).
     #[serde(default)]
     pub functions: BTreeMap<String, FunctionPermission>,
+    /// Access policy for the schema endpoint (`wasm_schema` / `GET /rpc/<app>/schema`).
+    ///
+    /// Defaults to `public` — anyone can view the schema.  Set to
+    /// `authenticated` or `role` to restrict schema discovery.
+    #[serde(default = "default_policy")]
+    pub schema_policy: FunctionPolicy,
+    /// Roles required when `schema_policy` is `Role`.
+    #[serde(default)]
+    pub schema_roles: Vec<String>,
 }
 
 /// OIDC provider configuration for an app's own identity provider.
