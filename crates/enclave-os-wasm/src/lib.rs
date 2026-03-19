@@ -85,7 +85,7 @@ use enclave_os_common::modules::{AppIdentity, ConfigEntry, ConfigLeaf, EnclaveMo
 use enclave_os_common::protocol::{Request, Response};
 use enclave_os_common::types::AEAD_KEY_SIZE;
 
-use crate::protocol::{AppPermissions, FunctionPolicy, WasmCall, WasmEnvelope, WasmManagementResult, WasmResult};
+use crate::protocol::{AppPermissions, FunctionPolicy, WasmCall, WasmEnvelope, WasmManagementResult, WasmResult, WasmSchemaRequest};
 use crate::metrics::WasmMetricsStore;
 use crate::registry::AppRegistry;
 
@@ -465,8 +465,6 @@ impl WasmModule {
         &self,
         call: &crate::protocol::ConnectCall,
     ) -> Result<WasmCall, String> {
-        use crate::protocol::{WitType, WasmParam};
-
         // Look up the function schema from the known map.
         let registry = self.registry.lock()
             .map_err(|_| String::from("registry lock poisoned"))?;

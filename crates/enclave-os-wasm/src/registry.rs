@@ -51,8 +51,7 @@ use wasmtime::component::{Component, Func, Val};
 
 use crate::engine::WasmEngine;
 use enclave_os_common::types::AEAD_KEY_SIZE;
-use crate::protocol::{AppPermissions, ExportedFunc, FunctionPolicy, WasmParam, WasmResult, WasmValue};
-use crate::wasi::AppContext;
+use crate::protocol::{AppPermissions, ExportedFunc, WasmParam, WasmResult, WasmValue};
 
 /// Maximum number of compiled WASM components kept in memory.
 ///
@@ -525,7 +524,7 @@ impl AppRegistry {
                 }
             };
             match instance.get_func(&mut store, &iface_idx) {
-                Some(f) => {
+                Some(_) => {
                     // The index resolved the instance; now get the function within it.
                     // We need to look up the function export under the interface.
                     match app
@@ -612,12 +611,9 @@ impl AppRegistry {
         //  Call 
         let call_err = func.call(&mut store, &val_params, &mut results).err();
 
-        // Post-return cleanup (required by the Component Model).
-        let post_err = if call_err.is_none() {
-            func.post_return(&mut store).err()
-        } else {
-            None
-        };
+        // Post-return cleanup — no longer needed per wasmtime deprecation.
+        // func.post_return is a no-op since wasmtime removed post-return requirements.
+        let post_err: Option<wasmtime::Error> = None;
 
         // Flush any remaining partial lines from the guest's stdout/stderr.
         store.data_mut().flush_logs();

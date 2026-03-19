@@ -10,7 +10,6 @@
 use std::collections::BTreeMap;
 use std::string::String;
 use std::sync::Mutex;
-use std::vec::Vec;
 
 use enclave_os_common::jwks::{extract_jwt_kid, JwksCache};
 use enclave_os_egress::client::{https_fetch, mozilla_root_store};

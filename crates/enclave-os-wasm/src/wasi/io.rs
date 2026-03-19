@@ -18,7 +18,7 @@ use wasmtime::component::{Linker, Resource, ResourceType};
 use wasmtime::{AsContextMut, StoreContextMut};
 
 use super::{
-    AppContext, InputStreamRes, IoErrorRes, OutputStreamKind,
+    AppContext, InputStreamRes, IoErrorRes,
     OutputStreamRes, PollableRes,
 };
 

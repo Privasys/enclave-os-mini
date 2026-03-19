@@ -1,10 +1,10 @@
 // Copyright (c) Privasys. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
-//! Compact JWT (JWS) implementation — ECDSA P-256 (ES256) only.
+//! Compact JWT (JWS) implementation — ES256 and RS256.
 //!
 //! This module provides:
-//! - [`JwtVerifier`]: verify and decode JWTs signed with ES256
+//! - [`JwtVerifier`]: verify and decode JWTs signed with ES256 or RS256
 //! - [`encode_jwt`]: create signed JWTs (useful for tests / admin tooling)
 //!
 //! The implementation is intentionally minimal — no `alg` negotiation, no
@@ -17,15 +17,16 @@
 //! BASE64URL(header) . BASE64URL(payload) . BASE64URL(signature)
 //! ```
 //!
-//! - Header **must** be `{"alg":"ES256","typ":"JWT"}` (or without `typ`).
-//! - Signature is the raw IEEE P1363 encoding (64 bytes for P-256).
+//! - Header `alg` must be `ES256` or `RS256`.
+//! - ES256 signature is raw IEEE P1363 encoding (64 bytes for P-256).
+//! - RS256 signature is PKCS#1 v1.5 encoding.
 //!
 //! ## Example
 //!
 //! ```rust,ignore
 //! use enclave_os_common::jwt::JwtVerifier;
 //!
-//! let verifier = JwtVerifier::from_pkcs8_public_key(public_key_der)?;
+//! let verifier = JwtVerifier::from_public_key_bytes(public_key_bytes)?;
 //! let claims: MyClaims = verifier.verify_and_decode(&jwt_bytes)?;
 //! ```
 
@@ -36,14 +37,15 @@ use std::{string::String, vec::Vec, format};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
-use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED};
+use ring::signature::{UnparsedPublicKey, ECDSA_P256_SHA256_FIXED, RSA_PKCS1_2048_8192_SHA256};
 
 // ---------------------------------------------------------------------------
 //  Constants
 // ---------------------------------------------------------------------------
 
-/// Expected `alg` value in the JWT header.
-const EXPECTED_ALG: &str = "ES256";
+/// Supported `alg` values in the JWT header.
+const ALG_ES256: &str = "ES256";
+const ALG_RS256: &str = "RS256";
 
 // ---------------------------------------------------------------------------
 //  JWT header
@@ -64,28 +66,39 @@ struct JwtHeader<'a> {
 //  JwtVerifier
 // ---------------------------------------------------------------------------
 
-/// Verifies compact JWTs signed with ECDSA P-256 (ES256).
+/// Verifies compact JWTs signed with ECDSA P-256 (ES256) or RSA (RS256).
 ///
 /// Create one per trusted public key and reuse it — the key is parsed once
 /// at construction time.
-pub struct JwtVerifier {
-    /// ring public key handle (P-256, fixed-length IEEE P1363 signature).
-    public_key: UnparsedPublicKey<Vec<u8>>,
+pub enum JwtVerifier {
+    /// ECDSA P-256 (ES256) verifier.
+    Es256(UnparsedPublicKey<Vec<u8>>),
+    /// RSA PKCS#1 v1.5 SHA-256 (RS256) verifier.
+    Rs256(UnparsedPublicKey<Vec<u8>>),
 }
 
 impl JwtVerifier {
-    /// Construct a verifier from a raw ECDSA P-256 public key in
+    /// Construct an ES256 verifier from a raw ECDSA P-256 public key in
     /// **uncompressed point** format (65 bytes: `04 || x || y`).
     pub fn from_public_key_bytes(raw: &[u8]) -> Result<Self, String> {
         if raw.len() != 65 || raw[0] != 0x04 {
             return Err("expected 65-byte uncompressed P-256 point (04 || x || y)".into());
         }
-        Ok(Self {
-            public_key: UnparsedPublicKey::new(
-                &ECDSA_P256_SHA256_FIXED,
-                raw.to_vec(),
-            ),
-        })
+        Ok(Self::Es256(UnparsedPublicKey::new(
+            &ECDSA_P256_SHA256_FIXED,
+            raw.to_vec(),
+        )))
+    }
+
+    /// Construct an RS256 verifier from a DER-encoded RSA public key (PKCS#1).
+    pub fn from_rsa_der(der: &[u8]) -> Result<Self, String> {
+        if der.len() < 64 {
+            return Err("RSA public key DER too short".into());
+        }
+        Ok(Self::Rs256(UnparsedPublicKey::new(
+            &RSA_PKCS1_2048_8192_SHA256,
+            der.to_vec(),
+        )))
     }
 
     /// Construct a verifier from a hex-encoded uncompressed public key.
@@ -132,11 +145,15 @@ impl JwtVerifier {
         let header: JwtHeader = serde_json::from_slice(&header_bytes)
             .map_err(|e| format!("jwt header json: {e}"))?;
 
-        if header.alg != EXPECTED_ALG {
-            return Err(format!(
-                "unsupported alg '{}', expected '{EXPECTED_ALG}'",
-                header.alg
-            ));
+        // Verify the algorithm matches the key type
+        match self {
+            Self::Es256(_) if header.alg != ALG_ES256 => {
+                return Err(format!("alg '{}' does not match ES256 key", header.alg));
+            }
+            Self::Rs256(_) if header.alg != ALG_RS256 => {
+                return Err(format!("alg '{}' does not match RS256 key", header.alg));
+            }
+            _ => {}
         }
 
         // --- Decode signature ---
@@ -147,7 +164,11 @@ impl JwtVerifier {
         // --- Verify: message = "header_b64.payload_b64" (ASCII bytes) ---
         let signed_data = &jwt_str[..header_b64.len() + 1 + payload_b64.len()];
 
-        self.public_key
+        let public_key = match self {
+            Self::Es256(k) => k,
+            Self::Rs256(k) => k,
+        };
+        public_key
             .verify(signed_data.as_bytes(), &sig_bytes)
             .map_err(|_| "jwt signature verification failed".to_string())?;
 
@@ -354,7 +375,7 @@ mod tests {
         let (_, pub_bytes) = generate_key_pair();
         let verifier = JwtVerifier::from_public_key_bytes(&pub_bytes).unwrap();
         let err = verifier.verify(jwt.as_bytes()).unwrap_err();
-        assert!(err.contains("unsupported alg"));
+        assert!(err.contains("does not match"), "expected alg mismatch error, got: {err}");
     }
 
     #[test]

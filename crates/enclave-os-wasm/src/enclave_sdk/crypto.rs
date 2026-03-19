@@ -29,7 +29,6 @@ use ring::signature::{self, EcdsaKeyPair, KeyPair};
 use wasmtime::component::{Linker, Val};
 use wasmtime::StoreContextMut;
 
-use super::keystore::{KeyMaterial, KeyStore};
 use super::AppContext;
 
 // =========================================================================
