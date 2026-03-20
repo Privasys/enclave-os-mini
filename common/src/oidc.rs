@@ -13,10 +13,10 @@
 //!
 //! | Role | Default claim value | Scope |
 //! |------|---------------------|-------|
-//! | Manager | `enclave-os-mini:manager` | WASM load/unload, TLS CA rotation, + all monitoring |
-//! | Monitoring | `enclave-os-mini:monitoring` | Read-only health/status/metrics |
-//! | Secret Owner | `enclave-os-mini:secret-owner` | Store/delete/update/list own secrets |
-//! | Secret Manager | `enclave-os-mini:secret-manager` | Issue bearer tokens for GetSecret defence-in-depth |
+//! | Manager | `privasys-platform:manager` | WASM load/unload, TLS CA rotation, + all monitoring |
+//! | Monitoring | `privasys-platform:monitoring` | Read-only health/status/metrics |
+//! | Secret Owner | `privasys-platform:secret-owner` | Store/delete/update/list own secrets |
+//! | Secret Manager | `privasys-platform:secret-manager` | Issue bearer tokens for GetSecret defence-in-depth |
 //!
 //! Manager implies Monitoring.  Secret Owner and Secret Manager are
 //! independent from Manager/Monitoring.
@@ -121,16 +121,16 @@ pub struct OidcConfig {
     /// Role claim path in the token (default: `urn:zitadel:iam:org:project:roles`).
     #[serde(default = "default_role_claim")]
     pub role_claim: String,
-    /// Claim value for the manager role (default: `enclave-os-mini:manager`).
+    /// Claim value for the manager role (default: `privasys-platform:manager`).
     #[serde(default = "default_manager_role")]
     pub manager_role: String,
-    /// Claim value for the monitoring role (default: `enclave-os-mini:monitoring`).
+    /// Claim value for the monitoring role (default: `privasys-platform:monitoring`).
     #[serde(default = "default_monitoring_role")]
     pub monitoring_role: String,
-    /// Claim value for the secret-owner role (default: `enclave-os-mini:secret-owner`).
+    /// Claim value for the secret-owner role (default: `privasys-platform:secret-owner`).
     #[serde(default = "default_secret_owner_role")]
     pub secret_owner_role: String,
-    /// Claim value for the secret-manager role (default: `enclave-os-mini:secret-manager`).
+    /// Claim value for the secret-manager role (default: `privasys-platform:secret-manager`).
     #[serde(default = "default_secret_manager_role")]
     pub secret_manager_role: String,
 }
@@ -139,16 +139,16 @@ fn default_role_claim() -> String {
     "urn:zitadel:iam:org:project:roles".into()
 }
 fn default_manager_role() -> String {
-    "enclave-os-mini:manager".into()
+    "privasys-platform:manager".into()
 }
 fn default_monitoring_role() -> String {
-    "enclave-os-mini:monitoring".into()
+    "privasys-platform:monitoring".into()
 }
 fn default_secret_owner_role() -> String {
-    "enclave-os-mini:secret-owner".into()
+    "privasys-platform:secret-owner".into()
 }
 fn default_secret_manager_role() -> String {
-    "enclave-os-mini:secret-manager".into()
+    "privasys-platform:secret-manager".into()
 }
 
 // ---------------------------------------------------------------------------
@@ -316,8 +316,8 @@ mod tests {
         let config = test_config();
         let claims = json!({
             "urn:zitadel:iam:org:project:roles": {
-                "enclave-os-mini:manager": { "orgId": "123" },
-                "enclave-os-mini:secret-owner": { "orgId": "123" }
+                "privasys-platform:manager": { "orgId": "123" },
+                "privasys-platform:secret-owner": { "orgId": "123" }
             }
         });
         let roles = extract_roles(&claims, &config);
@@ -330,7 +330,7 @@ mod tests {
     fn test_standard_array_format() {
         let config = test_config();
         let claims = json!({
-            "roles": ["enclave-os-mini:monitoring"]
+            "roles": ["privasys-platform:monitoring"]
         });
         let roles = extract_roles(&claims, &config);
         assert!(roles.contains(&OidcRole::Monitoring));
@@ -342,7 +342,7 @@ mod tests {
         let config = test_config();
         let claims = json!({
             "realm_access": {
-                "roles": ["enclave-os-mini:secret-manager"]
+                "roles": ["privasys-platform:secret-manager"]
             }
         });
         let roles = extract_roles(&claims, &config);
@@ -437,10 +437,10 @@ mod tests {
         let config = test_config();
         let claims = json!({
             "urn:zitadel:iam:org:project:roles": {
-                "enclave-os-mini:manager": { "org": "1" },
-                "enclave-os-mini:monitoring": { "org": "1" },
-                "enclave-os-mini:secret-owner": { "org": "1" },
-                "enclave-os-mini:secret-manager": { "org": "1" }
+                "privasys-platform:manager": { "org": "1" },
+                "privasys-platform:monitoring": { "org": "1" },
+                "privasys-platform:secret-owner": { "org": "1" },
+                "privasys-platform:secret-manager": { "org": "1" }
             }
         });
         let roles = extract_roles(&claims, &config);
@@ -453,7 +453,7 @@ mod tests {
         let claims = json!({
             "urn:zitadel:iam:org:project:roles": {
                 "some-other-app:admin": { "org": "1" },
-                "enclave-os-mini:manager": { "org": "1" }
+                "privasys-platform:manager": { "org": "1" }
             }
         });
         let roles = extract_roles(&claims, &config);
@@ -467,9 +467,9 @@ mod tests {
         let config = test_config();
         let claims = json!({
             "urn:zitadel:iam:org:project:roles": {
-                "enclave-os-mini:manager": { "org": "1" }
+                "privasys-platform:manager": { "org": "1" }
             },
-            "roles": ["enclave-os-mini:manager"]
+            "roles": ["privasys-platform:manager"]
         });
         let roles = extract_roles(&claims, &config);
         assert_eq!(roles.len(), 1);

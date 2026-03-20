@@ -57,7 +57,7 @@ is handled at the core level (see `SetAttestationServers` above).
 | `UpdateSecretPolicy` | Bearer | Secret Owner | Update a secret's access policy |
 | `ListSecrets` | Bearer | Secret Owner | List caller's secrets (metadata only) |
 
-"Monitoring+" means the `enclave-os-mini:monitoring` role or any higher
+"Monitoring+" means the `privasys-platform:monitoring` role or any higher
 role (manager implies monitoring).
 
 ---
@@ -81,10 +81,10 @@ to the module.
 
 | Role | Claim value | Scope |
 |------|------------|-------|
-| Manager | `enclave-os-mini:manager` | WASM load/unload |
-| Monitoring | `enclave-os-mini:monitoring` | Readyz, Status, Metrics, WASM list |
-| Secret Owner | `enclave-os-mini:secret-owner` | Vault store/delete/update/list/get (own) |
-| Secret Manager | `enclave-os-mini:secret-manager` | Issue bearer tokens for RA-TLS GetSecret |
+| Manager | `privasys-platform:manager` | WASM load/unload |
+| Monitoring | `privasys-platform:monitoring` | Readyz, Status, Metrics, WASM list |
+| Secret Owner | `privasys-platform:secret-owner` | Vault store/delete/update/list/get (own) |
+| Secret Manager | `privasys-platform:secret-manager` | Issue bearer tokens for RA-TLS GetSecret |
 
 Role claims are extracted from (checked in order):
 1. `urn:zitadel:iam:org:project:roles` (Zitadel map format)
@@ -294,7 +294,7 @@ verifying quotes against authenticated attestation servers.
 | `project_id` | string? | OIDC project ID for audience-scoped tokens |
 
 When `oidc_bootstrap` is present and the request includes an `auth` token
-with `enclave-os-mini:manager` + `ORG_USER_MANAGER` roles, the enclave:
+with `privasys-platform:manager` + `ORG_USER_MANAGER` roles, the enclave:
 
 1. Generates an ECDSA P-256 keypair inside the enclave.
 2. Registers the public key with the OIDC provider's key registration API

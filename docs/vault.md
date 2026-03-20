@@ -30,7 +30,7 @@ is critical.
 The owner is the entity that creates, deletes, manages, and lists secrets.
 
 - Authenticates via **OIDC bearer token** (Zitadel or any OIDC provider)
-- Must hold the **`enclave-os-mini:secret-owner`** role
+- Must hold the **`privasys-platform:secret-owner`** role
 - The owner's OIDC `sub` (subject) claim is stored in each `SecretRecord`,
   so only the original creator can delete, update, or list their secrets
 - Operations: `StoreSecret`, `DeleteSecret`, `UpdateSecretPolicy`,
@@ -63,7 +63,7 @@ The secret manager is a **separate actor** whose sole role is to issue
 bearer tokens at `GetSecret` time as defence-in-depth.
 
 - Authenticates via **OIDC bearer token**
-- Must hold the **`enclave-os-mini:secret-manager`** role
+- Must hold the **`privasys-platform:secret-manager`** role
 - **Cannot** read, write, or delete secrets, and **cannot** update policies
 - **Only** provides a bearer token that the remote TEE presents alongside
   its attestation evidence
@@ -281,8 +281,8 @@ request via the RA-TLS path.  (OIDC owner path bypasses policy evaluation.)
 
 | Role | Claim value | Operations |
 |------|------------|------------|
-| `secret-owner` | `enclave-os-mini:secret-owner` | Store, Delete, Update, List, Get (own secrets) |
-| `secret-manager` | `enclave-os-mini:secret-manager` | Issue bearer tokens for RA-TLS GetSecret |
+| `secret-owner` | `privasys-platform:secret-owner` | Store, Delete, Update, List, Get (own secrets) |
+| `secret-manager` | `privasys-platform:secret-manager` | Issue bearer tokens for RA-TLS GetSecret |
 
 ### Token Delivery
 

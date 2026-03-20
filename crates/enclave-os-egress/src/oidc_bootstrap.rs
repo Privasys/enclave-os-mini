@@ -91,7 +91,7 @@ struct TokenResponse {
 ///
 /// * `config` — OIDC bootstrap configuration (issuer, service account ID, …).
 /// * `manager_jwt` — The raw JWT of the calling manager.  Must carry both
-///   the `enclave-os-mini:manager` project role **and** the Zitadel
+///   the `privasys-platform:manager` project role **and** the Zitadel
 ///   `ORG_USER_MANAGER` IAM role (which grants `user.write`).
 ///
 /// # Errors
