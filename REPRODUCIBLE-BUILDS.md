@@ -64,7 +64,7 @@ cat build/mrenclave.txt
 | Binutils/ld | 2.42 | Ubuntu 24.04 default |
 | cmake | 3.28.x | Ubuntu 24.04 default |
 | Intel SGX SDK | 2.27.100.1 | Pinned in Dockerfile |
-| Teaclave SGX SDK | privasys-v0.1.0 | Pinned in `Cargo.lock` |
+| Teaclave SGX SDK | privasys-v0.2.0 | Pinned in `Cargo.lock` |
 | All Cargo deps | exact versions | `Cargo.lock` (committed) |
 
 ### Deterministic Settings

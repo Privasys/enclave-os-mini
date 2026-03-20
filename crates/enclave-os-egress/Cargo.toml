@@ -21,7 +21,7 @@ mock = []
 enclave-os-common = { path = "../../common", features = ["crypto"] }
 
 # TLS (Privasys fork with RA-TLS 0xFFBB challenge extension)
-rustls = { git = "https://github.com/Privasys/rustls", tag = "privasys-v0.1.0", default-features = false, features = ["ring", "tls12", "std"] }
+rustls = { git = "https://github.com/Privasys/rustls", tag = "privasys-v0.2.0", default-features = false, features = ["ring", "tls12", "std"] }
 rustls-pemfile = "2"
 
 # Mozilla root CAs for general-purpose HTTPS egress (WASM SDK, etc.)

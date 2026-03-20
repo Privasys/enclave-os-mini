@@ -25,7 +25,7 @@
 # SGX apt pkgs   latest from Intel repo (host-side only, don't affect MRENCLAVE)
 # Rust           nightly-2025-12-01  → rustc 1.93.0-nightly (b84478a1c)
 # LLVM           21.1.5  (bundled with rustc)
-# Teaclave SGX   privasys-v0.1.0  (pinned in Cargo.lock)
+# Teaclave SGX   privasys-v0.2.0  (pinned in Cargo.lock)
 # ─────────────────────────────────────────────────────────────────────────
 
 # Pin by tag; for maximum reproducibility, replace with a digest:
