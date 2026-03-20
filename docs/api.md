@@ -83,8 +83,8 @@ to the module.
 |------|------------|-------|
 | Manager | `privasys-platform:manager` | WASM load/unload |
 | Monitoring | `privasys-platform:monitoring` | Readyz, Status, Metrics, WASM list |
-| Secret Owner | `privasys-platform:secret-owner` | Vault store/delete/update/list/get (own) |
-| Secret Manager | `privasys-platform:secret-manager` | Issue bearer tokens for RA-TLS GetSecret |
+| Secret Owner | `enclave-vault:secret-owner` | Vault store/delete/update/list/get (own) |
+| Secret Manager | `enclave-vault:secret-manager` | Issue bearer tokens for RA-TLS GetSecret |
 
 Role claims are extracted from (checked in order):
 1. `urn:zitadel:iam:org:project:roles` (Zitadel map format)
