@@ -216,6 +216,8 @@ impl OidcClaims {
 ///    — supports map `{ "role": {...} }` or array `["role1", "role2"]`
 /// 2. Standard `roles` array
 /// 3. Keycloak `realm_access.roles`
+/// 4. Zitadel project-specific claims (`urn:zitadel:iam:org:project:{id}:roles`)
+///    — used by service accounts with the `projects` (plural) scope
 pub fn extract_roles(
     claims: &serde_json::Value,
     config: &OidcConfig,
@@ -236,6 +238,21 @@ pub fn extract_roles(
     if let Some(ra) = claims.get("realm_access") {
         if let Some(val) = ra.get("roles") {
             collect_role_strings(val, &mut role_strings);
+        }
+    }
+
+    // Path 4: Zitadel project-specific role claims
+    // Service accounts using the plural `urn:zitadel:iam:org:projects:roles` scope
+    // get roles under `urn:zitadel:iam:org:project:{projectId}:roles` instead of
+    // the generic `urn:zitadel:iam:org:project:roles`.
+    if let Some(obj) = claims.as_object() {
+        for (key, val) in obj {
+            if key.starts_with("urn:zitadel:iam:org:project:")
+                && key.ends_with(":roles")
+                && *key != config.role_claim
+            {
+                collect_role_strings(val, &mut role_strings);
+            }
         }
     }
 
@@ -488,6 +505,39 @@ mod tests {
         });
         let roles = extract_roles(&claims, &config);
         assert_eq!(roles, vec![OidcRole::Manager]);
+    }
+
+    // -- extract_roles: Zitadel project-specific claims ----------------------
+
+    #[test]
+    fn zitadel_project_specific_role_claim() {
+        let config = test_config();
+        // Service accounts using the plural `projects` scope get roles under
+        // project-specific claim paths.
+        let claims = json!({
+            "urn:zitadel:iam:org:project:363345836026888196:roles": {
+                "privasys-platform:manager": { "363334360528650244": "privasys.auth.privasys.org" }
+            }
+        });
+        let roles = extract_roles(&claims, &config);
+        assert_eq!(roles, vec![OidcRole::Manager]);
+    }
+
+    #[test]
+    fn zitadel_project_specific_multiple_projects() {
+        let config = test_config();
+        let claims = json!({
+            "urn:zitadel:iam:org:project:111:roles": {
+                "privasys-platform:manager": { "org": "1" }
+            },
+            "urn:zitadel:iam:org:project:222:roles": {
+                "privasys-platform:monitoring": { "org": "1" }
+            }
+        });
+        let roles = extract_roles(&claims, &config);
+        assert_eq!(roles.len(), 2);
+        assert!(roles.contains(&OidcRole::Manager));
+        assert!(roles.contains(&OidcRole::Monitoring));
     }
 
     // -- collect_role_strings: edge cases ------------------------------------
