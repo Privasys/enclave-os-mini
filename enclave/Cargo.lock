@@ -117,9 +117,9 @@ dependencies = [
 
 [[package]]
 name = "cc"
-version = "1.2.56"
+version = "1.2.57"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "aebf35691d1bfb0ac386a69bac2fde4dd276fb618cf8bf4f5318fe285e821bb2"
+checksum = "7a0dd1ca384932ff3641c8718a02769f1698e7563dc6974ffd03346116310423"
 dependencies = [
  "find-msvc-tools",
  "shlex",
@@ -581,9 +581,9 @@ dependencies = [
 
 [[package]]
 name = "itoa"
-version = "1.0.17"
+version = "1.0.18"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "92ecc6618181def0457392ccd0ee51198e065e016d1d527a7ac1b6dc7c1f09d2"
+checksum = "8f42a60cbdf9a97f5d2305f08a87dc4e09308d1276d28c869c684d7777685682"
 
 [[package]]
 name = "lazy_static"
@@ -851,12 +851,12 @@ dependencies = [
 [[package]]
 name = "rustls"
 version = "0.23.37"
-source = "git+https://github.com/Privasys/rustls?tag=privasys-v0.1.0#47091d34727ea285ab8a58e8af9e5f20d8d20b48"
+source = "git+https://github.com/Privasys/rustls?tag=privasys-v0.2.0#47091d34727ea285ab8a58e8af9e5f20d8d20b48"
 dependencies = [
  "once_cell",
  "ring",
  "rustls-pki-types",
- "rustls-webpki 0.103.9",
+ "rustls-webpki 0.103.10",
  "subtle",
  "zeroize",
 ]
@@ -892,9 +892,9 @@ dependencies = [
 
 [[package]]
 name = "rustls-webpki"
-version = "0.103.9"
+version = "0.103.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d7df23109aa6c1567d1c575b9952556388da57401e4ace1d15f79eedad0d8f53"
+checksum = "df33b2b81ac578cabaf06b89b0631153a3f416b0a886e8a7a1707fb51abbd1ef"
 dependencies = [
  "ring",
  "rustls-pki-types",
@@ -957,12 +957,12 @@ dependencies = [
 [[package]]
 name = "sgx_build_helper"
 version = "2.0.0"
-source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.1.0#0702dcc3ad4e8de5e72e689855bdcd81c54c0f82"
+source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.2.0#0702dcc3ad4e8de5e72e689855bdcd81c54c0f82"
 
 [[package]]
 name = "sgx_crypto"
 version = "2.0.0"
-source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.1.0#0702dcc3ad4e8de5e72e689855bdcd81c54c0f82"
+source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.2.0#0702dcc3ad4e8de5e72e689855bdcd81c54c0f82"
 dependencies = [
  "sgx_crypto_sys",
  "sgx_trts",
@@ -972,7 +972,7 @@ dependencies = [
 [[package]]
 name = "sgx_crypto_sys"
 version = "2.0.0"
-source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.1.0#0702dcc3ad4e8de5e72e689855bdcd81c54c0f82"
+source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.2.0#0702dcc3ad4e8de5e72e689855bdcd81c54c0f82"
 dependencies = [
  "sgx_build_helper",
  "sgx_download_prebuilt",
@@ -982,7 +982,7 @@ dependencies = [
 [[package]]
 name = "sgx_download_prebuilt"
 version = "2.0.0"
-source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.1.0#0702dcc3ad4e8de5e72e689855bdcd81c54c0f82"
+source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.2.0#0702dcc3ad4e8de5e72e689855bdcd81c54c0f82"
 dependencies = [
  "sgx_build_helper",
 ]
@@ -990,7 +990,7 @@ dependencies = [
 [[package]]
 name = "sgx_tlibc_sys"
 version = "2.0.0"
-source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.1.0#0702dcc3ad4e8de5e72e689855bdcd81c54c0f82"
+source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.2.0#0702dcc3ad4e8de5e72e689855bdcd81c54c0f82"
 dependencies = [
  "sgx_build_helper",
  "sgx_download_prebuilt",
@@ -1000,7 +1000,7 @@ dependencies = [
 [[package]]
 name = "sgx_trts"
 version = "2.0.0"
-source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.1.0#0702dcc3ad4e8de5e72e689855bdcd81c54c0f82"
+source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.2.0#0702dcc3ad4e8de5e72e689855bdcd81c54c0f82"
 dependencies = [
  "sgx_crypto_sys",
  "sgx_tlibc_sys",
@@ -1010,7 +1010,7 @@ dependencies = [
 [[package]]
 name = "sgx_tse"
 version = "2.0.0"
-source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.1.0#0702dcc3ad4e8de5e72e689855bdcd81c54c0f82"
+source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.2.0#0702dcc3ad4e8de5e72e689855bdcd81c54c0f82"
 dependencies = [
  "sgx_crypto",
  "sgx_trts",
@@ -1020,7 +1020,7 @@ dependencies = [
 [[package]]
 name = "sgx_tseal"
 version = "2.0.0"
-source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.1.0#0702dcc3ad4e8de5e72e689855bdcd81c54c0f82"
+source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.2.0#0702dcc3ad4e8de5e72e689855bdcd81c54c0f82"
 dependencies = [
  "sgx_crypto",
  "sgx_trts",
@@ -1031,7 +1031,7 @@ dependencies = [
 [[package]]
 name = "sgx_types"
 version = "2.0.0"
-source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.1.0#0702dcc3ad4e8de5e72e689855bdcd81c54c0f82"
+source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.2.0#0702dcc3ad4e8de5e72e689855bdcd81c54c0f82"
 
 [[package]]
 name = "sha2"
