@@ -25,6 +25,7 @@
 //! [`Engine`]: wasmtime::Engine
 //! [`Linker`]: wasmtime::component::Linker
 
+use std::collections::BTreeMap;
 use std::string::String;
 use std::vec::Vec;
 
@@ -224,14 +225,23 @@ impl WasmEngine {
     /// returns counts, this method extracts the complete type signature
     /// for every parameter and return value.  The result is an
     /// [`AppSchema`](crate::protocol::AppSchema) suitable for serving
-    /// via `wasm_schema` and generating protobuf descriptors.
+    /// via `wasm_schema` and generating MCP tool manifests.
+    ///
+    /// If `wasm_bytes` is provided, the `package-docs` custom section
+    /// is parsed and `///` doc comments are attached to functions and
+    /// parameters in the schema.
     pub fn discover_exports_typed(
         &self,
         app_name: &str,
         hostname: &str,
         component: &Component,
+        wasm_bytes: Option<&[u8]>,
     ) -> crate::protocol::AppSchema {
         use wasmtime::component::types::ComponentItem;
+
+        let docs = wasm_bytes
+            .map(parse_package_docs)
+            .unwrap_or_default();
 
         let ty = component.component_type();
         let mut functions = Vec::new();
@@ -240,19 +250,20 @@ impl WasmEngine {
         for (name, item) in ty.exports(&self.engine) {
             match item {
                 ComponentItem::ComponentFunc(func_ty) => {
-                    functions.push(func_type_to_schema(&name, &func_ty));
+                    functions.push(func_type_to_schema(&name, &func_ty, &docs));
                 }
                 ComponentItem::ComponentInstance(inst_ty) => {
                     let mut iface_fns = Vec::new();
                     for (func_name, nested) in inst_ty.exports(&self.engine) {
                         if let ComponentItem::ComponentFunc(func_ty) = nested {
-                            iface_fns.push(func_type_to_schema(&func_name, &func_ty));
+                            iface_fns.push(func_type_to_schema(&func_name, &func_ty, &docs));
                         }
                     }
                     if !iface_fns.is_empty() {
                         interfaces.push(crate::protocol::InterfaceSchema {
                             name: name.to_string(),
                             functions: iface_fns,
+                            description: docs.get(&format!("interface:{}", name)).cloned(),
                         });
                     }
                 }
@@ -265,6 +276,7 @@ impl WasmEngine {
             hostname: hostname.to_string(),
             functions,
             interfaces,
+            mcp_enabled: true,
         }
     }
 }
@@ -274,14 +286,24 @@ impl WasmEngine {
 // ---------------------------------------------------------------------------
 
 /// Convert a wasmtime [`ComponentFunc`] type to a [`FunctionSchema`].
+///
+/// The `docs` map is consulted for `///` doc comments extracted from
+/// the `package-docs` custom section. Keys use the convention:
+/// - `"func:<name>"` for function-level descriptions
+/// - `"param:<func>.<param>"` for parameter descriptions
 fn func_type_to_schema(
     name: &str,
     func_ty: &wasmtime::component::types::ComponentFunc,
+    docs: &BTreeMap<String, String>,
 ) -> crate::protocol::FunctionSchema {
     let params = func_ty.params()
-        .map(|(pname, ty)| crate::protocol::ParamSchema {
-            name: pname.to_string(),
-            ty: wit_type_from(&ty),
+        .map(|(pname, ty)| {
+            let desc = docs.get(&format!("param:{}.{}", name, pname)).cloned();
+            crate::protocol::ParamSchema {
+                name: pname.to_string(),
+                ty: wit_type_from(&ty),
+                description: desc,
+            }
         })
         .collect();
     let results = func_ty.results()
@@ -289,12 +311,14 @@ fn func_type_to_schema(
         .map(|(i, ty)| crate::protocol::ParamSchema {
             name: format!("ret{}", i),
             ty: wit_type_from(&ty),
+            description: None,
         })
         .collect();
     crate::protocol::FunctionSchema {
         name: name.to_string(),
         params,
         results,
+        description: docs.get(&format!("func:{}", name)).cloned(),
     }
 }
 
@@ -354,5 +378,139 @@ fn wit_type_from(ty: &wasmtime::component::types::Type) -> crate::protocol::WitT
         },
         // Resources — not yet supported in the wire protocol.
         _ => WitType::String,
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  package-docs custom section parser
+// ---------------------------------------------------------------------------
+
+/// Parse the `package-docs` WASM custom section into a documentation map.
+///
+/// The custom section contains a JSON object mapping item paths to their
+/// `///` doc comments from the WIT source.  This function walks the raw
+/// WASM binary looking for the custom section, then normalises the keys
+/// into the conventions used by [`func_type_to_schema()`]:
+///
+/// - `"func:<name>"` — function-level description
+/// - `"param:<func>.<param>"` — parameter description
+/// - `"interface:<name>"` — interface-level description
+///
+/// Returns an empty map if the section is missing or unparseable.
+fn parse_package_docs(wasm_bytes: &[u8]) -> BTreeMap<String, String> {
+    let mut docs = BTreeMap::new();
+
+    // Walk the WASM binary to find custom sections.
+    // A WASM binary starts with the 8-byte header (\0asm + version).
+    if wasm_bytes.len() < 8 {
+        return docs;
+    }
+    let mut pos = 8; // skip header
+
+    while pos < wasm_bytes.len() {
+        if pos >= wasm_bytes.len() {
+            break;
+        }
+        let section_id = wasm_bytes[pos];
+        pos += 1;
+
+        // Read section size (LEB128).
+        let (section_size, bytes_read) = match read_leb128(&wasm_bytes[pos..]) {
+            Some(v) => v,
+            None => break,
+        };
+        pos += bytes_read;
+
+        if section_id == 0 {
+            // Custom section — read the name.
+            let section_start = pos;
+            let (name_len, name_leb_bytes) = match read_leb128(&wasm_bytes[pos..]) {
+                Some(v) => v,
+                None => { pos += section_size; continue; }
+            };
+            let name_start = pos + name_leb_bytes;
+            let name_end = name_start + name_len;
+            if name_end > wasm_bytes.len() {
+                break;
+            }
+            if let Ok(name) = core::str::from_utf8(&wasm_bytes[name_start..name_end]) {
+                if name == "package-docs" {
+                    let payload_start = name_end;
+                    let payload_end = section_start + section_size;
+                    if payload_end <= wasm_bytes.len() {
+                        let payload = &wasm_bytes[payload_start..payload_end];
+                        if let Ok(map) = serde_json::from_slice::<serde_json::Value>(payload) {
+                            normalise_package_docs(&map, &mut docs);
+                        }
+                    }
+                    // Found the section — no need to continue.
+                    return docs;
+                }
+            }
+        }
+
+        pos += section_size;
+    }
+
+    docs
+}
+
+/// Read a LEB128-encoded unsigned integer. Returns `(value, bytes_consumed)`.
+fn read_leb128(bytes: &[u8]) -> Option<(usize, usize)> {
+    let mut result: usize = 0;
+    let mut shift = 0;
+    for (i, &byte) in bytes.iter().enumerate() {
+        result |= ((byte & 0x7F) as usize) << shift;
+        if byte & 0x80 == 0 {
+            return Some((result, i + 1));
+        }
+        shift += 7;
+        if shift >= 64 {
+            return None; // Overflow protection.
+        }
+    }
+    None
+}
+
+/// Normalise a `package-docs` JSON object into the keying convention
+/// used by the schema builder.
+///
+/// The JSON from `package-docs` uses paths like:
+/// - `"worlds/my-app/funcs/hello"` → function doc
+/// - `"worlds/my-app/interfaces/my-api"` → interface doc
+/// - `"interfaces/my-api/funcs/hello"` → interface function doc
+///
+/// We also accept the simpler flat format:
+/// - `"hello"` → function doc
+/// - `"hello.name"` → parameter doc
+fn normalise_package_docs(
+    val: &serde_json::Value,
+    docs: &mut BTreeMap<String, String>,
+) {
+    let obj = match val.as_object() {
+        Some(o) => o,
+        None => return,
+    };
+
+    for (key, value) in obj {
+        let desc = match value.as_str() {
+            Some(s) if !s.is_empty() => s,
+            _ => continue,
+        };
+
+        // WIT path format: worlds/<world>/funcs/<func>
+        if key.contains("/funcs/") {
+            let func_name = key.rsplit("/funcs/").next().unwrap_or(key);
+            docs.insert(format!("func:{}", func_name), desc.to_string());
+        } else if key.contains("/interfaces/") {
+            let iface_name = key.rsplit("/interfaces/").next().unwrap_or(key);
+            docs.insert(format!("interface:{}", iface_name), desc.to_string());
+        } else if key.contains('.') {
+            // Flat format: func.param
+            docs.insert(format!("param:{}", key), desc.to_string());
+        } else {
+            // Flat format: just a function name
+            docs.insert(format!("func:{}", key), desc.to_string());
+        }
     }
 }

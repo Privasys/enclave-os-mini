@@ -59,6 +59,10 @@ pub struct WasmEnvelope {
     /// Connect-protocol-style function call (named params as JSON object).
     #[serde(default)]
     pub connect_call: Option<ConnectCall>,
+
+    /// Request the MCP tool manifest for a WASM app.
+    #[serde(default)]
+    pub mcp_tools: Option<WasmMcpRequest>,
 }
 
 // ---------------------------------------------------------------------------
@@ -121,6 +125,16 @@ pub struct WasmLoad {
     /// Defaults to 10 000 000 (~a few hundred ms of compute) when absent.
     #[serde(default)]
     pub max_fuel: Option<u64>,
+    /// Whether to expose this app as an MCP tool server.
+    ///
+    /// When `true` (the default), the schema endpoint includes an
+    /// MCP-compatible tool manifest derived from the app's WIT types
+    /// and `///` doc comments embedded in the `package-docs` custom
+    /// section of the `.wasm` binary.
+    ///
+    /// Set to `false` to disable MCP tool generation for this app.
+    #[serde(default = "default_mcp_enabled")]
+    pub mcp_enabled: Option<bool>,
 }
 
 /// Unload a WASM app by name.
@@ -182,6 +196,49 @@ pub struct ConnectCall {
     pub app_auth: Option<String>,
 }
 
+/// Request the MCP tool manifest for a WASM app.
+///
+/// ```json
+/// { "mcp_tools": { "app": "my-app" } }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WasmMcpRequest {
+    /// App identifier.
+    pub app: String,
+    /// App-level OIDC bearer token (same semantics as [`WasmCall::app_auth`]).
+    #[serde(default)]
+    pub app_auth: Option<String>,
+}
+
+// ---------------------------------------------------------------------------
+//  MCP tool manifest types
+// ---------------------------------------------------------------------------
+
+/// MCP-compatible tool manifest for a WASM app.
+///
+/// Each exported function becomes an MCP tool whose `inputSchema` is a
+/// JSON Schema object derived from the function's WIT parameter types.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpToolManifest {
+    /// App identifier.
+    pub name: String,
+    /// List of tools (one per exported function).
+    pub tools: Vec<McpTool>,
+}
+
+/// A single MCP tool derived from a WIT exported function.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct McpTool {
+    /// Tool name (function path, e.g. `"hello"` or `"my-api/transform"`).
+    pub name: String,
+    /// Human-readable description from `///` doc comments in WIT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
+    /// JSON Schema for the tool's input parameters.
+    #[serde(rename = "inputSchema")]
+    pub input_schema: serde_json::Value,
+}
+
 /// Result of a management operation (load / unload / list).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status")]
@@ -221,6 +278,12 @@ pub enum WasmManagementResult {
     Schema {
         /// Full typed API schema.
         schema: AppSchema,
+    },
+    /// MCP tool manifest response.
+    #[serde(rename = "mcp_tools")]
+    McpTools {
+        /// MCP-compatible tool manifest.
+        manifest: McpToolManifest,
     },
 }
 
@@ -469,6 +532,10 @@ fn default_roles_claim() -> String {
     "roles".into()
 }
 
+fn default_mcp_enabled() -> Option<bool> {
+    Some(true)
+}
+
 // ---------------------------------------------------------------------------
 //  WIT type descriptors & API schema
 // ---------------------------------------------------------------------------
@@ -546,6 +613,9 @@ pub struct ParamSchema {
     pub name: String,
     #[serde(rename = "type")]
     pub ty: WitType,
+    /// Human-readable description from `///` doc comment in WIT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Full signature of an exported function.
@@ -554,6 +624,9 @@ pub struct FunctionSchema {
     pub name: String,
     pub params: Vec<ParamSchema>,
     pub results: Vec<ParamSchema>,
+    /// Human-readable description from `///` doc comment in WIT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// An exported interface containing one or more functions.
@@ -561,6 +634,9 @@ pub struct FunctionSchema {
 pub struct InterfaceSchema {
     pub name: String,
     pub functions: Vec<FunctionSchema>,
+    /// Human-readable description from `///` doc comment in WIT.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 /// Complete typed API schema for a WASM app.
@@ -579,6 +655,13 @@ pub struct AppSchema {
     /// Exported interfaces with their functions.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub interfaces: Vec<InterfaceSchema>,
+    /// Whether MCP tool generation is enabled for this app.
+    #[serde(default = "default_true")]
+    pub mcp_enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
 }
 
 impl AppSchema {
@@ -616,5 +699,157 @@ impl AppSchema {
             }
         }
         None
+    }
+
+    /// Generate an MCP tool manifest from the schema.
+    ///
+    /// Each exported function becomes an [`McpTool`] with a JSON Schema
+    /// `inputSchema` derived from its WIT parameter types.
+    pub fn to_mcp_manifest(&self) -> McpToolManifest {
+        let mut tools = Vec::new();
+
+        for f in &self.functions {
+            tools.push(function_to_mcp_tool(&f.name, f));
+        }
+        for iface in &self.interfaces {
+            for f in &iface.functions {
+                let qualified = format!("{}/{}", iface.name, f.name);
+                tools.push(function_to_mcp_tool(&qualified, f));
+            }
+        }
+
+        McpToolManifest {
+            name: self.name.clone(),
+            tools,
+        }
+    }
+}
+
+/// Convert a [`FunctionSchema`] to an [`McpTool`] with JSON Schema input.
+fn function_to_mcp_tool(name: &str, func: &FunctionSchema) -> McpTool {
+    let mut properties = serde_json::Map::new();
+    let mut required = Vec::new();
+
+    for p in &func.params {
+        let mut schema = wit_type_to_json_schema(&p.ty);
+        if let Some(ref desc) = p.description {
+            if let serde_json::Value::Object(ref mut m) = schema {
+                m.insert("description".into(), serde_json::Value::String(desc.clone()));
+            }
+        }
+        properties.insert(p.name.clone(), schema);
+        // All WIT params are required unless the type is option.
+        if !matches!(p.ty, WitType::Option { .. }) {
+            required.push(serde_json::Value::String(p.name.clone()));
+        }
+    }
+
+    let input_schema = serde_json::json!({
+        "type": "object",
+        "properties": properties,
+        "required": required,
+    });
+
+    McpTool {
+        name: name.to_string(),
+        description: func.description.clone(),
+        input_schema,
+    }
+}
+
+/// Convert a [`WitType`] to a JSON Schema value.
+fn wit_type_to_json_schema(ty: &WitType) -> serde_json::Value {
+    match ty {
+        WitType::Bool => serde_json::json!({ "type": "boolean" }),
+        WitType::U8 | WitType::U16 | WitType::U32 | WitType::U64
+        | WitType::S8 | WitType::S16 | WitType::S32 | WitType::S64 => {
+            serde_json::json!({ "type": "integer" })
+        }
+        WitType::Float32 | WitType::Float64 => {
+            serde_json::json!({ "type": "number" })
+        }
+        WitType::Char | WitType::String => {
+            serde_json::json!({ "type": "string" })
+        }
+        WitType::List { element } => serde_json::json!({
+            "type": "array",
+            "items": wit_type_to_json_schema(element),
+        }),
+        WitType::Option { inner } => {
+            let inner_schema = wit_type_to_json_schema(inner);
+            serde_json::json!({
+                "anyOf": [inner_schema, { "type": "null" }]
+            })
+        }
+        WitType::Result { ok, err } => {
+            let mut obj = serde_json::Map::new();
+            obj.insert("type".into(), serde_json::Value::String("object".into()));
+            let mut props = serde_json::Map::new();
+            if let Some(ok_ty) = ok {
+                props.insert("ok".into(), wit_type_to_json_schema(ok_ty));
+            }
+            if let Some(err_ty) = err {
+                props.insert("err".into(), wit_type_to_json_schema(err_ty));
+            }
+            obj.insert("properties".into(), serde_json::Value::Object(props));
+            serde_json::Value::Object(obj)
+        }
+        WitType::Record { fields } => {
+            let mut props = serde_json::Map::new();
+            let mut req = Vec::new();
+            for f in fields {
+                props.insert(f.name.clone(), wit_type_to_json_schema(&f.ty));
+                req.push(serde_json::Value::String(f.name.clone()));
+            }
+            serde_json::json!({
+                "type": "object",
+                "properties": props,
+                "required": req,
+            })
+        }
+        WitType::Tuple { elements } => {
+            let items: Vec<serde_json::Value> = elements.iter()
+                .map(wit_type_to_json_schema)
+                .collect();
+            serde_json::json!({
+                "type": "array",
+                "prefixItems": items,
+                "items": false,
+            })
+        }
+        WitType::Enum { names } => serde_json::json!({
+            "type": "string",
+            "enum": names,
+        }),
+        WitType::Variant { cases } => {
+            let one_of: Vec<serde_json::Value> = cases.iter()
+                .map(|c| {
+                    if let Some(ref t) = c.ty {
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "tag": { "const": c.name },
+                                "value": wit_type_to_json_schema(t),
+                            },
+                            "required": ["tag", "value"],
+                        })
+                    } else {
+                        serde_json::json!({
+                            "type": "object",
+                            "properties": {
+                                "tag": { "const": c.name },
+                            },
+                            "required": ["tag"],
+                        })
+                    }
+                })
+                .collect();
+            serde_json::json!({ "oneOf": one_of })
+        }
+        WitType::Flags { names } => serde_json::json!({
+            "type": "array",
+            "items": { "type": "string", "enum": names },
+            "uniqueItems": true,
+        }),
     }
 }

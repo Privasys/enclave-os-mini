@@ -220,13 +220,14 @@ impl WasmModule {
         encryption_key: Option<[u8; AEAD_KEY_SIZE]>,
         permissions: Option<AppPermissions>,
         max_fuel: u64,
+        mcp_enabled: bool,
     ) -> Result<(), String> {
         // Load into the registry (compile + introspect + per-app key)
         let meta = {
             let mut reg = self.registry
                 .lock()
                 .map_err(|_| String::from("registry lock poisoned"))?;
-            reg.load_app(name, hostname, wasm_bytes, encryption_key, permissions, max_fuel)?
+            reg.load_app(name, hostname, wasm_bytes, encryption_key, permissions, max_fuel, mcp_enabled)?
         };
 
         // ── Persist to KV store ────────────────────────────────────
@@ -782,8 +783,9 @@ impl EnclaveModule for WasmModule {
             };
 
             let max_fuel = load.max_fuel.unwrap_or(10_000_000);
+            let mcp_enabled = load.mcp_enabled.unwrap_or(true);
 
-            let mgmt_result = match self.load_app(&load.name, &hostname, &load.bytes, encryption_key, load.permissions, max_fuel) {
+            let mgmt_result = match self.load_app(&load.name, &hostname, &load.bytes, encryption_key, load.permissions, max_fuel, mcp_enabled) {
                 Ok(()) => {
                     // Return the loaded app's info
                     let apps = self.list_apps();
@@ -856,7 +858,52 @@ impl EnclaveModule for WasmModule {
             return Some(Response::Data(serialize_or_error(&mgmt_result)));
         }
 
-        // 6. connect_call — named-param function call (Connect protocol)
+        // 6. mcp_tools — MCP tool manifest for a single app
+        if let Some(ref mcp_req) = envelope.mcp_tools {
+            // Reuse schema access control (same permissions model).
+            let schema_req = WasmSchemaRequest {
+                app: mcp_req.app.clone(),
+                app_auth: mcp_req.app_auth.clone(),
+            };
+            if let Some(err_response) = self.check_schema_permissions(&schema_req) {
+                return Some(err_response);
+            }
+
+            let registry = match self.registry.lock() {
+                Ok(r) => r,
+                Err(_) => {
+                    let mgmt_result = WasmManagementResult::Error {
+                        message: String::from("registry lock poisoned"),
+                    };
+                    return Some(Response::Data(serialize_or_error(&mgmt_result)));
+                }
+            };
+            let mgmt_result = match registry.get_known(&mcp_req.app) {
+                Some(meta) => match &meta.schema {
+                    Some(s) if s.mcp_enabled => {
+                        WasmManagementResult::McpTools {
+                            manifest: s.to_mcp_manifest(),
+                        }
+                    }
+                    Some(_) => WasmManagementResult::Error {
+                        message: format!(
+                            "MCP is disabled for app '{}'",
+                            mcp_req.app,
+                        ),
+                    },
+                    None => WasmManagementResult::Error {
+                        message: format!(
+                            "app '{}' has no schema — try reloading it",
+                            mcp_req.app,
+                        ),
+                    },
+                },
+                None => WasmManagementResult::NotFound { name: mcp_req.app.clone() },
+            };
+            return Some(Response::Data(serialize_or_error(&mgmt_result)));
+        }
+
+        // 7. connect_call — named-param function call (Connect protocol)
         if let Some(ref call) = envelope.connect_call {
             // Translate to a WasmCall using the function schema.
             let wasm_call = match self.connect_to_wasm_call(call) {
