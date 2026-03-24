@@ -1079,9 +1079,125 @@ fn json_to_wasm_param(
                 Err(format!("param '{}': expected string or byte array for list<u8>", name))
             }
         }
-        _ => {
-            // For unsupported composite types, pass as JSON string.
-            Ok(WasmParam::String(serde_json::to_string(val).unwrap_or_default()))
+        WitType::List { element } => {
+            let arr = val.as_array()
+                .ok_or_else(|| format!("param '{}': expected array for list type", name))?;
+            let items: Result<Vec<WasmParam>, String> = arr.iter()
+                .enumerate()
+                .map(|(i, v)| json_to_wasm_param(v, element, &format!("{}[{}]", name, i)))
+                .collect();
+            Ok(WasmParam::List(items?))
+        }
+        WitType::Record { fields } => {
+            let obj = val.as_object()
+                .ok_or_else(|| format!("param '{}': expected object for record type", name))?;
+            let rec: Result<Vec<(String, WasmParam)>, String> = fields.iter()
+                .map(|f| {
+                    let v = obj.get(&f.name).unwrap_or(&serde_json::Value::Null);
+                    let p = json_to_wasm_param(v, &f.ty, &format!("{}.{}", name, f.name))?;
+                    Ok((f.name.clone(), p))
+                })
+                .collect();
+            Ok(WasmParam::Record(rec?))
+        }
+        WitType::Enum { names } => {
+            let s = val.as_str()
+                .ok_or_else(|| format!("param '{}': expected string for enum type", name))?;
+            if !names.contains(&s.to_string()) {
+                return Err(format!(
+                    "param '{}': unknown enum case '{}', expected one of: [{}]",
+                    name, s, names.join(", "),
+                ));
+            }
+            Ok(WasmParam::Enum(s.to_string()))
+        }
+        WitType::Option { inner } => {
+            if val.is_null() {
+                Ok(WasmParam::Option(None))
+            } else {
+                let p = json_to_wasm_param(val, inner, name)?;
+                Ok(WasmParam::Option(Some(Box::new(p))))
+            }
+        }
+        WitType::Variant { cases } => {
+            // Expect {"case-name": payload} or just "case-name" for unit cases.
+            if let Some(s) = val.as_str() {
+                if cases.iter().any(|c| c.name == s) {
+                    Ok(WasmParam::Variant(s.to_string(), None))
+                } else {
+                    Err(format!("param '{}': unknown variant case '{}'", name, s))
+                }
+            } else if let Some(obj) = val.as_object() {
+                if obj.len() != 1 {
+                    return Err(format!("param '{}': variant object must have exactly one key", name));
+                }
+                let (case_name, payload) = obj.iter().next().unwrap();
+                let case = cases.iter().find(|c| &c.name == case_name)
+                    .ok_or_else(|| format!("param '{}': unknown variant case '{}'", name, case_name))?;
+                match &case.ty {
+                    Some(ty) => {
+                        let p = json_to_wasm_param(payload, ty, &format!("{}.{}", name, case_name))?;
+                        Ok(WasmParam::Variant(case_name.clone(), Some(Box::new(p))))
+                    }
+                    None => Ok(WasmParam::Variant(case_name.clone(), None)),
+                }
+            } else {
+                Err(format!("param '{}': expected string or object for variant type", name))
+            }
+        }
+        WitType::Tuple { elements } => {
+            let arr = val.as_array()
+                .ok_or_else(|| format!("param '{}': expected array for tuple type", name))?;
+            if arr.len() != elements.len() {
+                return Err(format!(
+                    "param '{}': tuple expects {} elements, got {}",
+                    name, elements.len(), arr.len(),
+                ));
+            }
+            let items: Result<Vec<WasmParam>, String> = arr.iter()
+                .zip(elements.iter())
+                .enumerate()
+                .map(|(i, (v, t))| json_to_wasm_param(v, t, &format!("{}.{}", name, i)))
+                .collect();
+            Ok(WasmParam::Tuple(items?))
+        }
+        WitType::Flags { names } => {
+            let arr = val.as_array()
+                .ok_or_else(|| format!("param '{}': expected array of strings for flags type", name))?;
+            let flags: Result<Vec<String>, String> = arr.iter()
+                .map(|v| v.as_str()
+                    .map(|s| s.to_string())
+                    .ok_or_else(|| format!("param '{}': flag must be a string", name)))
+                .collect();
+            let flags = flags?;
+            for f in &flags {
+                if !names.contains(f) {
+                    return Err(format!("param '{}': unknown flag '{}'", name, f));
+                }
+            }
+            Ok(WasmParam::Flags(flags))
+        }
+        WitType::Result { ok, err } => {
+            // Expect {"ok": value} or {"err": value}
+            if let Some(obj) = val.as_object() {
+                if let Some(ok_val) = obj.get("ok") {
+                    let p = match ok {
+                        Some(ty) => Some(Box::new(json_to_wasm_param(ok_val, ty, &format!("{}.ok", name))?)),
+                        None => None,
+                    };
+                    Ok(WasmParam::Variant("ok".to_string(), p))
+                } else if let Some(err_val) = obj.get("err") {
+                    let p = match err {
+                        Some(ty) => Some(Box::new(json_to_wasm_param(err_val, ty, &format!("{}.err", name))?)),
+                        None => None,
+                    };
+                    Ok(WasmParam::Variant("err".to_string(), p))
+                } else {
+                    Err(format!("param '{}': result must have 'ok' or 'err' key", name))
+                }
+            } else {
+                Err(format!("param '{}': expected object for result type", name))
+            }
         }
     }
 }

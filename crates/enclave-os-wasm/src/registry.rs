@@ -688,6 +688,25 @@ fn param_to_val(p: &WasmParam) -> Val {
             // map to list<u8>.
             Val::List(v.iter().map(|&b| Val::U8(b)).collect::<Vec<_>>().into())
         }
+        WasmParam::List(items) => {
+            Val::List(items.iter().map(param_to_val).collect::<Vec<_>>().into())
+        }
+        WasmParam::Record(fields) => {
+            Val::Record(fields.iter()
+                .map(|(n, v)| (n.clone(), param_to_val(v)))
+                .collect::<Vec<_>>().into())
+        }
+        WasmParam::Enum(name) => Val::Enum(name.clone()),
+        WasmParam::Option(inner) => {
+            Val::Option(inner.as_ref().map(|v| Box::new(param_to_val(v))))
+        }
+        WasmParam::Variant(name, payload) => {
+            Val::Variant(name.clone(), payload.as_ref().map(|v| Box::new(param_to_val(v))))
+        }
+        WasmParam::Tuple(items) => {
+            Val::Tuple(items.iter().map(param_to_val).collect::<Vec<_>>().into())
+        }
+        WasmParam::Flags(names) => Val::Flags(names.clone()),
     }
 }
 

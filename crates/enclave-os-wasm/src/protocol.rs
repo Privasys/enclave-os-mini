@@ -348,6 +348,27 @@ pub enum WasmParam {
     /// Raw bytes (base64-encoded in JSON).
     #[serde(rename = "bytes")]
     Bytes(Vec<u8>),
+    /// A list of typed values.
+    #[serde(rename = "list")]
+    List(Vec<WasmParam>),
+    /// A record with named fields.
+    #[serde(rename = "record")]
+    Record(Vec<(String, WasmParam)>),
+    /// An enum case (identified by name).
+    #[serde(rename = "enum")]
+    Enum(String),
+    /// An optional value (Some or None).
+    #[serde(rename = "option")]
+    Option(Option<Box<WasmParam>>),
+    /// A variant case with optional payload.
+    #[serde(rename = "variant")]
+    Variant(String, Option<Box<WasmParam>>),
+    /// A tuple of positional values.
+    #[serde(rename = "tuple")]
+    Tuple(Vec<WasmParam>),
+    /// A set of named flags.
+    #[serde(rename = "flags")]
+    Flags(Vec<String>),
 }
 
 // ---------------------------------------------------------------------------
