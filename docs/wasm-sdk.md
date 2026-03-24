@@ -167,6 +167,7 @@ TCP sockets tunnelled through host OCALLs.
 | **Max WASM memory** | 4 MiB static allocation |
 | **Namespace isolation** | `app:<name>/*` — apps cannot access each other's data |
 | **Attestation** | SHA-256 of WASM bytecode embedded in RA-TLS certificates |
+| **MCP tool generation** | `///` doc comments + WIT types → MCP tool manifest with JSON Schema inputs (opt-out via `mcp_enabled: false`) |
 
 ---
 
@@ -195,7 +196,9 @@ your-wasm-app/
 
 ### 2. Define your world
 
-Create `wit/world.wit` importing only what you need:
+Create `wit/world.wit` importing only what you need. Use `///` doc comments
+on exports and parameters — these are embedded in the compiled binary and
+used by the enclave to generate MCP tool manifests and schema descriptions.
 
 ```wit
 package my-org:my-app;
@@ -209,8 +212,11 @@ world my-app {
     import wasi:random/random@0.2.0;
     import wasi:clocks/wall-clock@0.2.0;
 
-    // Export your functions
-    export process: func(input: string) -> string;
+    /// Process an input string and return the result.
+    export process: func(
+        /// The raw input to process.
+        input: string,
+    ) -> string;
 }
 ```
 

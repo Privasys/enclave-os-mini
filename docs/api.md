@@ -40,6 +40,9 @@ See [vault.md](vault.md) for vault-specific details and
 | `wasm_unload` | Bearer | Manager | Unload a WASM component |
 | `wasm_call` | App-level or none | Per-function | Call an exported function |
 | `wasm_list` | Bearer | Monitoring+ | List loaded WASM apps |
+| `wasm_schema` | App-level or none | — | Get typed API schema for an app |
+| `mcp_tools` | App-level or none | — | Get MCP tool manifest for an app |
+| `connect_call` | App-level or none | Per-function | Named-param function call (Connect protocol) |
 
 ### Egress
 
@@ -392,8 +395,7 @@ Load (or replace) a WASM component.  Requires **Manager** role.
 | `hostname` | string | no | SNI hostname for per-app TLS certificate (defaults to `name`) |
 | `encryption_key` | string | no | Hex-encoded 32-byte AES-256 key for per-app KV encryption. If omitted, a random key is generated inside the enclave via RDRAND |
 | `max_fuel` | u64 | no | Maximum fuel budget per call. Defaults to 10 000 000 (~a few hundred ms of compute) |
-| `permissions` | AppPermissions | no | Per-function access policy with app-developer OIDC. If omitted, all functions are public (no auth) |
-
+| `permissions` | AppPermissions | no | Per-function access policy with app-developer OIDC. If omitted, all functions are public (no auth) || `mcp_enabled` | bool | no | Whether to expose this app as an MCP tool server. Defaults to `true`. Set to `false` to disable MCP tool generation |
 **Response** (success)
 
 ```json
@@ -555,7 +557,114 @@ List all loaded WASM components.  Requires **Monitoring+** role.
 | `permissions_hash` | string? | SHA-256 of the permissions JSON (hex), or absent if no permissions |
 | `max_fuel` | u64 | Fuel budget per call for this app |
 
+### wasm_schema
 
+Retrieve the typed API schema for a loaded WASM app.  Uses app-level auth when the app has permissions configured, otherwise public.
+
+**Request**
+
+```json
+{
+  "auth": "<app-token>",
+  "wasm_schema": {
+    "app": "my-app"
+  }
+}
+```
+
+**Response**
+
+```json
+{
+  "status": "schema",
+  "schema": {
+    "app_name": "my-app",
+    "mcp_enabled": true,
+    "interfaces": [
+      {
+        "name": "default",
+        "description": "Example app with seven exported functions",
+        "functions": [
+          {
+            "name": "process",
+            "description": "Transform a string into uppercase",
+            "params": [
+              { "name": "input", "ty": "string", "description": "Text to transform" }
+            ],
+            "results": [
+              { "name": "", "ty": "string" }
+            ]
+          }
+        ]
+      }
+    ]
+  }
+}
+```
+
+### mcp_tools
+
+Retrieve the MCP (Model Context Protocol) tool manifest for a loaded WASM app.  Each exported function is described as an MCP tool with a JSON Schema input definition derived from WIT types.  Requires the app to have `mcp_enabled` set to `true` (the default).
+
+Uses app-level auth when the app has permissions configured, otherwise public.
+
+**Request**
+
+```json
+{
+  "auth": "<app-token>",
+  "mcp_tools": {
+    "app": "my-app"
+  }
+}
+```
+
+**Response**
+
+```json
+{
+  "status": "mcp_tools",
+  "manifest": {
+    "name": "my-app",
+    "tools": [
+      {
+        "name": "process",
+        "description": "Transform a string into uppercase",
+        "inputSchema": {
+          "type": "object",
+          "properties": {
+            "input": {
+              "type": "string",
+              "description": "Text to transform"
+            }
+          },
+          "required": ["input"]
+        }
+      }
+    ]
+  }
+}
+```
+
+| Field | Type | Description |
+|-------|------|-------------|
+| `manifest.name` | string | App identifier |
+| `manifest.tools` | array | One entry per exported function |
+| `tools[].name` | string | Function name |
+| `tools[].description` | string | From `///` doc comments in the WIT definition |
+| `tools[].inputSchema` | object | JSON Schema describing the function's input parameters |
+
+**Error codes**
+
+| Status | Meaning |
+|--------|---------|
+| `mcp_disabled` | The app was loaded with `mcp_enabled: false` |
+| `app_not_found` | No app loaded with that name |
+
+> **Extracting doc comments:** The enclave parses the `package-docs` custom
+> section embedded in compiled WASM components.  `///` comments above WIT
+> exports, parameters, types, and interfaces are translated into
+> `description` fields in the schema and MCP manifest automatically.
 
 ---
 

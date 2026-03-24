@@ -182,11 +182,12 @@ trait and provides:
 
 | Responsibility | Implementation |
 |----------------|----------------|
-| Wire protocol | `WasmEnvelope` — JSON discriminator for `wasm_load`, `wasm_call`, `wasm_list`, `wasm_unload` |
+| Wire protocol | `WasmEnvelope` — JSON discriminator for `wasm_load`, `wasm_call`, `wasm_list`, `wasm_unload`, `wasm_schema`, `connect_call`, `mcp_tools` |
 | App registry | `WasmRegistry` — stores loaded apps, handles export introspection |
 | Execution | Fresh `Store` + `Instance` per call (stateless), per-app fuel budget |
 | File system | `SealedKvStore` — AES-256-GCM encrypted, per-app isolated (`app:<name>/fs:<path>`) |
 | Attestation | Per-app config leaves + OIDs via `EnclaveModule` trait methods |
+| MCP | `mcp_tools` generates MCP-compatible tool manifests from WIT types + `package-docs` comments |
 
 ### Wire Protocol
 
@@ -198,6 +199,9 @@ All management commands are JSON messages inside `Request::Data` frames:
 | Call | `{"wasm_call": {"app": "...", "function": "...", "params": [...]}}` | `{"status": "ok", "returns": [...]}` |
 | List | `{"wasm_list": {}}` | `{"status": "apps", "apps": [...]}` |
 | Unload | `{"wasm_unload": {"name": "..."}}` | `{"status": "unloaded", "name": "..."}` |
+| Schema | `{"wasm_schema": {"app": "..."}}` | `{"status": "schema", "schema": {...}}` |
+| MCP Tools | `{"mcp_tools": {"app": "..."}}` | `{"status": "mcp_tools", "manifest": {...}}` |
+| Connect | `{"connect_call": {"app": "...", "function": "...", "body": {...}}}` | `{"status": "ok", "returns": [...]}` |
 
 See the [wasm-app-example](https://github.com/Privasys/wasm-app-example)
 README for detailed request/response examples including BYOK, per-app
