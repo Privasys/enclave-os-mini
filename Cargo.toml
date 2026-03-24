@@ -6,6 +6,7 @@ members = [
     "common",
     "host",
     "tests/integration",
+    "tests/wasm-docs-unit",
 ]
 exclude = [
     "enclave",
