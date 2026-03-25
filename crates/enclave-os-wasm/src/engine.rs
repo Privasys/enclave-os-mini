@@ -243,7 +243,15 @@ impl WasmEngine {
         // Use caller-provided docs (from wasm_load JSON) when available;
         // fall back to parsing the package-docs custom section from the
         // binary (works for non-AOT WASM but not for .cwasm).
+        // Provided docs use flat keys ("hello", "hello.param") — normalise
+        // them to the "func:" / "param:" convention the schema builder expects.
         let docs = provided_docs
+            .map(|d| {
+                let val = serde_json::to_value(&d).unwrap_or_default();
+                let mut normalised = BTreeMap::new();
+                crate::wasm_docs::normalise_package_docs(&val, &mut normalised);
+                normalised
+            })
             .unwrap_or_else(|| wasm_bytes.map(parse_package_docs).unwrap_or_default());
 
         let ty = component.component_type();
