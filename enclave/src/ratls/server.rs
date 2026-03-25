@@ -769,6 +769,14 @@ fn handle_http_request(
             handle_rpc_request(method, path, http_req, base_ctx)
         }
 
+        // ── FIDO2 endpoints ─────────────────────────────────────────
+        // These routes wrap the body into the FIDO2 module's protocol
+        // format and dispatch through the standard module pipeline.
+        #[cfg(feature = "fido2")]
+        (HttpMethod::Post, path) if path.starts_with("/fido2/") => {
+            handle_fido2_request(path, http_req, base_ctx)
+        }
+
         // ── Method mismatch on known paths ──────────────────────────
         (_, "/healthz") | (_, "/readyz") | (_, "/status") | (_, "/metrics")
         | (_, "/attestation-servers") | (_, "/data") | (_, "/shutdown") => {
@@ -918,6 +926,69 @@ fn handle_set_attestation_servers(
         count, hash_hex
     );
     HttpHandleResult::ok(body.into_bytes())
+}
+
+// ---------------------------------------------------------------------------
+//  FIDO2 request handling
+// ---------------------------------------------------------------------------
+
+/// Handle `POST /fido2/*` — FIDO2/WebAuthn ceremony endpoints.
+///
+/// No OIDC auth required — the FIDO2 ceremony IS the authentication.
+/// The body is forwarded as `Request::Data` to the module pipeline.
+///
+/// Supported paths:
+///   POST /fido2/register/begin
+///   POST /fido2/register/complete
+///   POST /fido2/authenticate/begin
+///   POST /fido2/authenticate/complete
+#[cfg(feature = "fido2")]
+fn handle_fido2_request(
+    path: &str,
+    http_req: &enclave_os_common::protocol::HttpRequest,
+    base_ctx: &enclave_os_common::modules::RequestContext,
+) -> HttpHandleResult {
+    use enclave_os_common::protocol::Request;
+
+    // Validate the path
+    match path {
+        "/fido2/register/begin"
+        | "/fido2/register/complete"
+        | "/fido2/authenticate/begin"
+        | "/fido2/authenticate/complete" => {}
+        _ => return HttpHandleResult::err(404, "unknown FIDO2 endpoint"),
+    }
+
+    // FIDO2 does not use OIDC auth — the ceremony authenticates the session.
+    // We still check for session tokens (for browser connections using
+    // previously issued tokens).
+    let oidc_claims = if let Some(ref auth) = http_req.authorization {
+        // Check if it's a FIDO2 session token (hex, 64 chars)
+        if auth.len() == 64 && auth.chars().all(|c| c.is_ascii_hexdigit()) {
+            // This is a FIDO2 session token — validate it
+            let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
+            match enclave_os_fido2::sessions::validate_token(auth, now) {
+                Ok(_entry) => None, // Token valid — no OIDC claims needed
+                Err(_) => return HttpHandleResult::err(401, "invalid session token"),
+            }
+        } else if crate::oidc_config().is_some() {
+            // Try as OIDC token
+            verify_auth_header(http_req)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+
+    let ctx = enclave_os_common::modules::RequestContext {
+        peer_cert_der: base_ctx.peer_cert_der.clone(),
+        client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
+        oidc_claims,
+    };
+
+    let req = Request::Data(http_req.body.clone());
+    dispatch_and_respond(req, &ctx)
 }
 
 // ---------------------------------------------------------------------------

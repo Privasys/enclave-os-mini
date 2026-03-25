@@ -39,12 +39,14 @@ mock = ["enclave-os-egress?/mock", "enclave-os-vault?/mock"]
 # Dependency graph:
 #   vault → kvstore, egress
 #   wasm  → kvstore, egress
+#   fido2 → kvstore
 #   kvstore (standalone)
 #   egress  (standalone)
 egress  = ["dep:enclave-os-egress"]
 kvstore = ["dep:enclave-os-kvstore"]
 vault   = ["dep:enclave-os-vault", "kvstore", "egress"]
 wasm    = ["dep:enclave-os-wasm", "kvstore", "egress"]
+fido2   = ["dep:enclave-os-fido2", "kvstore"]
 
 [dependencies]
 # Common types
@@ -83,6 +85,7 @@ enclave-os-egress  = { path = "../crates/enclave-os-egress", optional = true }
 enclave-os-kvstore = { path = "../crates/enclave-os-kvstore", optional = true }
 enclave-os-vault   = { path = "../crates/enclave-os-vault", optional = true }
 enclave-os-wasm    = { path = "../crates/enclave-os-wasm", optional = true }
+enclave-os-fido2   = { path = "../crates/enclave-os-fido2", optional = true }
 
 [profile.release]
 opt-level = "s"        # optimize for size

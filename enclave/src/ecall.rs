@@ -515,12 +515,33 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
         _module_count += 1;
     }
 
+    // ── FIDO2 module (WebAuthn authenticator ceremonies) ─────────────
+    #[cfg(feature = "fido2")]
+    {
+        let rp_id = config
+            .extra
+            .get("fido2_rp_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("privasys.org")
+            .to_string();
+        let rp_name = config
+            .extra
+            .get("fido2_rp_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("Privasys")
+            .to_string();
+        let fido2 = enclave_os_fido2::Fido2Module::new(rp_id, rp_name);
+        crate::modules::register_module(Box::new(fido2));
+        _module_count += 1;
+    }
+
     // ── Fallback: HelloWorld only (no module features enabled) ───────
     #[cfg(not(any(
         feature = "egress",
         feature = "kvstore",
         feature = "vault",
-        feature = "wasm"
+        feature = "wasm",
+        feature = "fido2"
     )))]
     {
         crate::modules::register_module(Box::new(

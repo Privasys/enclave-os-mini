@@ -35,6 +35,22 @@ pub struct RaTlsSession {
     /// extension `0xFFBB` (challenge mode only).  The client binds it
     /// into its own attestation report_data.
     client_challenge_nonce: Option<Vec<u8>>,
+    /// FIDO2 identity, set after a successful FIDO2 ceremony on this
+    /// session.  When present, subsequent requests on this TLS session
+    /// are authenticated without tokens.
+    fido2_identity: Option<FidoIdentity>,
+}
+
+/// Identity extracted from a successful FIDO2 registration or
+/// authentication ceremony.
+#[derive(Debug, Clone)]
+pub struct FidoIdentity {
+    /// Opaque user handle.
+    pub user_handle: String,
+    /// Credential ID used (base64url).
+    pub credential_id: String,
+    /// When the FIDO2 ceremony completed (unix timestamp).
+    pub authenticated_at: u64,
 }
 
 // SAFETY: RaTlsSession contains only owned types. rustls::ServerConnection
@@ -55,7 +71,7 @@ impl RaTlsSession {
         tls_conn: rustls::ServerConnection,
         client_challenge_nonce: Option<Vec<u8>>,
     ) -> Self {
-        Self { tls_conn, read_buf: Vec::new(), client_challenge_nonce }
+        Self { tls_conn, read_buf: Vec::new(), client_challenge_nonce, fido2_identity: None }
     }
 
     /// Whether the TLS handshake is still in progress.
@@ -285,6 +301,16 @@ impl RaTlsSession {
     /// extension `0xFFBB`.
     pub fn client_challenge_nonce(&self) -> Option<&Vec<u8>> {
         self.client_challenge_nonce.as_ref()
+    }
+
+    /// Return the FIDO2 identity for this session, if authenticated.
+    pub fn fido2_identity(&self) -> Option<&FidoIdentity> {
+        self.fido2_identity.as_ref()
+    }
+
+    /// Mark this session as FIDO2-authenticated.
+    pub fn set_fido2_identity(&mut self, identity: FidoIdentity) {
+        self.fido2_identity = Some(identity);
     }
 
     // ================================================================
