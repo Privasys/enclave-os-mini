@@ -1,5 +1,6 @@
 # Build artifacts
 /build/
+/build-output/
 /target/
 /enclave/target/
 /sysroot/
