@@ -222,13 +222,14 @@ impl WasmModule {
         permissions: Option<AppPermissions>,
         max_fuel: u64,
         mcp_enabled: bool,
+        docs: Option<std::collections::BTreeMap<String, String>>,
     ) -> Result<(), String> {
         // Load into the registry (compile + introspect + per-app key)
         let meta = {
             let mut reg = self.registry
                 .lock()
                 .map_err(|_| String::from("registry lock poisoned"))?;
-            reg.load_app(name, hostname, wasm_bytes, encryption_key, permissions, max_fuel, mcp_enabled)?
+            reg.load_app(name, hostname, wasm_bytes, encryption_key, permissions, max_fuel, mcp_enabled, docs)?
         };
 
         // ── Persist to KV store ────────────────────────────────────
@@ -786,7 +787,7 @@ impl EnclaveModule for WasmModule {
             let max_fuel = load.max_fuel.unwrap_or(10_000_000);
             let mcp_enabled = load.mcp_enabled.unwrap_or(true);
 
-            let mgmt_result = match self.load_app(&load.name, &hostname, &load.bytes, encryption_key, load.permissions, max_fuel, mcp_enabled) {
+            let mgmt_result = match self.load_app(&load.name, &hostname, &load.bytes, encryption_key, load.permissions, max_fuel, mcp_enabled, load.docs) {
                 Ok(()) => {
                     // Return the loaded app's info
                     let apps = self.list_apps();

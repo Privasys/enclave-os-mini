@@ -204,6 +204,7 @@ impl AppRegistry {
         permissions: Option<AppPermissions>,
         max_fuel: u64,
         mcp_enabled: bool,
+        docs: Option<std::collections::BTreeMap<String, String>>,
     ) -> Result<AppMeta, String> {
         if self.known.contains_key(name) {
             return Err(format!("app '{}' is already loaded", name));
@@ -239,7 +240,7 @@ impl AppRegistry {
             }
         };
         // ── Introspect exports (full WIT type schema) ──────────────
-        let mut schema = self.engine.discover_exports_typed(name, hostname, &component, Some(wasm_bytes));
+        let mut schema = self.engine.discover_exports_typed(name, hostname, &component, Some(wasm_bytes), docs);
         schema.mcp_enabled = mcp_enabled;
         let exports = schema.to_exports_map();
 
@@ -337,7 +338,7 @@ impl AppRegistry {
         let (exports, new_schema) = if let Some(ref s) = meta.schema {
             (s.to_exports_map(), None)
         } else {
-            let s = self.engine.discover_exports_typed(&meta.name, &meta.hostname, &component, Some(wasm_bytes));
+            let s = self.engine.discover_exports_typed(&meta.name, &meta.hostname, &component, Some(wasm_bytes), None);
             let e = s.to_exports_map();
             (e, Some(s))
         };

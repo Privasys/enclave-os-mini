@@ -236,12 +236,15 @@ impl WasmEngine {
         hostname: &str,
         component: &Component,
         wasm_bytes: Option<&[u8]>,
+        provided_docs: Option<std::collections::BTreeMap<String, String>>,
     ) -> crate::protocol::AppSchema {
         use wasmtime::component::types::ComponentItem;
 
-        let docs = wasm_bytes
-            .map(parse_package_docs)
-            .unwrap_or_default();
+        // Use caller-provided docs (from wasm_load JSON) when available;
+        // fall back to parsing the package-docs custom section from the
+        // binary (works for non-AOT WASM but not for .cwasm).
+        let docs = provided_docs
+            .unwrap_or_else(|| wasm_bytes.map(parse_package_docs).unwrap_or_default());
 
         let ty = component.component_type();
         let mut functions = Vec::new();

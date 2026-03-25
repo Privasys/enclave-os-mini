@@ -135,6 +135,19 @@ pub struct WasmLoad {
     /// Set to `false` to disable MCP tool generation for this app.
     #[serde(default = "default_mcp_enabled")]
     pub mcp_enabled: Option<bool>,
+    /// Optional pre-extracted WIT doc comments.
+    ///
+    /// AOT compilation strips WASM custom sections from the `.cwasm`
+    /// binary, so the `package-docs` section injected at build time is
+    /// lost.  This field allows the management service to pass the docs
+    /// as a separate JSON map so the enclave can still attach `///`
+    /// descriptions to the MCP tool manifest.
+    ///
+    /// Keys use the same flat format as `inject-wit-docs.py`:
+    ///   `"func-name"` → function description
+    ///   `"func-name.param"` → parameter description
+    #[serde(default)]
+    pub docs: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// Unload a WASM app by name.
