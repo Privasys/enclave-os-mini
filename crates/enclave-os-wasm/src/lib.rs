@@ -87,6 +87,7 @@ use enclave_os_common::protocol::{Request, Response};
 use enclave_os_common::types::AEAD_KEY_SIZE;
 
 use crate::protocol::{AppPermissions, FunctionPolicy, WasmCall, WasmEnvelope, WasmManagementResult, WasmResult, WasmSchemaRequest};
+use crate::protocol::{AppRolesAction, AppRolesResult, UserRoles};
 use crate::metrics::WasmMetricsStore;
 use crate::registry::AppRegistry;
 
@@ -211,7 +212,7 @@ impl WasmModule {
     ///
     /// If `permissions` is `Some`, per-function access control is
     /// enforced on `wasm_call` using the app developer's own OIDC
-    /// provider. The SHA-256 hash of the permissions JSON is included
+    /// provider. The SHA-256 hash of the configuration is included
     /// in the per-app RA-TLS certificate as OID 3.5.
     pub fn load_app(
         &self,
@@ -277,7 +278,7 @@ impl WasmModule {
     /// If the app is known but not currently compiled in memory, its
     /// WASM bytes are loaded from the sealed KV store and compiled
     /// on the fly (AOT deserialization — very fast).
-    fn dispatch_call(&self, call: &WasmCall) -> WasmResult {
+    fn dispatch_call(&self, call: &WasmCall, auth: Option<AuthResult>) -> WasmResult {
         // Ensure the app is compiled.  This is a no-op when the app
         // is already in the `loaded` map.
         if let Err(e) = self.ensure_app_loaded(&call.app) {
@@ -293,7 +294,9 @@ impl WasmModule {
                     };
                 }
             };
-            registry.call(&call.app, &call.function, &call.params)
+            let caller_id = auth.as_ref().and_then(|a| a.user_id.clone());
+            let caller_roles = auth.map(|a| a.roles).unwrap_or_default();
+            registry.call(&call.app, &call.function, &call.params, caller_id, caller_roles)
         };
 
         // Record fuel metrics.
@@ -317,8 +320,8 @@ impl WasmModule {
 
     /// Enforce per-app permission policy on a `wasm_call`.
     ///
-    /// Returns `Some(Response)` with an error if the call is denied,
-    /// or `None` if the call is permitted.
+    /// Returns `Err(Response)` with an error if the call is denied,
+    /// or `Ok(Option<AuthResult>)` if permitted (`None` = public, no auth).
     ///
     /// **Logic**:
     /// - App has no permissions → call is public (no auth needed).
@@ -328,13 +331,19 @@ impl WasmModule {
     ///   - `role` → require a valid token with at least one matching role.
     ///
     /// The app-level bearer token is taken from `call.app_auth`.
-    fn check_app_permissions(&self, call: &WasmCall) -> Option<Response> {
+    fn check_app_permissions(&self, call: &WasmCall) -> Result<Option<AuthResult>, Response> {
         // Look up the app's permissions policy.
-        let registry = self.registry.lock().ok()?;
+        let registry = self.registry.lock().map_err(|_| {
+            Response::Data(serialize_or_error(&WasmResult::Error {
+                message: String::from("registry lock poisoned"),
+            }))
+        })?;
         let permissions = match registry.app_permissions(&call.app) {
             Some(p) => p.clone(),
-            None => return None, // No permissions → public access.
+            None => return Ok(None), // No permissions → public access.
         };
+        // Build the app's role store for FIDO2 role lookup.
+        let role_store = build_app_role_store(&registry, &call.app);
         drop(registry); // Release lock before potentially slow token verification.
 
         // Determine the effective policy for this function.
@@ -345,7 +354,7 @@ impl WasmModule {
 
         // Public → no auth needed.
         if *policy == FunctionPolicy::Public {
-            return None;
+            return Ok(None);
         }
 
         // The app-level bearer token is in the wasm_call's `app_auth` field.
@@ -354,33 +363,33 @@ impl WasmModule {
             None => {
                 let err = WasmResult::Error {
                     message: format!(
-                        "authentication required: function '{}' on app '{}' requires a valid token from {}",
-                        call.function, call.app, permissions.oidc.issuer,
+                        "authentication required: function '{}' on app '{}' requires {}",
+                        call.function, call.app, auth_methods_description(&permissions),
                     ),
                 };
-                return Some(Response::Data(serialize_or_error(&err)));
+                return Err(Response::Data(serialize_or_error(&err)));
             }
         };
 
-        // Verify the token against the app's OIDC provider.
-        let caller_roles = match verify_app_token(token_str, &permissions.oidc) {
-            Ok(roles) => roles,
+        // Verify the token (FIDO2 session token or OIDC JWT).
+        let auth = match verify_auth_token(token_str, &permissions, role_store.as_ref()) {
+            Ok(r) => r,
             Err(e) => {
                 let err = WasmResult::Error {
-                    message: format!("app OIDC auth failed: {e}"),
+                    message: format!("app auth failed: {e}"),
                 };
-                return Some(Response::Data(serialize_or_error(&err)));
+                return Err(Response::Data(serialize_or_error(&err)));
             }
         };
 
         // Authenticated → token is valid, no role check needed.
         if *policy == FunctionPolicy::Authenticated {
-            return None;
+            return Ok(Some(auth));
         }
 
         // Role → check intersection.
         if !required_roles.is_empty() {
-            let has_role = caller_roles.iter().any(|r| required_roles.contains(r));
+            let has_role = auth.roles.iter().any(|r| required_roles.contains(r));
             if !has_role {
                 let err = WasmResult::Error {
                     message: format!(
@@ -388,11 +397,11 @@ impl WasmModule {
                         call.function, call.app, required_roles,
                     ),
                 };
-                return Some(Response::Data(serialize_or_error(&err)));
+                return Err(Response::Data(serialize_or_error(&err)));
             }
         }
 
-        None // Permitted.
+        Ok(Some(auth)) // Permitted with auth context.
     }
 
     /// Enforce per-app permission policy on a `wasm_schema` request.
@@ -412,6 +421,7 @@ impl WasmModule {
             Some(p) => p.clone(),
             None => return None, // No permissions → schema is public.
         };
+        let role_store = build_app_role_store(&registry, &req.app);
         drop(registry);
 
         if permissions.schema_policy == FunctionPolicy::Public {
@@ -423,19 +433,19 @@ impl WasmModule {
             None => {
                 let err = WasmManagementResult::Error {
                     message: format!(
-                        "authentication required: schema for app '{}' requires a valid token from {}",
-                        req.app, permissions.oidc.issuer,
+                        "authentication required: schema for app '{}' requires {}",
+                        req.app, auth_methods_description(&permissions),
                     ),
                 };
                 return Some(Response::Data(serialize_or_error(&err)));
             }
         };
 
-        let caller_roles = match verify_app_token(token_str, &permissions.oidc) {
-            Ok(roles) => roles,
+        let caller_roles = match verify_auth_token(token_str, &permissions, role_store.as_ref()) {
+            Ok(auth) => auth.roles,
             Err(e) => {
                 let err = WasmManagementResult::Error {
-                    message: format!("app OIDC auth failed: {e}"),
+                    message: format!("app auth failed: {e}"),
                 };
                 return Some(Response::Data(serialize_or_error(&err)));
             }
@@ -460,6 +470,173 @@ impl WasmModule {
         }
 
         None // Permitted.
+    }
+
+    /// Handle an `app_roles` role management request.
+    ///
+    /// Authenticates the caller, checks admin privileges for admin-only
+    /// actions, and delegates to `enclave_os_app_auth` for the actual
+    /// role operations.
+    fn handle_app_roles(
+        &self,
+        req: &crate::protocol::AppRolesRequest,
+    ) -> WasmManagementResult {
+        // Feature gate: app-auth must be enabled.
+        #[cfg(not(feature = "app-auth"))]
+        {
+            let _ = req;
+            return WasmManagementResult::Error {
+                message: String::from(
+                    "role management requires the enclave to be built with app-auth support",
+                ),
+            };
+        }
+
+        #[cfg(feature = "app-auth")]
+        {
+            // Verify the app exists and has permissions with FIDO2 or OIDC.
+            let registry = match self.registry.lock() {
+                Ok(r) => r,
+                Err(_) => {
+                    return WasmManagementResult::Error {
+                        message: String::from("registry lock poisoned"),
+                    };
+                }
+            };
+
+            let permissions = match registry.app_permissions(&req.app) {
+                Some(p) => p.clone(),
+                None => {
+                    return WasmManagementResult::Error {
+                        message: format!(
+                            "app '{}' has no permissions policy — role management requires auth",
+                            req.app,
+                        ),
+                    };
+                }
+            };
+
+            let role_store = match build_app_role_store(&registry, &req.app) {
+                Some(s) => s,
+                None => {
+                    return WasmManagementResult::NotFound {
+                        name: req.app.clone(),
+                    };
+                }
+            };
+            drop(registry);
+
+            // Authenticate the caller.
+            let token_str = match req.app_auth.as_deref() {
+                Some(t) => t,
+                None => {
+                    return WasmManagementResult::Error {
+                        message: format!(
+                            "authentication required: role management for app '{}' requires {}",
+                            req.app,
+                            auth_methods_description(&permissions),
+                        ),
+                    };
+                }
+            };
+
+            let auth = match verify_auth_token(token_str, &permissions, Some(&role_store)) {
+                Ok(r) => r,
+                Err(e) => {
+                    return WasmManagementResult::Error {
+                        message: format!("app auth failed: {e}"),
+                    };
+                }
+            };
+
+            // my_roles is accessible to any authenticated user.
+            if matches!(req.action, AppRolesAction::MyRoles) {
+                let user_id = auth.user_id.unwrap_or_default();
+                return WasmManagementResult::Roles {
+                    result: AppRolesResult::Roles {
+                        user_handle: user_id,
+                        roles: auth.roles,
+                    },
+                };
+            }
+
+            // All other actions require admin role.
+            if !auth.roles.contains(&"admin".to_string()) {
+                return WasmManagementResult::Error {
+                    message: String::from("admin role required for role management"),
+                };
+            }
+
+            // Dispatch the action.
+            match &req.action {
+                AppRolesAction::GetRoles { user_handle } => {
+                    match enclave_os_app_auth::get_user_roles(&role_store, user_handle) {
+                        Ok(roles) => WasmManagementResult::Roles {
+                            result: AppRolesResult::Roles {
+                                user_handle: user_handle.clone(),
+                                roles,
+                            },
+                        },
+                        Err(e) => WasmManagementResult::Error { message: e },
+                    }
+                }
+                AppRolesAction::SetRoles { user_handle, roles } => {
+                    match enclave_os_app_auth::set_user_roles(&role_store, user_handle, roles) {
+                        Ok(()) => WasmManagementResult::Roles {
+                            result: AppRolesResult::Ok {
+                                message: format!("roles updated for user '{}'", user_handle),
+                            },
+                        },
+                        Err(e) => WasmManagementResult::Error { message: e },
+                    }
+                }
+                AppRolesAction::RemoveRoles { user_handle } => {
+                    match enclave_os_app_auth::remove_user_roles(&role_store, user_handle) {
+                        Ok(()) => WasmManagementResult::Roles {
+                            result: AppRolesResult::Ok {
+                                message: format!("roles removed for user '{}'", user_handle),
+                            },
+                        },
+                        Err(e) => WasmManagementResult::Error { message: e },
+                    }
+                }
+                AppRolesAction::ListUsers => {
+                    match enclave_os_app_auth::list_users(&role_store) {
+                        Ok(users) => WasmManagementResult::Roles {
+                            result: AppRolesResult::Users {
+                                users: users
+                                    .into_iter()
+                                    .map(|(h, r)| UserRoles {
+                                        user_handle: h,
+                                        roles: r,
+                                    })
+                                    .collect(),
+                            },
+                        },
+                        Err(e) => WasmManagementResult::Error { message: e },
+                    }
+                }
+                AppRolesAction::GetDefaultRoles => {
+                    match enclave_os_app_auth::get_default_roles(&role_store) {
+                        Ok(roles) => WasmManagementResult::Roles {
+                            result: AppRolesResult::DefaultRoles { roles },
+                        },
+                        Err(e) => WasmManagementResult::Error { message: e },
+                    }
+                }
+                AppRolesAction::SetDefaultRoles { roles } => {
+                    match enclave_os_app_auth::set_default_roles(&role_store, roles) {
+                        Ok(()) => WasmManagementResult::Roles {
+                            result: AppRolesResult::Ok {
+                                message: String::from("default roles updated"),
+                            },
+                        },
+                        Err(e) => WasmManagementResult::Error { message: e },
+                    }
+                }
+                AppRolesAction::MyRoles => unreachable!(), // handled above
+            }
+        }
     }
 
     /// Convert a [`ConnectCall`] (named params as JSON) to a [`WasmCall`]
@@ -744,10 +921,11 @@ impl EnclaveModule for WasmModule {
 
         // 1. wasm_call — execute a function (app-level permissions)
         if let Some(ref call) = envelope.wasm_call {
-            if let Some(err_response) = self.check_app_permissions(call) {
-                return Some(err_response);
-            }
-            let result = self.dispatch_call(call);
+            let auth = match self.check_app_permissions(call) {
+                Ok(a) => a,
+                Err(response) => return Some(response),
+            };
+            let result = self.dispatch_call(call, auth);
             return Some(Response::Data(serialize_or_error(&result)));
         }
 
@@ -905,7 +1083,13 @@ impl EnclaveModule for WasmModule {
             return Some(Response::Data(serialize_or_error(&mgmt_result)));
         }
 
-        // 7. connect_call — named-param function call (Connect protocol)
+        // 7. app_roles — role management (feature-gated)
+        if let Some(ref roles_req) = envelope.app_roles {
+            let mgmt_result = self.handle_app_roles(roles_req);
+            return Some(Response::Data(serialize_or_error(&mgmt_result)));
+        }
+
+        // 8. connect_call — named-param function call (Connect protocol)
         if let Some(ref call) = envelope.connect_call {
             // Translate to a WasmCall using the function schema.
             let wasm_call = match self.connect_to_wasm_call(call) {
@@ -916,10 +1100,11 @@ impl EnclaveModule for WasmModule {
                 }
             };
             // Re-use the same permission + dispatch path as wasm_call.
-            if let Some(err_response) = self.check_app_permissions(&wasm_call) {
-                return Some(err_response);
-            }
-            let result = self.dispatch_call(&wasm_call);
+            let auth = match self.check_app_permissions(&wasm_call) {
+                Ok(a) => a,
+                Err(response) => return Some(response),
+            };
+            let result = self.dispatch_call(&wasm_call, auth);
             return Some(Response::Data(serialize_or_error(&result)));
         }
 
@@ -997,11 +1182,11 @@ fn build_app_identity(meta: &AppMeta) -> AppIdentity {
             oid: Some(enclave_os_common::oids::APP_KEY_SOURCE_OID),
         },
     ];
-    if let Some(ph) = meta.permissions_hash {
+    if let Some(ch) = meta.configuration_hash {
         config.push(ConfigEntry {
-            key: format!("wasm.{}.permissions_hash", meta.name),
-            value: ph.to_vec(),
-            oid: Some(enclave_os_common::oids::APP_PERMISSIONS_HASH_OID),
+            key: format!("wasm.{}.configuration_hash", meta.name),
+            value: ch.to_vec(),
+            oid: Some(enclave_os_common::oids::APP_CONFIGURATION_HASH_OID),
         });
     }
     AppIdentity {
@@ -1207,17 +1392,128 @@ fn json_to_wasm_param(
 //  App-level OIDC token verification
 // ---------------------------------------------------------------------------
 
+/// Describe the authentication methods available for an app (for error messages).
+fn auth_methods_description(permissions: &crate::protocol::AppPermissions) -> String {
+    let mut methods = Vec::new();
+    if let Some(oidc) = &permissions.oidc {
+        methods.push(format!("an OIDC token from {}", oidc.issuer));
+    }
+    if permissions.fido2 {
+        methods.push("a FIDO2 session token".into());
+    }
+    if methods.is_empty() {
+        "authentication (no method configured)".into()
+    } else {
+        methods.join(" or ")
+    }
+}
+
+/// Check if a token looks like a FIDO2 session token (64 hex chars).
+fn is_fido2_session_token(token: &str) -> bool {
+    token.len() == 64 && token.bytes().all(|b| b.is_ascii_hexdigit())
+}
+
+// ---------------------------------------------------------------------------
+//  Auth result & role store helpers
+// ---------------------------------------------------------------------------
+
+/// Result of authenticating an app-level token.
+struct AuthResult {
+    /// Caller's roles (from OIDC claims or enclave role store).
+    roles: Vec<String>,
+    /// Caller's identity (FIDO2 user_handle or OIDC `sub` claim).
+    user_id: Option<String>,
+}
+
+/// Build a [`SealedKvStore`] scoped to an app's `app:<name>` table.
+///
+/// Requires the registry lock to be held to read the encryption key.
+fn build_app_role_store(
+    registry: &AppRegistry,
+    app_name: &str,
+) -> Option<enclave_os_kvstore::SealedKvStore> {
+    let meta = registry.get_known(app_name)?;
+    let table = format!("app:{}", app_name);
+    Some(enclave_os_kvstore::SealedKvStore::from_master_key_with_table(
+        meta.encryption_key,
+        table.as_bytes(),
+    ))
+}
+
+/// Verify an app-level auth token, trying FIDO2 then OIDC as appropriate.
+///
+/// Returns an [`AuthResult`] with the caller's roles and identity.
+/// When `role_store` is provided, FIDO2 users get roles from the app's
+/// sealed KV space (with first-user bootstrap).
+fn verify_auth_token(
+    token: &str,
+    permissions: &crate::protocol::AppPermissions,
+    role_store: Option<&enclave_os_kvstore::SealedKvStore>,
+) -> Result<AuthResult, String> {
+    // Try FIDO2 session token first (if enabled and token looks right).
+    #[cfg(feature = "fido2")]
+    if permissions.fido2 && is_fido2_session_token(token) {
+        let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
+        match enclave_os_fido2::sessions::validate_token(token, now) {
+            Ok(entry) => {
+                let user_id = entry.user_handle.clone();
+                let roles = {
+                    #[cfg(feature = "app-auth")]
+                    {
+                        match role_store {
+                            Some(store) => enclave_os_app_auth::get_user_roles_with_bootstrap(
+                                store, &user_id,
+                            ).unwrap_or_default(),
+                            None => Vec::new(),
+                        }
+                    }
+                    #[cfg(not(feature = "app-auth"))]
+                    { let _ = role_store; Vec::new() }
+                };
+                return Ok(AuthResult { roles, user_id: Some(user_id) });
+            }
+            Err(e) => {
+                // If OIDC is also available, fall through silently.
+                if permissions.oidc.is_none() {
+                    return Err(format!("FIDO2 auth failed: {e}"));
+                }
+                // Otherwise fall through to OIDC attempt.
+            }
+        }
+    }
+
+    #[cfg(not(feature = "fido2"))]
+    if permissions.fido2 && permissions.oidc.is_none() {
+        return Err(
+            "app requires FIDO2 authentication but enclave was built without FIDO2 support".into(),
+        );
+    }
+
+    // Suppress unused-variable warning when both features are off.
+    #[cfg(not(feature = "fido2"))]
+    let _ = role_store;
+
+    // Try OIDC JWT verification.
+    if let Some(oidc) = &permissions.oidc {
+        let (roles, sub) = verify_app_token(token, oidc)?;
+        return Ok(AuthResult { roles, user_id: sub });
+    }
+
+    Err("no authentication method available for this app".into())
+}
+
 /// Verify a JWT against an app developer's OIDC provider.
 ///
 /// Performs full JWKS-based ES256 signature verification, then validates
-/// `iss`, `aud`, and `exp` claims.  Returns the list of role strings.
+/// `iss`, `aud`, and `exp` claims.  Returns the list of role strings
+/// and the `sub` claim (user identity).
 ///
 /// Does **not** use the platform's OIDC config — uses the app's own
 /// `AppOidcConfig`.
 fn verify_app_token(
     token: &str,
     oidc: &crate::protocol::AppOidcConfig,
-) -> Result<Vec<String>, String> {
+) -> Result<(Vec<String>, Option<String>), String> {
     // Verify ES256 signature via JWKS (rejects alg:none, fetches/caches keys)
     let claims: serde_json::Value = crate::jwks_fetcher::verify_jwt_signature(
         token,
@@ -1251,6 +1547,11 @@ fn verify_app_token(
         }
     }
 
+    // Extract subject (user identity).
+    let sub = claims.get("sub")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+
     // Extract roles from the configured roles_claim path.
     let mut roles = Vec::new();
     if let Some(val) = claims.get(&oidc.roles_claim) {
@@ -1272,7 +1573,7 @@ fn verify_app_token(
 
     roles.sort();
     roles.dedup();
-    Ok(roles)
+    Ok((roles, sub))
 }
 
 /// Collect role strings from a JSON value (array of strings or Zitadel

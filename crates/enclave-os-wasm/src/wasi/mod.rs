@@ -177,6 +177,13 @@ pub struct AppContext {
     /// Routes all host-side storage through AES-256-GCM encryption.
     pub sealed_kv: SealedKvStore,
 
+    // ── Caller identity (set per-request before WASM dispatch) ────
+    /// Authenticated caller's user ID (FIDO2 user_handle or OIDC sub).
+    /// `None` when the function has a public policy or no auth was provided.
+    pub caller_id: Option<String>,
+    /// Authenticated caller's roles (from enclave role store or OIDC claims).
+    pub caller_roles: Vec<String>,
+
     // ── Resource tracking ──────────────────────────────────────────
     /// Output-stream rep → kind.
     pub(crate) output_streams: BTreeMap<u32, OutputStreamKind>,
@@ -217,6 +224,8 @@ impl AppContext {
             args: Vec::new(),
             keystore: KeyStore::new(),
             sealed_kv: SealedKvStore::from_master_key_with_table(master_key, format!("app:{}", app_name).as_bytes()),
+            caller_id: None,
+            caller_roles: Vec::new(),
             output_streams: BTreeMap::new(),
             input_streams: BTreeMap::new(),
             tcp_sockets: BTreeMap::new(),

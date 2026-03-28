@@ -122,15 +122,16 @@ pub const APP_KEY_SOURCE_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 3, 4];
 /// Per-app Key Source (dotted-string).
 pub const APP_KEY_SOURCE_OID_STR: &str = "1.3.6.1.4.1.65230.3.4";
 
-/// Per-app Permissions Hash — `1.3.6.1.4.1.65230.3.5`
+/// Per-app Configuration Hash — `1.3.6.1.4.1.65230.3.5`
 ///
-/// 32-byte SHA-256 hash of the app's `permissions` JSON payload (the
-/// exact bytes supplied in [`WasmLoad::permissions`]).  Allows attesters
-/// to verify which permission policy is active for the app without
-/// needing the full manifest.
+/// 32-byte SHA-256 hash of the app's configuration metadata: auth
+/// policy (derived from WIT `@auth` annotations), MCP settings, and
+/// any future WIT-derived configuration.  Allows attesters to verify
+/// which configuration is active for the app without needing the full
+/// manifest.
 ///
 /// Shared across enclave-os-mini (WASM apps) and enclave-os-virtual
-/// (container permissions).
-pub const APP_PERMISSIONS_HASH_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 3, 5];
-/// Per-app Permissions Hash (dotted-string).
-pub const APP_PERMISSIONS_HASH_OID_STR: &str = "1.3.6.1.4.1.65230.3.5";
+/// (container configuration).
+pub const APP_CONFIGURATION_HASH_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 3, 5];
+/// Per-app Configuration Hash (dotted-string).
+pub const APP_CONFIGURATION_HASH_OID_STR: &str = "1.3.6.1.4.1.65230.3.5";

@@ -51,7 +51,7 @@ use wasmtime::component::{Component, Func, Val};
 
 use crate::engine::WasmEngine;
 use enclave_os_common::types::AEAD_KEY_SIZE;
-use crate::protocol::{AppPermissions, ExportedFunc, WasmParam, WasmResult, WasmValue};
+use crate::protocol::{AppPermissions, ExportedFunc, FunctionPermission, FunctionPolicy, WasmParam, WasmResult, WasmValue};
 
 /// Maximum number of compiled WASM components kept in memory.
 ///
@@ -60,6 +60,85 @@ use crate::protocol::{AppPermissions, ExportedFunc, WasmParam, WasmResult, WasmV
 /// when the limit is reached.  Apps evicted from memory remain
 /// persisted in the sealed KV store and are reloaded on demand.
 const MAX_LOADED_APPS: usize = 10;
+
+// ---------------------------------------------------------------------------
+//  WIT @auth annotation extraction
+// ---------------------------------------------------------------------------
+
+/// Parse a single `@auth` annotation value into a policy and optional roles.
+///
+/// Supported forms:
+///   - `"public"`                   → (Public, [])
+///   - `"authenticated"`            → (Authenticated, [])
+///   - `"role(role-a, role-b)"`     → (Role, ["role-a", "role-b"])
+fn parse_auth_annotation(value: &str) -> (FunctionPolicy, Vec<String>) {
+    let v = value.trim();
+    if v.eq_ignore_ascii_case("public") {
+        return (FunctionPolicy::Public, Vec::new());
+    }
+    if v.eq_ignore_ascii_case("authenticated") {
+        return (FunctionPolicy::Authenticated, Vec::new());
+    }
+    // role(role-a, role-b, ...)
+    if let Some(inner) = v.strip_prefix("role(").and_then(|s| s.strip_suffix(')')) {
+        let roles: Vec<String> = inner
+            .split(',')
+            .map(|r| r.trim().to_string())
+            .filter(|r| !r.is_empty())
+            .collect();
+        return (FunctionPolicy::Role, roles);
+    }
+    // Unrecognised → default to authenticated (safe fallback).
+    (FunctionPolicy::Authenticated, Vec::new())
+}
+
+/// Extract per-function auth policies from docs `auth:*` keys.
+///
+/// Returns a merged `AppPermissions` if any `auth:` entries are found:
+/// - `auth:__default__` → `default_policy` / `default_roles`
+/// - `auth:<func-name>` → per-function override in `functions`
+/// - OIDC/FIDO2 provider config is taken from the operator-supplied
+///   `permissions` (if any).
+fn merge_auth_from_docs(
+    docs: &BTreeMap<String, String>,
+    permissions: Option<AppPermissions>,
+) -> Option<AppPermissions> {
+    let auth_entries: Vec<(&str, &str)> = docs
+        .iter()
+        .filter_map(|(k, v)| k.strip_prefix("auth:").map(|name| (name, v.as_str())))
+        .collect();
+
+    if auth_entries.is_empty() {
+        return permissions;
+    }
+
+    // Start with existing permissions or a fresh default.
+    let mut perms = permissions.unwrap_or(AppPermissions {
+        version: 1,
+        oidc: None,
+        fido2: false,
+        default_policy: FunctionPolicy::Public,
+        default_roles: Vec::new(),
+        functions: BTreeMap::new(),
+        schema_policy: FunctionPolicy::Public,
+        schema_roles: Vec::new(),
+    });
+
+    for (name, value) in auth_entries {
+        let (policy, roles) = parse_auth_annotation(value);
+        if name == "__default__" {
+            perms.default_policy = policy;
+            perms.default_roles = roles;
+        } else {
+            perms.functions.insert(
+                name.to_string(),
+                FunctionPermission { policy, roles },
+            );
+        }
+    }
+
+    Some(perms)
+}
 
 // ---------------------------------------------------------------------------
 //  Persisted app metadata
@@ -77,7 +156,7 @@ pub struct AppMeta {
     pub encryption_key: [u8; AEAD_KEY_SIZE],
     pub key_source: String,
     pub permissions: Option<AppPermissions>,
-    pub permissions_hash: Option<[u8; 32]>,
+    pub configuration_hash: Option<[u8; 32]>,
     pub max_fuel: u64,
     /// Full WIT type schema generated at load time.
     ///
@@ -122,8 +201,8 @@ pub struct LoadedApp {
     exports: BTreeMap<String, (usize, usize)>,
     /// Optional per-app permission policy.
     pub permissions: Option<AppPermissions>,
-    /// SHA-256 hash of the permissions JSON (if any).
-    pub permissions_hash: Option<[u8; 32]>,
+    /// SHA-256 hash of the app configuration (auth policy + MCP settings).
+    pub configuration_hash: Option<[u8; 32]>,
     /// Maximum fuel budget per `wasm_call` for this app.
     pub max_fuel: u64,
 }
@@ -240,6 +319,11 @@ impl AppRegistry {
             }
         };
         // ── Introspect exports (full WIT type schema) ──────────────
+        // Extract @auth annotations from docs before passing to schema builder.
+        let permissions = match docs {
+            Some(ref d) => merge_auth_from_docs(d, permissions),
+            None => permissions,
+        };
         let mut schema = self.engine.discover_exports_typed(name, hostname, &component, Some(wasm_bytes), docs);
         schema.mcp_enabled = mcp_enabled;
         let exports = schema.to_exports_map();
@@ -251,8 +335,8 @@ impl AppRegistry {
             ));
         }
 
-        // ── Permissions hash ────────────────────────────────────────────
-        let permissions_hash = permissions.as_ref().map(|p| {
+        // ── Configuration hash ──────────────────────────────────────────────────────
+        let configuration_hash = permissions.as_ref().map(|p| {
             let canonical = serde_json::to_vec(p)
                 .expect("AppPermissions must be serialisable");
             let h = digest::digest(&digest::SHA256, &canonical);
@@ -278,7 +362,7 @@ impl AppRegistry {
             encryption_key: app_key,
             key_source: key_source.clone(),
             permissions: permissions.clone(),
-            permissions_hash,
+            configuration_hash,
             max_fuel,
             schema: Some(schema),
         };
@@ -295,7 +379,7 @@ impl AppRegistry {
                 component,
                 exports,
                 permissions,
-                permissions_hash,
+                configuration_hash,
                 max_fuel,
             },
         );
@@ -359,7 +443,7 @@ impl AppRegistry {
             component,
             exports,
             permissions: meta.permissions,
-            permissions_hash: meta.permissions_hash,
+            configuration_hash: meta.configuration_hash,
             max_fuel: meta.max_fuel,
         });
         self.touch(name);
@@ -393,7 +477,7 @@ impl AppRegistry {
                     code_hash: enclave_os_common::hex::hex_encode(&meta.code_hash),
                     key_source: meta.key_source.clone(),
                     exports,
-                    permissions_hash: meta.permissions_hash.map(|h| enclave_os_common::hex::hex_encode(&h)),
+                    configuration_hash: meta.configuration_hash.map(|h| enclave_os_common::hex::hex_encode(&h)),
                     max_fuel: meta.max_fuel,
                     loaded: self.loaded.contains_key(&meta.name),
                 }
@@ -431,9 +515,9 @@ impl AppRegistry {
             .collect()
     }
 
-    /// Get the permissions hash for a known app (for OID 3.5 attestation).
-    pub fn app_permissions_hash(&self, name: &str) -> Option<&[u8; 32]> {
-        self.known.get(name).and_then(|m| m.permissions_hash.as_ref())
+    /// Get the configuration hash for a known app (for OID 3.5 attestation).
+    pub fn app_configuration_hash(&self, name: &str) -> Option<&[u8; 32]> {
+        self.known.get(name).and_then(|m| m.configuration_hash.as_ref())
     }
 
     /// Get the permissions policy for a known app (for call-time enforcement).
@@ -469,6 +553,8 @@ impl AppRegistry {
         app_name: &str,
         function: &str,
         params: &[WasmParam],
+        caller_id: Option<String>,
+        caller_roles: Vec<String>,
     ) -> (WasmResult, i64) {
         self.touch(app_name);
 
@@ -506,6 +592,13 @@ impl AppRegistry {
 
         // Record fuel before execution for delta calculation.
         let fuel_before = store.get_fuel().unwrap_or(0) as i64;
+
+        // ── Inject authenticated caller context ────────────────────
+        {
+            let ctx = store.data_mut();
+            ctx.caller_id = caller_id;
+            ctx.caller_roles = caller_roles;
+        }
 
         // ── Resolve the exported function ──────────────────────────
         // Functions can be at the root or under an exported instance.

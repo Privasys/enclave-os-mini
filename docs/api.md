@@ -409,7 +409,7 @@ Load (or replace) a WASM component.  Requires **Manager** role.
     "exports": [
       { "name": "process", "param_count": 1, "result_count": 1 }
     ],
-    "permissions_hash": "e5f6a7b8...",
+    "configuration_hash": "e5f6a7b8...",
     "max_fuel": 20000000
   }
 }
@@ -554,7 +554,7 @@ List all loaded WASM components.  Requires **Monitoring+** role.
 | `code_hash` | string | SHA-256 of WASM component bytecode (hex) |
 | `key_source` | string | `"generated"` or `"byok:<fingerprint>"` |
 | `exports` | array | Discovered exported function signatures |
-| `permissions_hash` | string? | SHA-256 of the permissions JSON (hex), or absent if no permissions |
+| `configuration_hash` | string? | SHA-256 of the app configuration (hex), or absent if no permissions |
 | `max_fuel` | u64 | Fuel budget per call for this app |
 
 ### wasm_schema
@@ -757,16 +757,16 @@ for the platform OIDC):
 
 ### Attestation
 
-The SHA-256 hash of the permissions JSON is included in the per-app
-RA-TLS certificate as OID `1.3.6.1.4.1.65230.3.5` (App Permissions
+The SHA-256 hash of the app configuration is included in the per-app
+RA-TLS certificate as OID `1.3.6.1.4.1.65230.3.5` (App Configuration
 Hash).  Clients connecting via the app's SNI hostname can verify exactly
-which permission policy is active — without trusting the host.
+which configuration is active — without trusting the host.
 
 | Per-app OID | Value |
 |-------------|-------|
 | `3.2` | Code hash (WASM bytecode SHA-256) |
 | `3.4` | Key source (`"generated"` or `"byok:<fingerprint>"`) |
-| `3.5` | Permissions hash (SHA-256 of permissions JSON) |
+| `3.5` | Configuration hash (SHA-256 of app configuration) |
 
 ---
 

@@ -3,13 +3,14 @@
 
 //! **Enclave OS SDK** — `privasys:enclave-os@0.1.0` host function implementations.
 //!
-//! This module exposes three Component Model interfaces to WASM apps:
+//! This module exposes four Component Model interfaces to WASM apps:
 //!
 //! | Interface | Purpose |
 //! |-----------|---------|
 //! | `privasys:enclave-os/crypto@0.1.0` | Cryptographic primitives (digest, AEAD, ECDSA, HMAC, RNG) |
 //! | `privasys:enclave-os/keystore@0.1.0` | Key generation / import / export / lifecycle |
 //! | `privasys:enclave-os/https@0.1.0` | Secure HTTPS egress (TLS inside enclave) |
+//! | `privasys:enclave-os/auth@0.1.0` | Caller identity & role management |
 //!
 //! ## Security model
 //!
@@ -27,6 +28,7 @@
 //! enclave_sdk::add_to_linker(&mut linker)?;
 //! ```
 
+pub mod auth;
 pub mod crypto;
 pub mod https;
 pub mod keystore;
@@ -38,13 +40,15 @@ use wasmtime::component::Linker;
 
 /// Register all `privasys:enclave-os@0.1.0` host function implementations.
 ///
-/// This populates three interface namespaces on the linker:
+/// This populates four interface namespaces on the linker:
 /// - `privasys:enclave-os/crypto@0.1.0`
 /// - `privasys:enclave-os/keystore@0.1.0`
 /// - `privasys:enclave-os/https@0.1.0`
+/// - `privasys:enclave-os/auth@0.1.0`
 pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
     crypto::add_to_linker(linker)?;
     keystore::add_to_linker(linker)?;
     https::add_to_linker(linker)?;
+    auth::add_to_linker(linker)?;
     Ok(())
 }

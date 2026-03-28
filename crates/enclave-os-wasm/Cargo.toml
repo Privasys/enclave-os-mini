@@ -17,6 +17,12 @@ enclave-os-common = { path = "../../common", features = ["jwt"] }
 enclave-os-kvstore = { path = "../enclave-os-kvstore" }
 enclave-os-egress = { path = "../enclave-os-egress" }
 
+# FIDO2 session token validation (optional — only needed when apps use FIDO2 auth)
+enclave-os-fido2 = { path = "../enclave-os-fido2", optional = true }
+
+# Per-app role management (optional — enclave-managed RBAC for FIDO2 users)
+enclave-os-app-auth = { path = "../enclave-os-app-auth", optional = true }
+
 # Wasmtime with SGX support (Privasys fork, `sgx` branch).
 #
 # The fork adds a `target_vendor = "teaclave"` check in `sys/mod.rs`
@@ -58,3 +64,14 @@ serde_json = "1"
 
 # wasi:random — RDRAND hardware RNG inside SGX (no OCALL)
 getrandom = { version = "0.2", features = ["rdrand"] }
+
+[features]
+# Enable FIDO2 session token validation for wasm app authentication.
+# When enabled, apps with `"fido2": true` in their permissions can accept
+# FIDO2 session tokens in `app_auth` alongside (or instead of) OIDC JWTs.
+fido2 = ["dep:enclave-os-fido2"]
+
+# Enable enclave-managed per-app role-based access control.
+# When enabled, FIDO2-authenticated users get roles stored in the app's
+# sealed KV space.  The first user auto-bootstraps as admin.
+app-auth = ["dep:enclave-os-app-auth"]

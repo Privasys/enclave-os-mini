@@ -63,6 +63,14 @@ pub struct WasmEnvelope {
     /// Request the MCP tool manifest for a WASM app.
     #[serde(default)]
     pub mcp_tools: Option<WasmMcpRequest>,
+
+    /// Role management for a WASM app.
+    ///
+    /// Manage user roles in the app's sealed KV space.  Requires app-level
+    /// authentication via `app_auth`.  Administrative actions require the
+    /// `admin` role.
+    #[serde(default)]
+    pub app_roles: Option<AppRolesRequest>,
 }
 
 // ---------------------------------------------------------------------------
@@ -135,13 +143,17 @@ pub struct WasmLoad {
     /// Set to `false` to disable MCP tool generation for this app.
     #[serde(default = "default_mcp_enabled")]
     pub mcp_enabled: Option<bool>,
-    /// Optional pre-extracted WIT doc comments.
+    /// Optional pre-extracted WIT doc comments and auth annotations.
     ///
     /// AOT compilation strips WASM custom sections from the `.cwasm`
     /// binary, so the `package-docs` section injected at build time is
     /// lost.  This field allows the management service to pass the docs
     /// as a separate JSON map so the enclave can still attach `///`
     /// descriptions to the MCP tool manifest.
+    ///
+    /// Also carries `@auth` annotations extracted from WIT comments:
+    ///   `"auth:func-name"` → per-function auth policy
+    ///   `"auth:__default__"` → world-level default auth policy
     ///
     /// Keys use the same flat format as `inject-wit-docs.py`:
     ///   `"func-name"` → function description
@@ -298,6 +310,12 @@ pub enum WasmManagementResult {
         /// MCP-compatible tool manifest.
         manifest: McpToolManifest,
     },
+    /// Role management response.
+    #[serde(rename = "roles")]
+    Roles {
+        /// Role management result.
+        result: AppRolesResult,
+    },
 }
 
 // ---------------------------------------------------------------------------
@@ -316,12 +334,13 @@ pub struct WasmCall {
     /// An empty vec means no parameters.
     #[serde(default)]
     pub params: Vec<WasmParam>,
-    /// App-level OIDC bearer token.
+    /// App-level authentication token (OIDC JWT or FIDO2 session token).
     ///
     /// When the app has a `permissions` policy, this token is verified
-    /// against the app developer's OIDC provider (not the platform's).
-    /// The field is separate from the top-level `"auth"` to avoid
-    /// collision with the platform auth layer.
+    /// against the app developer's OIDC provider (JWT) or the enclave's
+    /// FIDO2 session store (opaque hex token).  The field is separate
+    /// from the top-level `"auth"` to avoid collision with the platform
+    /// auth layer.
     #[serde(default)]
     pub app_auth: Option<String>,
 }
@@ -454,10 +473,10 @@ pub struct AppInfo {
     pub key_source: String,
     /// Exported function signatures discovered from the component.
     pub exports: Vec<ExportedFunc>,
-    /// SHA-256 hash of the permissions JSON (hex), or `null` if no
+    /// SHA-256 hash of the app configuration (hex), or `null` if no
     /// permissions policy is configured (all functions are public).
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub permissions_hash: Option<String>,
+    pub configuration_hash: Option<String>,
     /// Maximum fuel budget per call for this app.
     pub max_fuel: u64,
     /// Whether the app is currently compiled in enclave memory.
@@ -495,12 +514,25 @@ pub struct AppPermissions {
     /// Schema version (must be `1`).
     pub version: u32,
     /// App developer's OIDC provider configuration for token verification.
-    pub oidc: AppOidcConfig,
+    ///
+    /// Optional when `fido2` is `true` — apps may use FIDO2-only auth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oidc: Option<AppOidcConfig>,
+    /// Accept FIDO2 session tokens from the enclave's FIDO2 module.
+    ///
+    /// When `true`, callers may pass a FIDO2 session token (opaque hex
+    /// string) in `app_auth` instead of an OIDC JWT.  The token is
+    /// validated against the enclave's in-memory session store.
+    ///
+    /// FIDO2 tokens satisfy `Authenticated` policy but carry no roles,
+    /// so `Role` policy requires an OIDC JWT.
+    #[serde(default)]
+    pub fido2: bool,
     /// Default policy for functions not listed in `functions`.
     ///
     /// - `"public"` — no authentication required
-    /// - `"authenticated"` — valid OIDC token required (any role)
-    /// - `"role"` — requires `default_roles`
+    /// - `"authenticated"` — valid token required (OIDC JWT or FIDO2 session)
+    /// - `"role"` — requires `default_roles` (OIDC only)
     #[serde(default = "default_policy")]
     pub default_policy: FunctionPolicy,
     /// Roles required when `default_policy` is `Role`.
@@ -568,6 +600,88 @@ fn default_roles_claim() -> String {
 
 fn default_mcp_enabled() -> Option<bool> {
     Some(true)
+}
+
+// ---------------------------------------------------------------------------
+//  Per-app role management
+// ---------------------------------------------------------------------------
+
+/// Role management request for a WASM app.
+///
+/// Manages user roles in the app's sealed KV space.  The calling user
+/// must authenticate via `app_auth` (FIDO2 session token or OIDC JWT).
+/// Administrative actions require the `admin` role.
+///
+/// ```json
+/// { "app_roles": { "app": "my-app", "app_auth": "...", "action": "list_users" } }
+/// { "app_roles": { "app": "my-app", "app_auth": "...", "action": "set_roles",
+///                   "data": {"user_handle": "abc", "roles": ["admin"]} } }
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AppRolesRequest {
+    /// App identifier.
+    pub app: String,
+    /// App-level authentication token.
+    #[serde(default)]
+    pub app_auth: Option<String>,
+    /// The role management action and its parameters.
+    #[serde(flatten)]
+    pub action: AppRolesAction,
+}
+
+/// Role management action.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", content = "data")]
+pub enum AppRolesAction {
+    /// Get roles for a specific user (admin required).
+    #[serde(rename = "get_roles")]
+    GetRoles { user_handle: String },
+    /// Assign roles to a user (admin required).
+    #[serde(rename = "set_roles")]
+    SetRoles { user_handle: String, roles: Vec<String> },
+    /// Remove all roles from a user (admin required).
+    #[serde(rename = "remove_roles")]
+    RemoveRoles { user_handle: String },
+    /// List all users and their roles (admin required).
+    #[serde(rename = "list_users")]
+    ListUsers,
+    /// Get the default roles for new users (admin required).
+    #[serde(rename = "get_default_roles")]
+    GetDefaultRoles,
+    /// Set the default roles for new users (admin required).
+    #[serde(rename = "set_default_roles")]
+    SetDefaultRoles { roles: Vec<String> },
+    /// Get the calling user's own roles (any authenticated user).
+    #[serde(rename = "my_roles")]
+    MyRoles,
+}
+
+/// Result of a role management operation.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type")]
+pub enum AppRolesResult {
+    /// A single user's roles.
+    #[serde(rename = "roles")]
+    Roles {
+        user_handle: String,
+        roles: Vec<String>,
+    },
+    /// All users and their roles.
+    #[serde(rename = "users")]
+    Users { users: Vec<UserRoles> },
+    /// Default roles configuration.
+    #[serde(rename = "default_roles")]
+    DefaultRoles { roles: Vec<String> },
+    /// Action completed successfully.
+    #[serde(rename = "ok")]
+    Ok { message: String },
+}
+
+/// A user and their assigned roles.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserRoles {
+    pub user_handle: String,
+    pub roles: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
