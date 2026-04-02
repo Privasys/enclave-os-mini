@@ -50,6 +50,7 @@ echo "==> Configuring CMake build..."
 cmake -S "${SRC}" -B "${BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
     -DENABLE_WASM=ON \
+    -DENABLE_FIDO2=ON \
     -DCMAKE_C_COMPILER=gcc \
     -DCMAKE_CXX_COMPILER=g++
 

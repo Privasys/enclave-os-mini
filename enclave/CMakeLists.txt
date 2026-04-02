@@ -9,9 +9,11 @@
 #
 #   cmake -DENABLE_VAULT=ON                    → vault + kvstore + egress
 #   cmake -DENABLE_WASM=ON                     → wasm  + kvstore + egress
+#   cmake -DENABLE_FIDO2=ON                    → fido2 + kvstore
 #   cmake -DENABLE_EGRESS=ON                   → egress only
 #   cmake -DENABLE_KVSTORE=ON                  → kvstore only
 #   cmake -DENABLE_VAULT=ON -DENABLE_WASM=ON   → all four modules
+#   cmake -DENABLE_WASM=ON -DENABLE_FIDO2=ON   → wasm + fido2 (full auth)
 #
 # Each flag maps to a Cargo feature on the enclave crate.  The default
 # ecall_run (feature = "default-ecall") registers whichever modules are
@@ -25,6 +27,7 @@ option(ENABLE_EGRESS  "Include the HTTPS egress module"                       OF
 option(ENABLE_KVSTORE "Include the sealed KV store module"                    OFF)
 option(ENABLE_VAULT   "Include the vault module (implies egress + kvstore)"   OFF)
 option(ENABLE_WASM    "Include the WASM runtime module (implies egress + kvstore)" OFF)
+option(ENABLE_FIDO2   "Include the FIDO2/WebAuthn authentication module (implies kvstore)" OFF)
 
 set(CUSTOM_ENCLAVE_DIR "" CACHE PATH
     "Path to an external composition crate with a custom ecall_run. \
@@ -57,6 +60,9 @@ else()
     endif()
     if(ENABLE_WASM)
         list(APPEND _features "wasm")
+    endif()
+    if(ENABLE_FIDO2)
+        list(APPEND _features "fido2")
     endif()
 
     # Join into comma-separated string for Cargo
