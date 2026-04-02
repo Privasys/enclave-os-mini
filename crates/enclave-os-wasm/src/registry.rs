@@ -296,6 +296,20 @@ impl AppRegistry {
 
         // ── Deserialize (AOT) ──────────────────────────────────────
         let component = self.engine.deserialize(wasm_bytes)?;
+
+        // ── Trial instantiation ────────────────────────────────────
+        // Eagerly verify that the component can be linked against the
+        // host SDK (auth, kvstore, egress, etc.).  Without this check
+        // a missing import (e.g. auth@0.1.0 on an old binary) would
+        // only surface on the first wasm_call, after the management
+        // service already reported a successful deployment.
+        {
+            let mut probe_store = self.engine.new_store(name, [0u8; AEAD_KEY_SIZE], 1);
+            self.engine.linker().instantiate(&mut probe_store, &component).map_err(|e| {
+                format!("component failed trial instantiation (linker error): {}", e)
+            })?;
+        }
+
         // ── Per-app encryption key ─────────────────────────────────
         let (app_key, key_source) = match encryption_key {
             Some(k) => {

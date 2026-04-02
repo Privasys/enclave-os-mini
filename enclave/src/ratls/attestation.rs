@@ -388,6 +388,10 @@ fn build_leaf_cert(
     };
     use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
+    let ca_cert_der = CertificateDer::from(ca.ca_cert_der.as_slice());
+    let ca_params = CertificateParams::from_ca_cert_der(&ca_cert_der)
+        .map_err(|e| format!("CA cert parse: {}", e))?;
+
     // --- Leaf key pair ---
     let leaf_pkcs8_der = PrivatePkcs8KeyDer::from(leaf_pkcs8.to_vec());
     let leaf_key = KeyPair::from_pkcs8_der_and_sign_algo(
@@ -400,14 +404,25 @@ fn build_leaf_cert(
     let mut leaf_params = CertificateParams::new(Vec::<String>::new())
         .map_err(|e| format!("leaf params: {}", e))?;
 
+    // CN is always the app hostname (or enclave-wide fallback name).
     leaf_params.distinguished_name.push(
         DnType::CommonName,
         DnValue::Utf8String(common_name.into()),
     );
-    leaf_params.distinguished_name.push(
+
+    // Copy C, ST, L, O, OU from the intermediate CA so the leaf's
+    // subject matches the issuer's organisation fields.
+    for dn_type in &[
+        DnType::CountryName,
+        DnType::StateOrProvinceName,
+        DnType::LocalityName,
         DnType::OrganizationName,
-        DnValue::Utf8String("Privasys".into()),
-    );
+        DnType::OrganizationalUnitName,
+    ] {
+        if let Some(value) = ca_params.distinguished_name.get(dn_type) {
+            leaf_params.distinguished_name.push(dn_type.clone(), value.clone());
+        }
+    }
 
     // Validity: wide window; actual freshness is proved by the quote.
     leaf_params.not_before = rcgen::date_time_ymd(2024, 1, 1);
@@ -433,9 +448,6 @@ fn build_leaf_cert(
     )
     .map_err(|e| format!("CA key: {}", e))?;
 
-    let ca_cert_der = CertificateDer::from(ca.ca_cert_der.as_slice());
-    let ca_params = CertificateParams::from_ca_cert_der(&ca_cert_der)
-        .map_err(|e| format!("CA cert parse: {}", e))?;
     let ca_cert = ca_params.self_signed(&ca_key)
         .map_err(|e| format!("CA cert reconstruct: {}", e))?;
 

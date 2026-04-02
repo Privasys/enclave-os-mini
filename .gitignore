@@ -27,9 +27,6 @@ config/enclave_private.pem
 Thumbs.db
 .DS_Store
 
-# Local status doc
-status.md
-
 # Test certificate private keys
 *.key
 *.crt
