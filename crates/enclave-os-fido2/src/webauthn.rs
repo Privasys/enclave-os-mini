@@ -186,14 +186,14 @@ pub fn extract_p256_public_key(cose_cbor: &[u8]) -> Result<Vec<u8>, String> {
     // Helper: find integer key in CBOR map
     let find_int = |key: i64| -> Option<&ciborium::Value> {
         map.iter()
-            .find(|(k, _)| matches!(k, ciborium::Value::Integer(i) if i64::from(*i) == key))
+            .find(|(k, _)| matches!(k, ciborium::Value::Integer(i) if i128::from(*i) as i64 == key))
             .map(|(_, v)| v)
     };
 
     // Verify key type = EC2 (2)
     let kty = find_int(COSE_KEY_KTY)
         .and_then(|v| match v {
-            ciborium::Value::Integer(i) => Some(i64::from(*i)),
+            ciborium::Value::Integer(i) => Some(i128::from(*i) as i64),
             _ => None,
         })
         .ok_or("COSE key missing kty")?;
@@ -204,7 +204,7 @@ pub fn extract_p256_public_key(cose_cbor: &[u8]) -> Result<Vec<u8>, String> {
     // Verify curve = P-256 (1)
     let crv = find_int(COSE_KEY_CRV)
         .and_then(|v| match v {
-            ciborium::Value::Integer(i) => Some(i64::from(*i)),
+            ciborium::Value::Integer(i) => Some(i128::from(*i) as i64),
             _ => None,
         })
         .ok_or("COSE key missing crv")?;

@@ -10,6 +10,7 @@
 use std::collections::HashMap;
 use std::sync::Mutex;
 
+use base64::Engine;
 use ring::rand::{SecureRandom, SystemRandom};
 
 use crate::types::*;
