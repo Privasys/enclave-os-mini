@@ -105,9 +105,45 @@ pub fn list_credentials(rp_id: &str, user_handle: &str) -> Result<Vec<String>, S
 //  AAGUID allowlist
 // ---------------------------------------------------------------------------
 
+/// Privasys Wallet AAGUID: f47ac10b-58cc-4372-a567-0e02b2c3d479
+pub const PRIVASYS_WALLET_AAGUID: [u8; 16] = [
+    0xf4, 0x7a, 0xc1, 0x0b, 0x58, 0xcc, 0x43, 0x72,
+    0xa5, 0x67, 0x0e, 0x02, 0xb2, 0xc3, 0xd4, 0x79,
+];
+
+/// Privasys Wallet AAGUID as a hex string.
+pub const PRIVASYS_WALLET_AAGUID_HEX: &str = "f47ac10b58cc4372a5670e02b2c3d479";
+
+/// Initialise the AAGUID allowlist if none is stored.
+///
+/// Called during `Fido2Module::new()`. If the KV store has no allowlist,
+/// sets the default to Privasys Wallet only. If an explicit list is
+/// provided, it overrides whatever is stored.
+pub fn init_aaguid_allowlist(explicit: Option<&[String]>) -> Result<(), String> {
+    let kv = kv_store().ok_or("kv store not initialised")?;
+    let store = kv.lock().map_err(|_| "kv store lock poisoned")?;
+
+    if let Some(list) = explicit {
+        let json =
+            serde_json::to_vec(list).map_err(|e| format!("serialise aaguid list: {e}"))?;
+        return store.put(AAGUID_ALLOW_KEY, &json);
+    }
+
+    // Only set default if nothing is stored yet
+    if store.get(AAGUID_ALLOW_KEY)?.is_none() {
+        let default = vec![PRIVASYS_WALLET_AAGUID_HEX.to_string()];
+        let json =
+            serde_json::to_vec(&default).map_err(|e| format!("serialise aaguid list: {e}"))?;
+        store.put(AAGUID_ALLOW_KEY, &json)?;
+    }
+
+    Ok(())
+}
+
 /// Check whether an AAGUID (16 bytes) is in the allowlist.
 ///
-/// If no allowlist is stored, all AAGUIDs are accepted (open mode).
+/// If no allowlist is stored (should not happen after init), rejects all
+/// — secure by default.
 pub fn is_aaguid_allowed(aaguid: &[u8; 16]) -> Result<bool, String> {
     let kv = kv_store().ok_or("kv store not initialised")?;
     let store = kv.lock().map_err(|_| "kv store lock poisoned")?;
@@ -116,11 +152,15 @@ pub fn is_aaguid_allowed(aaguid: &[u8; 16]) -> Result<bool, String> {
         Some(bytes) => {
             let allowed: Vec<String> = serde_json::from_slice(&bytes)
                 .map_err(|e| format!("deserialise aaguid list: {e}"))?;
+            // Wildcard: ["*"] accepts all (for development/testing only)
+            if allowed.iter().any(|a| a == "*") {
+                return Ok(true);
+            }
             let hex = hex_encode(aaguid);
             Ok(allowed.iter().any(|a| a.eq_ignore_ascii_case(&hex)))
         }
-        // No allowlist = accept all (open mode for initial development)
-        None => Ok(true),
+        // No allowlist after init = reject all (secure by default)
+        None => Ok(false),
     }
 }
 
@@ -157,4 +197,86 @@ fn add_to_user_index(
 
 fn hex_encode(bytes: &[u8]) -> String {
     bytes.iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Pure-logic AAGUID check: returns true if the AAGUID hex is in the allowlist,
+/// or if the list contains the wildcard `"*"`.
+pub fn check_aaguid_in_list(aaguid: &[u8; 16], allowed: &[String]) -> bool {
+    if allowed.iter().any(|a| a == "*") {
+        return true;
+    }
+    let hex = hex_encode(aaguid);
+    allowed.iter().any(|a| a.eq_ignore_ascii_case(&hex))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const PRIVASYS_AAGUID: [u8; 16] = PRIVASYS_WALLET_AAGUID;
+    const WINDOWS_HELLO_AAGUID: [u8; 16] = [
+        0x08, 0x98, 0x70, 0x58, 0xca, 0xdc, 0x4b, 0x81,
+        0xb6, 0xe1, 0x30, 0xde, 0x50, 0xdc, 0xbe, 0x96,
+    ];
+    const ZERO_AAGUID: [u8; 16] = [0u8; 16];
+
+    #[test]
+    fn privasys_aaguid_allowed_by_default_list() {
+        let list = vec![PRIVASYS_WALLET_AAGUID_HEX.to_string()];
+        assert!(check_aaguid_in_list(&PRIVASYS_AAGUID, &list));
+    }
+
+    #[test]
+    fn windows_hello_rejected_by_default_list() {
+        let list = vec![PRIVASYS_WALLET_AAGUID_HEX.to_string()];
+        assert!(!check_aaguid_in_list(&WINDOWS_HELLO_AAGUID, &list));
+    }
+
+    #[test]
+    fn zero_aaguid_rejected() {
+        let list = vec![PRIVASYS_WALLET_AAGUID_HEX.to_string()];
+        assert!(!check_aaguid_in_list(&ZERO_AAGUID, &list));
+    }
+
+    #[test]
+    fn wildcard_allows_everything() {
+        let list = vec!["*".to_string()];
+        assert!(check_aaguid_in_list(&PRIVASYS_AAGUID, &list));
+        assert!(check_aaguid_in_list(&WINDOWS_HELLO_AAGUID, &list));
+        assert!(check_aaguid_in_list(&ZERO_AAGUID, &list));
+    }
+
+    #[test]
+    fn empty_list_rejects_all() {
+        let list: Vec<String> = vec![];
+        assert!(!check_aaguid_in_list(&PRIVASYS_AAGUID, &list));
+        assert!(!check_aaguid_in_list(&WINDOWS_HELLO_AAGUID, &list));
+    }
+
+    #[test]
+    fn case_insensitive_match() {
+        let list = vec!["F47AC10B58CC4372A5670E02B2C3D479".to_string()];
+        assert!(check_aaguid_in_list(&PRIVASYS_AAGUID, &list));
+    }
+
+    #[test]
+    fn multiple_aaguids_in_list() {
+        let list = vec![
+            PRIVASYS_WALLET_AAGUID_HEX.to_string(),
+            "0898705800000000000000000000beef".to_string(),
+        ];
+        assert!(check_aaguid_in_list(&PRIVASYS_AAGUID, &list));
+        // Windows Hello not in the list
+        assert!(!check_aaguid_in_list(&WINDOWS_HELLO_AAGUID, &list));
+    }
+
+    #[test]
+    fn hex_encode_produces_lowercase() {
+        assert_eq!(hex_encode(&PRIVASYS_AAGUID), PRIVASYS_WALLET_AAGUID_HEX);
+    }
+
+    #[test]
+    fn aaguid_constant_matches_hex_constant() {
+        assert_eq!(hex_encode(&PRIVASYS_WALLET_AAGUID), PRIVASYS_WALLET_AAGUID_HEX);
+    }
 }

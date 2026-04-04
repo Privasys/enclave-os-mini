@@ -68,9 +68,18 @@ impl Fido2Module {
     ///
     /// `rp_id` is the relying party identifier (e.g. `"myapp.apps.privasys.org"`).
     /// `rp_name` is a human-readable name (e.g. `"My Application"`).
-    pub fn new(rp_id: String, rp_name: String) -> Self {
+    /// `aaguid_allowlist` overrides the default (Privasys Wallet only).
+    /// Pass `None` for the secure default, or `Some(&["*"])` for open mode.
+    pub fn new(rp_id: String, rp_name: String, aaguid_allowlist: Option<&[String]>) -> Self {
         challenge::init();
         sessions::init();
+        if let Err(e) = credentials::init_aaguid_allowlist(aaguid_allowlist) {
+            // Log but don't fail — the module is usable, registration will
+            // reject all AAGUIDs if the allowlist couldn't be initialised.
+            #[cfg(feature = "sgx")]
+            enclave_os_common::enclave_log_error!("FIDO2: init AAGUID allowlist failed: {e}");
+            let _ = e;
+        }
         Self { rp_id, rp_name }
     }
 }

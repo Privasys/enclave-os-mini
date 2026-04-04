@@ -530,7 +530,14 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
             .and_then(|v| v.as_str())
             .unwrap_or("Privasys")
             .to_string();
-        let fido2 = enclave_os_fido2::Fido2Module::new(rp_id, rp_name);
+        // Optional explicit AAGUID allowlist from config.
+        // Default: Privasys Wallet only. Use ["*"] for open mode.
+        let aaguid_allowlist: Option<Vec<String>> = config
+            .extra
+            .get("fido2_aaguid_allowlist")
+            .and_then(|v| serde_json::from_value(v.clone()).ok());
+        let aaguid_ref = aaguid_allowlist.as_deref();
+        let fido2 = enclave_os_fido2::Fido2Module::new(rp_id, rp_name, aaguid_ref);
         crate::modules::register_module(Box::new(fido2));
         _module_count += 1;
     }
