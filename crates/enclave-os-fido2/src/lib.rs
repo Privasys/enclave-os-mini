@@ -199,7 +199,7 @@ impl Fido2Module {
                 alg: COSE_ALG_ES256,
             }],
             authenticator_selection: AuthenticatorSelection {
-                authenticator_attachment: "platform".into(),
+                authenticator_attachment: "cross-platform".into(),
                 resident_key: "required".into(),
                 user_verification: "required".into(),
             },
