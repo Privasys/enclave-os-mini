@@ -134,7 +134,6 @@ Clients verify: **MRENCLAVE** (code identity) + **Config Merkle Root** (config i
 | Repository | Description |
 |------------|-------------|
 | [ra-tls-clients](https://github.com/Privasys/ra-tls-clients) | RA-TLS client libraries (Go, Python, Rust, TypeScript, C#) |
-| [ra-tls-caddy](https://github.com/Privasys/ra-tls-caddy) | Caddy module for RA-TLS in Confidential VMs |
 | [wasm-app-example](https://github.com/Privasys/wasm-app-example) | Example WASM app + composition crate for Enclave OS |
 | [teaclave-sgx-sdk](https://github.com/Privasys/teaclave-sgx-sdk) | Privasys fork of Teaclave SGX SDK |
 | [wasmtime](https://github.com/Privasys/wasmtime) | Privasys fork of Wasmtime (branch `sgx`, AOT-only) |
