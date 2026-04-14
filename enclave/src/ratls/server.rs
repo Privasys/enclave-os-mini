@@ -987,7 +987,24 @@ fn handle_fido2_request(
         oidc_claims,
     };
 
-    let req = Request::Data(http_req.body.clone());
+    // Inject the endpoint path as the serde `"type"` discriminator so
+    // the FIDO2 module can dispatch without seeing HTTP details.
+    // "/fido2/register/begin" → type = "register/begin"
+    let route = &path["/fido2/".len()..]; // "register/begin" etc.
+    let body = match serde_json::from_slice::<serde_json::Value>(&http_req.body) {
+        Ok(serde_json::Value::Object(mut map)) => {
+            map.insert("type".into(), serde_json::Value::String(route.into()));
+            serde_json::to_vec(&map).unwrap_or_else(|_| http_req.body.clone())
+        }
+        _ => {
+            // Empty body (e.g. authenticate/begin with no args) — create
+            // a minimal JSON object with just the type discriminator.
+            let obj = serde_json::json!({ "type": route });
+            serde_json::to_vec(&obj).unwrap_or_else(|_| http_req.body.clone())
+        }
+    };
+
+    let req = Request::Data(body);
     dispatch_and_respond(req, &ctx)
 }
 

@@ -43,142 +43,193 @@ pub const SESSION_TOKEN_BYTES: usize = 32;
 pub const CHALLENGE_BYTES: usize = 32;
 
 // ---------------------------------------------------------------------------
-//  FIDO2 wire protocol — request
+//  FIDO2 wire protocol — request (standard WebAuthn, camelCase)
 // ---------------------------------------------------------------------------
 
 /// FIDO2-specific request, JSON-encoded inside `Request::Data`.
+///
+/// Wire format follows the WebAuthn specification (camelCase fields).
+/// The `type` discriminator maps to logical endpoints:
+///   - `"register/begin"` → begin registration
+///   - `"register/complete"` → complete registration
+///   - `"authenticate/begin"` → begin authentication
+///   - `"authenticate/complete"` → complete authentication
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "type")]
 pub enum Fido2Request {
     /// Begin registration: enclave generates a challenge and returns
     /// `PublicKeyCredentialCreationOptions`.
-    #[serde(rename = "register_begin")]
+    #[serde(rename = "register/begin")]
     RegisterBegin {
         /// User-visible display name (e.g. email or username).
+        #[serde(rename = "userName")]
         user_name: String,
         /// Opaque user handle (base64url, up to 64 bytes).
+        #[serde(rename = "userHandle")]
         user_handle: String,
         /// Browser session ID from QR code — the token will be bound to
         /// this session so the browser can use it.
-        #[serde(default)]
-        browser_session_id: Option<String>,
+        #[serde(default, rename = "sessionId")]
+        session_id: Option<String>,
     },
 
-    /// Complete registration: client sends the attestation response.
-    #[serde(rename = "register_complete")]
+    /// Complete registration: client sends the standard WebAuthn
+    /// attestation response.
+    #[serde(rename = "register/complete")]
     RegisterComplete {
-        /// The challenge that was issued (base64url).
+        /// The challenge that was issued (base64url) — passed as a
+        /// top-level field (mirrors query-param semantics for HTTP).
         challenge: String,
-        /// base64url-encoded `AttestationObject` (CBOR).
-        attestation_object: String,
-        /// base64url-encoded `clientDataJSON`.
-        client_data_json: String,
         /// base64url-encoded credential ID.
-        credential_id: String,
-        /// Browser session ID — opaque session token will be bound to this.
-        #[serde(default)]
-        browser_session_id: Option<String>,
+        id: String,
+        /// base64url-encoded credential ID (same as `id`).
+        #[serde(rename = "rawId")]
+        raw_id: String,
+        /// Always `"public-key"`.
+        #[serde(rename = "type")]
+        cred_type: Option<String>,
+        /// The attestation response object.
+        response: RegisterResponseBody,
         /// Push notification token for future authentication requests.
-        #[serde(default)]
+        #[serde(default, rename = "pushToken")]
         push_token: Option<String>,
     },
 
     /// Begin authentication: enclave generates a challenge and returns
     /// `PublicKeyCredentialRequestOptions`.
-    #[serde(rename = "authenticate_begin")]
+    #[serde(rename = "authenticate/begin")]
     AuthenticateBegin {
         /// Optional credential ID hint (base64url). If provided, the
         /// enclave includes it in `allowCredentials`.
-        #[serde(default)]
+        #[serde(default, rename = "credentialId")]
         credential_id: Option<String>,
         /// Browser session ID from QR code or push payload.
-        #[serde(default)]
-        browser_session_id: Option<String>,
+        #[serde(default, rename = "sessionId")]
+        session_id: Option<String>,
     },
 
-    /// Complete authentication: client sends the assertion response.
-    #[serde(rename = "authenticate_complete")]
+    /// Complete authentication: client sends the standard WebAuthn
+    /// assertion response.
+    #[serde(rename = "authenticate/complete")]
     AuthenticateComplete {
         /// The challenge that was issued (base64url).
         challenge: String,
         /// base64url-encoded credential ID used.
-        credential_id: String,
-        /// base64url-encoded `authenticatorData`.
-        authenticator_data: String,
-        /// base64url-encoded signature (ECDSA P-256 / SHA-256).
-        signature: String,
-        /// base64url-encoded `clientDataJSON`.
-        client_data_json: String,
-        /// Browser session ID for token binding.
-        #[serde(default)]
-        browser_session_id: Option<String>,
+        id: String,
+        /// base64url-encoded credential ID (same as `id`).
+        #[serde(rename = "rawId")]
+        raw_id: String,
+        /// Always `"public-key"`.
+        #[serde(rename = "type")]
+        cred_type: Option<String>,
+        /// The assertion response object.
+        response: AuthenticateResponseBody,
     },
 }
 
+/// Body of `response` in a registration completion (standard WebAuthn).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RegisterResponseBody {
+    /// base64url-encoded `AttestationObject` (CBOR).
+    #[serde(rename = "attestationObject")]
+    pub attestation_object: String,
+    /// base64url-encoded `clientDataJSON`.
+    #[serde(rename = "clientDataJSON")]
+    pub client_data_json: String,
+}
+
+/// Body of `response` in an authentication completion (standard WebAuthn).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AuthenticateResponseBody {
+    /// base64url-encoded `authenticatorData`.
+    #[serde(rename = "authenticatorData")]
+    pub authenticator_data: String,
+    /// base64url-encoded `clientDataJSON`.
+    #[serde(rename = "clientDataJSON")]
+    pub client_data_json: String,
+    /// base64url-encoded ECDSA P-256 / SHA-256 signature.
+    pub signature: String,
+}
+
 // ---------------------------------------------------------------------------
-//  FIDO2 wire protocol — response
+//  FIDO2 wire protocol — response (standard WebAuthn, camelCase)
 // ---------------------------------------------------------------------------
 
 /// FIDO2-specific response, JSON-encoded inside `Response::Data`.
+///
+/// Registration and authentication options are wrapped in a `publicKey`
+/// object to match the WebAuthn `CredentialCreationOptions` /
+/// `CredentialRequestOptions` layout.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "type")]
+#[serde(untagged)]
 pub enum Fido2Response {
-    /// Registration challenge + options.
-    #[serde(rename = "register_options")]
+    /// Registration challenge + options (`{ publicKey: { ... } }`).
     RegisterOptions {
-        /// base64url-encoded 32-byte random challenge.
-        challenge: String,
-        /// Relying party info.
-        rp: RelyingParty,
-        /// User info (echo back).
-        user: PublicKeyUser,
-        /// Accepted public key algorithms.
-        pub_key_cred_params: Vec<PubKeyCredParam>,
-        /// Authenticator selection criteria.
-        authenticator_selection: AuthenticatorSelection,
-        /// Attestation conveyance preference.
-        attestation: String,
+        #[serde(rename = "publicKey")]
+        public_key: PublicKeyCreationOptions,
     },
 
     /// Registration success.
-    #[serde(rename = "register_ok")]
     RegisterOk {
         /// Confirmation.
         status: String,
         /// Opaque session token for the browser (hex, 64 chars).
-        /// `None` if no `browser_session_id` was provided.
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none", rename = "sessionToken")]
         session_token: Option<String>,
     },
 
-    /// Authentication challenge + options.
-    #[serde(rename = "authenticate_options")]
+    /// Authentication challenge + options (`{ publicKey: { ... } }`).
     AuthenticateOptions {
-        /// base64url-encoded 32-byte random challenge.
-        challenge: String,
-        /// Allowed credentials (from stored registrations).
-        #[serde(skip_serializing_if = "Vec::is_empty")]
-        allow_credentials: Vec<AllowCredential>,
-        /// User verification requirement.
-        user_verification: String,
+        #[serde(rename = "publicKey")]
+        public_key: PublicKeyRequestOptions,
     },
 
     /// Authentication success.
-    #[serde(rename = "authenticate_ok")]
     AuthenticateOk {
         /// Confirmation.
         status: String,
         /// Opaque session token for the browser (hex, 64 chars).
-        #[serde(skip_serializing_if = "Option::is_none")]
+        #[serde(skip_serializing_if = "Option::is_none", rename = "sessionToken")]
         session_token: Option<String>,
     },
 
     /// Error.
-    #[serde(rename = "error")]
     Error {
         /// Human-readable error message.
         error: String,
     },
+}
+
+/// `PublicKeyCredentialCreationOptions` (WebAuthn Level 2+).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicKeyCreationOptions {
+    /// base64url-encoded 32-byte random challenge.
+    pub challenge: String,
+    /// Relying party info.
+    pub rp: RelyingParty,
+    /// User info (echo back).
+    pub user: PublicKeyUser,
+    /// Accepted public key algorithms.
+    #[serde(rename = "pubKeyCredParams")]
+    pub pub_key_cred_params: Vec<PubKeyCredParam>,
+    /// Authenticator selection criteria.
+    #[serde(rename = "authenticatorSelection")]
+    pub authenticator_selection: AuthenticatorSelection,
+    /// Attestation conveyance preference.
+    pub attestation: String,
+}
+
+/// `PublicKeyCredentialRequestOptions` (WebAuthn Level 2+).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PublicKeyRequestOptions {
+    /// base64url-encoded 32-byte random challenge.
+    pub challenge: String,
+    /// Allowed credentials (from stored registrations).
+    #[serde(skip_serializing_if = "Vec::is_empty", rename = "allowCredentials")]
+    pub allow_credentials: Vec<AllowCredential>,
+    /// User verification requirement.
+    #[serde(rename = "userVerification")]
+    pub user_verification: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -202,6 +253,7 @@ pub struct PublicKeyUser {
     /// Display name.
     pub name: String,
     /// Display name (same as `name` for our purposes).
+    #[serde(rename = "displayName")]
     pub display_name: String,
 }
 
@@ -219,10 +271,13 @@ pub struct PubKeyCredParam {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AuthenticatorSelection {
     /// Authenticator attachment.
+    #[serde(rename = "authenticatorAttachment")]
     pub authenticator_attachment: String,
     /// Resident key requirement.
+    #[serde(rename = "residentKey")]
     pub resident_key: String,
     /// User verification requirement.
+    #[serde(rename = "userVerification")]
     pub user_verification: String,
 }
 

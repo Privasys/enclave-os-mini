@@ -106,45 +106,42 @@ impl EnclaveModule for Fido2Module {
             Fido2Request::RegisterBegin {
                 user_name,
                 user_handle,
-                browser_session_id,
-            } => self.handle_register_begin(&user_name, &user_handle, browser_session_id),
+                session_id,
+            } => self.handle_register_begin(&user_name, &user_handle, session_id),
 
             Fido2Request::RegisterComplete {
                 challenge,
-                attestation_object,
-                client_data_json,
-                credential_id,
-                browser_session_id,
+                id: credential_id,
+                raw_id: _,
+                cred_type: _,
+                response: resp_body,
                 push_token,
             } => self.handle_register_complete(
                 &challenge,
-                &attestation_object,
-                &client_data_json,
+                &resp_body.attestation_object,
+                &resp_body.client_data_json,
                 &credential_id,
-                browser_session_id,
                 push_token,
                 ctx,
             ),
 
             Fido2Request::AuthenticateBegin {
                 credential_id,
-                browser_session_id,
-            } => self.handle_authenticate_begin(credential_id.as_deref(), browser_session_id),
+                session_id,
+            } => self.handle_authenticate_begin(credential_id.as_deref(), session_id),
 
             Fido2Request::AuthenticateComplete {
                 challenge,
-                credential_id,
-                authenticator_data,
-                signature,
-                client_data_json,
-                browser_session_id,
+                id: credential_id,
+                raw_id: _,
+                cred_type: _,
+                response: resp_body,
             } => self.handle_authenticate_complete(
                 &challenge,
                 &credential_id,
-                &authenticator_data,
-                &signature,
-                &client_data_json,
-                browser_session_id,
+                &resp_body.authenticator_data,
+                &resp_body.signature,
+                &resp_body.client_data_json,
                 ctx,
             ),
         };
@@ -163,18 +160,18 @@ impl EnclaveModule for Fido2Module {
 // ---------------------------------------------------------------------------
 
 impl Fido2Module {
-    /// Handle `register_begin`: generate challenge + creation options.
+    /// Handle `register/begin`: generate challenge + creation options.
     fn handle_register_begin(
         &self,
         user_name: &str,
         user_handle: &str,
-        browser_session_id: Option<String>,
+        session_id: Option<String>,
     ) -> Fido2Response {
         let now = current_time_secs();
 
         let challenge = match challenge::create_challenge(
             now,
-            browser_session_id,
+            session_id,
             Ceremony::Registration,
             Some(user_handle.to_string()),
             Some(user_name.to_string()),
@@ -184,37 +181,38 @@ impl Fido2Module {
         };
 
         Fido2Response::RegisterOptions {
-            challenge,
-            rp: RelyingParty {
-                id: self.rp_id.clone(),
-                name: self.rp_name.clone(),
+            public_key: PublicKeyCreationOptions {
+                challenge,
+                rp: RelyingParty {
+                    id: self.rp_id.clone(),
+                    name: self.rp_name.clone(),
+                },
+                user: PublicKeyUser {
+                    id: user_handle.to_string(),
+                    name: user_name.to_string(),
+                    display_name: user_name.to_string(),
+                },
+                pub_key_cred_params: vec![PubKeyCredParam {
+                    cred_type: "public-key".into(),
+                    alg: COSE_ALG_ES256,
+                }],
+                authenticator_selection: AuthenticatorSelection {
+                    authenticator_attachment: "cross-platform".into(),
+                    resident_key: "required".into(),
+                    user_verification: "required".into(),
+                },
+                attestation: "direct".into(),
             },
-            user: PublicKeyUser {
-                id: user_handle.to_string(),
-                name: user_name.to_string(),
-                display_name: user_name.to_string(),
-            },
-            pub_key_cred_params: vec![PubKeyCredParam {
-                cred_type: "public-key".into(),
-                alg: COSE_ALG_ES256,
-            }],
-            authenticator_selection: AuthenticatorSelection {
-                authenticator_attachment: "cross-platform".into(),
-                resident_key: "required".into(),
-                user_verification: "required".into(),
-            },
-            attestation: "direct".into(),
         }
     }
 
-    /// Handle `register_complete`: verify attestation, store credential.
+    /// Handle `register/complete`: verify attestation, store credential.
     fn handle_register_complete(
         &self,
         challenge_b64: &str,
         attestation_object_b64: &str,
         client_data_json_b64: &str,
         credential_id_b64: &str,
-        browser_session_id: Option<String>,
         push_token: Option<String>,
         _ctx: &RequestContext,
     ) -> Fido2Response {
@@ -227,8 +225,8 @@ impl Fido2Module {
                 Err(e) => return Fido2Response::Error { error: e },
             };
 
-        // Use the browser session ID from the challenge if the request didn't provide one
-        let browser_session_id = browser_session_id.or(consumed.browser_session_id);
+        // Session ID was stored at begin time
+        let session_id = consumed.browser_session_id;
         let user_handle = consumed.user_handle.unwrap_or_default();
         let user_name = consumed.user_name.unwrap_or_default();
 
@@ -324,8 +322,8 @@ impl Fido2Module {
             return Fido2Response::Error { error: e };
         }
 
-        // 12. Issue session token for browser (if browser_session_id provided)
-        let session_token = match browser_session_id {
+        // 12. Issue session token for browser (if session_id was provided at begin)
+        let session_token = match session_id {
             Some(ref sid) => {
                 match sessions::issue_token(now, &user_handle, credential_id_b64, sid) {
                     Ok(token) => Some(token),
@@ -341,17 +339,17 @@ impl Fido2Module {
         }
     }
 
-    /// Handle `authenticate_begin`: generate challenge.
+    /// Handle `authenticate/begin`: generate challenge.
     fn handle_authenticate_begin(
         &self,
         credential_id_b64: Option<&str>,
-        browser_session_id: Option<String>,
+        session_id: Option<String>,
     ) -> Fido2Response {
         let now = current_time_secs();
 
         let challenge = match challenge::create_challenge(
             now,
-            browser_session_id,
+            session_id,
             Ceremony::Authentication,
             None,
             None,
@@ -369,13 +367,15 @@ impl Fido2Module {
         };
 
         Fido2Response::AuthenticateOptions {
-            challenge,
-            allow_credentials,
-            user_verification: "required".into(),
+            public_key: PublicKeyRequestOptions {
+                challenge,
+                allow_credentials,
+                user_verification: "required".into(),
+            },
         }
     }
 
-    /// Handle `authenticate_complete`: verify assertion.
+    /// Handle `authenticate/complete`: verify assertion.
     fn handle_authenticate_complete(
         &self,
         challenge_b64: &str,
@@ -383,7 +383,6 @@ impl Fido2Module {
         authenticator_data_b64: &str,
         signature_b64: &str,
         client_data_json_b64: &str,
-        browser_session_id: Option<String>,
         _ctx: &RequestContext,
     ) -> Fido2Response {
         let now = current_time_secs();
@@ -395,7 +394,7 @@ impl Fido2Module {
                 Err(e) => return Fido2Response::Error { error: e },
             };
 
-        let browser_session_id = browser_session_id.or(consumed.browser_session_id);
+        let session_id = consumed.browser_session_id;
 
         // 2. Parse and verify clientDataJSON
         let (_client_data, client_data_raw) = match webauthn::parse_client_data(
@@ -473,7 +472,7 @@ impl Fido2Module {
         }
 
         // 10. Issue session token for browser
-        let session_token = match browser_session_id {
+        let session_token = match session_id {
             Some(ref sid) => {
                 match sessions::issue_token(now, &record.user_handle, credential_id_b64, sid) {
                     Ok(token) => Some(token),
