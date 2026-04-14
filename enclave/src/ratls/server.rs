@@ -950,8 +950,14 @@ fn handle_fido2_request(
 ) -> HttpHandleResult {
     use enclave_os_common::protocol::Request;
 
-    // Validate the path
-    match path {
+    // Split path from query string (e.g. "/fido2/register/begin?session_id=x")
+    let (base_path, query_string) = match path.find('?') {
+        Some(pos) => (&path[..pos], Some(&path[pos + 1..])),
+        None => (path, None),
+    };
+
+    // Validate the base path (without query parameters)
+    match base_path {
         "/fido2/register/begin"
         | "/fido2/register/complete"
         | "/fido2/authenticate/begin"
@@ -990,17 +996,59 @@ fn handle_fido2_request(
     // Inject the endpoint path as the serde `"type"` discriminator so
     // the FIDO2 module can dispatch without seeing HTTP details.
     // "/fido2/register/begin" → type = "register/begin"
-    let route = &path["/fido2/".len()..]; // "register/begin" etc.
+    let route = &base_path["/fido2/".len()..]; // "register/begin" etc.
+
+    // Helper: inject query-string parameters into a serde_json::Map.
+    // Maps known snake_case query param names to the camelCase field
+    // names expected by `Fido2Request` serde renames.
+    let inject_query_params = |map: &mut serde_json::Map<String, serde_json::Value>| {
+        if let Some(qs) = query_string {
+            for pair in qs.split('&') {
+                if let Some((key, value)) = pair.split_once('=') {
+                    // Simple percent-decode: only `%XX` sequences used by
+                    // encodeURIComponent on base64url / UUID values.
+                    let decoded: String = {
+                        let mut out = String::with_capacity(value.len());
+                        let mut chars = value.as_bytes().iter();
+                        while let Some(&b) = chars.next() {
+                            if b == b'%' {
+                                if let (Some(&h), Some(&l)) = (chars.next(), chars.next()) {
+                                    let hi = (h as char).to_digit(16).unwrap_or(0) as u8;
+                                    let lo = (l as char).to_digit(16).unwrap_or(0) as u8;
+                                    out.push((hi << 4 | lo) as char);
+                                }
+                            } else {
+                                out.push(b as char);
+                            }
+                        }
+                        out
+                    };
+                    // Map snake_case query params → camelCase JSON field names
+                    let json_key = match key {
+                        "session_id" => "sessionId",
+                        _ => key,
+                    };
+                    // Don't overwrite values already present in the body.
+                    map.entry(json_key)
+                        .or_insert(serde_json::Value::String(decoded));
+                }
+            }
+        }
+    };
+
     let body = match serde_json::from_slice::<serde_json::Value>(&http_req.body) {
         Ok(serde_json::Value::Object(mut map)) => {
             map.insert("type".into(), serde_json::Value::String(route.into()));
+            inject_query_params(&mut map);
             serde_json::to_vec(&map).unwrap_or_else(|_| http_req.body.clone())
         }
         _ => {
             // Empty body (e.g. authenticate/begin with no args) — create
             // a minimal JSON object with just the type discriminator.
-            let obj = serde_json::json!({ "type": route });
-            serde_json::to_vec(&obj).unwrap_or_else(|_| http_req.body.clone())
+            let mut map = serde_json::Map::new();
+            map.insert("type".into(), serde_json::Value::String(route.into()));
+            inject_query_params(&mut map);
+            serde_json::to_vec(&map).unwrap_or_else(|_| http_req.body.clone())
         }
     };
 
