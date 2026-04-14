@@ -85,9 +85,6 @@ pub enum Fido2Request {
         /// base64url-encoded credential ID (same as `id`).
         #[serde(rename = "rawId")]
         raw_id: String,
-        /// Always `"public-key"`.
-        #[serde(rename = "type")]
-        cred_type: Option<String>,
         /// The attestation response object.
         response: RegisterResponseBody,
         /// Push notification token for future authentication requests.
@@ -119,9 +116,6 @@ pub enum Fido2Request {
         /// base64url-encoded credential ID (same as `id`).
         #[serde(rename = "rawId")]
         raw_id: String,
-        /// Always `"public-key"`.
-        #[serde(rename = "type")]
-        cred_type: Option<String>,
         /// The assertion response object.
         response: AuthenticateResponseBody,
     },

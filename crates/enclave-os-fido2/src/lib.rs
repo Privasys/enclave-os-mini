@@ -113,7 +113,6 @@ impl EnclaveModule for Fido2Module {
                 challenge,
                 id: credential_id,
                 raw_id: _,
-                cred_type: _,
                 response: resp_body,
                 push_token,
             } => self.handle_register_complete(
@@ -134,7 +133,6 @@ impl EnclaveModule for Fido2Module {
                 challenge,
                 id: credential_id,
                 raw_id: _,
-                cred_type: _,
                 response: resp_body,
             } => self.handle_authenticate_complete(
                 &challenge,
