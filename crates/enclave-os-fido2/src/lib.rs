@@ -436,10 +436,15 @@ impl Fido2Module {
             return Fido2Response::Error { error: "rpIdHash mismatch".into() };
         }
 
-        // 7. Verify sign count (monotonically increasing)
+        // 7. Verify sign count (strict clone detection per WebAuthn §7.2 step 17)
+        //    If the new signCount is nonzero but not greater than the stored value,
+        //    reject — the authenticator may have been cloned.
         if auth_data.sign_count != 0 && auth_data.sign_count <= record.sign_count {
             return Fido2Response::Error {
-                error: "sign count not increasing — possible cloned authenticator".into(),
+                error: format!(
+                    "sign count not increasing ({} <= {}) — possible cloned authenticator",
+                    auth_data.sign_count, record.sign_count
+                ),
             };
         }
 
