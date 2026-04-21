@@ -171,9 +171,13 @@ impl WasmModule {
                                             "Restored persisted WASM app: {} (hostname={})",
                                             meta.name, meta.hostname,
                                         );
-                                        // Register per-app identity with the global CertStore
-                                        // so SNI-based attestation works after restart.
-                                        register_app_identity(&meta);
+                                        // NOTE: do NOT call register_app_identity() here.
+                                        // The CertStore is initialised later in
+                                        // `finalize_and_run()` and collects identities from
+                                        // every module via `app_identities()` (see
+                                        // `WasmModule::app_identities()` below). Calling
+                                        // `cert_store()` here would panic because the global
+                                        // OnceLock has not been set yet.
                                         registry.register_known(meta);
                                     }
                                     Err(e) => {
