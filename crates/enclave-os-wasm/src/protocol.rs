@@ -450,6 +450,14 @@ pub enum WasmValue {
     String(String),
     #[serde(rename = "bytes")]
     Bytes(Vec<u8>),
+    /// Record value — fields rendered as a JSON object whose keys are the
+    /// WIT field names. Used for record/tuple/option/variant/enum/flags
+    /// returns so callers can read individual fields directly.
+    #[serde(rename = "record")]
+    Record(serde_json::Value),
+    /// List value — rendered as a JSON array.
+    #[serde(rename = "list")]
+    List(serde_json::Value),
 }
 
 // ---------------------------------------------------------------------------

@@ -846,14 +846,86 @@ fn val_to_wasm_value(v: &Val) -> WasmValue {
                     .collect();
                 WasmValue::Bytes(bytes)
             } else {
-                // Fallback: JSON-encode the list as a string.
-                let inner: Vec<String> = items.iter().map(|v| format!("{:?}", v)).collect();
-                WasmValue::String(format!("[{}]", inner.join(", ")))
+                WasmValue::List(val_to_json(v))
             }
         }
         Val::Char(c) => WasmValue::String(c.to_string()),
-        // For complex types (record, tuple, variant, enum, option, result,
-        // flags, resource) — serialize a debug representation.
-        other => WasmValue::String(format!("{:?}", other)),
+        Val::Record(_) => WasmValue::Record(val_to_json(v)),
+        // For other complex types (tuple, variant, enum, option, result,
+        // flags, resource) — emit a JSON object describing the value so
+        // callers receive structured data instead of a Debug string.
+        _ => WasmValue::Record(val_to_json(v)),
+    }
+}
+
+/// Recursively convert a wasmtime [`Val`] into a [`serde_json::Value`].
+///
+/// Records become JSON objects keyed by WIT field name; lists become arrays;
+/// options become `null` or the inner value; variants become
+/// `{"<case>": <payload>}`; enums become their case name as a string;
+/// flags become an array of set flag names; tuples become arrays;
+/// results become `{"ok": ...}` or `{"err": ...}`.
+fn val_to_json(v: &Val) -> serde_json::Value {
+    use serde_json::{Map, Number, Value};
+    match v {
+        Val::Bool(b) => Value::Bool(*b),
+        Val::S8(n) => Value::Number((*n as i64).into()),
+        Val::U8(n) => Value::Number((*n as u64).into()),
+        Val::S16(n) => Value::Number((*n as i64).into()),
+        Val::U16(n) => Value::Number((*n as u64).into()),
+        Val::S32(n) => Value::Number((*n as i64).into()),
+        Val::U32(n) => Value::Number((*n as u64).into()),
+        Val::S64(n) => Value::Number((*n).into()),
+        Val::U64(n) => Value::Number((*n).into()),
+        Val::Float32(f) => Number::from_f64(*f as f64).map(Value::Number).unwrap_or(Value::Null),
+        Val::Float64(f) => Number::from_f64(*f).map(Value::Number).unwrap_or(Value::Null),
+        Val::String(s) => Value::String(s.to_string()),
+        Val::Char(c) => Value::String(c.to_string()),
+        Val::List(items) => Value::Array(items.iter().map(val_to_json).collect()),
+        Val::Record(fields) => {
+            let mut m = Map::new();
+            for (name, val) in fields.iter() {
+                m.insert(name.clone(), val_to_json(val));
+            }
+            Value::Object(m)
+        }
+        Val::Tuple(items) => Value::Array(items.iter().map(val_to_json).collect()),
+        Val::Option(inner) => match inner {
+            Some(boxed) => val_to_json(boxed.as_ref()),
+            None => Value::Null,
+        },
+        Val::Variant(case, payload) => {
+            let mut m = Map::new();
+            let payload_val = match payload {
+                Some(boxed) => val_to_json(boxed.as_ref()),
+                None => Value::Null,
+            };
+            m.insert(case.clone(), payload_val);
+            Value::Object(m)
+        }
+        Val::Enum(name) => Value::String(name.clone()),
+        Val::Flags(names) => Value::Array(names.iter().map(|n| Value::String(n.clone())).collect()),
+        Val::Result(r) => {
+            let mut m = Map::new();
+            match r {
+                Ok(opt) => {
+                    let v = match opt {
+                        Some(boxed) => val_to_json(boxed.as_ref()),
+                        None => Value::Null,
+                    };
+                    m.insert("ok".to_string(), v);
+                }
+                Err(opt) => {
+                    let v = match opt {
+                        Some(boxed) => val_to_json(boxed.as_ref()),
+                        None => Value::Null,
+                    };
+                    m.insert("err".to_string(), v);
+                }
+            }
+            Value::Object(m)
+        }
+        // Resources and any unhandled variants — emit Debug as a string fallback.
+        other => Value::String(format!("{:?}", other)),
     }
 }

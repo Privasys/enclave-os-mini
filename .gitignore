@@ -4,6 +4,7 @@
 /target/
 /enclave/target/
 /sysroot/
+target/
 
 # NOTE: Cargo.lock is intentionally COMMITTED for reproducible builds.
 # Do not add it to .gitignore.
