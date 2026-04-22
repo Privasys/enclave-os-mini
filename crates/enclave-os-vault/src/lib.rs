@@ -1148,13 +1148,14 @@ fn handle_promote_pending(
         .tees
         .push(Principal::Tee(pending.profile));
     record.policy_version = record.policy_version.saturating_add(1);
+    let new_tee_idx = record.policy.principals.tees.len() - 1;
 
     if let Err(e) = audit_and_save(
         &mut record,
         "PromotePendingProfile",
         &caller,
         AuditDecision::Allowed,
-        &format!("id={} -> tees[{}]", pending_id, record.policy.principals.tees.len() - 1),
+        &format!("id={} -> tees[{}]", pending_id, new_tee_idx),
     ) {
         return e;
     }
