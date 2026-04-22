@@ -28,7 +28,7 @@ use enclave_os_common::modules::{EnclaveModule, RequestContext};
 use enclave_os_common::protocol::{Request, Response};
 use enclave_os_kvstore::SealedKvStore;
 
-use crate::policy::{evaluate_op, evaluate_policy_update, resolve_caller, CallerRole};
+use crate::policy::{evaluate_op, evaluate_policy_update, resolve_caller};
 use crate::types::{
     KeyInfo, KeyListEntry, KeyPolicy, KeyRecord, KeyType, Operation, Principal, VaultRequest,
     VaultResponse, DEFAULT_KEY_TTL_SECONDS, MAX_KEY_TTL_SECONDS,

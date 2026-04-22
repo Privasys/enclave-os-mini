@@ -6,7 +6,7 @@ name = "enclave-os-vault"
 version = "0.1.0"
 edition = "2021"
 license = "AGPL-3.0"
-description = "Secret store/fetch module for enclave-os — JWT-gated storage inside SGX."
+description = "vHSM-style key store for enclave-os — policy-gated keys with OIDC + RA-TLS principals."
 
 [lib]
 name = "enclave_os_vault"
@@ -16,21 +16,21 @@ name = "enclave_os_vault"
 mock = ["enclave-os-egress/mock"]
 
 [dependencies]
-# Shared types, module trait, and OCall vtable
+# Shared types, module trait, OIDC claims, quote primitives
 enclave-os-common  = { path = "../../common", features = ["jwt"] }
 
-# KV store for persisting secrets (sealed with MRENCLAVE-bound key)
+# Sealed KV store for persisted KeyRecords (MRENCLAVE-bound seal key)
 enclave-os-kvstore = { path = "../enclave-os-kvstore" }
 
-# Outbound HTTPS + attestation server verification
+# Attestation server verification of remote TEE quotes (Principal::Tee)
 enclave-os-egress = { path = "../enclave-os-egress" }
 
-# JWT payload types
+# Wire protocol + persisted records are JSON
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 
-# Base64url decoding of secret payloads
+# Base64url decoding of CreateKey material
 base64 = "0.21"
 
-# X.509 certificate parsing (extract quote + OID extensions from peer certs)
+# X.509 parsing for peer-cert quote + OID claim extraction
 x509-parser = "0.16"
