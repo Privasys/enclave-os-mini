@@ -244,18 +244,6 @@ fn load_record(handle: &str) -> Result<KeyRecord, VaultResponse> {
         .map_err(|e| VaultResponse::Error(format!("corrupt record: {e}")))
 }
 
-fn save_record(record: &KeyRecord) -> Result<(), VaultResponse> {
-    let kv = kv()?;
-    let bytes = serde_json::to_vec(record)
-        .map_err(|e| VaultResponse::Error(format!("serialise record: {e}")))?;
-    let store = kv
-        .lock()
-        .map_err(|_| VaultResponse::Error("kv store lock poisoned".into()))?;
-    store
-        .put(&record_key(&record.handle), &bytes)
-        .map_err(|e| VaultResponse::Error(format!("kv put failed: {e}")))
-}
-
 // ---------------------------------------------------------------------------
 //  Time
 // ---------------------------------------------------------------------------
