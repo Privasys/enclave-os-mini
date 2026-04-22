@@ -1,20 +1,13 @@
 // Copyright (c) Privasys. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
-//! Vault-specific types: wire protocol, access policies, and persisted records.
+//! Vault wire protocol, policy schema and persisted records.
 //!
-//! The vault protocol is carried inside [`Request::Data`] /
-//! [`Response::Data`] — it never leaks into the shared protocol crate.
+//! The vault speaks JSON inside [`Request::Data`]/[`Response::Data`].
+//! The schema is HSM/vHSM-shaped: callers manipulate **keys** (with
+//! handles, types, and operation policies), not opaque "secrets".
 //!
-//! ## OIDC-based auth model
-//!
-//! Secret ownership is tied to the OIDC `sub` claim (the caller's unique
-//! identity from Zitadel or any OIDC provider).  The `"auth"` bearer token
-//! in the JSON envelope is verified by the enclave's auth layer before
-//! reaching the vault; the vault reads `ctx.oidc_claims.sub` for ownership.
-//!
-//! No more `OpenVault` / `CloseVault` — the OIDC subject *is* the vault
-//! namespace.
+//! See `docs/vault.md` for the full design.
 
 use std::string::String;
 use std::vec::Vec;
@@ -25,225 +18,341 @@ use serde::{Deserialize, Serialize};
 //  TTL constants
 // ---------------------------------------------------------------------------
 
-/// Maximum secret TTL: 3 months (90 days) in seconds.
-pub const MAX_SECRET_TTL_SECONDS: u64 = 90 * 24 * 60 * 60;
+/// Maximum key TTL: 3 months (90 days).
+pub const MAX_KEY_TTL_SECONDS: u64 = 90 * 24 * 60 * 60;
 
-/// Default secret TTL: 1 month (30 days) in seconds.
-pub const DEFAULT_SECRET_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
+/// Default key TTL: 1 month (30 days).
+pub const DEFAULT_KEY_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
 
 // ---------------------------------------------------------------------------
-//  Vault wire protocol
+//  Wire protocol
 // ---------------------------------------------------------------------------
 
-/// Vault-specific request, JSON-encoded inside `Request::Data`.
-///
-/// All mutating operations require the caller's OIDC token (via the JSON
-/// `"auth"` field) with the **secret-owner** role.  `GetSecret` supports
-/// a dual-path: OIDC owner *or* RA-TLS TEE with optional bearer token.
+/// A vault RPC request, JSON-encoded inside `Request::Data`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum VaultRequest {
-    /// Store a named secret with an access policy.
+    /// Create a new key with caller-supplied material.
     ///
-    /// Requires OIDC **secret-owner** role.  The caller's `sub` becomes
-    /// the secret owner.
-    StoreSecret {
-        /// Human-readable secret name (e.g. `"customer-123-dek"`).
-        name: String,
-        /// Base64url-encoded secret bytes.
-        secret: String,
-        /// Access policy for this secret.
-        policy: SecretPolicy,
+    /// The caller's OIDC identity must match `policy.principals.owner`.
+    /// The handle must not already exist.
+    CreateKey {
+        handle: String,
+        key_type: KeyType,
+        /// Base64url-encoded raw key material (sealed at rest).
+        material_b64: String,
+        /// Whether the material may ever leave the enclave (gates `ExportKey`).
+        exportable: bool,
+        policy: KeyPolicy,
     },
 
-    /// Retrieve a named secret.
+    /// Export the raw key material.
     ///
-    /// **Dual-path auth:**
-    /// - **OIDC owner path**: caller's `sub` matches the stored owner.
-    ///   No RA-TLS required.
-    /// - **RA-TLS TEE path**: mutual RA-TLS client certificate with
-    ///   matching measurements + optional bearer token from the secret
-    ///   manager.
-    GetSecret {
-        /// Secret name.
-        name: String,
-        /// Optional bearer token (raw bytes) for defence-in-depth when
-        /// using the RA-TLS path.
-        #[serde(default)]
-        bearer_token: Option<Vec<u8>>,
-    },
+    /// Allowed only if `exportable == true` and an `OperationRule` grants
+    /// the caller [`Operation::ExportKey`].
+    ExportKey { handle: String },
 
-    /// Delete a named secret.
+    /// Delete a key and its policy.
     ///
-    /// Requires OIDC **secret-owner** role.  Only the original owner
-    /// (matching `sub`) can delete.
-    DeleteSecret {
-        /// Name of the secret to delete.
-        name: String,
-    },
+    /// Gated by an `OperationRule` granting the caller [`Operation::DeleteKey`].
+    DeleteKey { handle: String },
 
-    /// Update the access policy for an existing secret.
+    /// Replace the policy on an existing key.
     ///
-    /// Requires OIDC **secret-owner** role.  Only the original owner
-    /// (matching `sub`) can update.
-    UpdateSecretPolicy {
-        /// Name of the secret whose policy should be updated.
-        name: String,
-        /// New access policy.
-        policy: SecretPolicy,
-    },
+    /// Each changed top-level field must be allowed by `policy.mutability`
+    /// for the caller's role (owner / manager). Immutable fields cannot
+    /// change.
+    UpdatePolicy { handle: String, new_policy: KeyPolicy },
 
-    /// List all secrets owned by the caller.
+    /// Read the policy for a key (metadata only).
     ///
-    /// Requires OIDC **secret-owner** role.  Returns metadata only
-    /// (name + expires_at), never the secret values.
-    ListSecrets,
+    /// Allowed for any principal listed in the key's `PrincipalSet`.
+    GetPolicy { handle: String },
+
+    /// Read key metadata. Never returns the key material.
+    /// Same access rules as `GetPolicy`.
+    GetKeyInfo { handle: String },
+
+    /// List handles owned by the caller (OIDC).
+    ListKeys,
 }
 
-/// Vault-specific response, JSON-encoded inside `Response::Data`.
+/// A vault RPC response, JSON-encoded inside `Response::Data`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum VaultResponse {
-    /// Secret stored successfully.
-    SecretStored {
-        /// The secret name (echo back).
-        name: String,
-        /// Unix timestamp when this secret expires.
-        expires_at: u64,
-    },
-    /// Secret retrieved successfully.
-    SecretValue {
-        /// The plaintext secret bytes.
-        secret: Vec<u8>,
-        /// Unix timestamp when this secret expires.
-        expires_at: u64,
-    },
-    /// Secret deleted successfully.
-    SecretDeleted,
-    /// Secret policy updated successfully.
-    PolicyUpdated,
-    /// List of secrets owned by the caller.
-    SecretList {
-        /// Metadata for each owned secret.
-        secrets: Vec<SecretListEntry>,
-    },
-    /// Error with human-readable message.
+    KeyCreated { handle: String, expires_at: u64 },
+    KeyMaterial { material: Vec<u8>, expires_at: u64 },
+    KeyDeleted,
+    PolicyUpdated { policy_version: u32 },
+    Policy { policy: KeyPolicy, policy_version: u32 },
+    KeyInfo(KeyInfo),
+    KeyList { keys: Vec<KeyListEntry> },
     Error(String),
 }
 
-/// Metadata for a single secret in a list response.
+/// Public-only metadata for a key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SecretListEntry {
-    /// Secret name.
-    pub name: String,
-    /// Unix timestamp when this secret expires.
+pub struct KeyInfo {
+    pub handle: String,
+    pub key_type: KeyType,
+    pub exportable: bool,
+    pub created_at: u64,
+    pub expires_at: u64,
+    pub policy_version: u32,
+}
+
+/// Entry returned by `VaultRequest::ListKeys`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyListEntry {
+    pub handle: String,
+    pub key_type: KeyType,
     pub expires_at: u64,
 }
 
 // ---------------------------------------------------------------------------
-//  OID types
+//  Key types
 // ---------------------------------------------------------------------------
 
-/// A single OID key-value requirement in a secret policy.
+/// What kind of key material this handle holds.
 ///
-/// The key is a dotted OID string (e.g. `"1.3.6.1.4.1.65230.2.1"`)
-/// and the value is the expected hex-encoded extension bytes.
-///
-/// When a caller requests a secret via the RA-TLS path, the vault checks
-/// that every `OidRequirement` in the policy has a matching `OidClaim`
-/// from the caller.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OidRequirement {
-    /// Dotted OID string (e.g. `"1.3.6.1.4.1.65230.2.1"`).
-    pub oid: String,
-    /// Expected value (hex-encoded bytes).
-    pub value: String,
-}
-
-/// An OID claim from the caller's RA-TLS certificate, sent alongside
-/// attestation evidence.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OidClaim {
-    /// Dotted OID string.
-    pub oid: String,
-    /// Actual value (hex-encoded bytes).
-    pub value: String,
+/// Phase 1 only stores `RawShare` (a Shamir share of an external secret),
+/// matching what the vault was used for previously. Other variants
+/// (symmetric KEKs, asymmetric signing keys, BIP32 seeds) are reserved
+/// in the schema and will be implemented when their operations land.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum KeyType {
+    /// One Shamir share of an external secret. Reconstructed client-side.
+    RawShare,
 }
 
 // ---------------------------------------------------------------------------
-//  Access policy
+//  Operations
 // ---------------------------------------------------------------------------
 
-/// Access policy for a vault secret.
+/// Per-key operations that can be granted by an `OperationRule`.
 ///
-/// Defines which TEE measurements (MRENCLAVE for SGX, MRTD for TDX) are
-/// allowed to retrieve the secret via the **RA-TLS path**, and optional
-/// defence-in-depth via a bearer token from the secret manager.
-///
-/// The OIDC owner can always retrieve their own secrets without RA-TLS.
+/// Management operations on the namespace (`CreateKey`, `ListKeys`) are
+/// not policy-gated and have no variant here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum Operation {
+    ExportKey,
+    DeleteKey,
+    UpdatePolicy,
+}
+
+// ---------------------------------------------------------------------------
+//  Principals
+// ---------------------------------------------------------------------------
+
+/// An identity that can act on a key.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Principal {
+    /// An OIDC subject from a specific issuer.
+    ///
+    /// `required_roles` is matched against the resolved roles in the
+    /// caller's verified bearer token. Empty means any role is fine.
+    Oidc {
+        issuer: String,
+        sub: String,
+        #[serde(default)]
+        required_roles: Vec<String>,
+    },
+
+    /// A remote TEE that authenticates via mutual RA-TLS.
+    ///
+    /// Bidirectional challenge-response is always required (it is the
+    /// only safe mode); there is no flag for it.
+    Tee(AttestationProfile),
+}
+
+/// A reference into a `PrincipalSet`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PrincipalRef {
+    Owner,
+    Manager(u32),
+    Auditor(u32),
+    Tee(u32),
+    /// Any tee in `principals.tees` that authenticates successfully.
+    AnyTee,
+}
+
+/// Named identities for a key.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SecretPolicy {
-    /// SGX MRENCLAVE values (hex-encoded, 64 chars each) allowed to retrieve.
+pub struct PrincipalSet {
+    /// The single creator/owner. Required.
+    pub owner: Principal,
+    /// Optional approvers / policy mutators (governance, not runtime).
     #[serde(default)]
-    pub allowed_mrenclave: Vec<String>,
-    /// TDX MRTD values (hex-encoded, 96 chars each) allowed to retrieve.
+    pub managers: Vec<Principal>,
+    /// Optional read-only principals (metadata + future audit log).
     #[serde(default)]
-    pub allowed_mrtd: Vec<String>,
-    /// OIDC `sub` of the secret manager authorised to issue bearer tokens
-    /// for this secret.
-    ///
-    /// If present, `GetSecret` via the RA-TLS path requires a valid bearer
-    /// token whose OIDC `sub` matches this value and who has the
-    /// `secret-manager` role.
-    ///
-    /// This provides defense-in-depth: even if remote attestation is
-    /// compromised, the attacker still needs a fresh bearer token from
-    /// the secret manager.
+    pub auditors: Vec<Principal>,
+    /// Remote TEE clients allowed to act on this key at runtime.
     #[serde(default)]
-    pub manager_sub: Option<String>,
-    /// Required X.509 OID extensions from the caller's RA-TLS certificate.
-    /// Each entry must have a matching claim from the caller.  Empty means
-    /// no OID checks.
+    pub tees: Vec<Principal>,
+}
+
+// ---------------------------------------------------------------------------
+//  Attestation
+// ---------------------------------------------------------------------------
+
+/// What measurements / claims a remote TEE quote must satisfy to match
+/// a `Principal::Tee`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttestationProfile {
+    /// Human-readable label, e.g. `"app:v3 / SGX"`.
+    pub name: String,
+
+    /// Acceptable measurements. The quote's measurement must equal one
+    /// of these (TEE type implied by the variant).
+    pub measurements: Vec<Measurement>,
+
+    /// Attestation servers that may verify the quote. The vault calls
+    /// each in turn; first success wins.
+    pub attestation_servers: Vec<AttestationServer>,
+
+    /// Required X.509 OID extensions on the peer certificate. Each entry
+    /// must be present with the exact value.
     #[serde(default)]
     pub required_oids: Vec<OidRequirement>,
-    /// Time-to-live in seconds from creation.  Capped at [`MAX_SECRET_TTL_SECONDS`]
-    /// (3 months).  If omitted or zero, defaults to [`DEFAULT_SECRET_TTL_SECONDS`]
-    /// (30 days).
+}
+
+/// A measurement value that identifies a specific enclave build.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub enum Measurement {
+    /// SGX MRENCLAVE, hex-encoded (lowercase, 64 chars).
+    Mrenclave(String),
+    /// TDX MRTD, hex-encoded (lowercase, 96 chars).
+    Mrtd(String),
+}
+
+/// An attestation server endpoint, optionally pinned by SPKI hash.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AttestationServer {
+    pub url: String,
+    #[serde(default)]
+    pub pinned_spki_sha256_hex: Option<String>,
+}
+
+/// A required X.509 OID extension on the peer certificate.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OidRequirement {
+    pub oid: String,
+    pub value: String,
+}
+
+// ---------------------------------------------------------------------------
+//  Operation rules
+// ---------------------------------------------------------------------------
+
+/// Grants a set of operations to a set of principals.
+///
+/// A request is allowed iff there exists at least one rule whose `ops`
+/// includes the requested op AND whose `principals` references the
+/// caller's resolved principal.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OperationRule {
+    pub ops: Vec<Operation>,
+    pub principals: Vec<PrincipalRef>,
+}
+
+// ---------------------------------------------------------------------------
+//  Lifecycle
+// ---------------------------------------------------------------------------
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct Lifecycle {
+    /// Capped at [`MAX_KEY_TTL_SECONDS`]. Zero means default.
     #[serde(default)]
     pub ttl_seconds: u64,
 }
 
-// ---------------------------------------------------------------------------
-//  Persisted secret record
-// ---------------------------------------------------------------------------
-
-/// A named secret with its metadata, stored in the sealed KV store.
-///
-/// The KV key is `"secret:{owner_sub}:{name}"` (UTF-8 bytes).
-/// The value is a JSON-serialized `SecretRecord`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SecretRecord {
-    /// The plaintext secret bytes (encrypted at rest by the KV store layer).
-    pub secret: Vec<u8>,
-    /// Access policy.
-    pub policy: SecretPolicy,
-    /// Unix timestamp (seconds) when the secret was stored.
-    pub created_at: u64,
-    /// Unix timestamp (seconds) when the secret expires.
-    pub expires_at: u64,
-    /// OIDC `sub` of the secret owner.
-    pub owner_sub: String,
+impl Default for Lifecycle {
+    fn default() -> Self {
+        Lifecycle { ttl_seconds: DEFAULT_KEY_TTL_SECONDS }
+    }
 }
 
 // ---------------------------------------------------------------------------
-//  Bearer token claims (for RA-TLS path defence-in-depth)
+//  Mutability
 // ---------------------------------------------------------------------------
 
-/// JWT payload for bearer tokens issued by the secret manager.
+/// Top-level fields of a `KeyPolicy` that can change via `UpdatePolicy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum PolicyField {
+    Owner,
+    Managers,
+    Auditors,
+    Tees,
+    Operations,
+    Lifecycle,
+    Mutability,
+}
+
+/// Who is allowed to change which fields on `UpdatePolicy`.
 ///
-/// The secret manager signs this via their OIDC provider.  The vault
-/// verifies the bearer token's `sub` against the `manager_sub` stored
-/// in the secret's policy.
-#[derive(Debug, Deserialize)]
-pub struct BearerTokenClaims {
-    /// Name of the secret this token authorises access to.
-    pub name: String,
+/// Defaults are intentionally conservative: only the owner can change
+/// runtime-shape fields (managers/auditors/tees/operations/lifecycle);
+/// the owner field itself and the mutability rules are immutable;
+/// managers can change nothing. Adopters loosen this explicitly when
+/// they want to e.g. let a manager add a new TEE for an enclave upgrade.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Mutability {
+    #[serde(default)]
+    pub owner_can: Vec<PolicyField>,
+    #[serde(default)]
+    pub manager_can: Vec<PolicyField>,
+    #[serde(default)]
+    pub immutable: Vec<PolicyField>,
+}
+
+impl Default for Mutability {
+    fn default() -> Self {
+        Mutability {
+            owner_can: vec![
+                PolicyField::Managers,
+                PolicyField::Auditors,
+                PolicyField::Tees,
+                PolicyField::Operations,
+                PolicyField::Lifecycle,
+            ],
+            manager_can: Vec::new(),
+            immutable: vec![PolicyField::Owner, PolicyField::Mutability],
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  KeyPolicy
+// ---------------------------------------------------------------------------
+
+/// The full access policy attached to a key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyPolicy {
+    /// Schema version; currently 1.
+    pub version: u32,
+    pub principals: PrincipalSet,
+    pub operations: Vec<OperationRule>,
+    #[serde(default)]
+    pub mutability: Mutability,
+    #[serde(default)]
+    pub lifecycle: Lifecycle,
+}
+
+// ---------------------------------------------------------------------------
+//  Persisted record
+// ---------------------------------------------------------------------------
+
+/// What the vault stores in the sealed KV at `key:<handle>`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KeyRecord {
+    pub handle: String,
+    pub key_type: KeyType,
+    pub exportable: bool,
+    /// Sealed by the kvstore layer at rest; in plaintext in this struct
+    /// only while it lives in enclave memory.
+    pub material: Vec<u8>,
+    pub policy: KeyPolicy,
+    pub policy_version: u32,
+    pub created_at: u64,
+    pub expires_at: u64,
 }
