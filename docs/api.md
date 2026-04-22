@@ -86,8 +86,9 @@ to the module.
 |------|------------|-------|
 | Manager | `privasys-platform:manager` | WASM load/unload |
 | Monitoring | `privasys-platform:monitoring` | Readyz, Status, Metrics, WASM list |
-| Secret Owner | `enclave-vault:secret-owner` | Vault store/delete/update/list/get (own) |
-| Secret Manager | `enclave-vault:secret-manager` | Issue bearer tokens for RA-TLS GetSecret |
+| Vault Owner | `vault:owner` | Vault create/delete/update/list/export own keys |
+| Vault Manager | `vault:manager` | Issue ApprovalTokens for policy-gated vault operations |
+| Vault Auditor | `vault:auditor` | Read vault metadata and audit log |
 
 Role claims are extracted from (checked in order):
 1. `urn:zitadel:iam:org:project:roles` (Zitadel map format)

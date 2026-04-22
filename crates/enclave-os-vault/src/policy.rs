@@ -115,8 +115,9 @@ fn oidc_role_str(role: &enclave_os_common::oidc::OidcRole) -> &'static str {
     match role {
         OidcRole::Manager => "manager",
         OidcRole::Monitoring => "monitoring",
-        OidcRole::SecretOwner => "secret-owner",
-        OidcRole::SecretManager => "secret-manager",
+        OidcRole::VaultOwner => "vault:owner",
+        OidcRole::VaultManager => "vault:manager",
+        OidcRole::VaultAuditor => "vault:auditor",
     }
 }
 

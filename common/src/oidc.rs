@@ -15,11 +15,12 @@
 //! |------|---------------------|-------|
 //! | Manager | `privasys-platform:manager` | WASM load/unload, TLS CA rotation, + all monitoring |
 //! | Monitoring | `privasys-platform:monitoring` | Read-only health/status/metrics |
-//! | Secret Owner | `enclave-vault:secret-owner` | Store/delete/update/list own secrets |
-//! | Secret Manager | `enclave-vault:secret-manager` | Issue bearer tokens for GetSecret defence-in-depth |
+//! | Vault Owner | `vault:owner` | Create/delete/update/list own keys; export own keys |
+//! | Vault Manager | `vault:manager` | Issue ApprovalTokens for policy-gated operations |
+//! | Vault Auditor | `vault:auditor` | Read metadata + audit log for keys they auditor |
 //!
-//! Manager implies Monitoring.  Secret Owner and Secret Manager are
-//! independent from Manager/Monitoring.
+//! Manager implies Monitoring.  Vault roles are independent from
+//! Manager/Monitoring.
 //!
 //! ## Token Delivery
 //!
@@ -127,12 +128,15 @@ pub struct OidcConfig {
     /// Claim value for the monitoring role (default: `privasys-platform:monitoring`).
     #[serde(default = "default_monitoring_role")]
     pub monitoring_role: String,
-    /// Claim value for the secret-owner role (default: `enclave-vault:secret-owner`).
-    #[serde(default = "default_secret_owner_role")]
-    pub secret_owner_role: String,
-    /// Claim value for the secret-manager role (default: `enclave-vault:secret-manager`).
-    #[serde(default = "default_secret_manager_role")]
-    pub secret_manager_role: String,
+    /// Claim value for the vault-owner role (default: `vault:owner`).
+    #[serde(default = "default_vault_owner_role")]
+    pub vault_owner_role: String,
+    /// Claim value for the vault-manager role (default: `vault:manager`).
+    #[serde(default = "default_vault_manager_role")]
+    pub vault_manager_role: String,
+    /// Claim value for the vault-auditor role (default: `vault:auditor`).
+    #[serde(default = "default_vault_auditor_role")]
+    pub vault_auditor_role: String,
 }
 
 fn default_role_claim() -> String {
@@ -144,11 +148,14 @@ fn default_manager_role() -> String {
 fn default_monitoring_role() -> String {
     "privasys-platform:monitoring".into()
 }
-fn default_secret_owner_role() -> String {
-    "enclave-vault:secret-owner".into()
+fn default_vault_owner_role() -> String {
+    "vault:owner".into()
 }
-fn default_secret_manager_role() -> String {
-    "enclave-vault:secret-manager".into()
+fn default_vault_manager_role() -> String {
+    "vault:manager".into()
+}
+fn default_vault_auditor_role() -> String {
+    "vault:auditor".into()
 }
 
 // ---------------------------------------------------------------------------
@@ -162,10 +169,12 @@ pub enum OidcRole {
     Manager,
     /// Read-only monitoring — healthz, readyz, status, metrics.
     Monitoring,
-    /// Vault secret owner — store/delete/update/list own secrets.
-    SecretOwner,
-    /// Vault secret manager — defence-in-depth bearer tokens for GetSecret.
-    SecretManager,
+    /// Vault owner — create/delete/update/list/export own keys.
+    VaultOwner,
+    /// Vault manager — issue ApprovalTokens for policy-gated operations.
+    VaultManager,
+    /// Vault auditor — read metadata + audit log for keys they auditor.
+    VaultAuditor,
 }
 
 /// Verified OIDC claims extracted from a bearer token.
@@ -194,14 +203,19 @@ impl OidcClaims {
         })
     }
 
-    /// Returns `true` if the token has the SecretOwner role.
-    pub fn has_secret_owner(&self) -> bool {
-        self.roles.iter().any(|r| matches!(r, OidcRole::SecretOwner))
+    /// Returns `true` if the token has the VaultOwner role.
+    pub fn has_vault_owner(&self) -> bool {
+        self.roles.iter().any(|r| matches!(r, OidcRole::VaultOwner))
     }
 
-    /// Returns `true` if the token has the SecretManager role.
-    pub fn has_secret_manager(&self) -> bool {
-        self.roles.iter().any(|r| matches!(r, OidcRole::SecretManager))
+    /// Returns `true` if the token has the VaultManager role.
+    pub fn has_vault_manager(&self) -> bool {
+        self.roles.iter().any(|r| matches!(r, OidcRole::VaultManager))
+    }
+
+    /// Returns `true` if the token has the VaultAuditor role.
+    pub fn has_vault_auditor(&self) -> bool {
+        self.roles.iter().any(|r| matches!(r, OidcRole::VaultAuditor))
     }
 }
 
@@ -267,13 +281,17 @@ pub fn extract_roles(
             if !roles.contains(&OidcRole::Monitoring) {
                 roles.push(OidcRole::Monitoring);
             }
-        } else if s == &config.secret_owner_role {
-            if !roles.contains(&OidcRole::SecretOwner) {
-                roles.push(OidcRole::SecretOwner);
+        } else if s == &config.vault_owner_role {
+            if !roles.contains(&OidcRole::VaultOwner) {
+                roles.push(OidcRole::VaultOwner);
             }
-        } else if s == &config.secret_manager_role {
-            if !roles.contains(&OidcRole::SecretManager) {
-                roles.push(OidcRole::SecretManager);
+        } else if s == &config.vault_manager_role {
+            if !roles.contains(&OidcRole::VaultManager) {
+                roles.push(OidcRole::VaultManager);
+            }
+        } else if s == &config.vault_auditor_role {
+            if !roles.contains(&OidcRole::VaultAuditor) {
+                roles.push(OidcRole::VaultAuditor);
             }
         }
     }
@@ -323,8 +341,9 @@ mod tests {
             role_claim: default_role_claim(),
             manager_role: default_manager_role(),
             monitoring_role: default_monitoring_role(),
-            secret_owner_role: default_secret_owner_role(),
-            secret_manager_role: default_secret_manager_role(),
+            vault_owner_role: default_vault_owner_role(),
+            vault_manager_role: default_vault_manager_role(),
+            vault_auditor_role: default_vault_auditor_role(),
         }
     }
 
@@ -334,12 +353,12 @@ mod tests {
         let claims = json!({
             "urn:zitadel:iam:org:project:roles": {
                 "privasys-platform:manager": { "orgId": "123" },
-                "enclave-vault:secret-owner": { "orgId": "123" }
+                "vault:owner": { "orgId": "123" }
             }
         });
         let roles = extract_roles(&claims, &config);
         assert!(roles.contains(&OidcRole::Manager));
-        assert!(roles.contains(&OidcRole::SecretOwner));
+        assert!(roles.contains(&OidcRole::VaultOwner));
         assert!(!roles.contains(&OidcRole::Monitoring));
     }
 
@@ -359,11 +378,11 @@ mod tests {
         let config = test_config();
         let claims = json!({
             "realm_access": {
-                "roles": ["enclave-vault:secret-manager"]
+                "roles": ["vault:manager"]
             }
         });
         let roles = extract_roles(&claims, &config);
-        assert!(roles.contains(&OidcRole::SecretManager));
+        assert!(roles.contains(&OidcRole::VaultManager));
     }
 
     #[test]
@@ -403,18 +422,20 @@ mod tests {
     #[test]
     fn manager_does_not_imply_secret_owner() {
         let claims = OidcClaims { sub: "svc".into(), roles: vec![OidcRole::Manager] };
-        assert!(!claims.has_secret_owner());
-        assert!(!claims.has_secret_manager());
+        assert!(!claims.has_vault_owner());
+        assert!(!claims.has_vault_manager());
+        assert!(!claims.has_vault_auditor());
     }
 
     #[test]
     fn secret_roles_are_independent() {
         let claims = OidcClaims {
             sub: "svc".into(),
-            roles: vec![OidcRole::SecretOwner, OidcRole::SecretManager],
+            roles: vec![OidcRole::VaultOwner, OidcRole::VaultManager, OidcRole::VaultAuditor],
         };
-        assert!(claims.has_secret_owner());
-        assert!(claims.has_secret_manager());
+        assert!(claims.has_vault_owner());
+        assert!(claims.has_vault_manager());
+        assert!(claims.has_vault_auditor());
         assert!(!claims.has_manager());
         assert!(!claims.has_monitoring());
     }
@@ -428,14 +449,16 @@ mod tests {
             roles: vec![
                 OidcRole::Manager,
                 OidcRole::Monitoring,
-                OidcRole::SecretOwner,
-                OidcRole::SecretManager,
+                OidcRole::VaultOwner,
+                OidcRole::VaultManager,
+                OidcRole::VaultAuditor,
             ],
         };
         assert!(claims.has_manager());
         assert!(claims.has_monitoring());
-        assert!(claims.has_secret_owner());
-        assert!(claims.has_secret_manager());
+        assert!(claims.has_vault_owner());
+        assert!(claims.has_vault_manager());
+        assert!(claims.has_vault_auditor());
     }
 
     #[test]
@@ -443,8 +466,9 @@ mod tests {
         let claims = OidcClaims { sub: "nobody".into(), roles: vec![] };
         assert!(!claims.has_manager());
         assert!(!claims.has_monitoring());
-        assert!(!claims.has_secret_owner());
-        assert!(!claims.has_secret_manager());
+        assert!(!claims.has_vault_owner());
+        assert!(!claims.has_vault_manager());
+        assert!(!claims.has_vault_auditor());
     }
 
     // -- extract_roles: Zitadel map format -----------------------------------
@@ -456,12 +480,13 @@ mod tests {
             "urn:zitadel:iam:org:project:roles": {
                 "privasys-platform:manager": { "org": "1" },
                 "privasys-platform:monitoring": { "org": "1" },
-                "enclave-vault:secret-owner": { "org": "1" },
-                "enclave-vault:secret-manager": { "org": "1" }
+                "vault:owner": { "org": "1" },
+                "vault:manager": { "org": "1" },
+                "vault:auditor": { "org": "1" }
             }
         });
         let roles = extract_roles(&claims, &config);
-        assert_eq!(roles.len(), 4);
+        assert_eq!(roles.len(), 5);
     }
 
     #[test]
