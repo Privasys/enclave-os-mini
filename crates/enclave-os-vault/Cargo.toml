@@ -34,3 +34,8 @@ base64 = "0.21"
 
 # X.509 parsing for peer-cert quote + OID claim extraction
 x509-parser = "0.16"
+
+# In-enclave crypto: AES-256-GCM (Wrap/Unwrap), HMAC-SHA-256 (Mac),
+# ECDSA-P256 (Sign + ApprovalToken issue/verify). Same version as the
+# rest of the workspace; pulled transitively via enclave-os-common too.
+ring = "0.17"

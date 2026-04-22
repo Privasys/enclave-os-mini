@@ -26,9 +26,10 @@ use enclave_os_common::modules::RequestContext;
 use enclave_os_common::oidc::OidcClaims;
 
 use crate::quote::{dissect_peer_cert, parse_quote, verify_challenge_binding, TeeType};
+use crate::signing::verify_approval_token;
 use crate::types::{
-    AttestationProfile, KeyPolicy, Measurement, Mutability, Operation, OperationRule, Principal,
-    PrincipalRef,
+    ApprovalToken, AttestationProfile, Condition, KeyPolicy, Measurement, Mutability, Operation,
+    OperationRule, Principal, PrincipalRef,
 };
 
 // ---------------------------------------------------------------------------
@@ -93,7 +94,7 @@ fn oidc_matches(principal: &Principal, claims: &OidcClaims) -> bool {
             sub,
             required_roles,
         } => sub == &claims.sub && has_required_roles(claims, required_roles),
-        Principal::Tee(_) => false,
+        Principal::Tee(_) | Principal::Fido2 { .. } => false,
     }
 }
 
@@ -127,7 +128,7 @@ fn oidc_role_str(role: &enclave_os_common::oidc::OidcRole) -> &'static str {
 ///   3. parse + measurement match against `profile.measurements`,
 ///   4. bidirectional challenge-response binding,
 ///   5. required OID extension match.
-fn tee_matches(
+pub(crate) fn tee_matches(
     profile: &AttestationProfile,
     peer_der: &[u8],
     challenge_nonce: Option<&[u8]>,
@@ -194,10 +195,13 @@ fn measurement_matches(identity: &crate::quote::QuoteIdentity, allowed: &[Measur
 // ---------------------------------------------------------------------------
 
 /// Verify the caller is allowed to perform `op` on the key whose policy
-/// is `policy`.
+/// is `policy`. The `handle` and `approvals` parameters are needed to
+/// evaluate [`Condition::ManagerApproval`].
 pub fn evaluate_op(
     policy: &KeyPolicy,
     op: Operation,
+    handle: &str,
+    approvals: &[ApprovalToken],
     ctx: &RequestContext,
 ) -> Result<(), String> {
     let (caller_ref, _role) = resolve_caller(policy, ctx).ok_or_else(|| {
@@ -206,19 +210,29 @@ pub fn evaluate_op(
             .to_string()
     })?;
 
-    let granted = policy
-        .operations
-        .iter()
-        .any(|rule| rule.ops.contains(&op) && rule_grants_to(rule, caller_ref));
+    // First filter rules that grant op to caller. Then require at least
+    // one of those rules to have all of its `requires` conditions met.
+    let mut last_err: Option<String> = None;
+    for rule in policy.operations.iter() {
+        if !rule.ops.contains(&op) || !rule_grants_to(rule, caller_ref) {
+            continue;
+        }
+        match evaluate_conditions(&rule.requires, policy, op, handle, approvals, ctx) {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = Some(e),
+        }
+    }
 
-    if granted {
-        Ok(())
-    } else {
-        Err(format!(
+    Err(match last_err {
+        Some(e) => format!(
+            "no OperationRule grants {:?} to caller with all conditions met: {}",
+            op, e
+        ),
+        None => format!(
             "caller is in policy.principals but no OperationRule grants {:?}",
             op
-        ))
-    }
+        ),
+    })
 }
 
 fn rule_grants_to(rule: &OperationRule, caller: PrincipalRef) -> bool {
@@ -230,6 +244,98 @@ fn rule_grants_to(rule: &OperationRule, caller: PrincipalRef) -> bool {
         (PrincipalRef::AnyTee, PrincipalRef::Tee(_)) => true,
         _ => false,
     })
+}
+
+// ---------------------------------------------------------------------------
+//  Condition evaluation
+// ---------------------------------------------------------------------------
+
+fn evaluate_conditions(
+    conditions: &[Condition],
+    policy: &KeyPolicy,
+    op: Operation,
+    handle: &str,
+    approvals: &[ApprovalToken],
+    ctx: &RequestContext,
+) -> Result<(), String> {
+    let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
+    for cond in conditions {
+        match cond {
+            Condition::TimeWindow {
+                not_before,
+                not_after,
+            } => {
+                if *not_before != 0 && now < *not_before {
+                    return Err(format!("TimeWindow: now={} before not_before={}", now, not_before));
+                }
+                if *not_after != 0 && now > *not_after {
+                    return Err(format!("TimeWindow: now={} after not_after={}", now, not_after));
+                }
+            }
+            Condition::AttestationMatches(profile) => {
+                let peer = ctx.peer_cert_der.as_deref().ok_or_else(|| {
+                    "AttestationMatches: no peer RA-TLS cert in request".to_string()
+                })?;
+                if !tee_matches(profile, peer, ctx.client_challenge_nonce.as_deref()) {
+                    return Err(format!(
+                        "AttestationMatches: peer does not match profile '{}'",
+                        profile.name
+                    ));
+                }
+            }
+            Condition::ManagerApproval {
+                manager,
+                fresh_for_seconds,
+            } => {
+                let mgr_idx = *manager;
+                let mgr = policy
+                    .principals
+                    .managers
+                    .get(mgr_idx as usize)
+                    .ok_or_else(|| {
+                        format!(
+                            "ManagerApproval: manager index {} out of range",
+                            mgr_idx
+                        )
+                    })?;
+                let mgr_sub = match mgr {
+                    Principal::Oidc { sub, .. } => sub.as_str(),
+                    Principal::Tee(_) | Principal::Fido2 { .. } => {
+                        return Err(
+                            "ManagerApproval: only OIDC managers can issue approval tokens"
+                                .to_string(),
+                        )
+                    }
+                };
+                let mut accepted = false;
+                let mut last_err: Option<String> = None;
+                for token in approvals {
+                    match verify_approval_token(
+                        token,
+                        handle,
+                        op,
+                        mgr_idx,
+                        mgr_sub,
+                        *fresh_for_seconds,
+                        now,
+                    ) {
+                        Ok(()) => {
+                            accepted = true;
+                            break;
+                        }
+                        Err(e) => last_err = Some(e),
+                    }
+                }
+                if !accepted {
+                    return Err(match last_err {
+                        Some(e) => format!("ManagerApproval: no token accepted ({})", e),
+                        None => "ManagerApproval: no approval token supplied".into(),
+                    });
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -309,15 +415,10 @@ fn principal_vec_eq(a: &[Principal], b: &[Principal]) -> bool {
     a == b
 }
 fn operations_eq(a: &[OperationRule], b: &[OperationRule]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    a.iter().zip(b.iter()).all(|(x, y)| x.ops == y.ops && x.principals == y.principals)
+    a == b
 }
 fn mutability_eq(a: &Mutability, b: &Mutability) -> bool {
-    a.owner_can == b.owner_can
-        && a.manager_can == b.manager_can
-        && a.immutable == b.immutable
+    a == b
 }
 
 
