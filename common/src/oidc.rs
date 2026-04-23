@@ -3,26 +3,30 @@
 
 //! OIDC token verification for enclave-os.
 //!
-//! Provides JWT validation against a Zitadel (or any OIDC-compliant) provider.
-//! Tokens are verified using public keys fetched from the provider's JWKS
-//! endpoint, with a configurable cache TTL.
+//! Provides JWT validation against Privasys ID (or any OIDC-compliant
+//! provider). Tokens are verified using public keys fetched from the
+//! provider's JWKS endpoint, with a configurable cache TTL.
 //!
-//! ## Role Model
+//! ## Role model
 //!
-//! Five roles are defined, scoped to different parts of the enclave:
+//! `OidcClaims` carries the raw role strings extracted from the JWT plus
+//! two precomputed booleans for the two **platform** roles enforced by
+//! the enclave host code itself:
 //!
-//! | Role | Default claim value | Scope |
-//! |------|---------------------|-------|
-//! | Manager | `privasys-platform:manager` | WASM load/unload, TLS CA rotation, + all monitoring |
-//! | Monitoring | `privasys-platform:monitoring` | Read-only health/status/metrics |
-//! | Vault Owner | `vault:owner` | Create/delete/update/list own keys; export own keys |
-//! | Vault Manager | `vault:manager` | Issue ApprovalTokens for policy-gated operations |
-//! | Vault Auditor | `vault:auditor` | Read metadata + audit log for keys they auditor |
+//! | Booleans on `OidcClaims` | Default claim value | Scope |
+//! |--------------------------|---------------------|-------|
+//! | `is_manager` | `privasys-platform:manager` | WASM lifecycle, TLS CA rotation, all monitoring |
+//! | `is_monitoring` | `privasys-platform:monitoring` | Read-only health/status/metrics |
 //!
-//! Manager implies Monitoring.  Vault roles are independent from
-//! Manager/Monitoring.
+//! `is_manager` implies `is_monitoring`.
 //!
-//! ## Token Delivery
+//! All other roles (notably the `vault:*` family) are not interpreted in
+//! `common`: they are kept as raw strings in `OidcClaims.roles` and matched
+//! by the consuming crate against its own per-resource policy. This keeps
+//! `common` agnostic to feature crates and avoids a closed enum that has
+//! to be edited every time a new role is introduced.
+//!
+//! ## Token delivery
 //!
 //! Since enclave-os-mini uses a frame protocol (not HTTP), the OIDC bearer
 //! token is passed inside the JSON envelope as an `"auth"` field:
@@ -109,6 +113,13 @@ pub fn global_oidc_config() -> Option<&'static OidcConfig> {
 // ---------------------------------------------------------------------------
 
 /// OIDC provider configuration, passed via [`EnclaveConfig`].
+///
+/// Only the two **platform** role names (`manager_role`, `monitoring_role`)
+/// are configurable here, because they are enforced inside the enclave
+/// host code (WASM lifecycle, TLS CA rotation, monitoring endpoints).
+/// Roles enforced by feature crates — e.g. `vault:owner`,
+/// `vault:manager`, `vault:auditor` — live in those crates' own per-key
+/// or per-resource policy, not in this global config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OidcConfig {
     /// OIDC issuer URL (e.g. `https://auth.privasys.org`).
@@ -120,6 +131,11 @@ pub struct OidcConfig {
     #[serde(default)]
     pub jwks_uri: String,
     /// Role claim path in the token (default: `urn:zitadel:iam:org:project:roles`).
+    ///
+    /// The default value is the Zitadel-compatible claim Privasys ID
+    /// emits. Other OIDC providers (Keycloak, Auth0, Okta, …) use other
+    /// paths — `extract_roles` also tries the standard `roles` array
+    /// and Keycloak's `realm_access.roles`.
     #[serde(default = "default_role_claim")]
     pub role_claim: String,
     /// Claim value for the manager role (default: `privasys-platform:manager`).
@@ -128,15 +144,6 @@ pub struct OidcConfig {
     /// Claim value for the monitoring role (default: `privasys-platform:monitoring`).
     #[serde(default = "default_monitoring_role")]
     pub monitoring_role: String,
-    /// Claim value for the vault-owner role (default: `vault:owner`).
-    #[serde(default = "default_vault_owner_role")]
-    pub vault_owner_role: String,
-    /// Claim value for the vault-manager role (default: `vault:manager`).
-    #[serde(default = "default_vault_manager_role")]
-    pub vault_manager_role: String,
-    /// Claim value for the vault-auditor role (default: `vault:auditor`).
-    #[serde(default = "default_vault_auditor_role")]
-    pub vault_auditor_role: String,
 }
 
 fn default_role_claim() -> String {
@@ -148,74 +155,52 @@ fn default_manager_role() -> String {
 fn default_monitoring_role() -> String {
     "privasys-platform:monitoring".into()
 }
-fn default_vault_owner_role() -> String {
-    "vault:owner".into()
-}
-fn default_vault_manager_role() -> String {
-    "vault:manager".into()
-}
-fn default_vault_auditor_role() -> String {
-    "vault:auditor".into()
-}
 
 // ---------------------------------------------------------------------------
 //  Verified claims
 // ---------------------------------------------------------------------------
 
-/// The resolved role from an OIDC token.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-pub enum OidcRole {
-    /// Platform operator — WASM lifecycle, TLS CA rotation, + all monitoring.
-    Manager,
-    /// Read-only monitoring — healthz, readyz, status, metrics.
-    Monitoring,
-    /// Vault owner — create/delete/update/list/export own keys.
-    VaultOwner,
-    /// Vault manager — issue ApprovalTokens for policy-gated operations.
-    VaultManager,
-    /// Vault auditor — read metadata + audit log for keys they auditor.
-    VaultAuditor,
-}
-
 /// Verified OIDC claims extracted from a bearer token.
 ///
-/// Populated by the auth layer in [`RequestContext`](super::modules::RequestContext)
-/// after successful token verification.
+/// Populated by the auth layer in
+/// [`RequestContext`](super::modules::RequestContext) after successful
+/// token verification.
+///
+/// `roles` carries the raw role strings collected from the JWT (deduped,
+/// claim-path agnostic). The two platform booleans are precomputed
+/// against the configured `manager_role` / `monitoring_role` so host
+/// code does not need to reach back into the global config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OidcClaims {
     /// OIDC subject (`sub` claim) — unique user/service identity.
     pub sub: String,
-    /// Resolved roles from the token.
-    pub roles: Vec<OidcRole>,
+    /// Raw role strings extracted from the JWT, deduped.
+    pub roles: Vec<String>,
+    /// Precomputed: bearer holds the configured manager role.
+    pub is_manager: bool,
+    /// Precomputed: bearer holds either the manager or monitoring role.
+    pub is_monitoring: bool,
 }
 
 impl OidcClaims {
-    /// Returns `true` if the token has the Manager role.
+    /// Build verified claims from a subject and the raw role strings
+    /// returned by [`extract_roles`], applying the platform-role hierarchy
+    /// (manager implies monitoring).
+    pub fn from_raw(sub: String, roles: Vec<String>, config: &OidcConfig) -> Self {
+        let is_manager = roles.iter().any(|r| r == &config.manager_role);
+        let is_monitoring =
+            is_manager || roles.iter().any(|r| r == &config.monitoring_role);
+        Self { sub, roles, is_manager, is_monitoring }
+    }
+
+    /// Returns `true` if the token has the configured manager role.
     pub fn has_manager(&self) -> bool {
-        self.roles.iter().any(|r| matches!(r, OidcRole::Manager))
+        self.is_manager
     }
 
-    /// Returns `true` if the token has Monitoring access
-    /// (either explicit Monitoring role or Manager, which implies it).
+    /// Returns `true` if the token has monitoring access (manager or monitoring).
     pub fn has_monitoring(&self) -> bool {
-        self.roles.iter().any(|r| {
-            matches!(r, OidcRole::Manager | OidcRole::Monitoring)
-        })
-    }
-
-    /// Returns `true` if the token has the VaultOwner role.
-    pub fn has_vault_owner(&self) -> bool {
-        self.roles.iter().any(|r| matches!(r, OidcRole::VaultOwner))
-    }
-
-    /// Returns `true` if the token has the VaultManager role.
-    pub fn has_vault_manager(&self) -> bool {
-        self.roles.iter().any(|r| matches!(r, OidcRole::VaultManager))
-    }
-
-    /// Returns `true` if the token has the VaultAuditor role.
-    pub fn has_vault_auditor(&self) -> bool {
-        self.roles.iter().any(|r| matches!(r, OidcRole::VaultAuditor))
+        self.is_monitoring
     }
 }
 
@@ -223,84 +208,64 @@ impl OidcClaims {
 //  Role extraction from raw JWT claims
 // ---------------------------------------------------------------------------
 
-/// Extract [`OidcRole`]s from raw JWT claims JSON, searching multiple
+/// Extract role strings from raw JWT claims JSON, searching multiple
 /// claim paths (aligned with Enclave OS Virtual):
 ///
 /// 1. Configured `role_claim` (default: `urn:zitadel:iam:org:project:roles`)
 ///    — supports map `{ "role": {...} }` or array `["role1", "role2"]`
 /// 2. Standard `roles` array
 /// 3. Keycloak `realm_access.roles`
-/// 4. Zitadel project-specific claims (`urn:zitadel:iam:org:project:{id}:roles`)
-///    — used by service accounts with the `projects` (plural) scope
+/// 4. Project-specific claims (`urn:zitadel:iam:org:project:{id}:roles`),
+///    used by service accounts with the plural `projects` scope
+///
+/// Returns the deduped union of role strings found in all paths. The
+/// returned strings are not interpreted: it is up to the caller (or
+/// [`OidcClaims::from_raw`]) to map them to platform booleans and to
+/// the per-resource policy of feature crates.
 pub fn extract_roles(
     claims: &serde_json::Value,
     config: &OidcConfig,
-) -> Vec<OidcRole> {
-    let mut role_strings: Vec<String> = Vec::new();
+) -> Vec<String> {
+    let mut roles: Vec<String> = Vec::new();
 
     // Path 1: configured role_claim
     if let Some(val) = claims.get(&config.role_claim) {
-        collect_role_strings(val, &mut role_strings);
+        collect_role_strings(val, &mut roles);
     }
 
     // Path 2: standard "roles" array
     if let Some(val) = claims.get("roles") {
-        collect_role_strings(val, &mut role_strings);
+        collect_role_strings(val, &mut roles);
     }
 
     // Path 3: Keycloak realm_access.roles
     if let Some(ra) = claims.get("realm_access") {
         if let Some(val) = ra.get("roles") {
-            collect_role_strings(val, &mut role_strings);
+            collect_role_strings(val, &mut roles);
         }
     }
 
-    // Path 4: Zitadel project-specific role claims
-    // Service accounts using the plural `urn:zitadel:iam:org:projects:roles` scope
-    // get roles under `urn:zitadel:iam:org:project:{projectId}:roles` instead of
-    // the generic `urn:zitadel:iam:org:project:roles`.
+    // Path 4: project-specific role claims.
+    // Service accounts using the plural `urn:zitadel:iam:org:projects:roles`
+    // scope get roles under `urn:zitadel:iam:org:project:{projectId}:roles`
+    // instead of the generic `urn:zitadel:iam:org:project:roles`.
     if let Some(obj) = claims.as_object() {
         for (key, val) in obj {
             if key.starts_with("urn:zitadel:iam:org:project:")
                 && key.ends_with(":roles")
                 && *key != config.role_claim
             {
-                collect_role_strings(val, &mut role_strings);
+                collect_role_strings(val, &mut roles);
             }
         }
     }
 
-    // Map role strings to OidcRole
-    let mut roles = Vec::new();
-    for s in &role_strings {
-        if s == &config.manager_role {
-            if !roles.contains(&OidcRole::Manager) {
-                roles.push(OidcRole::Manager);
-            }
-        } else if s == &config.monitoring_role {
-            if !roles.contains(&OidcRole::Monitoring) {
-                roles.push(OidcRole::Monitoring);
-            }
-        } else if s == &config.vault_owner_role {
-            if !roles.contains(&OidcRole::VaultOwner) {
-                roles.push(OidcRole::VaultOwner);
-            }
-        } else if s == &config.vault_manager_role {
-            if !roles.contains(&OidcRole::VaultManager) {
-                roles.push(OidcRole::VaultManager);
-            }
-        } else if s == &config.vault_auditor_role {
-            if !roles.contains(&OidcRole::VaultAuditor) {
-                roles.push(OidcRole::VaultAuditor);
-            }
-        }
-    }
     roles
 }
 
 /// Collect role strings from a JSON value that is either:
-/// - An object (Zitadel format): `{ "role-name": { ... } }` → keys are roles
-/// - An array of strings: `["role1", "role2"]`
+/// - An object `{ "role-name": { ... } }` — keys are the role names
+/// - An array of strings `["role1", "role2"]`
 fn collect_role_strings(val: &serde_json::Value, out: &mut Vec<String>) {
     match val {
         serde_json::Value::Object(map) => {
@@ -341,14 +306,21 @@ mod tests {
             role_claim: default_role_claim(),
             manager_role: default_manager_role(),
             monitoring_role: default_monitoring_role(),
-            vault_owner_role: default_vault_owner_role(),
-            vault_manager_role: default_vault_manager_role(),
-            vault_auditor_role: default_vault_auditor_role(),
         }
     }
 
+    fn claims_with(roles: &[&str]) -> OidcClaims {
+        OidcClaims::from_raw(
+            "svc".into(),
+            roles.iter().map(|s| s.to_string()).collect(),
+            &test_config(),
+        )
+    }
+
+    // -- extract_roles: claim shapes -----------------------------------------
+
     #[test]
-    fn test_zitadel_map_format() {
+    fn object_map_format() {
         let config = test_config();
         let claims = json!({
             "urn:zitadel:iam:org:project:roles": {
@@ -357,152 +329,35 @@ mod tests {
             }
         });
         let roles = extract_roles(&claims, &config);
-        assert!(roles.contains(&OidcRole::Manager));
-        assert!(roles.contains(&OidcRole::VaultOwner));
-        assert!(!roles.contains(&OidcRole::Monitoring));
+        assert!(roles.iter().any(|r| r == "privasys-platform:manager"));
+        assert!(roles.iter().any(|r| r == "vault:owner"));
+        assert_eq!(roles.len(), 2);
     }
 
     #[test]
-    fn test_standard_array_format() {
+    fn standard_array_format() {
+        let config = test_config();
+        let claims = json!({ "roles": ["privasys-platform:monitoring"] });
+        let roles = extract_roles(&claims, &config);
+        assert_eq!(roles, vec!["privasys-platform:monitoring".to_string()]);
+    }
+
+    #[test]
+    fn keycloak_realm_access() {
         let config = test_config();
         let claims = json!({
-            "roles": ["privasys-platform:monitoring"]
+            "realm_access": { "roles": ["vault:manager"] }
         });
         let roles = extract_roles(&claims, &config);
-        assert!(roles.contains(&OidcRole::Monitoring));
-        assert!(!roles.contains(&OidcRole::Manager));
+        assert_eq!(roles, vec!["vault:manager".to_string()]);
     }
 
     #[test]
-    fn test_keycloak_realm_access() {
-        let config = test_config();
-        let claims = json!({
-            "realm_access": {
-                "roles": ["vault:manager"]
-            }
-        });
-        let roles = extract_roles(&claims, &config);
-        assert!(roles.contains(&OidcRole::VaultManager));
-    }
-
-    #[test]
-    fn test_has_monitoring_via_manager() {
-        let claims = OidcClaims {
-            sub: "user1".into(),
-            roles: vec![OidcRole::Manager],
-        };
-        assert!(claims.has_monitoring()); // manager implies monitoring
-        assert!(claims.has_manager());
-    }
-
-    #[test]
-    fn test_no_roles() {
+    fn no_roles() {
         let config = test_config();
         let claims = json!({"sub": "user1"});
-        let roles = extract_roles(&claims, &config);
-        assert!(roles.is_empty());
+        assert!(extract_roles(&claims, &config).is_empty());
     }
-
-    // -- Role hierarchy: manager implies monitoring --------------------------
-
-    #[test]
-    fn manager_implies_monitoring() {
-        let claims = OidcClaims { sub: "svc".into(), roles: vec![OidcRole::Manager] };
-        assert!(claims.has_manager());
-        assert!(claims.has_monitoring(), "manager must imply monitoring");
-    }
-
-    #[test]
-    fn monitoring_does_not_imply_manager() {
-        let claims = OidcClaims { sub: "svc".into(), roles: vec![OidcRole::Monitoring] };
-        assert!(claims.has_monitoring());
-        assert!(!claims.has_manager(), "monitoring must not imply manager");
-    }
-
-    #[test]
-    fn manager_does_not_imply_secret_owner() {
-        let claims = OidcClaims { sub: "svc".into(), roles: vec![OidcRole::Manager] };
-        assert!(!claims.has_vault_owner());
-        assert!(!claims.has_vault_manager());
-        assert!(!claims.has_vault_auditor());
-    }
-
-    #[test]
-    fn secret_roles_are_independent() {
-        let claims = OidcClaims {
-            sub: "svc".into(),
-            roles: vec![OidcRole::VaultOwner, OidcRole::VaultManager, OidcRole::VaultAuditor],
-        };
-        assert!(claims.has_vault_owner());
-        assert!(claims.has_vault_manager());
-        assert!(claims.has_vault_auditor());
-        assert!(!claims.has_manager());
-        assert!(!claims.has_monitoring());
-    }
-
-    // -- Multiple roles ------------------------------------------------------
-
-    #[test]
-    fn all_four_roles() {
-        let claims = OidcClaims {
-            sub: "admin".into(),
-            roles: vec![
-                OidcRole::Manager,
-                OidcRole::Monitoring,
-                OidcRole::VaultOwner,
-                OidcRole::VaultManager,
-                OidcRole::VaultAuditor,
-            ],
-        };
-        assert!(claims.has_manager());
-        assert!(claims.has_monitoring());
-        assert!(claims.has_vault_owner());
-        assert!(claims.has_vault_manager());
-        assert!(claims.has_vault_auditor());
-    }
-
-    #[test]
-    fn empty_roles() {
-        let claims = OidcClaims { sub: "nobody".into(), roles: vec![] };
-        assert!(!claims.has_manager());
-        assert!(!claims.has_monitoring());
-        assert!(!claims.has_vault_owner());
-        assert!(!claims.has_vault_manager());
-        assert!(!claims.has_vault_auditor());
-    }
-
-    // -- extract_roles: Zitadel map format -----------------------------------
-
-    #[test]
-    fn zitadel_all_roles() {
-        let config = test_config();
-        let claims = json!({
-            "urn:zitadel:iam:org:project:roles": {
-                "privasys-platform:manager": { "org": "1" },
-                "privasys-platform:monitoring": { "org": "1" },
-                "vault:owner": { "org": "1" },
-                "vault:manager": { "org": "1" },
-                "vault:auditor": { "org": "1" }
-            }
-        });
-        let roles = extract_roles(&claims, &config);
-        assert_eq!(roles.len(), 5);
-    }
-
-    #[test]
-    fn zitadel_unknown_roles_ignored() {
-        let config = test_config();
-        let claims = json!({
-            "urn:zitadel:iam:org:project:roles": {
-                "some-other-app:admin": { "org": "1" },
-                "privasys-platform:manager": { "org": "1" }
-            }
-        });
-        let roles = extract_roles(&claims, &config);
-        assert_eq!(roles, vec![OidcRole::Manager]);
-    }
-
-    // -- extract_roles: duplicate role claim paths ---------------------------
 
     #[test]
     fn duplicate_roles_across_paths_deduplicated() {
@@ -514,42 +369,32 @@ mod tests {
             "roles": ["privasys-platform:manager"]
         });
         let roles = extract_roles(&claims, &config);
-        assert_eq!(roles.len(), 1);
-        assert_eq!(roles[0], OidcRole::Manager);
+        assert_eq!(roles, vec!["privasys-platform:manager".to_string()]);
     }
-
-    // -- extract_roles: custom role_claim config -----------------------------
 
     #[test]
     fn custom_role_claim_path() {
         let mut config = test_config();
         config.role_claim = "custom_roles".into();
-        config.manager_role = "admin".into();
-        let claims = json!({
-            "custom_roles": ["admin"]
-        });
+        let claims = json!({ "custom_roles": ["admin"] });
         let roles = extract_roles(&claims, &config);
-        assert_eq!(roles, vec![OidcRole::Manager]);
+        assert_eq!(roles, vec!["admin".to_string()]);
     }
 
-    // -- extract_roles: Zitadel project-specific claims ----------------------
-
     #[test]
-    fn zitadel_project_specific_role_claim() {
+    fn project_specific_role_claim() {
         let config = test_config();
-        // Service accounts using the plural `projects` scope get roles under
-        // project-specific claim paths.
         let claims = json!({
             "urn:zitadel:iam:org:project:363345836026888196:roles": {
                 "privasys-platform:manager": { "363334360528650244": "privasys.auth.privasys.org" }
             }
         });
         let roles = extract_roles(&claims, &config);
-        assert_eq!(roles, vec![OidcRole::Manager]);
+        assert_eq!(roles, vec!["privasys-platform:manager".to_string()]);
     }
 
     #[test]
-    fn zitadel_project_specific_multiple_projects() {
+    fn project_specific_multiple_projects() {
         let config = test_config();
         let claims = json!({
             "urn:zitadel:iam:org:project:111:roles": {
@@ -561,8 +406,42 @@ mod tests {
         });
         let roles = extract_roles(&claims, &config);
         assert_eq!(roles.len(), 2);
-        assert!(roles.contains(&OidcRole::Manager));
-        assert!(roles.contains(&OidcRole::Monitoring));
+        assert!(roles.iter().any(|r| r == "privasys-platform:manager"));
+        assert!(roles.iter().any(|r| r == "privasys-platform:monitoring"));
+    }
+
+    // -- Platform booleans ---------------------------------------------------
+
+    #[test]
+    fn manager_implies_monitoring() {
+        let claims = claims_with(&["privasys-platform:manager"]);
+        assert!(claims.has_manager());
+        assert!(claims.has_monitoring(), "manager must imply monitoring");
+    }
+
+    #[test]
+    fn monitoring_does_not_imply_manager() {
+        let claims = claims_with(&["privasys-platform:monitoring"]);
+        assert!(claims.has_monitoring());
+        assert!(!claims.has_manager(), "monitoring must not imply manager");
+    }
+
+    #[test]
+    fn vault_roles_do_not_imply_platform_roles() {
+        let claims = claims_with(&["vault:owner", "vault:manager", "vault:auditor"]);
+        assert!(!claims.has_manager());
+        assert!(!claims.has_monitoring());
+        // Raw strings are still visible to feature crates.
+        assert_eq!(claims.roles.len(), 3);
+        assert!(claims.roles.iter().any(|r| r == "vault:owner"));
+    }
+
+    #[test]
+    fn empty_roles() {
+        let claims = claims_with(&[]);
+        assert!(!claims.has_manager());
+        assert!(!claims.has_monitoring());
+        assert!(claims.roles.is_empty());
     }
 
     // -- collect_role_strings: edge cases ------------------------------------
@@ -570,8 +449,7 @@ mod tests {
     #[test]
     fn collect_from_non_string_array_items() {
         let mut out = Vec::new();
-        let val = json!([42, "valid", null, true]);
-        collect_role_strings(&val, &mut out);
+        collect_role_strings(&json!([42, "valid", null, true]), &mut out);
         assert_eq!(out, vec!["valid"]);
     }
 
@@ -579,9 +457,7 @@ mod tests {
     fn collect_from_scalar_is_noop() {
         let mut out = Vec::new();
         collect_role_strings(&json!("single-string"), &mut out);
-        assert!(out.is_empty());
         collect_role_strings(&json!(42), &mut out);
-        assert!(out.is_empty());
         collect_role_strings(&json!(null), &mut out);
         assert!(out.is_empty());
     }

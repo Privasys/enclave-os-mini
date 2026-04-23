@@ -1319,7 +1319,7 @@ fn verify_oidc_token(token: &str) -> Result<enclave_os_common::oidc::OidcClaims,
     // Extract roles
     let roles = enclave_os_common::oidc::extract_roles(&claims, config);
 
-    Ok(enclave_os_common::oidc::OidcClaims { sub, roles })
+    Ok(enclave_os_common::oidc::OidcClaims::from_raw(sub, roles, config))
 }
 
 /// Decode base64url (no padding) to bytes.

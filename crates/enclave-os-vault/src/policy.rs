@@ -99,26 +99,15 @@ fn oidc_matches(principal: &Principal, claims: &OidcClaims) -> bool {
 }
 
 /// True iff every name in `required_roles` is present in the verified
-/// claims (matched by the role's `as_str()` form).
+/// claims (case-insensitive string match against the raw role strings
+/// from the JWT).
 pub fn has_required_roles(claims: &OidcClaims, required_roles: &[String]) -> bool {
     if required_roles.is_empty() {
         return true;
     }
-    let claim_role_strs: Vec<&str> = claims.roles.iter().map(|r| oidc_role_str(r)).collect();
-    required_roles
-        .iter()
-        .all(|r| claim_role_strs.iter().any(|c| c.eq_ignore_ascii_case(r)))
-}
-
-fn oidc_role_str(role: &enclave_os_common::oidc::OidcRole) -> &'static str {
-    use enclave_os_common::oidc::OidcRole;
-    match role {
-        OidcRole::Manager => "manager",
-        OidcRole::Monitoring => "monitoring",
-        OidcRole::VaultOwner => "vault:owner",
-        OidcRole::VaultManager => "vault:manager",
-        OidcRole::VaultAuditor => "vault:auditor",
-    }
+    required_roles.iter().all(|r| {
+        claims.roles.iter().any(|c| c.eq_ignore_ascii_case(r))
+    })
 }
 
 /// Verify that the peer cert satisfies a given `AttestationProfile`.
