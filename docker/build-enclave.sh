@@ -46,11 +46,31 @@ cargo fetch --locked
 cargo fetch --locked --manifest-path enclave/Cargo.toml
 
 # ── Step 2: CMake configure ─────────────────────────────────────────────
-echo "==> Configuring CMake build..."
+#
+# FLAVOR controls which optional modules are enabled:
+#   base  → no extra modules (HelloWorld + sgx + default-ecall only)
+#   wasm  → -DENABLE_WASM=ON -DENABLE_FIDO2=ON
+#
+# The vault flavor is built out-of-tree by the enclave-vaults repo using its
+# own composition crate (CUSTOM_ENCLAVE_DIR), so it is not exposed here.
+FLAVOR="${FLAVOR:-wasm}"
+FLAVOR_FLAGS=()
+case "${FLAVOR}" in
+    base)
+        ;;
+    wasm)
+        FLAVOR_FLAGS+=(-DENABLE_WASM=ON -DENABLE_FIDO2=ON)
+        ;;
+    *)
+        echo "ERROR: unknown FLAVOR='${FLAVOR}' (expected: base, wasm)" >&2
+        exit 2
+        ;;
+esac
+
+echo "==> Configuring CMake build (flavor=${FLAVOR})..."
 cmake -S "${SRC}" -B "${BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
-    -DENABLE_WASM=ON \
-    -DENABLE_FIDO2=ON \
+    "${FLAVOR_FLAGS[@]}" \
     -DCMAKE_C_COMPILER=gcc \
     -DCMAKE_CXX_COMPILER=g++
 

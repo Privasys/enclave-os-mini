@@ -484,6 +484,7 @@ dependencies = [
  "enclave-os-common",
  "enclave-os-egress",
  "enclave-os-kvstore",
+ "ring",
  "serde",
  "serde_json",
  "x509-parser",
