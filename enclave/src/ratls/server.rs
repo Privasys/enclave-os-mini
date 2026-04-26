@@ -296,12 +296,15 @@ impl IngressServer {
             match session.recv_http_request() {
                 Ok(Some(http_req)) => {
                     let close = http_req.connection_close;
-                    let result = handle_http_request(&http_req, &base_ctx);
+                    let result = handle_http_request_with_session(&http_req, &base_ctx);
 
                     // Send HTTP response
                     let send_close = close || result.shutdown;
-                    match session.send_http_response(
+                    let ct = result.content_type.as_deref()
+                        .unwrap_or("application/json");
+                    match session.send_http_response_typed(
                         result.status,
+                        ct,
                         &result.body,
                         send_close,
                     ) {
@@ -657,21 +660,24 @@ struct HttpHandleResult {
     status: u16,
     body: Vec<u8>,
     shutdown: bool,
+    /// Optional Content-Type override (defaults to `application/json`).
+    content_type: Option<String>,
 }
 
 impl HttpHandleResult {
     fn ok(body: Vec<u8>) -> Self {
-        Self { status: 200, body, shutdown: false }
+        Self { status: 200, body, shutdown: false, content_type: None }
     }
     fn err(status: u16, msg: &str) -> Self {
         Self {
             status,
             body: format!("{{\"error\":\"{}\"}}", msg).into_bytes(),
             shutdown: false,
+            content_type: None,
         }
     }
     fn shutdown() -> Self {
-        Self { status: 200, body: b"{}".to_vec(), shutdown: true }
+        Self { status: 200, body: b"{}".to_vec(), shutdown: true, content_type: None }
     }
 }
 
@@ -777,6 +783,11 @@ fn handle_http_request(
             handle_fido2_request(path, http_req, base_ctx)
         }
 
+        // ── Session-relay bootstrap (no auth required) ──────────────
+        (HttpMethod::Post, "/__privasys/session-bootstrap") => {
+            handle_session_bootstrap(http_req)
+        }
+
         // ── Method mismatch on known paths ──────────────────────────
         (_, "/healthz") | (_, "/readyz") | (_, "/status") | (_, "/metrics")
         | (_, "/attestation-servers") | (_, "/data") | (_, "/shutdown") => {
@@ -786,6 +797,123 @@ fn handle_http_request(
         // ── Unknown path ────────────────────────────────────────────
         _ => HttpHandleResult::err(404, "not found"),
     }
+}
+
+/// Wrap [`handle_http_request`] with the browser→enclave session relay.
+///
+/// If the incoming request carries `Content-Type: application/privasys-sealed+cbor`
+/// and `Authorization: PrivasysSession <id>`, decrypt the body, dispatch the
+/// inner request, then seal the response. Otherwise dispatch the request as-is.
+fn handle_http_request_with_session(
+    http_req: &enclave_os_common::protocol::HttpRequest,
+    base_ctx: &enclave_os_common::modules::RequestContext,
+) -> HttpHandleResult {
+    let is_sealed = http_req
+        .content_type
+        .as_deref()
+        .map(|ct| ct.starts_with(crate::sessionrelay::SEALED_CONTENT_TYPE))
+        .unwrap_or(false);
+
+    if !is_sealed {
+        return handle_http_request(http_req, base_ctx);
+    }
+
+    let session_id = match http_req.privasys_session.as_deref() {
+        Some(s) if !s.is_empty() => s,
+        _ => return HttpHandleResult::err(401, "missing PrivasysSession"),
+    };
+
+    let now = wall_seconds_now();
+    let method_str = http_method_str(&http_req.method);
+
+    let plaintext = match crate::sessionrelay::open_request(
+        session_id,
+        method_str,
+        &http_req.path,
+        &http_req.body,
+        now,
+    ) {
+        Ok(v) => v,
+        Err(e) => return HttpHandleResult::err(e.http_status(), e.as_str()),
+    };
+
+    // Build inner request with decrypted body and JSON Content-Type.
+    let mut inner = http_req.clone();
+    inner.body = plaintext;
+    inner.content_type = Some("application/json".to_string());
+    // Inner dispatch must NOT see the PrivasysSession token as auth.
+    inner.privasys_session = None;
+
+    let inner_result = handle_http_request(&inner, base_ctx);
+
+    // Seal response body using the SAME (method, path) AD as the request.
+    let sealed = match crate::sessionrelay::seal_response(
+        session_id,
+        method_str,
+        &http_req.path,
+        &inner_result.body,
+        now,
+    ) {
+        Ok(v) => v,
+        Err(e) => return HttpHandleResult::err(e.http_status(), e.as_str()),
+    };
+
+    HttpHandleResult {
+        status: inner_result.status,
+        body: sealed,
+        shutdown: inner_result.shutdown,
+        content_type: Some(crate::sessionrelay::SEALED_CONTENT_TYPE.to_string()),
+    }
+}
+
+fn http_method_str(m: &enclave_os_common::protocol::HttpMethod) -> &'static str {
+    use enclave_os_common::protocol::HttpMethod;
+    match m {
+        HttpMethod::Get => "GET",
+        HttpMethod::Post => "POST",
+        HttpMethod::Put => "PUT",
+    }
+}
+
+fn wall_seconds_now() -> u64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// `POST /__privasys/session-bootstrap` — returns
+/// `{"session_id":"...","enc_pub":"<base64url>","expires_at":<u64>}`.
+///
+/// Request body: `{"sdk_pub":"<base64url SEC1 uncompressed P-256>"}`.
+fn handle_session_bootstrap(
+    http_req: &enclave_os_common::protocol::HttpRequest,
+) -> HttpHandleResult {
+    #[derive(serde::Deserialize)]
+    struct Req {
+        sdk_pub: String,
+    }
+    let req: Req = match serde_json::from_slice(&http_req.body) {
+        Ok(v) => v,
+        Err(_) => return HttpHandleResult::err(400, "invalid bootstrap body"),
+    };
+    let sdk_pub = match crate::sessionrelay::b64_decode(&req.sdk_pub) {
+        Some(v) => v,
+        None => return HttpHandleResult::err(400, "invalid sdk_pub base64"),
+    };
+    let now = wall_seconds_now();
+    let bs = match crate::sessionrelay::bootstrap(&sdk_pub, now) {
+        Ok(b) => b,
+        Err(e) => return HttpHandleResult::err(e.http_status(), e.as_str()),
+    };
+    let body = format!(
+        "{{\"session_id\":\"{}\",\"enc_pub\":\"{}\",\"expires_at\":{}}}",
+        bs.session_id,
+        crate::sessionrelay::b64url_encode(&bs.enc_pub),
+        bs.expires_at,
+    );
+    HttpHandleResult::ok(body.into_bytes())
 }
 
 /// Verify the `Authorization: Bearer` header and return OIDC claims.

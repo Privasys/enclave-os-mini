@@ -232,6 +232,11 @@ pub struct HttpRequest {
     /// Separate from `authorization` (platform OIDC) so that app-level
     /// permissions can use a different OIDC provider.
     pub app_auth: Option<String>,
+    /// Privasys browser-session id (without the `"PrivasysSession "` prefix), if present.
+    /// Set when `Authorization: PrivasysSession <id>` is sent (mutually exclusive with `Bearer`).
+    pub privasys_session: Option<String>,
+    /// Value of the `Content-Type` header (lowercased), if present.
+    pub content_type: Option<String>,
     /// Request body (empty for GET).
     pub body: Vec<u8>,
     /// Whether the client sent `Connection: close`.
@@ -283,6 +288,8 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
     let mut content_length: Option<usize> = None;
     let mut authorization: Option<String> = None;
     let mut app_auth: Option<String> = None;
+    let mut privasys_session: Option<String> = None;
+    let mut content_type: Option<String> = None;
     let mut connection_close = false;
 
     for h in req.headers.iter() {
@@ -296,7 +303,13 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
             if let Ok(val) = core::str::from_utf8(h.value) {
                 if let Some(token) = val.strip_prefix("Bearer ") {
                     authorization = Some(token.to_string());
+                } else if let Some(sid) = val.strip_prefix("PrivasysSession ") {
+                    privasys_session = Some(sid.trim().to_string());
                 }
+            }
+        } else if h.name.eq_ignore_ascii_case("content-type") {
+            if let Ok(val) = core::str::from_utf8(h.value) {
+                content_type = Some(val.trim().to_ascii_lowercase());
             }
         } else if h.name.eq_ignore_ascii_case("x-app-auth") {
             if let Ok(val) = core::str::from_utf8(h.value) {
@@ -334,6 +347,8 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
             path,
             authorization,
             app_auth,
+            privasys_session,
+            content_type,
             body,
             connection_close,
         },
@@ -346,6 +361,16 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
 /// The response always includes `Content-Type: application/json` and
 /// `Content-Length`.  `Connection: close` is added when `close` is true.
 pub fn format_http_response(status: u16, body: &[u8], close: bool) -> Vec<u8> {
+    format_http_response_with_type(status, "application/json", body, close)
+}
+
+/// Format an HTTP/1.1 response with a caller-chosen `Content-Type`.
+pub fn format_http_response_with_type(
+    status: u16,
+    content_type: &str,
+    body: &[u8],
+    close: bool,
+) -> Vec<u8> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -361,8 +386,8 @@ pub fn format_http_response(status: u16, body: &[u8], close: bool) -> Vec<u8> {
     let conn_header = if close { "Connection: close\r\n" } else { "" };
 
     let header = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: application/json\r\nContent-Length: {}\r\n{}\r\n",
-        status, reason, body.len(), conn_header,
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}\r\n",
+        status, reason, content_type, body.len(), conn_header,
     );
 
     let mut resp = header.into_bytes();

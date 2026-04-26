@@ -57,6 +57,7 @@ pub mod ocall;
 pub mod ratls;
 pub mod rpc_client;
 pub mod sealed_config;
+pub mod sessionrelay;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::OnceLock;

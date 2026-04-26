@@ -208,6 +208,24 @@ impl RaTlsSession {
         Ok(all_output)
     }
 
+    /// Like [`send_http_response`] but lets the caller pick the
+    /// `Content-Type` (e.g. `application/privasys-sealed+cbor`).
+    pub fn send_http_response_typed(
+        &mut self,
+        status: u16,
+        content_type: &str,
+        body: &[u8],
+        close: bool,
+    ) -> Result<Vec<u8>, &'static str> {
+        let response =
+            protocol::format_http_response_with_type(status, content_type, body, close);
+        let mut all_output = Vec::new();
+        self.write_plaintext_chunked(&response, &mut all_output)?;
+        let final_output = self.collect_tls_output()?;
+        all_output.extend_from_slice(&final_output);
+        Ok(all_output)
+    }
+
     /// Drain all available decrypted plaintext from the TLS reader into
     /// the internal accumulation buffer.
     fn drain_plaintext(&mut self) -> Result<(), &'static str> {
