@@ -3,8 +3,7 @@
 
 //! Browser→enclave session relay.
 //!
-//! Implements the wire format documented in
-//! `.operations/plans/session-relay-plan.md`:
+//! Wire format:
 //!
 //! * P-256 ECDH + HKDF-SHA256 (salt=session_id, info="privasys-session/v1", L=32)
 //!   to derive a 32-byte AES-GCM key per session.
