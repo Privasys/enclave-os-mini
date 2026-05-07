@@ -132,11 +132,20 @@ interface keystore {
 /// The host only transports encrypted TLS bytes via OCALLs —
 /// it never sees request URLs, headers, bodies, or responses in plaintext.
 ///
-/// Trust anchors: Mozilla root CA bundle (webpki-roots).
+/// Trust anchors: Mozilla root CA bundle (webpki-roots) by default. Apps
+/// can override with their own DER-encoded root certificates via the
+/// `ca-roots-der` field on `request`.
+///
 /// Protocol: TLS 1.3 (preferred) or TLS 1.2.
 ///
 /// **Plain HTTP is not supported.** Only `https://` URLs are accepted.
 /// Requests to `http://` URLs will be rejected with an error.
+///
+/// Optional **RA-TLS** verification is supported via the `ratls` field on
+/// `request`: after standard chain validation, the server's leaf certificate
+/// is checked for an attestation quote, expected measurements, ReportData
+/// binding, configuration OIDs, and (optionally) cryptographic verification
+/// against one or more attestation servers.
 interface https {
     /// Request method (HTTPS only — plain HTTP is not supported).
     enum method {
@@ -149,12 +158,77 @@ interface https {
         options,
     }
 
+    /// Trusted Execution Environment type.
+    enum tee-type {
+        /// Intel SGX (quote version 3).
+        sgx,
+        /// Intel TDX (quote version 4).
+        tdx,
+    }
+
+    /// A single expected X.509 extension to verify on the RA-TLS leaf cert.
+    ///
+    /// Common Privasys OIDs:
+    /// - `1.3.6.1.4.1.65230.1.1` — config Merkle root
+    /// - `1.3.6.1.4.1.65230.2.1` — egress CA bundle hash
+    /// - `1.3.6.1.4.1.65230.2.5` — combined WASM apps hash
+    /// - `1.3.6.1.4.1.65230.2.7` — attestation servers list hash
+    record expected-oid {
+        /// Dotted-string OID (e.g. "1.3.6.1.4.1.65230.1.1").
+        oid: string,
+        /// Expected raw extension value — must match exactly.
+        value: list<u8>,
+    }
+
+    /// RA-TLS verification policy applied after standard chain validation.
+    ///
+    /// What is verified:
+    /// 1. Quote presence in the leaf cert (TEE-specific extension).
+    /// 2. Measurement registers (mr-enclave / mr-signer for SGX, mr-td for TDX).
+    /// 3. ReportData binding `SHA-512(SHA-256(pubkey) || binding)` —
+    ///    when `challenge-nonce` is set, the nonce is the binding;
+    ///    otherwise the deterministic per-TEE binding is reproduced.
+    /// 4. Each `expected-oids` entry is compared against the cert extension.
+    /// 5. When `attestation-servers` is non-empty, the raw quote is POSTed
+    ///    to every server and **all** must confirm before the handshake
+    ///    succeeds.
+    record ratls-policy {
+        /// Which TEE type to expect.
+        tee: tee-type,
+        /// Expected MRENCLAVE (SGX, 32 bytes). `none` = skip check.
+        mr-enclave: option<list<u8>>,
+        /// Expected MRSIGNER (SGX, 32 bytes). `none` = skip check.
+        mr-signer: option<list<u8>>,
+        /// Expected MRTD (TDX, 48 bytes). `none` = skip check.
+        mr-td: option<list<u8>>,
+        /// Challenge-response nonce. If `none`, the verifier reproduces
+        /// the deterministic ReportData binding. If `some(nonce)`, the
+        /// 64-byte ReportData must equal `SHA-512(SHA-256(pubkey) || nonce)`.
+        ///
+        /// The nonce should also be sent in TLS ClientHello extension
+        /// `0xFFBB` so the remote enclave embeds it in its quote.
+        challenge-nonce: option<list<u8>>,
+        /// X.509 OID extensions to verify.
+        expected-oids: list<expected-oid>,
+        /// Attestation server URLs for cryptographic quote verification.
+        /// All servers must confirm the quote.
+        attestation-servers: list<string>,
+    }
+
     /// An outgoing HTTPS request.
     record request {
         method: method,
         url: string,
         headers: list<tuple<string, string>>,
         body: option<list<u8>>,
+        /// Optional RA-TLS verification policy. When `none`, only standard
+        /// X.509 chain validation is performed against the trust anchors.
+        ratls: option<ratls-policy>,
+        /// Optional custom trust anchors as DER-encoded root certificates.
+        /// When `some`, **replaces** the default Mozilla root CA bundle —
+        /// only the supplied DERs will be trusted (an empty list trusts
+        /// nothing). When `none`, the Mozilla bundle is used.
+        ca-roots-der: option<list<list<u8>>>,
     }
 
     /// An HTTPS response received from the remote server.

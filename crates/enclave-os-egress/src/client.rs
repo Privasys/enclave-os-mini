@@ -41,6 +41,10 @@ use enclave_os_common::oids;
 // Re-export shared quote primitives for callers building `RaTlsPolicy` values.
 pub use enclave_os_common::quote::TeeType;
 
+/// Re-export of `rustls::RootCertStore` so downstream callers can refer to
+/// the trust-anchor type without depending on `rustls` directly.
+pub use rustls::RootCertStore;
+
 // Re-export the dotted-string OIDs for callers building `ExpectedOid` values.
 pub use enclave_os_common::oids::{
     CONFIG_MERKLE_ROOT_OID_STR as OID_CONFIG_MERKLE_ROOT,
@@ -76,6 +80,25 @@ pub fn mozilla_root_store() -> &'static RootCertStore {
         store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
         store
     })
+}
+
+/// Build a fresh [`RootCertStore`] from caller-supplied DER root certificates.
+///
+/// Useful for callers (e.g. the WASM SDK host shim) that want to use a
+/// custom set of trust anchors without depending on `rustls` directly.
+/// Returns an error if any DER cannot be parsed as an X.509 certificate.
+pub fn root_store_from_der<I, B>(ders: I) -> Result<RootCertStore, String>
+where
+    I: IntoIterator<Item = B>,
+    B: Into<Vec<u8>>,
+{
+    let mut store = RootCertStore::empty();
+    for (i, der) in ders.into_iter().enumerate() {
+        store
+            .add(rustls::pki_types::CertificateDer::from(der.into()))
+            .map_err(|e| format!("ca-roots-der[{}]: invalid root certificate: {}", i, e))?;
+    }
+    Ok(store)
 }
 
 // =========================================================================
