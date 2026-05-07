@@ -168,6 +168,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cpp_demangle"
+version = "0.4.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "f2bb79cb74d735044c972aae58ed0aaa9a837e85b01106a54c39e42e97f62253"
+dependencies = [
+ "cfg-if",
+]
+
+[[package]]
 name = "cpufeatures"
 version = "0.2.17"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -178,32 +187,33 @@ dependencies = [
 
 [[package]]
 name = "cranelift-assembler-x64"
-version = "0.130.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "0.133.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "cranelift-assembler-x64-meta",
 ]
 
 [[package]]
 name = "cranelift-assembler-x64-meta"
-version = "0.130.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "0.133.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "cranelift-srcgen",
 ]
 
 [[package]]
 name = "cranelift-bforest"
-version = "0.130.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "0.133.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "cranelift-entity",
+ "wasmtime-internal-core",
 ]
 
 [[package]]
 name = "cranelift-bitset"
-version = "0.130.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "0.133.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "serde",
  "serde_derive",
@@ -212,8 +222,8 @@ dependencies = [
 
 [[package]]
 name = "cranelift-codegen"
-version = "0.130.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "0.133.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "bumpalo",
  "cranelift-assembler-x64",
@@ -225,7 +235,7 @@ dependencies = [
  "cranelift-entity",
  "cranelift-isle",
  "gimli",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.0",
  "libm",
  "log",
  "pulley-interpreter",
@@ -239,8 +249,8 @@ dependencies = [
 
 [[package]]
 name = "cranelift-codegen-meta"
-version = "0.130.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "0.133.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "cranelift-assembler-x64-meta",
  "cranelift-codegen-shared",
@@ -251,21 +261,21 @@ dependencies = [
 
 [[package]]
 name = "cranelift-codegen-shared"
-version = "0.130.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "0.133.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 
 [[package]]
 name = "cranelift-control"
-version = "0.130.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "0.133.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "arbitrary",
 ]
 
 [[package]]
 name = "cranelift-entity"
-version = "0.130.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "0.133.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "cranelift-bitset",
  "serde",
@@ -275,8 +285,8 @@ dependencies = [
 
 [[package]]
 name = "cranelift-frontend"
-version = "0.130.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "0.133.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "cranelift-codegen",
  "log",
@@ -286,13 +296,13 @@ dependencies = [
 
 [[package]]
 name = "cranelift-isle"
-version = "0.130.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "0.133.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 
 [[package]]
 name = "cranelift-native"
-version = "0.130.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "0.133.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "cranelift-codegen",
  "libc",
@@ -301,8 +311,8 @@ dependencies = [
 
 [[package]]
 name = "cranelift-srcgen"
-version = "0.130.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "0.133.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 
 [[package]]
 name = "crc32fast"
@@ -528,7 +538,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -595,15 +605,15 @@ dependencies = [
 
 [[package]]
 name = "hashbrown"
-version = "0.15.5"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "9229cfe53dfd69f0609a49f65461bd93001ea1ef889cd5529dd176593f5338a1"
-
-[[package]]
-name = "hashbrown"
 version = "0.16.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
+
+[[package]]
+name = "hashbrown"
+version = "0.17.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "4f467dd6dccf739c208452f8014c75c18bb8301b050ad1cfb27153803edb0f51"
 dependencies = [
  "foldhash",
  "serde",
@@ -630,12 +640,12 @@ checksum = "3d3067d79b975e8844ca9eb072e16b31c3c1c36928edf9c6789548c524d0d954"
 
 [[package]]
 name = "indexmap"
-version = "2.13.0"
+version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7714e70437a7dc3ac8eb7e6f8df75fd8eb422675fc7678aff7364301092b1017"
+checksum = "d466e9454f08e4a911e14806c24e16fba1b4c121d1ea474396f396069cf949d9"
 dependencies = [
  "equivalent",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.0",
  "serde",
  "serde_core",
 ]
@@ -669,9 +679,9 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "libc"
-version = "0.2.184"
+version = "0.2.186"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "48f5d2a454e16a5ea0f4ced81bd44e4cfc7bd3a507b61887c99fd3538b28e4af"
+checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
 
 [[package]]
 name = "libm"
@@ -693,12 +703,9 @@ checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
 name = "mach2"
-version = "0.4.3"
+version = "0.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "d640282b302c0bb0a2a8e0233ead9035e3bed871f0b7e81fe4a1ec829765db44"
-dependencies = [
- "libc",
-]
+checksum = "dae608c151f68243f2b000364e1f7b186d9c29845f7d2d85bd31b9ad77ad552b"
 
 [[package]]
 name = "memchr"
@@ -767,12 +774,12 @@ dependencies = [
 
 [[package]]
 name = "object"
-version = "0.38.1"
+version = "0.39.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "271638cd5fa9cca89c4c304675ca658efc4e64a66c716b7cfe1afb4b9611dbbc"
+checksum = "2e5a6c098c7a3b6547378093f5cc30bc54fd361ce711e05293a5cc589562739b"
 dependencies = [
  "crc32fast",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.0",
  "indexmap",
  "memchr",
 ]
@@ -821,8 +828,8 @@ dependencies = [
 
 [[package]]
 name = "pulley-interpreter"
-version = "43.0.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "46.0.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "cranelift-bitset",
  "log",
@@ -832,8 +839,8 @@ dependencies = [
 
 [[package]]
 name = "pulley-macros"
-version = "43.0.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "46.0.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -864,13 +871,13 @@ dependencies = [
 
 [[package]]
 name = "regalloc2"
-version = "0.15.0"
+version = "0.15.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "952ddbfc6f9f64d006c3efd8c9851a6ba2f2b944ba94730db255d55006e0ffda"
+checksum = "de2c52737737f8609e94f975dee22854a2d5c125772d4b1cf292120f4d45c186"
 dependencies = [
  "allocator-api2",
  "bumpalo",
- "hashbrown 0.15.5",
+ "hashbrown 0.17.0",
  "log",
  "rustc-hash",
  "smallvec",
@@ -889,6 +896,12 @@ dependencies = [
  "untrusted",
  "windows-sys 0.52.0",
 ]
+
+[[package]]
+name = "rustc-demangle"
+version = "0.1.27"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b50b8869d9fc858ce7266cce0194bd74df58b9d0e3f6df3a9fc8eb470d95c09d"
 
 [[package]]
 name = "rustc-hash"
@@ -915,7 +928,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
@@ -1287,9 +1300,9 @@ checksum = "ccf3ec651a847eb01de73ccad15eb7d99f80485de043efb2f370cd654f4ea44b"
 
 [[package]]
 name = "wasm-encoder"
-version = "0.245.1"
+version = "0.248.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f9dca005e69bf015e45577e415b9af8c67e8ee3c0e38b5b0add5aa92581ed5c"
+checksum = "ac92cf547bc18d27ecc521015c08c353b4f18b84ab388bb6d1b6b682c620d9b6"
 dependencies = [
  "leb128fmt",
  "wasmparser",
@@ -1297,12 +1310,12 @@ dependencies = [
 
 [[package]]
 name = "wasmparser"
-version = "0.245.1"
+version = "0.248.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4f08c9adee0428b7bddf3890fc27e015ac4b761cc608c822667102b8bfd6995e"
+checksum = "aa4439c5eee9df71ee0c6efb37f63b1fcb1fec38f85f5142c54e7ed05d33091a"
 dependencies = [
  "bitflags",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.0",
  "indexmap",
  "semver",
  "serde",
@@ -1310,9 +1323,9 @@ dependencies = [
 
 [[package]]
 name = "wasmprinter"
-version = "0.245.1"
+version = "0.248.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5f41517a3716fbb8ccf46daa9c1325f760fcbff5168e75c7392288e410b91ac8"
+checksum = "30b264a5410b008d4d199a92bf536eae703cbd614482fc1ec53831cf19e1c183"
 dependencies = [
  "anyhow",
  "termcolor",
@@ -1321,8 +1334,8 @@ dependencies = [
 
 [[package]]
 name = "wasmtime"
-version = "43.0.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "46.0.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "addr2line",
  "async-trait",
@@ -1362,18 +1375,21 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-environ"
-version = "43.0.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "46.0.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "anyhow",
+ "cpp_demangle",
+ "cranelift-bforest",
  "cranelift-bitset",
  "cranelift-entity",
  "gimli",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.0",
  "indexmap",
  "log",
  "object",
  "postcard",
+ "rustc-demangle",
  "semver",
  "serde",
  "serde_derive",
@@ -1389,8 +1405,8 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-component-macro"
-version = "43.0.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "46.0.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "anyhow",
  "proc-macro2",
@@ -1403,23 +1419,23 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-component-util"
-version = "43.0.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "46.0.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 
 [[package]]
 name = "wasmtime-internal-core"
-version = "43.0.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "46.0.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
- "hashbrown 0.16.1",
+ "hashbrown 0.17.0",
  "libm",
  "serde",
 ]
 
 [[package]]
 name = "wasmtime-internal-cranelift"
-version = "43.0.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "46.0.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "cfg-if",
  "cranelift-codegen",
@@ -1444,8 +1460,8 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-fiber"
-version = "43.0.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "46.0.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "cc",
  "cfg-if",
@@ -1458,8 +1474,8 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-jit-debug"
-version = "43.0.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "46.0.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "cc",
  "wasmtime-internal-versioned-export-macros",
@@ -1467,8 +1483,8 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-jit-icache-coherence"
-version = "43.0.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "46.0.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "cfg-if",
  "libc",
@@ -1478,8 +1494,8 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-unwinder"
-version = "43.0.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "46.0.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "cfg-if",
  "cranelift-codegen",
@@ -1490,8 +1506,8 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-versioned-export-macros"
-version = "43.0.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "46.0.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1500,8 +1516,8 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-winch"
-version = "43.0.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "46.0.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "cranelift-codegen",
  "gimli",
@@ -1516,8 +1532,8 @@ dependencies = [
 
 [[package]]
 name = "wasmtime-internal-wit-bindgen"
-version = "43.0.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "46.0.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "anyhow",
  "bitflags",
@@ -1550,13 +1566,13 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.61.2",
+ "windows-sys 0.52.0",
 ]
 
 [[package]]
 name = "winch-codegen"
-version = "43.0.0"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#6c0e87195b38f3669a473e55c0691b22945c1353"
+version = "46.0.0"
+source = "git+https://github.com/Privasys/wasmtime?branch=sgx#8d7034efd8a5d627769254d8307a5f7643d67b17"
 dependencies = [
  "cranelift-assembler-x64",
  "cranelift-codegen",
@@ -1661,12 +1677,12 @@ checksum = "589f6da84c646204747d1270a2a5661ea66ed1cced2631d546fdfb155959f9ec"
 
 [[package]]
 name = "wit-parser"
-version = "0.245.1"
+version = "0.248.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "330698718e82983499419494dd1e3d7811a457a9bf9f69734e8c5f07a2547929"
+checksum = "247ad505da2915a082fe13204c5ba8788425aea1de54f43b284818cf82637856"
 dependencies = [
  "anyhow",
- "hashbrown 0.16.1",
+ "hashbrown 0.17.0",
  "id-arena",
  "indexmap",
  "log",
