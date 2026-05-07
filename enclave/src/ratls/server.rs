@@ -1226,6 +1226,7 @@ fn handle_data_request_http(
                 status: 400,
                 body: msg,
                 shutdown: false,
+                content_type: None,
             },
             Response::Ok => HttpHandleResult::ok(b"{}".to_vec()),
             other => {
@@ -1365,6 +1366,7 @@ fn dispatch_and_respond(
                 status: 400,
                 body: msg,
                 shutdown: false,
+                content_type: None,
             },
             Response::Ok => HttpHandleResult::ok(b"{}".to_vec()),
             other => HttpHandleResult::ok(
