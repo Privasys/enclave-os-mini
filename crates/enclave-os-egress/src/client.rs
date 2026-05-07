@@ -26,7 +26,7 @@ use rustls::client::WebPkiServerVerifier;
 use rustls::crypto::ring::default_provider;
 use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
 use rustls::{
-    ClientConfig, ClientConnection, DigitallySignedStruct, Error, RootCertStore, SignatureScheme,
+    ClientConfig, ClientConnection, DigitallySignedStruct, Error, SignatureScheme,
 };
 
 use x509_parser::prelude::*;
