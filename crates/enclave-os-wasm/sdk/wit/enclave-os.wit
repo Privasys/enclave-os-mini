@@ -245,3 +245,52 @@ interface https {
     /// Plain HTTP (`http://`) is rejected — only `https://` is allowed.
     fetch: func(request: request) -> result<response, string>;
 }
+
+// ─── Caller identity & role management ─────────────────────────────
+
+/// Authenticated caller identity and per-app role management.
+///
+/// The runtime populates the caller's identity (subject) and current
+/// role set on the request context **before** the WASM function runs.
+/// This interface lets the guest read those fields and (with admin
+/// privileges) inspect or modify the per-app role table that lives in
+/// the enclave's sealed KV store.
+///
+/// # Authorization
+///
+/// `get-caller-id` and `get-my-roles` succeed for any authenticated
+/// caller and return an error when the call was unauthenticated.
+///
+/// All other functions require the caller to hold one of the listed
+/// privileged roles in the **current app** — they are enforced on the
+/// host side, not by the guest.  Required roles per function:
+///
+/// | Function          | Required role(s)                |
+/// |-------------------|---------------------------------|
+/// | list-users        | `admin` or `user-management`    |
+/// | get-user-roles    | `admin` or `user-management`    |
+/// | set-user-roles    | `admin`                         |
+/// | remove-user-roles | `admin`                         |
+interface auth {
+    /// Return the authenticated caller's stable subject identifier
+    /// (typically the OIDC `sub`, or a FIDO2 credential id).
+    get-caller-id: func() -> result<string, string>;
+
+    /// Return the role names currently held by the caller for this app.
+    get-my-roles: func() -> result<list<string>, string>;
+
+    /// List every user that has at least one role assignment in this
+    /// app's sealed KV store.  Returns `(user-id, roles)` tuples.
+    list-users: func() -> result<list<tuple<string, list<string>>>, string>;
+
+    /// Return the role list for a specific user.  Empty list when the
+    /// user has no assignments.
+    get-user-roles: func(user-id: string) -> result<list<string>, string>;
+
+    /// Replace the role list for a user.  Pass an empty list to clear
+    /// the user's roles without deleting the entry.
+    set-user-roles: func(user-id: string, roles: list<string>) -> result<string, string>;
+
+    /// Delete every role assignment for a user.
+    remove-user-roles: func(user-id: string) -> result<string, string>;
+}
