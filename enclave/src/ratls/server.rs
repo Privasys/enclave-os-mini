@@ -988,63 +988,7 @@ fn handle_set_attestation_servers(
 
     let servers = parsed.servers;
 
-    // Collect servers that need OIDC bootstrap before we move `servers`.
-    let bootstrap_configs: Vec<(String, enclave_os_common::protocol::OidcBootstrap)> =
-        servers
-            .iter()
-            .filter_map(|s| {
-                s.oidc_bootstrap
-                    .as_ref()
-                    .map(|b| (s.url.clone(), b.clone()))
-            })
-            .collect();
-
     let (count, hash) = enclave_os_common::attestation_servers::set(servers);
-
-    // OIDC bootstrap: for each server with oidc_bootstrap config,
-    // generate a keypair, register with Zitadel, and obtain a token.
-    #[cfg(feature = "egress")]
-    if !bootstrap_configs.is_empty() {
-        let manager_jwt = match raw_auth_token.as_deref() {
-            Some(jwt) => jwt,
-            None => {
-                return HttpHandleResult::err(
-                    400,
-                    "OIDC bootstrap requires an auth token (manager JWT)",
-                );
-            }
-        };
-
-        for (url, config) in &bootstrap_configs {
-            match enclave_os_egress::oidc_bootstrap::bootstrap(config, manager_jwt) {
-                Ok(result) => {
-                    enclave_os_common::attestation_servers::set_oidc_state(
-                        url,
-                        config.clone(),
-                        result.key_id,
-                        result.private_key_der,
-                        result.access_token,
-                        result.expires_in,
-                    );
-                    enclave_log_info!(
-                        "OIDC bootstrap succeeded for {} (key registered, token expires in {}s)",
-                        url,
-                        result.expires_in,
-                    );
-                }
-                Err(e) => {
-                    enclave_log_error!(
-                        "OIDC bootstrap failed for {}: {}",
-                        url, e
-                    );
-                    return HttpHandleResult::err(
-                        500,
-                        &format!("OIDC bootstrap failed for {url}: {e}"),
-                    );
-                }
-            }
-        }
-    }
 
     let hash_hex = hash
         .map(|h| enclave_os_common::hex::hex_encode(&h))

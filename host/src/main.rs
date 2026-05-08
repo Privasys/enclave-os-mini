@@ -71,35 +71,15 @@ struct Cli {
     #[arg(long, value_delimiter = ',')]
     attestation_servers: Option<Vec<String>>,
 
-    /// OIDC issuer URL (e.g. https://auth.privasys.org).
+    /// OIDC issuer URL (e.g. https://privasys.id).
     /// When set (together with --oidc-audience), enables OIDC-based RBAC.
     #[arg(long)]
     oidc_issuer: Option<String>,
 
-    /// OIDC audience claim (e.g. the OIDC project ID).
+    /// OIDC audience claim (e.g. `privasys-platform`).
     /// Required when --oidc-issuer is set.
     #[arg(long)]
     oidc_audience: Option<String>,
-
-    /// Manager JWT for OIDC bootstrap at startup.
-    /// When set together with --oidc-service-account-id, the enclave
-    /// generates a keypair, registers the public key with the OIDC
-    /// provider using this token, and self-provisions a bearer token
-    /// for each attestation server that has OIDC bootstrap enabled.
-    #[arg(long)]
-    manager_token: Option<String>,
-
-    /// Service-account user ID for OIDC bootstrap.
-    /// The enclave registers its public key under this user via
-    /// the OIDC provider's key registration API.
-    #[arg(long)]
-    oidc_service_account_id: Option<String>,
-
-    /// OIDC project ID for audience-scoped tokens (optional).
-    /// When set, the jwt-bearer grant requests an audience scope
-    /// for this project.
-    #[arg(long)]
-    oidc_project_id: Option<String>,
 
     /// Enable debug logging
     #[arg(short, long)]
@@ -244,31 +224,12 @@ fn main() -> Result<()> {
     }
 
     // If attestation server URLs are provided, build AttestationServer objects.
-    // When OIDC bootstrap flags are set, each server gets an oidc_bootstrap config.
     if let Some(ref servers) = cli.attestation_servers {
         info!("Attestation servers: {:?}", servers);
 
-        let oidc_bootstrap = if let Some(ref svc_id) = cli.oidc_service_account_id {
-            let issuer = cli.oidc_issuer.as_deref()
-                .ok_or_else(|| anyhow::anyhow!("--oidc-issuer is required when --oidc-service-account-id is set"))?;
-            Some(serde_json::json!({
-                "issuer": issuer,
-                "service_account_id": svc_id,
-                "project_id": cli.oidc_project_id,
-            }))
-        } else {
-            None
-        };
-
         let server_objects: Vec<serde_json::Value> = servers
             .iter()
-            .map(|url| {
-                let mut obj = serde_json::json!({ "url": url });
-                if let Some(ref bootstrap) = oidc_bootstrap {
-                    obj["oidc_bootstrap"] = bootstrap.clone();
-                }
-                obj
-            })
+            .map(|url| serde_json::json!({ "url": url }))
             .collect();
 
         config["attestation_servers"] = serde_json::to_value(&server_objects)
@@ -286,20 +247,6 @@ fn main() -> Result<()> {
         });
     } else if cli.oidc_audience.is_some() {
         anyhow::bail!("--oidc-issuer is required when --oidc-audience is set");
-    }
-
-    // Manager token for OIDC bootstrap at startup
-    if let Some(ref token) = cli.manager_token {
-        if cli.oidc_service_account_id.is_none() {
-            anyhow::bail!("--oidc-service-account-id is required when --manager-token is set");
-        }
-        if cli.oidc_issuer.is_none() {
-            anyhow::bail!("--oidc-issuer is required when --manager-token is set");
-        }
-        info!("Manager token provided for OIDC bootstrap ({} chars)", token.len());
-        config["manager_token"] = serde_json::Value::String(token.clone());
-    } else if cli.oidc_service_account_id.is_some() {
-        anyhow::bail!("--manager-token is required when --oidc-service-account-id is set");
     }
 
     let config_bytes = serde_json::to_vec(&config)?;

@@ -1570,18 +1570,14 @@ fn verify_app_token(
             collect_role_strings(val, &mut roles);
         }
     }
-    // Zitadel map format
-    if let Some(val) = claims.get("urn:zitadel:iam:org:project:roles") {
-        collect_role_strings(val, &mut roles);
-    }
 
     roles.sort();
     roles.dedup();
     Ok((roles, sub))
 }
 
-/// Collect role strings from a JSON value (array of strings or Zitadel
-/// map `{ "role": {...} }`).
+/// Collect role strings from a JSON value (array of strings or map
+/// `{ "role": {...} }`).
 fn collect_role_strings(val: &serde_json::Value, out: &mut Vec<String>) {
     match val {
         serde_json::Value::Array(arr) => {

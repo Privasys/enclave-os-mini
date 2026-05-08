@@ -122,20 +122,17 @@ pub fn global_oidc_config() -> Option<&'static OidcConfig> {
 /// or per-resource policy, not in this global config.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OidcConfig {
-    /// OIDC issuer URL (e.g. `https://auth.privasys.org`).
+    /// OIDC issuer URL (e.g. `https://privasys.id`).
     pub issuer: String,
-    /// Expected `aud` claim (e.g. `enclave-os-mini`).
+    /// Expected `aud` claim (e.g. `privasys-platform`).
     pub audience: String,
     /// Optional JWKS URI for token signature verification.
     /// If empty, auto-discovered from `{issuer}/.well-known/openid-configuration`.
     #[serde(default)]
     pub jwks_uri: String,
-    /// Role claim path in the token (default: `urn:zitadel:iam:org:project:roles`).
-    ///
-    /// The default value is the Zitadel-compatible claim Privasys ID
-    /// emits. Other OIDC providers (Keycloak, Auth0, Okta, …) use other
-    /// paths — `extract_roles` also tries the standard `roles` array
-    /// and Keycloak's `realm_access.roles`.
+    /// Role claim path in the token (default: `roles`, the RFC 9068 flat
+    /// string array Privasys ID emits). `extract_roles` also tries
+    /// Keycloak's `realm_access.roles` for compatibility.
     #[serde(default = "default_role_claim")]
     pub role_claim: String,
     /// Claim value for the manager role (default: `privasys-platform:manager`).
@@ -147,7 +144,7 @@ pub struct OidcConfig {
 }
 
 fn default_role_claim() -> String {
-    "urn:zitadel:iam:org:project:roles".into()
+    "roles".into()
 }
 fn default_manager_role() -> String {
     "privasys-platform:manager".into()
@@ -209,14 +206,12 @@ impl OidcClaims {
 // ---------------------------------------------------------------------------
 
 /// Extract role strings from raw JWT claims JSON, searching multiple
-/// claim paths (aligned with Enclave OS Virtual):
+/// claim paths:
 ///
-/// 1. Configured `role_claim` (default: `urn:zitadel:iam:org:project:roles`)
-///    — supports map `{ "role": {...} }` or array `["role1", "role2"]`
-/// 2. Standard `roles` array
+/// 1. Configured `role_claim` (default: `roles`, RFC 9068 flat string array)
+///    — supports array `["role1", "role2"]` or map `{ "role": {...} }`
+/// 2. Standard `roles` array (always tried, even if `role_claim` differs)
 /// 3. Keycloak `realm_access.roles`
-/// 4. Project-specific claims (`urn:zitadel:iam:org:project:{id}:roles`),
-///    used by service accounts with the plural `projects` scope
 ///
 /// Returns the deduped union of role strings found in all paths. The
 /// returned strings are not interpreted: it is up to the caller (or
@@ -233,30 +228,17 @@ pub fn extract_roles(
         collect_role_strings(val, &mut roles);
     }
 
-    // Path 2: standard "roles" array
-    if let Some(val) = claims.get("roles") {
-        collect_role_strings(val, &mut roles);
+    // Path 2: standard "roles" array (skip if role_claim already pointed there)
+    if config.role_claim != "roles" {
+        if let Some(val) = claims.get("roles") {
+            collect_role_strings(val, &mut roles);
+        }
     }
 
     // Path 3: Keycloak realm_access.roles
     if let Some(ra) = claims.get("realm_access") {
         if let Some(val) = ra.get("roles") {
             collect_role_strings(val, &mut roles);
-        }
-    }
-
-    // Path 4: project-specific role claims.
-    // Service accounts using the plural `urn:zitadel:iam:org:projects:roles`
-    // scope get roles under `urn:zitadel:iam:org:project:{projectId}:roles`
-    // instead of the generic `urn:zitadel:iam:org:project:roles`.
-    if let Some(obj) = claims.as_object() {
-        for (key, val) in obj {
-            if key.starts_with("urn:zitadel:iam:org:project:")
-                && key.ends_with(":roles")
-                && *key != config.role_claim
-            {
-                collect_role_strings(val, &mut roles);
-            }
         }
     }
 
@@ -300,8 +282,8 @@ mod tests {
 
     fn test_config() -> OidcConfig {
         OidcConfig {
-            issuer: "https://auth.privasys.org".into(),
-            audience: "enclave-os-mini".into(),
+            issuer: "https://privasys.id".into(),
+            audience: "privasys-platform".into(),
             jwks_uri: String::new(),
             role_claim: default_role_claim(),
             manager_role: default_manager_role(),
@@ -321,9 +303,12 @@ mod tests {
 
     #[test]
     fn object_map_format() {
-        let config = test_config();
+        // role_claim default is "roles"; map shape (legacy compatibility)
+        // is still accepted by collect_role_strings.
+        let mut config = test_config();
+        config.role_claim = "app_roles".into();
         let claims = json!({
-            "urn:zitadel:iam:org:project:roles": {
+            "app_roles": {
                 "privasys-platform:manager": { "orgId": "123" },
                 "vault:owner": { "orgId": "123" }
             }
@@ -363,10 +348,8 @@ mod tests {
     fn duplicate_roles_across_paths_deduplicated() {
         let config = test_config();
         let claims = json!({
-            "urn:zitadel:iam:org:project:roles": {
-                "privasys-platform:manager": { "org": "1" }
-            },
-            "roles": ["privasys-platform:manager"]
+            "roles": ["privasys-platform:manager"],
+            "realm_access": { "roles": ["privasys-platform:manager"] }
         });
         let roles = extract_roles(&claims, &config);
         assert_eq!(roles, vec!["privasys-platform:manager".to_string()]);
@@ -379,35 +362,6 @@ mod tests {
         let claims = json!({ "custom_roles": ["admin"] });
         let roles = extract_roles(&claims, &config);
         assert_eq!(roles, vec!["admin".to_string()]);
-    }
-
-    #[test]
-    fn project_specific_role_claim() {
-        let config = test_config();
-        let claims = json!({
-            "urn:zitadel:iam:org:project:363345836026888196:roles": {
-                "privasys-platform:manager": { "363334360528650244": "privasys.auth.privasys.org" }
-            }
-        });
-        let roles = extract_roles(&claims, &config);
-        assert_eq!(roles, vec!["privasys-platform:manager".to_string()]);
-    }
-
-    #[test]
-    fn project_specific_multiple_projects() {
-        let config = test_config();
-        let claims = json!({
-            "urn:zitadel:iam:org:project:111:roles": {
-                "privasys-platform:manager": { "org": "1" }
-            },
-            "urn:zitadel:iam:org:project:222:roles": {
-                "privasys-platform:monitoring": { "org": "1" }
-            }
-        });
-        let roles = extract_roles(&claims, &config);
-        assert_eq!(roles.len(), 2);
-        assert!(roles.iter().any(|r| r == "privasys-platform:manager"));
-        assert!(roles.iter().any(|r| r == "privasys-platform:monitoring"));
     }
 
     // -- Platform booleans ---------------------------------------------------

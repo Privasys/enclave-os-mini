@@ -107,29 +107,6 @@ pub struct ModuleStatus {
     pub details: serde_json::Value,
 }
 
-/// OIDC bootstrap configuration for an attestation server.
-///
-/// When present on an [`AttestationServer`], the enclave will
-/// self-provision its own bearer token instead of relying on a
-/// statically provided one.  The flow:
-///
-/// 1. Generate an ECDSA P-256 keypair inside the enclave.
-/// 2. Register the public key with the OIDC provider's key registration
-///    API using the manager's JWT (passed via the `"auth"` field).
-/// 3. Build a JWT assertion signed with the private key and exchange it
-///    for an access token via the `jwt-bearer` OIDC grant.
-/// 4. Store the token; lazily refresh at 75 % of its lifetime.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OidcBootstrap {
-    /// OIDC issuer URL (e.g. `https://auth.privasys.org`).
-    pub issuer: String,
-    /// Service-account user ID that will own the registered key.
-    pub service_account_id: String,
-    /// OIDC project ID — used as `aud` when requesting scoped tokens.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub project_id: Option<String>,
-}
-
 /// An attestation server endpoint with an optional bearer token.
 ///
 /// Used by the management API to configure per-server authentication
@@ -137,10 +114,6 @@ pub struct OidcBootstrap {
 /// endpoint (e.g. `https://as.privasys.org/`); the token is a
 /// long-lived OIDC bearer token that the enclave presents when
 /// submitting quotes for verification.
-///
-/// When [`oidc_bootstrap`](Self::oidc_bootstrap) is set, the enclave
-/// provisions its own token automatically and the static `token` field
-/// is ignored.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AttestationServer {
     /// Attestation server verification URL.
@@ -148,10 +121,6 @@ pub struct AttestationServer {
     /// Optional OIDC bearer token for authenticated servers.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub token: Option<String>,
-    /// Optional OIDC bootstrap config — when set the enclave will
-    /// self-provision a bearer token via the OIDC jwt-bearer grant.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub oidc_bootstrap: Option<OidcBootstrap>,
 }
 
 /// Enclave-level metrics counters.
