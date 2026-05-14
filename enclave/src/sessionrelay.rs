@@ -156,14 +156,19 @@ pub fn bootstrap(sdk_pub: &[u8], now: u64) -> Result<Bootstrap, SessionError> {
     let shared = agree_ephemeral(priv_key, &peer, |secret| secret.to_vec())
         .map_err(|_| SessionError::InvalidPubKey)?;
 
-    // Generate 16 random bytes → 32-char hex session id.
+    // Generate 16 random bytes; session_id is the base64url (no-padding)
+    // encoding of those bytes. The HKDF salt MUST be the raw 16 bytes,
+    // not the encoded string — matches the canonical contract shared
+    // with the Go reference (`enclave-os-virtual/internal/sessionrelay`)
+    // and the SDK (`auth/sdk/src/enclave-session.ts`, which decodes
+    // `sessionId` via base64url before salting).
     let mut sid_bytes = [0u8; 16];
     use ring::rand::SecureRandom;
     rng.fill(&mut sid_bytes).map_err(|_| SessionError::Crypto)?;
-    let session_id = hex_lower(&sid_bytes);
+    let session_id = b64url_encode(&sid_bytes);
 
-    // HKDF: salt = session_id (UTF-8 bytes), ikm = shared_secret.
-    let prk = hkdf_extract(session_id.as_bytes(), &shared);
+    // HKDF: salt = raw session_id bytes (16 B), ikm = shared_secret.
+    let prk = hkdf_extract(&sid_bytes, &shared);
     let key_bytes = hkdf_expand(&prk, KEY_INFO, 32);
     let mut aead_key = [0u8; 32];
     aead_key.copy_from_slice(&key_bytes);
@@ -489,16 +494,6 @@ pub fn seal_response(
 }
 
 // ── Helpers ─────────────────────────────────────────────────────────
-
-fn hex_lower(bytes: &[u8]) -> String {
-    const HEX: &[u8; 16] = b"0123456789abcdef";
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for &b in bytes {
-        s.push(HEX[(b >> 4) as usize] as char);
-        s.push(HEX[(b & 0x0F) as usize] as char);
-    }
-    s
-}
 
 /// Decode standard-or-URL-safe base64 (with or without padding).
 pub fn b64_decode(s: &str) -> Option<Vec<u8>> {
