@@ -164,6 +164,14 @@ pub struct AppMeta {
     /// a fresh schema is generated when the app is next lazy-loaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<crate::protocol::AppSchema>,
+    /// Per-app environment variables (sealed at rest with `encryption_key`).
+    ///
+    /// Surfaced to the guest via `wasi:cli/environment.get-environment()`.
+    /// Values are intentionally excluded from `configuration_hash` (only
+    /// the sorted key list is folded in) so secret rotation does not
+    /// change the public attestation digest.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub env: BTreeMap<String, String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -205,6 +213,8 @@ pub struct LoadedApp {
     pub configuration_hash: Option<[u8; 32]>,
     /// Maximum fuel budget per `wasm_call` for this app.
     pub max_fuel: u64,
+    /// Per-app environment variables (see [`AppMeta::env`]).
+    pub env: BTreeMap<String, String>,
 }
 
 impl LoadedApp {
@@ -284,6 +294,7 @@ impl AppRegistry {
         max_fuel: u64,
         mcp_enabled: bool,
         docs: Option<std::collections::BTreeMap<String, String>>,
+        env: Option<std::collections::BTreeMap<String, String>>,
     ) -> Result<AppMeta, String> {
         if self.known.contains_key(name) {
             return Err(format!("app '{}' is already loaded", name));
@@ -349,15 +360,31 @@ impl AppRegistry {
             ));
         }
 
-        // ── Configuration hash ──────────────────────────────────────────────────────
-        let configuration_hash = permissions.as_ref().map(|p| {
-            let canonical = serde_json::to_vec(p)
-                .expect("AppPermissions must be serialisable");
+        // ── Env vars (normalise + key list for config hash) ────────
+        let env_map: BTreeMap<String, String> = env.unwrap_or_default();
+        let env_keys: Vec<&str> = env_map.keys().map(|s| s.as_str()).collect();
+
+        // ── Configuration hash ──────────────────────────────────────
+        // Includes permissions + the sorted list of env var KEYS
+        // (NEVER values, so secrets cannot leak through attestation
+        // and rotation does not invalidate the per-app cert).
+        let configuration_hash = if permissions.is_some() || !env_map.is_empty() {
+            #[derive(Serialize)]
+            struct ConfigDigestInput<'a> {
+                permissions: Option<&'a AppPermissions>,
+                env_keys: &'a [&'a str],
+            }
+            let canonical = serde_json::to_vec(&ConfigDigestInput {
+                permissions: permissions.as_ref(),
+                env_keys: &env_keys,
+            }).expect("config digest input must be serialisable");
             let h = digest::digest(&digest::SHA256, &canonical);
             let mut out = [0u8; 32];
             out.copy_from_slice(h.as_ref());
-            out
-        });
+            Some(out)
+        } else {
+            None
+        };
 
         // Validate permissions version
         if let Some(ref p) = permissions {
@@ -379,6 +406,7 @@ impl AppRegistry {
             configuration_hash,
             max_fuel,
             schema: Some(schema),
+            env: env_map.clone(),
         };
         self.known.insert(name.to_string(), meta.clone());
 
@@ -395,6 +423,7 @@ impl AppRegistry {
                 permissions,
                 configuration_hash,
                 max_fuel,
+                env: env_map,
             },
         );
         self.touch(name);
@@ -459,6 +488,7 @@ impl AppRegistry {
             permissions: meta.permissions,
             configuration_hash: meta.configuration_hash,
             max_fuel: meta.max_fuel,
+            env: meta.env,
         });
         self.touch(name);
         self.evict_if_needed();
@@ -607,11 +637,16 @@ impl AppRegistry {
         // Record fuel before execution for delta calculation.
         let fuel_before = store.get_fuel().unwrap_or(0) as i64;
 
-        // ── Inject authenticated caller context ────────────────────
+        // ── Inject authenticated caller context + env vars ─────────
         {
             let ctx = store.data_mut();
             ctx.caller_id = caller_id;
             ctx.caller_roles = caller_roles;
+            if !app.env.is_empty() {
+                ctx.env_vars = app.env.iter()
+                    .map(|(k, v)| (k.clone(), v.clone()))
+                    .collect();
+            }
         }
 
         // ── Resolve the exported function ──────────────────────────

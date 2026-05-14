@@ -160,6 +160,28 @@ pub struct WasmLoad {
     ///   `"func-name.param"` → parameter description
     #[serde(default)]
     pub docs: Option<std::collections::BTreeMap<String, String>>,
+
+    /// Optional per-app environment variables.
+    ///
+    /// Surfaced to the guest via `wasi:cli/environment.get-environment()`
+    /// (which the runtime already implements by reading
+    /// [`crate::wasi::AppContext::env_vars`]). Use this for app-level
+    /// configuration that varies per deployment but is not part of the
+    /// code identity, e.g. third-party API tokens, per-tenant base URLs,
+    /// or feature flags.
+    ///
+    /// Values are sealed-at-rest with the per-app encryption key (same
+    /// crypt path as the KV store), so a host operator with disk access
+    /// cannot read them. They are never logged.
+    ///
+    /// To preserve the integrity of the per-app RA-TLS configuration
+    /// hash (`OID 1.3.6.1.4.1.65230.3.5`), only the SORTED LIST OF KEYS
+    /// is folded into the hash — values are deliberately excluded so
+    /// rotating an API token does not change the attestation digest
+    /// (and so secrets never leak through the public attestation
+    /// extension). See `registry::load_app`.
+    #[serde(default)]
+    pub env: Option<std::collections::BTreeMap<String, String>>,
 }
 
 /// Unload a WASM app by name.
