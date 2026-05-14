@@ -22,6 +22,25 @@ use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
 use std::vec::Vec;
 
+/// Serde adapter: encode `Vec<u8>` as a standard-base64 string on the wire.
+///
+/// Used for `WasmLoad.bytes` so a multi-megabyte cwasm doesn't bloat ~5×
+/// when JSON-encoded as an array of integers.
+mod base64_bytes {
+    use base64::{engine::general_purpose::STANDARD, Engine};
+    use serde::{Deserialize, Deserializer, Serializer};
+    use std::vec::Vec;
+
+    pub fn serialize<S: Serializer>(b: &Vec<u8>, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&STANDARD.encode(b))
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Vec<u8>, D::Error> {
+        let s = <&str>::deserialize(d)?;
+        STANDARD.decode(s).map_err(serde::de::Error::custom)
+    }
+}
+
 // ---------------------------------------------------------------------------
 //  Envelope — top-level JSON discriminator
 // ---------------------------------------------------------------------------
@@ -94,7 +113,9 @@ pub struct WasmEnvelope {
 pub struct WasmLoad {
     /// App identifier — used in subsequent `wasm_call` requests.
     pub name: String,
-    /// Raw WASM component bytecode (AOT-compiled).
+    /// Raw WASM component bytecode (AOT-compiled), wire-encoded as
+    /// standard base64.
+    #[serde(with = "base64_bytes")]
     pub bytes: Vec<u8>,
     /// SNI hostname for this app's dedicated TLS certificate.
     ///

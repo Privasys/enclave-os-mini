@@ -8,6 +8,7 @@ import socket
 import json
 import sys
 import os
+import base64
 
 HOST = "localhost"
 PORT = 8445
@@ -86,7 +87,7 @@ def test_wasm_load(token, cwasm_path):
     payload = json.dumps({
         "wasm_load": {
             "name": "example",
-            "bytes": list(cwasm_bytes),
+            "bytes": base64.b64encode(cwasm_bytes).decode(),
             "permissions": {
                 "http_hosts": ["*"],
                 "kv_namespaces": ["default"]

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Minimal debug test for wasm_load over HTTP/1.1."""
-import ssl, socket, json, os, sys
+import ssl, socket, json, os, sys, base64
 
 HOST = "localhost"
 PORT = 8445
@@ -16,7 +16,7 @@ with open("/home/ubuntu/projects/wasm_example.cwasm", "rb") as f:
 payload = json.dumps({
     "wasm_load": {
         "name": "example",
-        "bytes": list(cwasm),
+        "bytes": base64.b64encode(cwasm).decode(),
         "permissions": {"http_hosts": ["*"], "kv_namespaces": ["default"]}
     }
 }).encode()
