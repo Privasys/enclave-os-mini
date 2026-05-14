@@ -342,6 +342,7 @@ dependencies = [
  "serde_json",
  "sgx_types",
  "sgx_urts",
+ "socket2",
 ]
 
 [[package]]

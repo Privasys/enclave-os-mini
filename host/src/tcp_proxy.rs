@@ -20,6 +20,7 @@ use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::time::{Duration, Instant};
 
 use enclave_os_common::channel::{
     self, ChannelMsgType, CHANNEL_MSG_HEADER,
@@ -31,12 +32,41 @@ use log::{info, warn, error, debug};
 /// Maximum bytes to read from a TCP socket in one call.
 const TCP_READ_BUF: usize = 32_768;
 
+/// Hard cap on simultaneously-tracked connections. Leaves headroom under
+/// the conventional 1024 default `RLIMIT_NOFILE`. New `accept()` calls
+/// past this cap drop the freshly-accepted socket immediately so the
+/// listener never wedges with `EMFILE`.
+const MAX_CONNS: usize = 800;
+
+/// Per-connection idle timeout. Any tracked connection that has not
+/// produced read/write activity for this long is force-closed and the
+/// enclave is notified. Catches half-dead peers (NAT timeouts, suspended
+/// laptops, slow-loris ClientHello stalls) that never trigger TCP keepalive.
+const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// How often the proxy loop scans for idle connections.
+const IDLE_SCAN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// TCP keepalive parameters applied to every accepted socket. The kernel
+/// sends the first probe after `KEEPALIVE_IDLE`, then `KEEPALIVE_RETRIES`
+/// further probes spaced by `KEEPALIVE_INTERVAL`. Dead peers are reaped
+/// in roughly `KEEPALIVE_IDLE + retries * interval` (~3.5 min by default).
+const KEEPALIVE_IDLE: Duration = Duration::from_secs(120);
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(30);
+const KEEPALIVE_RETRIES: u32 = 3;
+
+/// Per-connection state tracked by the proxy.
+struct ConnState {
+    stream: TcpStream,
+    last_activity: Instant,
+}
+
 /// TCP proxy for enclave inbound connections.
 pub struct TcpProxy {
     /// TCP listener socket (non-blocking).
     listener: TcpListener,
-    /// Active connections: conn_id → stream.
-    connections: HashMap<u32, TcpStream>,
+    /// Active connections: conn_id → state.
+    connections: HashMap<u32, ConnState>,
     /// Next connection ID to assign.
     next_conn_id: u32,
     /// Producer for `data_host_to_enc` — sends TCP data to the enclave.
@@ -47,6 +77,8 @@ pub struct TcpProxy {
     shutdown: Arc<AtomicBool>,
     /// True once the enclave has signalled DataReady.
     ready: bool,
+    /// Last time we ran the idle-connection sweep.
+    last_idle_scan: Instant,
 }
 
 impl TcpProxy {
@@ -71,6 +103,7 @@ impl TcpProxy {
             data_rx,
             shutdown,
             ready: false,
+            last_idle_scan: Instant::now(),
         })
     }
 
@@ -99,6 +132,13 @@ impl TcpProxy {
             // 2. Read from TCP sockets → send to enclave
             did_work |= self.read_sockets(&mut read_buf);
 
+            // 4. Periodically reap idle connections (catches half-dead peers
+            //    that never trigger TCP keepalive — e.g. stalled TLS handshakes).
+            if self.last_idle_scan.elapsed() >= IDLE_SCAN_INTERVAL {
+                self.reap_idle_connections();
+                self.last_idle_scan = Instant::now();
+            }
+
             // If no work was done, yield briefly to avoid busy-spinning
             if !did_work {
                 std::thread::sleep(std::time::Duration::from_micros(50));
@@ -120,6 +160,19 @@ impl TcpProxy {
         for _ in 0..16 {
             match self.listener.accept() {
                 Ok((stream, addr)) => {
+                    // Hard cap to avoid wedging the listener with EMFILE.
+                    // Drop the freshly-accepted socket immediately if we're
+                    // already tracking too many connections — better to refuse
+                    // a single connection than to leak FDs and DoS ourselves.
+                    if self.connections.len() >= MAX_CONNS {
+                        warn!(
+                            "Connection cap reached ({}), dropping new connection from {}",
+                            MAX_CONNS, addr
+                        );
+                        drop(stream);
+                        continue;
+                    }
+
                     let conn_id = self.next_conn_id;
                     self.next_conn_id = self.next_conn_id.wrapping_add(1);
                     if self.next_conn_id == 0 {
@@ -132,15 +185,25 @@ impl TcpProxy {
                     }
                     // Disable Nagle's algorithm for lower latency
                     let _ = stream.set_nodelay(true);
+                    // Enable TCP keepalive so the kernel reaps half-dead peers
+                    // (NAT timeouts, suspended laptops, killed clients) that
+                    // never sent FIN/RST. Without this the host never sees a
+                    // read error and the FD leaks until process restart.
+                    if let Err(e) = enable_keepalive(&stream) {
+                        warn!("set keepalive failed for conn_id={}: {}", conn_id, e);
+                    }
 
                     let peer_addr = addr.to_string();
-                    info!("Accepted conn_id={} from {}", conn_id, peer_addr);
+                    info!("Accepted conn_id={} from {} (active={})", conn_id, peer_addr, self.connections.len() + 1);
 
                     // Send TcpNew to enclave
                     let msg = channel::encode_tcp_new(conn_id, &peer_addr);
                     self.data_tx.send(&msg);
 
-                    self.connections.insert(conn_id, stream);
+                    self.connections.insert(
+                        conn_id,
+                        ConnState { stream, last_activity: Instant::now() },
+                    );
                     accepted = true;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
@@ -159,8 +222,8 @@ impl TcpProxy {
         let mut did_work = false;
         let mut to_close = Vec::new();
 
-        for (&conn_id, stream) in self.connections.iter_mut() {
-            match stream.read(buf) {
+        for (&conn_id, conn) in self.connections.iter_mut() {
+            match conn.stream.read(buf) {
                 Ok(0) => {
                     // Peer closed connection
                     debug!("Peer closed conn_id={}", conn_id);
@@ -169,6 +232,7 @@ impl TcpProxy {
                 Ok(n) => {
                     let msg = channel::encode_tcp_data(conn_id, &buf[..n]);
                     self.data_tx.send(&msg);
+                    conn.last_activity = Instant::now();
                     did_work = true;
                 }
                 Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => {
@@ -190,6 +254,35 @@ impl TcpProxy {
         }
 
         did_work
+    }
+
+    /// Force-close any connection that has been idle for longer than
+    /// `IDLE_TIMEOUT`. Belt-and-braces to TCP keepalive: catches stalled
+    /// TLS handshakes and slow-loris peers where the kernel still considers
+    /// the connection healthy. Notifies the enclave so its rustls state
+    /// is freed too.
+    fn reap_idle_connections(&mut self) {
+        let now = Instant::now();
+        let stale: Vec<u32> = self
+            .connections
+            .iter()
+            .filter(|(_, c)| now.duration_since(c.last_activity) >= IDLE_TIMEOUT)
+            .map(|(&id, _)| id)
+            .collect();
+        if stale.is_empty() {
+            return;
+        }
+        warn!(
+            "Reaping {} idle connection(s) (idle ≥ {}s, active={})",
+            stale.len(),
+            IDLE_TIMEOUT.as_secs(),
+            self.connections.len()
+        );
+        for conn_id in stale {
+            self.connections.remove(&conn_id);
+            let msg = channel::encode_tcp_close(conn_id);
+            self.data_tx.send(&msg);
+        }
     }
 
     /// Read messages from the enclave data channel and process them.
@@ -237,11 +330,11 @@ impl TcpProxy {
 
     /// Write data to a TCP socket. If the write fails, close the connection.
     fn write_to_socket(&mut self, conn_id: u32, data: &[u8]) {
-        if let Some(stream) = self.connections.get_mut(&conn_id) {
+        if let Some(conn) = self.connections.get_mut(&conn_id) {
             // Write all data (may need multiple writes for large payloads)
             let mut offset = 0;
             while offset < data.len() {
-                match stream.write(&data[offset..]) {
+                match conn.stream.write(&data[offset..]) {
                     Ok(0) => {
                         warn!("Zero-length write on conn_id={}", conn_id);
                         self.connections.remove(&conn_id);
@@ -265,8 +358,22 @@ impl TcpProxy {
                     }
                 }
             }
+            conn.last_activity = Instant::now();
         } else {
             debug!("Write to unknown conn_id={}, ignoring", conn_id);
         }
     }
+}
+
+/// Enable TCP keepalive on a stream with our standard parameters.
+/// Uses `socket2` for portable access to `TCP_KEEPIDLE`/`TCP_KEEPINTVL`/
+/// `TCP_KEEPCNT` (the std lib's `TcpKeepalive` only exposes `time`).
+fn enable_keepalive(stream: &TcpStream) -> io::Result<()> {
+    use socket2::{SockRef, TcpKeepalive};
+    let sock = SockRef::from(stream);
+    let ka = TcpKeepalive::new()
+        .with_time(KEEPALIVE_IDLE)
+        .with_interval(KEEPALIVE_INTERVAL)
+        .with_retries(KEEPALIVE_RETRIES);
+    sock.set_tcp_keepalive(&ka)
 }
