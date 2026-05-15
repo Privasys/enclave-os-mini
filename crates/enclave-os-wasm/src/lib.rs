@@ -78,6 +78,7 @@ pub mod wasi;
 pub mod wasm_docs;
 
 use std::sync::Mutex;
+use std::sync::OnceLock;
 use std::vec::Vec;
 
 use ring::digest;
@@ -228,14 +229,15 @@ impl WasmModule {
         max_fuel: u64,
         mcp_enabled: bool,
         docs: Option<std::collections::BTreeMap<String, String>>,
-        env: Option<std::collections::BTreeMap<String, String>>,
+        config_api_function: Option<String>,
+        owners: Vec<String>,
     ) -> Result<(), String> {
         // Load into the registry (compile + introspect + per-app key)
         let meta = {
             let mut reg = self.registry
                 .lock()
                 .map_err(|_| String::from("registry lock poisoned"))?;
-            reg.load_app(name, hostname, wasm_bytes, encryption_key, permissions, max_fuel, mcp_enabled, docs, env)?
+            reg.load_app(name, hostname, wasm_bytes, encryption_key, permissions, max_fuel, mcp_enabled, docs, config_api_function, owners)?
         };
 
         // ── Persist to KV store ────────────────────────────────────
@@ -278,6 +280,42 @@ impl WasmModule {
             .unwrap_or_default()
     }
 
+    /// Install (or replace) an app-defined attestation extension at
+    /// arc `1.3.6.1.4.1.65230.3.5.{arc_suffix}`. Persists the new
+    /// extension set to KV (so it survives restarts) and re-registers
+    /// the per-app identity with the global CertStore so the next
+    /// RA-TLS handshake serves a leaf that includes the extension.
+    ///
+    /// Called by the `set-attestation-extension` host function in the
+    /// `privasys:enclave-os/attestation@0.1.0` SDK interface.
+    pub fn set_attestation_extension(&self, name: &str, arc_suffix: u32, value: Vec<u8>) -> Result<(), String> {
+        let updated_meta = {
+            let mut reg = self.registry
+                .lock()
+                .map_err(|_| String::from("registry lock poisoned"))?;
+            reg.set_extension(name, arc_suffix, value)
+                .ok_or_else(|| format!("unknown app: '{}'", name))?
+        };
+        // Persist updated metadata to KV so extensions survive restart.
+        // We do not need the wasm bytes here \u2014 only the meta entry
+        // changes; persist_app_to_kv writes both, so use a smaller
+        // path that updates only the meta.
+        self.persist_meta_to_kv(name, &updated_meta);
+        register_app_identity(&updated_meta);
+        Ok(())
+    }
+
+    /// Lift the freeze gate for `name` (no-op when the app has no
+    /// declared `config_api` or is already configured). Called by
+    /// the `set-config-complete` host function.
+    pub fn mark_configured(&self, name: &str) -> Result<(), String> {
+        let mut reg = self.registry
+            .lock()
+            .map_err(|_| String::from("registry lock poisoned"))?;
+        reg.mark_configured(name);
+        Ok(())
+    }
+
     /// Dispatch a parsed `WasmCall` to the appropriate app and record metrics.
     ///
     /// If the app is known but not currently compiled in memory, its
@@ -288,6 +326,27 @@ impl WasmModule {
         // is already in the `loaded` map.
         if let Err(e) = self.ensure_app_loaded(&call.app) {
             return WasmResult::Error { message: e };
+        }
+
+        // Freeze gate: when the app declared a `config_api` function
+        // at load time and has not yet called `set-config-complete`,
+        // every export OTHER than the configure function returns an
+        // error. The flag is in-memory only — after a restart the app
+        // is frozen again and must reconfigure from its sealed state.
+        {
+            let registry = match self.registry.lock() {
+                Ok(r) => r,
+                Err(_) => {
+                    return WasmResult::Error {
+                        message: String::from("registry lock poisoned"),
+                    };
+                }
+            };
+            if registry.is_frozen(&call.app, &call.function) {
+                return WasmResult::Error {
+                    message: String::from("app is awaiting initial configuration"),
+                };
+            }
         }
 
         let (result, fuel_consumed) = {
@@ -336,7 +395,11 @@ impl WasmModule {
     ///   - `role` → require a valid token with at least one matching role.
     ///
     /// The app-level bearer token is taken from `call.app_auth`.
-    fn check_app_permissions(&self, call: &WasmCall) -> Result<Option<AuthResult>, Response> {
+    fn check_app_permissions(
+        &self,
+        call: &WasmCall,
+        ctx: &RequestContext,
+    ) -> Result<Option<AuthResult>, Response> {
         // Look up the app's permissions policy.
         let registry = self.registry.lock().map_err(|_| {
             Response::Data(serialize_or_error(&WasmResult::Error {
@@ -359,6 +422,56 @@ impl WasmModule {
 
         // Public → no auth needed.
         if *policy == FunctionPolicy::Public {
+            return Ok(None);
+        }
+
+        // Owner → restricted to the per-app owners team (the
+        // platform-OIDC `sub` claims that the management service
+        // shipped on `wasm_load.owners`). Used by the @config-api
+        // freeze-gate entrypoint so that only the developer who owns
+        // the app can initialise it. The platform `manager` role is
+        // NOT a substitute: managers can deploy any app, but an app's
+        // configure entrypoint is private to its owners team.
+        if *policy == FunctionPolicy::Owner {
+            // Find the owners list from the registry.
+            let owners: Vec<String> = {
+                let reg = self.registry.lock().map_err(|_| {
+                    Response::Data(serialize_or_error(&WasmResult::Error {
+                        message: String::from("registry lock poisoned"),
+                    }))
+                })?;
+                reg.app_owners(&call.app)
+            };
+            if owners.is_empty() {
+                let err = WasmResult::Error {
+                    message: format!(
+                        "owner-only: app '{}' has no owners team configured; redeploy from the platform to populate it",
+                        call.app,
+                    ),
+                };
+                return Err(Response::Data(serialize_or_error(&err)));
+            }
+            let claims = match ctx.oidc_claims.as_ref() {
+                Some(c) => c,
+                None => {
+                    let err = WasmResult::Error {
+                        message: format!(
+                            "owner-only: function '{}' on app '{}' requires platform OIDC authentication",
+                            call.function, call.app,
+                        ),
+                    };
+                    return Err(Response::Data(serialize_or_error(&err)));
+                }
+            };
+            if !owners.iter().any(|s| s == &claims.sub) {
+                let err = WasmResult::Error {
+                    message: format!(
+                        "owner-only: caller is not on the owners team for app '{}'",
+                        call.app,
+                    ),
+                };
+                return Err(Response::Data(serialize_or_error(&err)));
+            }
             return Ok(None);
         }
 
@@ -748,6 +861,25 @@ impl WasmModule {
         self.update_kv_manifest(&kv);
     }
 
+    /// Persist only an app's metadata (used after extension updates).
+    fn persist_meta_to_kv(&self, name: &str, meta: &AppMeta) {
+        let kv = match enclave_os_kvstore::kv_store() {
+            Some(kv) => kv,
+            None => return,
+        };
+        let kv = match kv.lock() {
+            Ok(kv) => kv,
+            Err(_) => return,
+        };
+        if let Ok(meta_json) = serde_json::to_vec(meta) {
+            if let Err(e) = kv.put(&kv_meta_key(name), &meta_json) {
+                enclave_os_common::enclave_log_error!(
+                    "KV: failed to update metadata for app '{}': {}", name, e,
+                );
+            }
+        }
+    }
+
     /// Remove an app's metadata and WASM bytes from the sealed KV
     /// store and update the manifest.
     fn remove_app_from_kv(&self, name: &str) {
@@ -820,6 +952,60 @@ impl WasmModule {
         let mut reg = self.registry.lock()
             .map_err(|_| String::from("registry lock poisoned"))?;
         reg.ensure_loaded(name, &wasm_bytes)
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  Global accessor for the SDK host functions
+// ---------------------------------------------------------------------------
+//
+// SDK host functions registered on wasmtime's Linker (e.g.
+// `set-attestation-extension`) only have access to a `StoreContextMut`
+// that contains an `AppContext` \u2014 not a `WasmModule`. To call back
+// into the module (mutate registry, persist KV, re-register identity)
+// the enclave init code installs a `'static` reference once at startup.
+
+static WASM_MODULE_GLOBAL: OnceLock<&'static WasmModule> = OnceLock::new();
+
+/// Install the process-wide handle to the WASM module. Call exactly
+/// once during enclave initialisation, immediately after constructing
+/// the [`WasmModule`]. Subsequent calls are silently ignored.
+///
+/// The reference must outlive the process; in practice the enclave
+/// constructs `WasmModule` once and leaks it via `Box::leak` so the
+/// `'static` bound is satisfied trivially.
+pub fn install_global(m: &'static WasmModule) {
+    let _ = WASM_MODULE_GLOBAL.set(m);
+}
+
+/// Borrow the process-wide WASM module handle. Returns `None` if
+/// `install_global` was not called (e.g. SDK host fn invoked before
+/// init completed). Callers should treat `None` as a
+/// programmer-error and return a host-side error to the guest.
+pub fn global() -> Option<&'static WasmModule> {
+    WASM_MODULE_GLOBAL.get().copied()
+}
+
+/// Boxable adapter so the `'static` reference can be re-registered
+/// with [`crate::modules::register_module`] (which expects
+/// `Box<dyn EnclaveModule>`). Forwards every trait method to the
+/// underlying singleton without taking ownership.
+pub struct WasmModuleHandle(pub &'static WasmModule);
+
+impl EnclaveModule for WasmModuleHandle {
+    fn name(&self) -> &str { self.0.name() }
+    fn handle(&self, req: &Request, ctx: &RequestContext) -> Option<Response> {
+        self.0.handle(req, ctx)
+    }
+    fn config_leaves(&self) -> Vec<enclave_os_common::modules::ConfigLeaf> {
+        self.0.config_leaves()
+    }
+    fn custom_oids(&self) -> Vec<enclave_os_common::modules::ModuleOid> {
+        self.0.custom_oids()
+    }
+    fn app_identities(&self) -> Vec<AppIdentity> { self.0.app_identities() }
+    fn enrich_metrics(&self, m: &mut enclave_os_common::protocol::EnclaveMetrics) {
+        self.0.enrich_metrics(m)
     }
 }
 
@@ -926,7 +1112,7 @@ impl EnclaveModule for WasmModule {
 
         // 1. wasm_call — execute a function (app-level permissions)
         if let Some(ref call) = envelope.wasm_call {
-            let auth = match self.check_app_permissions(call) {
+            let auth = match self.check_app_permissions(call, ctx) {
                 Ok(a) => a,
                 Err(response) => return Some(response),
             };
@@ -970,7 +1156,7 @@ impl EnclaveModule for WasmModule {
             let max_fuel = load.max_fuel.unwrap_or(10_000_000);
             let mcp_enabled = load.mcp_enabled.unwrap_or(true);
 
-            let mgmt_result = match self.load_app(&load.name, &hostname, &load.bytes, encryption_key, load.permissions, max_fuel, mcp_enabled, load.docs, None) {
+            let mgmt_result = match self.load_app(&load.name, &hostname, &load.bytes, encryption_key, load.permissions, max_fuel, mcp_enabled, load.docs, load.config_api.map(|c| c.function), load.owners) {
                 Ok(()) => {
                     // Return the loaded app's info
                     let apps = self.list_apps();
@@ -1105,7 +1291,7 @@ impl EnclaveModule for WasmModule {
                 }
             };
             // Re-use the same permission + dispatch path as wasm_call.
-            let auth = match self.check_app_permissions(&wasm_call) {
+            let auth = match self.check_app_permissions(&wasm_call, ctx) {
                 Ok(a) => a,
                 Err(response) => return Some(response),
             };
@@ -1192,6 +1378,25 @@ fn build_app_identity(meta: &AppMeta) -> AppIdentity {
             key: format!("wasm.{}.configuration_hash", meta.name),
             value: ch.to_vec(),
             oid: Some(enclave_os_common::oids::APP_CONFIGURATION_HASH_OID),
+        });
+    }
+    // App-defined extensions live under sub-OIDs of
+    // APP_CONFIGURATION_HASH_OID (1.3.6.1.4.1.65230.3.5.{arc_suffix}).
+    // The parent OID carries the WIT-derived configuration hash; the
+    // sub-arc carries opaque values installed at runtime by the app.
+    for (arc_suffix, value) in &meta.extensions {
+        let mut full_oid: Vec<u64> =
+            enclave_os_common::oids::APP_CONFIGURATION_HASH_OID.to_vec();
+        full_oid.push(*arc_suffix as u64);
+        // Leak to obtain a 'static slice. Acceptable: extensions are
+        // monotonically added and the registry lives for the
+        // process lifetime; the leaked memory is bounded by the
+        // number of distinct (app, arc) pairs ever installed.
+        let leaked: &'static [u64] = Box::leak(full_oid.into_boxed_slice());
+        config.push(ConfigEntry {
+            key: format!("wasm.{}.extension.{}", meta.name, arc_suffix),
+            value: value.clone(),
+            oid: Some(leaked),
         });
     }
     AppIdentity {

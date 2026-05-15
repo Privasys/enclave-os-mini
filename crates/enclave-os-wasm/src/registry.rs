@@ -79,6 +79,9 @@ fn parse_auth_annotation(value: &str) -> (FunctionPolicy, Vec<String>) {
     if v.eq_ignore_ascii_case("authenticated") {
         return (FunctionPolicy::Authenticated, Vec::new());
     }
+    if v.eq_ignore_ascii_case("owner") {
+        return (FunctionPolicy::Owner, Vec::new());
+    }
     // role(role-a, role-b, ...)
     if let Some(inner) = v.strip_prefix("role(").and_then(|s| s.strip_suffix(')')) {
         let roles: Vec<String> = inner
@@ -164,14 +167,29 @@ pub struct AppMeta {
     /// a fresh schema is generated when the app is next lazy-loaded.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub schema: Option<crate::protocol::AppSchema>,
-    /// Per-app environment variables (sealed at rest with `encryption_key`).
-    ///
-    /// Surfaced to the guest via `wasi:cli/environment.get-environment()`.
-    /// Values are intentionally excluded from `configuration_hash` (only
-    /// the sorted key list is folded in) so secret rotation does not
-    /// change the public attestation digest.
+    /// App-defined attestation extensions installed at runtime via the
+    /// SDK `set-attestation-extension(arc_suffix, value)` call. Each
+    /// entry is embedded in the per-app RA-TLS leaf certificate as a
+    /// non-critical extension under OID
+    /// `1.3.6.1.4.1.65230.3.5.{arc_suffix}`. Persisted so the
+    /// extensions survive enclave restarts; the cert is replayed
+    /// before traffic is unblocked.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
-    pub env: BTreeMap<String, String>,
+    pub extensions: BTreeMap<u32, Vec<u8>>,
+    /// Optional configure-only function name. When `Some(fn_name)`,
+    /// only `wasm_call` invocations targeting `fn_name` are allowed
+    /// until the app calls `set-config-complete`. Persisted so that
+    /// after every enclave restart the app re-enters the frozen
+    /// state and must be reconfigured before serving traffic.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub config_api_function: Option<String>,
+    /// Per-app owners team. Platform OIDC `sub` claims authorised to
+    /// invoke exports decorated with the `Owner` auth policy
+    /// (typically the `@config-api` configure entrypoint). Persisted
+    /// so the freeze-gate stays callable by the right principals
+    /// across restarts without consulting the platform.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub owners: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -213,8 +231,6 @@ pub struct LoadedApp {
     pub configuration_hash: Option<[u8; 32]>,
     /// Maximum fuel budget per `wasm_call` for this app.
     pub max_fuel: u64,
-    /// Per-app environment variables (see [`AppMeta::env`]).
-    pub env: BTreeMap<String, String>,
 }
 
 impl LoadedApp {
@@ -252,6 +268,14 @@ pub struct AppRegistry {
     lru: BTreeMap<String, u64>,
     /// Monotonic counter incremented on each access.
     lru_counter: u64,
+    /// Per-app configure-only function name. Apps not present here
+    /// have no freeze gate and accept calls to any export.
+    config_api: BTreeMap<String, String>,
+    /// Per-app freeze flag. `false` means only the configure function
+    /// is callable; `true` means all exports are callable. In-memory
+    /// only — always reset to `false` on (re)load when `config_api`
+    /// is set.
+    configured: BTreeMap<String, bool>,
 }
 
 impl AppRegistry {
@@ -263,6 +287,8 @@ impl AppRegistry {
             loaded: BTreeMap::new(),
             lru: BTreeMap::new(),
             lru_counter: 0,
+            config_api: BTreeMap::new(),
+            configured: BTreeMap::new(),
         }
     }
 
@@ -294,7 +320,8 @@ impl AppRegistry {
         max_fuel: u64,
         mcp_enabled: bool,
         docs: Option<std::collections::BTreeMap<String, String>>,
-        env: Option<std::collections::BTreeMap<String, String>>,
+        config_api_function: Option<String>,
+        owners: Vec<String>,
     ) -> Result<AppMeta, String> {
         if self.known.contains_key(name) {
             return Err(format!("app '{}' is already loaded", name));
@@ -349,6 +376,17 @@ impl AppRegistry {
             Some(ref d) => merge_auth_from_docs(d, permissions),
             None => permissions,
         };
+        // Extract @config-api decoration from docs. The WIT-derived
+        // decoration is the source of truth; the protocol-level
+        // `config_api_function` parameter (sourced from privasys.json
+        // or a Dockerfile LABEL) is only honoured as a fallback when
+        // the WIT does not declare one. This keeps the freeze gate
+        // bound to the measured app code rather than to deploy-time
+        // metadata that is not part of the attestation.
+        let config_api_function = match docs.as_ref().and_then(|d| d.get("config-api")) {
+            Some(name) => Some(name.clone()),
+            None => config_api_function,
+        };
         let mut schema = self.engine.discover_exports_typed(name, hostname, &component, Some(wasm_bytes), docs);
         schema.mcp_enabled = mcp_enabled;
         let exports = schema.to_exports_map();
@@ -360,23 +398,17 @@ impl AppRegistry {
             ));
         }
 
-        // ── Env vars (normalise + key list for config hash) ────────
-        let env_map: BTreeMap<String, String> = env.unwrap_or_default();
-        let env_keys: Vec<&str> = env_map.keys().map(|s| s.as_str()).collect();
-
         // ── Configuration hash ──────────────────────────────────────
-        // Includes permissions + the sorted list of env var KEYS
-        // (NEVER values, so secrets cannot leak through attestation
-        // and rotation does not invalidate the per-app cert).
-        let configuration_hash = if permissions.is_some() || !env_map.is_empty() {
+        // Hash of the per-app permissions policy (auth + MCP). When
+        // no permissions are declared, this is None and no
+        // configuration-hash OID is emitted.
+        let configuration_hash = if permissions.is_some() {
             #[derive(Serialize)]
             struct ConfigDigestInput<'a> {
                 permissions: Option<&'a AppPermissions>,
-                env_keys: &'a [&'a str],
             }
             let canonical = serde_json::to_vec(&ConfigDigestInput {
                 permissions: permissions.as_ref(),
-                env_keys: &env_keys,
             }).expect("config digest input must be serialisable");
             let h = digest::digest(&digest::SHA256, &canonical);
             let mut out = [0u8; 32];
@@ -406,9 +438,17 @@ impl AppRegistry {
             configuration_hash,
             max_fuel,
             schema: Some(schema),
-            env: env_map.clone(),
+            extensions: BTreeMap::new(),
+            config_api_function: config_api_function.clone(),
+            owners,
         };
         self.known.insert(name.to_string(), meta.clone());
+        // Wire the freeze gate: when a config_api function is
+        // declared, the app is frozen until set-config-complete.
+        if let Some(ref f) = config_api_function {
+            self.config_api.insert(name.to_string(), f.clone());
+            self.configured.insert(name.to_string(), false);
+        }
 
         self.loaded.insert(
             name.to_string(),
@@ -423,7 +463,6 @@ impl AppRegistry {
                 permissions,
                 configuration_hash,
                 max_fuel,
-                env: env_map,
             },
         );
         self.touch(name);
@@ -438,6 +477,13 @@ impl AppRegistry {
     /// KV store.  The component stays uncompiled until the first
     /// `wasm_call` triggers [`ensure_loaded()`](Self::ensure_loaded).
     pub fn register_known(&mut self, meta: AppMeta) {
+        // Re-arm the freeze gate on every restart: an app that was
+        // configured before reboot must reconfigure (re-supply its
+        // secrets) before serving traffic again.
+        if let Some(ref f) = meta.config_api_function {
+            self.config_api.insert(meta.name.clone(), f.clone());
+            self.configured.insert(meta.name.clone(), false);
+        }
         self.known.insert(meta.name.clone(), meta);
     }
 
@@ -488,7 +534,6 @@ impl AppRegistry {
             permissions: meta.permissions,
             configuration_hash: meta.configuration_hash,
             max_fuel: meta.max_fuel,
-            env: meta.env,
         });
         self.touch(name);
         self.evict_if_needed();
@@ -501,7 +546,41 @@ impl AppRegistry {
     pub fn remove_app(&mut self, name: &str) -> Option<String> {
         self.loaded.remove(name);
         self.lru.remove(name);
+        self.config_api.remove(name);
+        self.configured.remove(name);
         self.known.remove(name).map(|m| m.hostname)
+    }
+
+    /// Returns `true` when the app is frozen (declared a `config_api`
+    /// at load time and has not yet called `set-config-complete`) and
+    /// the requested function is NOT the configure function.
+    pub fn is_frozen(&self, name: &str, function: &str) -> bool {
+        let configured = self.configured.get(name).copied().unwrap_or(true);
+        if configured {
+            return false;
+        }
+        match self.config_api.get(name) {
+            Some(cfg_fn) => cfg_fn != function,
+            None => false,
+        }
+    }
+
+    /// Flip the in-memory freeze flag for `name` to `true`. No-op when
+    /// the app has no declared `config_api` or is already configured.
+    pub fn mark_configured(&mut self, name: &str) {
+        if self.config_api.contains_key(name) {
+            self.configured.insert(name.to_string(), true);
+        }
+    }
+
+    /// Install (or replace) an app-defined attestation extension at
+    /// arc `1.3.6.1.4.1.65230.3.5.{arc_suffix}`. Returns the updated
+    /// metadata so the caller can re-register the app identity with
+    /// the global CertStore. Persistence to KV is the caller's job.
+    pub fn set_extension(&mut self, name: &str, arc_suffix: u32, value: Vec<u8>) -> Option<AppMeta> {
+        let meta = self.known.get_mut(name)?;
+        meta.extensions.insert(arc_suffix, value);
+        Some(meta.clone())
     }
 
     /// List all known apps with their metadata.
@@ -567,6 +646,17 @@ impl AppRegistry {
     /// Get the permissions policy for a known app (for call-time enforcement).
     pub fn app_permissions(&self, name: &str) -> Option<&AppPermissions> {
         self.known.get(name).and_then(|m| m.permissions.as_ref())
+    }
+
+    /// Per-app owners team (platform-OIDC `sub` claims). Used to
+    /// authorize the `Owner` auth policy on `wasm_call`. Returns an
+    /// empty `Vec` for unknown apps or apps with no owners (which
+    /// also means the @config-api freeze gate is uncallable).
+    pub fn app_owners(&self, name: &str) -> Vec<String> {
+        self.known
+            .get(name)
+            .map(|m| m.owners.clone())
+            .unwrap_or_default()
     }
 
     /// Whether an app is known (persisted) but not necessarily compiled.
@@ -637,16 +727,11 @@ impl AppRegistry {
         // Record fuel before execution for delta calculation.
         let fuel_before = store.get_fuel().unwrap_or(0) as i64;
 
-        // ── Inject authenticated caller context + env vars ─────────
+        // ── Inject authenticated caller context ────────────────────
         {
             let ctx = store.data_mut();
             ctx.caller_id = caller_id;
             ctx.caller_roles = caller_roles;
-            if !app.env.is_empty() {
-                ctx.env_vars = app.env.iter()
-                    .map(|(k, v)| (k.clone(), v.clone()))
-                    .collect();
-            }
         }
 
         // ── Resolve the exported function ──────────────────────────

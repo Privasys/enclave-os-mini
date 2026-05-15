@@ -294,3 +294,40 @@ interface auth {
     /// Delete every role assignment for a user.
     remove-user-roles: func(user-id: string) -> result<string, string>;
 }
+
+// ─── App-controlled attestation extensions ─────────────────────────
+
+/// Configure-then-freeze pattern: an app boots frozen when one of
+/// its exports carries the `@config-api` decoration. Until that
+/// export runs successfully and the app calls
+/// `set-config-complete`, every other export returns the runtime
+/// error `"app is awaiting initial configuration"`. The
+/// `@config-api` export is also implicitly *owner-only*: only the
+/// deployer (a caller bearing the platform `manager` role) can
+/// invoke it, regardless of any `@auth` annotation.
+///
+/// Typical flow:
+///   1. The deployer installs the app (`wasm_load`).
+///   2. The deployer calls the `@config-api` export over RA-TLS,
+///      passing secret material (e.g. an API key).
+///   3. The app stores the secret to its sealed KV store, advertises
+///      a public commitment via `set-attestation-extension`, then
+///      calls `set-config-complete`.
+///   4. The runtime persists the extensions so they survive
+///      restarts; the freeze itself is re-armed on every enclave
+///      restart so the deployer must re-inject the secret before
+///      traffic flows again.
+interface attestation {
+    /// Install (or replace) a non-critical X.509 extension on the
+    /// per-app RA-TLS leaf at OID `1.3.6.1.4.1.65230.3.5.{arc-suffix}`.
+    ///
+    /// The value is persisted to the sealed KV store so it survives
+    /// enclave restarts. Capped at 4096 bytes to keep the leaf
+    /// certificate reasonable; typical use is a 32-byte hash.
+    set-attestation-extension: func(arc-suffix: u32, value: list<u8>) -> result<_, string>;
+
+    /// Lift the freeze gate so the app's other exports become
+    /// callable. Idempotent. No-op when the app declares no
+    /// `@config-api` export or is already configured.
+    set-config-complete: func() -> result<_, string>;
+}

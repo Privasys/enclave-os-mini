@@ -193,15 +193,32 @@ pub struct WasmLoad {
     /// be used as a fallback.
     #[serde(default)]
     pub config_api: Option<ConfigApi>,
+
+    /// Per-app owners team. List of platform OIDC `sub` claims that
+    /// are authorised to call WIT exports decorated `@auth owner`
+    /// (typically the `@config-api` entrypoint). The list is supplied
+    /// by the management service and persisted with the app metadata,
+    /// so that owner-only calls succeed across enclave restarts
+    /// without consulting the platform.
+    ///
+    /// When empty, no caller can satisfy the Owner policy and the
+    /// `@config-api` export remains inaccessible — this is intentional
+    /// belt-and-braces for misconfigured deployments.
+    #[serde(default)]
+    pub owners: Vec<String>,
 }
 
 /// Configure-endpoint declaration. See [`WasmLoad::config_api`].
+///
+/// WASM apps are dispatched by exported function name, not by HTTP path,
+/// so the configure decoration is a single function name (e.g. `"configure"`).
+/// Until the named function returns Ok and the app calls
+/// `set-config-complete`, all other `wasm_call` invocations on the app
+/// fail with `"app is awaiting initial configuration"`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ConfigApi {
-    /// HTTP method, e.g. "POST". Case-insensitive on the wire.
-    pub method: String,
-    /// Path, e.g. "/configure".
-    pub path: String,
+    /// Exported function name (matches the export key used by `wasm_call`).
+    pub function: String,
 }
 
 /// Unload a WASM app by name.
@@ -638,6 +655,12 @@ pub enum FunctionPolicy {
     Authenticated,
     /// A valid OIDC token with at least one of the specified roles.
     Role,
+    /// Restricted to the app *owner* (the deployer). Enforced at the
+    /// platform OIDC layer using the same `manager` role required to
+    /// invoke `wasm_load`/`wasm_unload`. Used for the `@config-api`
+    /// configure entrypoint so that an unconfigured app cannot be
+    /// initialised by an unauthenticated public caller.
+    Owner,
 }
 
 fn default_policy() -> FunctionPolicy {

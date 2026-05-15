@@ -29,6 +29,7 @@
 //! ```
 
 pub mod auth;
+pub mod attestation;
 pub mod crypto;
 pub mod https;
 pub mod keystore;
@@ -50,5 +51,6 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     keystore::add_to_linker(linker)?;
     https::add_to_linker(linker)?;
     auth::add_to_linker(linker)?;
+    attestation::add_to_linker(linker)?;
     Ok(())
 }

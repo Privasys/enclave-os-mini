@@ -135,3 +135,18 @@ pub const APP_KEY_SOURCE_OID_STR: &str = "1.3.6.1.4.1.65230.3.4";
 pub const APP_CONFIGURATION_HASH_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 3, 5];
 /// Per-app Configuration Hash (dotted-string).
 pub const APP_CONFIGURATION_HASH_OID_STR: &str = "1.3.6.1.4.1.65230.3.5";
+
+// App-defined runtime extensions live at sub-OIDs of
+// [`APP_CONFIGURATION_HASH_OID`], i.e. `1.3.6.1.4.1.65230.3.5.{n}`. Apps
+// install them via the SDK `set-attestation-extension(arc-suffix, value)`
+// call. Each value is embedded as a non-critical X.509 extension in the
+// per-app RA-TLS leaf certificate so that verifying clients can prove the
+// running app saw exactly the value the deployer delivered (e.g. SHA-256
+// of a configured API key, an MCP-server URL list, a vector-DB project
+// id). Persisted across enclave restarts.
+//
+// Construction is intentionally inlined at the call site (see
+// `enclave-os-wasm/src/lib.rs::build_app_identity`) to avoid duplicating
+// the parent OID under a second name. Shared with enclave-os-virtual,
+// whose manager exposes the same arc through the
+// `/api/v1/containers/<name>/attestation-extensions` endpoint.

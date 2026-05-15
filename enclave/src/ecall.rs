@@ -511,7 +511,14 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
                 return -34;
             }
         };
-        crate::modules::register_module(Box::new(wasm));
+        // Leak to obtain a `'static` reference and install it as the
+        // global handle so SDK host functions (e.g.
+        // `set-attestation-extension`) can call back into the
+        // module. The leaked allocation lives for the process
+        // lifetime, which matches the module's intended scope.
+        let wasm_static: &'static enclave_os_wasm::WasmModule = Box::leak(Box::new(wasm));
+        enclave_os_wasm::install_global(wasm_static);
+        crate::modules::register_module(Box::new(enclave_os_wasm::WasmModuleHandle(wasm_static)));
         _module_count += 1;
     }
 
