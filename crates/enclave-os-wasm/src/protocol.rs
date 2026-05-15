@@ -182,27 +182,26 @@ pub struct WasmLoad {
     #[serde(default)]
     pub docs: Option<std::collections::BTreeMap<String, String>>,
 
-    /// Optional per-app environment variables.
+    /// Optional config-API decoration. When present, the wasm runtime
+    /// freezes all non-configure paths with HTTP 503 until the
+    /// declared endpoint has been called successfully. The flag is
+    /// in-process only; after a restart the app is frozen again.
     ///
-    /// Surfaced to the guest via `wasi:cli/environment.get-environment()`
-    /// (which the runtime already implements by reading
-    /// [`crate::wasi::AppContext::env_vars`]). Use this for app-level
-    /// configuration that varies per deployment but is not part of the
-    /// code identity, e.g. third-party API tokens, per-tenant base URLs,
-    /// or feature flags.
-    ///
-    /// Values are sealed-at-rest with the per-app encryption key (same
-    /// crypt path as the KV store), so a host operator with disk access
-    /// cannot read them. They are never logged.
-    ///
-    /// To preserve the integrity of the per-app RA-TLS configuration
-    /// hash (`OID 1.3.6.1.4.1.65230.3.5`), only the SORTED LIST OF KEYS
-    /// is folded into the hash — values are deliberately excluded so
-    /// rotating an API token does not change the attestation digest
-    /// (and so secrets never leak through the public attestation
-    /// extension). See `registry::load_app`.
+    /// Sourced from a WIT decoration on the app (the wasm equivalent
+    /// of a Dockerfile `LABEL org.privasys.config_api`); these win
+    /// because they are part of the measurement. `privasys.json` may
+    /// be used as a fallback.
     #[serde(default)]
-    pub env: Option<std::collections::BTreeMap<String, String>>,
+    pub config_api: Option<ConfigApi>,
+}
+
+/// Configure-endpoint declaration. See [`WasmLoad::config_api`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConfigApi {
+    /// HTTP method, e.g. "POST". Case-insensitive on the wire.
+    pub method: String,
+    /// Path, e.g. "/configure".
+    pub path: String,
 }
 
 /// Unload a WASM app by name.

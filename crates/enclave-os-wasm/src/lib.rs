@@ -970,7 +970,7 @@ impl EnclaveModule for WasmModule {
             let max_fuel = load.max_fuel.unwrap_or(10_000_000);
             let mcp_enabled = load.mcp_enabled.unwrap_or(true);
 
-            let mgmt_result = match self.load_app(&load.name, &hostname, &load.bytes, encryption_key, load.permissions, max_fuel, mcp_enabled, load.docs, load.env) {
+            let mgmt_result = match self.load_app(&load.name, &hostname, &load.bytes, encryption_key, load.permissions, max_fuel, mcp_enabled, load.docs, None) {
                 Ok(()) => {
                     // Return the loaded app's info
                     let apps = self.list_apps();
