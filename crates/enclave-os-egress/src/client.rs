@@ -365,18 +365,28 @@ fn https_request_inner(
     flush_tls(fd, &mut tls_conn).map_err(|_| "flush failed".to_string())?;
 
     // Read the complete response with cursor-based multi-record TLS
-    // reads and drain-all-plaintext inner loop.
+    // reads. We MUST drain decrypted plaintext between successive
+    // `process_new_packets` calls — otherwise rustls's internal
+    // received-plaintext buffer fills up on large responses (each
+    // 16 KiB TLS record contributes ~16 KiB plaintext) and yields
+    // `Custom { kind: Other, error: "received plaintext buffer full" }`.
     let mut response_data = Vec::new();
     let mut net_buf = vec![0u8; 16384];
     let mut app_buf = vec![0u8; 16384];
     let mut body_limit_hit = false;
 
-    loop {
+    // Disable rustls's internal plaintext buffer cap; we drain
+    // aggressively below and enforce our own MAX_RESPONSE_BODY limit
+    // on `response_data`.
+    tls_conn.set_buffer_limit(None);
+
+    'outer: loop {
         match ocall::net_recv(fd, &mut net_buf) {
             Ok(0) => break,
             Ok(n) => {
                 // A single net_recv may contain multiple TLS records.
-                // Use a cursor to feed them all to rustls.
+                // Feed them all to rustls, draining plaintext after
+                // each decryption pass.
                 let mut cursor = std::io::Cursor::new(&net_buf[..n]);
                 while (cursor.position() as usize) < n {
                     match tls_conn.read_tls(&mut cursor) {
@@ -384,30 +394,31 @@ fn https_request_inner(
                         Ok(_) => {
                             tls_conn.process_new_packets()
                                 .map_err(|e| format!("TLS error: {:?}", e))?;
+
+                            // Drain plaintext NOW (inside the cursor
+                            // loop) so the rustls deframer / decrypter
+                            // buffers stay near-empty across the
+                            // remaining records in this chunk.
+                            loop {
+                                match tls_conn.reader().read(&mut app_buf) {
+                                    Ok(0) => break,
+                                    Ok(m) => {
+                                        response_data.extend_from_slice(&app_buf[..m]);
+                                        if response_data.len() > MAX_RESPONSE_BODY + 16384 {
+                                            body_limit_hit = true;
+                                            break;
+                                        }
+                                    }
+                                    Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                                    Err(_) => break,
+                                }
+                            }
+                            if body_limit_hit {
+                                break 'outer;
+                            }
                         }
                         Err(e) => return Err(format!("read_tls error: {:?}", e)),
                     }
-                }
-
-                // Drain ALL available application data. A single
-                // process_new_packets() call can produce multiple
-                // plaintext chunks.
-                loop {
-                    match tls_conn.reader().read(&mut app_buf) {
-                        Ok(0) => break,
-                        Ok(m) => {
-                            response_data.extend_from_slice(&app_buf[..m]);
-                            if response_data.len() > MAX_RESPONSE_BODY + 16384 {
-                                body_limit_hit = true;
-                                break;
-                            }
-                        }
-                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
-                        Err(_) => break,
-                    }
-                }
-                if body_limit_hit {
-                    break;
                 }
             }
             Err(_) => break,
