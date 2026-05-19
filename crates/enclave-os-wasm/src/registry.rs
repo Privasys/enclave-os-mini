@@ -47,11 +47,29 @@ use std::vec::Vec;
 use ring::digest;
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Serialize, Deserialize};
+use wasmtime::Store;
 use wasmtime::component::{Component, Func, Val};
 
 use crate::engine::WasmEngine;
+use crate::wasi::AppContext;
 use enclave_os_common::types::AEAD_KEY_SIZE;
 use crate::protocol::{AppPermissions, ExportedFunc, FunctionPermission, FunctionPolicy, WasmParam, WasmResult, WasmValue};
+
+/// Owned per-invocation state produced by
+/// [`AppRegistry::prepare_call()`]. Holds everything needed to run
+/// the wasm function **without** the registry mutex held — this is
+/// critical because wasm host functions (e.g.
+/// `attestation.set-config-complete`) re-enter the registry to
+/// mutate freeze-gate / extension state; holding the registry mutex
+/// across `func.call()` would deadlock the single-threaded enclave
+/// dispatcher.
+pub struct CallPrep {
+    pub store: Store<AppContext>,
+    pub func: Func,
+    pub val_params: Vec<Val>,
+    pub result_count: usize,
+    pub fuel_before: i64,
+}
 
 /// Maximum number of compiled WASM components kept in memory.
 ///
@@ -674,53 +692,61 @@ impl AppRegistry {
         self.known.get(name)
     }
 
-    /// Call an exported function on a loaded app.
+    /// Prepare to call an exported function on a loaded app.
     ///
     /// The app **must** already be in the `loaded` map (call
     /// [`ensure_loaded()`](Self::ensure_loaded) first).  Touches the
     /// LRU counter so the app is less likely to be evicted.
     ///
-    /// Returns the [`WasmResult`] and the fuel consumed (0 on error
-    /// before execution starts).
-    pub fn call(
+    /// Returns a [`CallPrep`] containing an instantiated [`Store`]
+    /// and resolved [`Func`] ready for invocation. The caller MUST
+    /// drop the registry mutex before invoking `prep.func.call(...)` —
+    /// wasm host functions registered in [`enclave_sdk`] re-acquire
+    /// the registry lock to mutate freeze / extension state, so
+    /// holding the lock across wasm execution would deadlock the
+    /// enclave's single-threaded dispatcher.
+    ///
+    /// Returns `Err(WasmResult::Error)` if the app or function is
+    /// missing or instantiation fails.
+    pub fn prepare_call(
         &mut self,
         app_name: &str,
         function: &str,
         params: &[WasmParam],
         caller_id: Option<String>,
         caller_roles: Vec<String>,
-    ) -> (WasmResult, i64) {
+    ) -> Result<CallPrep, WasmResult> {
         self.touch(app_name);
 
         // ── Look up app ────────────────────────────────────────────
         let app = match self.loaded.get(app_name) {
             Some(a) => a,
             None => {
-                return (WasmResult::Error {
+                return Err(WasmResult::Error {
                     message: format!("app '{}' is not loaded", app_name),
-                }, 0);
+                });
             }
         };
 
         // ── Verify function exists ─────────────────────────────────
         if !app.exports.contains_key(function) {
-            return (WasmResult::Error {
+            return Err(WasmResult::Error {
                 message: format!(
                     "app '{}' has no export '{}'. Available: [{}]",
                     app_name,
                     function,
                     app.exports.keys().cloned().collect::<Vec<_>>().join(", "),
                 ),
-            }, 0);
+            });
         }
 
         // ── Instantiate ────────────────────────────────────────────
         let (mut store, instance) = match self.engine.instantiate(app_name, app.encryption_key, app.max_fuel, &app.component) {
             Ok(pair) => pair,
             Err(e) => {
-                return (WasmResult::Error {
+                return Err(WasmResult::Error {
                     message: format!("instantiation failed: {}", e),
-                }, 0);
+                });
             }
         };
 
@@ -745,12 +771,12 @@ impl AppRegistry {
             let iface_idx = match app.component.get_export_index(None, iface_name) {
                 Some(idx) => idx,
                 None => {
-                    return (WasmResult::Error {
+                    return Err(WasmResult::Error {
                         message: format!(
                             "interface '{}' not found in app '{}'",
                             iface_name, app_name,
                         ),
-                    }, 0);
+                    });
                 }
             };
             match instance.get_func(&mut store, &iface_idx) {
@@ -764,21 +790,21 @@ impl AppRegistry {
                         Some(func_idx) => match instance.get_func(&mut store, &func_idx) {
                             Some(f) => f,
                             None => {
-                                return (WasmResult::Error {
+                                return Err(WasmResult::Error {
                                     message: format!(
                                         "function '{}' not found in interface '{}' of app '{}'",
                                         func_name, iface_name, app_name,
                                     ),
-                                }, 0);
+                                });
                             }
                         },
                         None => {
-                            return (WasmResult::Error {
+                            return Err(WasmResult::Error {
                                 message: format!(
                                     "function '{}' not found in interface '{}' of app '{}'",
                                     func_name, iface_name, app_name,
                                 ),
-                            }, 0);
+                            });
                         }
                     }
                 }
@@ -791,21 +817,21 @@ impl AppRegistry {
                         Some(func_idx) => match instance.get_func(&mut store, &func_idx) {
                             Some(f) => f,
                             None => {
-                                return (WasmResult::Error {
+                                return Err(WasmResult::Error {
                                     message: format!(
                                         "function '{}' not callable in interface '{}' of app '{}'",
                                         func_name, iface_name, app_name,
                                     ),
-                                }, 0);
+                                });
                             }
                         },
                         None => {
-                            return (WasmResult::Error {
+                            return Err(WasmResult::Error {
                                 message: format!(
                                     "function '{}' not found in interface '{}' of app '{}'",
                                     func_name, iface_name, app_name,
                                 ),
-                            }, 0);
+                            });
                         }
                     }
                 }
@@ -815,12 +841,12 @@ impl AppRegistry {
             match instance.get_func(&mut store, function) {
                 Some(f) => f,
                 None => {
-                    return (WasmResult::Error {
+                    return Err(WasmResult::Error {
                         message: format!(
                             "function '{}' not found at root of app '{}'",
                             function, app_name,
                         ),
-                    }, 0);
+                    });
                 }
             }
         };
@@ -828,46 +854,24 @@ impl AppRegistry {
         // ── Marshal parameters ─────────────────────────────────────
         let val_params: Vec<Val> = params.iter().map(param_to_val).collect();
 
-        // ── Allocate result slots ──────────────────────────────────
-        // We need to know how many results to expect.  For dynamic
-        // dispatch (Func, not TypedFunc) we query the function type.
+        // ── Determine expected result count ────────────────────────
+        // For dynamic dispatch (Func, not TypedFunc) we look up the
+        // declared result count from the exports map.
         let result_count = app
             .exports
             .get(function)
             .map(|&(_, r)| r)
             .unwrap_or(0);
-        let mut results = vec![Val::Bool(false); result_count];
 
-        //  Call 
-        let call_err = func.call(&mut store, &val_params, &mut results).err();
-
-        // Post-return cleanup — no longer needed per wasmtime deprecation.
-        // func.post_return is a no-op since wasmtime removed post-return requirements.
-        let post_err: Option<wasmtime::Error> = None;
-
-        // Flush any remaining partial lines from the guest's stdout/stderr.
-        store.data_mut().flush_logs();
-
-        // Calculate fuel consumed.
-        let fuel_after = store.get_fuel().unwrap_or(0) as i64;
-        let fuel_consumed = fuel_before - fuel_after;
-
-        //  Check deferred errors 
-        if let Some(e) = call_err {
-            return (WasmResult::Error {
-                message: format!("call failed: {}", e),
-            }, fuel_consumed);
-        }
-        if let Some(e) = post_err {
-            return (WasmResult::Error {
-                message: format!("post_return failed: {}", e),
-            }, fuel_consumed);
-        }
-
-        //  Marshal results 
-        let returns: Vec<WasmValue> = results.iter().map(val_to_wasm_value).collect();
-
-        (WasmResult::Ok { returns }, fuel_consumed)
+        // Hand off to the caller; wasm execution must happen with the
+        // registry mutex released so host functions can re-enter.
+        Ok(CallPrep {
+            store,
+            func,
+            val_params,
+            result_count,
+            fuel_before,
+        })
     }
 
     // ── LRU helpers ────────────────────────────────────────────────
@@ -939,7 +943,7 @@ fn param_to_val(p: &WasmParam) -> Val {
 }
 
 /// Convert a wasmtime [`Val`] to a [`WasmValue`].
-fn val_to_wasm_value(v: &Val) -> WasmValue {
+pub(crate) fn val_to_wasm_value(v: &Val) -> WasmValue {
     match v {
         Val::Bool(b) => WasmValue::Bool(*b),
         Val::S8(n) => WasmValue::S32(*n as i32),

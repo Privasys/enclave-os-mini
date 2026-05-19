@@ -349,7 +349,13 @@ impl WasmModule {
             }
         }
 
-        let (result, fuel_consumed) = {
+        // Prepare under lock, but release the lock before invoking
+        // the wasm function. Wasm host bindings (e.g.
+        // `attestation.set-config-complete`) re-enter `WasmModule`
+        // methods that re-acquire `self.registry` — holding the
+        // registry mutex across `func.call(...)` would deadlock the
+        // single-threaded enclave dispatcher permanently.
+        let prep = {
             let mut registry = match self.registry.lock() {
                 Ok(r) => r,
                 Err(_) => {
@@ -360,7 +366,35 @@ impl WasmModule {
             };
             let caller_id = auth.as_ref().and_then(|a| a.user_id.clone());
             let caller_roles = auth.map(|a| a.roles).unwrap_or_default();
-            registry.call(&call.app, &call.function, &call.params, caller_id, caller_roles)
+            registry.prepare_call(&call.app, &call.function, &call.params, caller_id, caller_roles)
+        };
+
+        let mut prep = match prep {
+            Ok(p) => p,
+            Err(err) => {
+                // Preparation failed before any wasm executed; no fuel
+                // consumed and no error metric beyond the existing
+                // "error" path below.
+                if let Ok(mut m) = self.metrics.lock() {
+                    m.record_error(&call.app, &call.function);
+                }
+                return err;
+            }
+        };
+
+        // Execute the wasm function WITHOUT the registry mutex held.
+        let mut results = vec![wasmtime::component::Val::Bool(false); prep.result_count];
+        let call_err = prep.func.call(&mut prep.store, &prep.val_params, &mut results).err();
+        prep.store.data_mut().flush_logs();
+        let fuel_after = prep.store.get_fuel().unwrap_or(0) as i64;
+        let fuel_consumed = prep.fuel_before - fuel_after;
+
+        let result = if let Some(e) = call_err {
+            WasmResult::Error { message: format!("call failed: {}", e) }
+        } else {
+            let returns: Vec<protocol::WasmValue> =
+                results.iter().map(crate::registry::val_to_wasm_value).collect();
+            WasmResult::Ok { returns }
         };
 
         // Record fuel metrics.
