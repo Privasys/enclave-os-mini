@@ -462,10 +462,19 @@ impl WasmModule {
         // Owner → restricted to the per-app owners team (the
         // platform-OIDC `sub` claims that the management service
         // shipped on `wasm_load.owners`). Used by the @config-api
-        // freeze-gate entrypoint so that only the developer who owns
-        // the app can initialise it. The platform `manager` role is
-        // NOT a substitute: managers can deploy any app, but an app's
-        // configure entrypoint is private to its owners team.
+        // freeze-gate entrypoint so that only a developer on the
+        // owners team can initialise it. The platform `manager` role
+        // is NOT a substitute: managers can deploy any app, but an
+        // app's configure entrypoint is private to its owners team.
+        //
+        // The caller's identity is taken from the wasm_call's
+        // `app_auth` bearer (the end-user's OIDC token, forwarded by
+        // the management service), *not* from the RA-TLS Authorization
+        // header — that header carries the management service's own
+        // service-account token (used to authenticate to the enclave
+        // for `wasm_load` etc.) and would otherwise cause every
+        // legitimate owner-only call to fail with "not on the owners
+        // team" because the SA's `sub` is the platform itself.
         if *policy == FunctionPolicy::Owner {
             // Find the owners list from the registry.
             let owners: Vec<String> = {
@@ -485,28 +494,51 @@ impl WasmModule {
                 };
                 return Err(Response::Data(serialize_or_error(&err)));
             }
-            let claims = match ctx.oidc_claims.as_ref() {
-                Some(c) => c,
+            let token_str = match call.app_auth.as_deref() {
+                Some(t) => t,
                 None => {
                     let err = WasmResult::Error {
                         message: format!(
-                            "owner-only: function '{}' on app '{}' requires platform OIDC authentication",
+                            "owner-only: function '{}' on app '{}' requires the caller's platform OIDC bearer in app_auth",
                             call.function, call.app,
                         ),
                     };
                     return Err(Response::Data(serialize_or_error(&err)));
                 }
             };
-            if !owners.iter().any(|s| s == &claims.sub) {
+            let auth = match verify_auth_token(token_str, &permissions, role_store.as_ref()) {
+                Ok(a) => a,
+                Err(e) => {
+                    let err = WasmResult::Error {
+                        message: format!("owner-only: app_auth verification failed: {e}"),
+                    };
+                    return Err(Response::Data(serialize_or_error(&err)));
+                }
+            };
+            let caller_sub = match auth.user_id.as_deref() {
+                Some(s) => s,
+                None => {
+                    let err = WasmResult::Error {
+                        message: format!(
+                            "owner-only: app_auth on '{}' did not yield a caller identity (need OIDC JWT with 'sub')",
+                            call.app,
+                        ),
+                    };
+                    return Err(Response::Data(serialize_or_error(&err)));
+                }
+            };
+            if !owners.iter().any(|s| s == caller_sub) {
                 let err = WasmResult::Error {
                     message: format!(
-                        "owner-only: caller is not on the owners team for app '{}'",
-                        call.app,
+                        "owner-only: caller '{}' is not on the owners team for app '{}' (team has {} member(s))",
+                        caller_sub, call.app, owners.len(),
                     ),
                 };
                 return Err(Response::Data(serialize_or_error(&err)));
             }
-            return Ok(None);
+            // Surface the caller's identity to the wasm app so it can
+            // log who configured it.
+            return Ok(Some(auth));
         }
 
         // The app-level bearer token is in the wasm_call's `app_auth` field.
