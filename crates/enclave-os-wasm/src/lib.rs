@@ -832,15 +832,16 @@ impl WasmModule {
         // Look up the function schema from the known map.
         let registry = self.registry.lock()
             .map_err(|_| String::from("registry lock poisoned"))?;
-        let meta = registry.get_known(&call.app)
-            .ok_or_else(|| format!("app '{}' is not loaded", call.app))?;
+        let resolved_app = registry.resolve_app(&call.app)?;
+        let meta = registry.get_known(&resolved_app)
+            .ok_or_else(|| format!("app '{}' is not loaded", resolved_app))?;
         let schema = meta.schema.as_ref()
-            .ok_or_else(|| format!("app '{}' has no schema — try reloading it", call.app))?;
+            .ok_or_else(|| format!("app '{}' has no schema — try reloading it", resolved_app))?;
         let func = schema.find_function(&call.function)
             .ok_or_else(|| format!(
                 "function '{}' not found in app '{}'. Available: [{}]",
                 call.function,
-                call.app,
+                resolved_app,
                 schema.functions.iter().map(|f| f.name.as_str())
                     .chain(schema.interfaces.iter().flat_map(|i| {
                         i.functions.iter().map(move |f| f.name.as_str())
@@ -860,7 +861,7 @@ impl WasmModule {
         }
 
         Ok(WasmCall {
-            app: call.app.clone(),
+            app: resolved_app,
             function: call.function.clone(),
             params,
             app_auth: call.app_auth.clone(),
@@ -1297,9 +1298,30 @@ impl EnclaveModule for WasmModule {
 
         // 6. mcp_tools — MCP tool manifest for a single app
         if let Some(ref mcp_req) = envelope.mcp_tools {
+            // Resolve empty `app` to the single loaded app (used by the
+            // HTTP MCP route `/api/v1/mcp/tools` which doesn't carry an app).
+            let resolved_app = {
+                let registry = match self.registry.lock() {
+                    Ok(r) => r,
+                    Err(_) => {
+                        let mgmt_result = WasmManagementResult::Error {
+                            message: String::from("registry lock poisoned"),
+                        };
+                        return Some(Response::Data(serialize_or_error(&mgmt_result)));
+                    }
+                };
+                match registry.resolve_app(&mcp_req.app) {
+                    Ok(name) => name,
+                    Err(msg) => {
+                        let mgmt_result = WasmManagementResult::Error { message: msg };
+                        return Some(Response::Data(serialize_or_error(&mgmt_result)));
+                    }
+                }
+            };
+
             // Reuse schema access control (same permissions model).
             let schema_req = WasmSchemaRequest {
-                app: mcp_req.app.clone(),
+                app: resolved_app.clone(),
                 app_auth: mcp_req.app_auth.clone(),
             };
             if let Some(err_response) = self.check_schema_permissions(&schema_req) {
@@ -1315,7 +1337,7 @@ impl EnclaveModule for WasmModule {
                     return Some(Response::Data(serialize_or_error(&mgmt_result)));
                 }
             };
-            let mgmt_result = match registry.get_known(&mcp_req.app) {
+            let mgmt_result = match registry.get_known(&resolved_app) {
                 Some(meta) => match &meta.schema {
                     Some(s) if s.mcp_enabled => {
                         WasmManagementResult::McpTools {
@@ -1325,17 +1347,17 @@ impl EnclaveModule for WasmModule {
                     Some(_) => WasmManagementResult::Error {
                         message: format!(
                             "MCP is disabled for app '{}'",
-                            mcp_req.app,
+                            resolved_app,
                         ),
                     },
                     None => WasmManagementResult::Error {
                         message: format!(
                             "app '{}' has no schema — try reloading it",
-                            mcp_req.app,
+                            resolved_app,
                         ),
                     },
                 },
-                None => WasmManagementResult::NotFound { name: mcp_req.app.clone() },
+                None => WasmManagementResult::NotFound { name: resolved_app.clone() },
             };
             return Some(Response::Data(serialize_or_error(&mgmt_result)));
         }

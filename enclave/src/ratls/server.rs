@@ -775,6 +775,20 @@ fn handle_http_request(
             handle_rpc_request(method, path, http_req, base_ctx)
         }
 
+        // ── MCP-server HTTP shim ────────────────────────────────────
+        // GET  /api/v1/mcp/tools           — list MCP tool manifest (single loaded app).
+        // POST /api/v1/mcp/tools/<fn>      — invoke an MCP tool by name.
+        //
+        // Mirrors the public MCP-over-HTTP transport expected by
+        // confidential-ai's `privasys_http` tool catalog. App is implicit:
+        // the single loaded WASM app on this enclave.
+        (method, path)
+            if path == "/api/v1/mcp/tools"
+                || path.starts_with("/api/v1/mcp/tools/") =>
+        {
+            handle_mcp_tools_request(method, path, http_req, base_ctx)
+        }
+
         // ── FIDO2 endpoints ─────────────────────────────────────────
         // These routes wrap the body into the FIDO2 module's protocol
         // format and dispatch through the standard module pipeline.
@@ -1294,6 +1308,248 @@ fn handle_rpc_request(
     let body = serde_json::to_vec(&envelope).unwrap_or_default();
     let req = Request::Data(body);
     dispatch_and_respond(req, &ctx)
+}
+
+// ---------------------------------------------------------------------------
+//  MCP-over-HTTP shim
+// ---------------------------------------------------------------------------
+
+/// Handle `GET /api/v1/mcp/tools` and `POST /api/v1/mcp/tools/<function>`.
+///
+/// Adapts the public MCP-over-HTTP transport (expected by external clients
+/// such as confidential-ai's `privasys_http` catalog) onto the existing
+/// WasmEnvelope dispatch pipeline:
+///
+/// - `GET /api/v1/mcp/tools`      → `mcp_tools` envelope (single-app enclave).
+/// - `POST /api/v1/mcp/tools/<fn>` → `connect_call` envelope with named params.
+///
+/// The single loaded app is resolved inside the WASM module so callers don't
+/// need to know the app name. The MCP-spec `inputSchema` field is rewritten
+/// to snake-case `input_schema` to match the public MCP HTTP contract.
+fn handle_mcp_tools_request(
+    method: &enclave_os_common::protocol::HttpMethod,
+    path: &str,
+    http_req: &enclave_os_common::protocol::HttpRequest,
+    base_ctx: &enclave_os_common::modules::RequestContext,
+) -> HttpHandleResult {
+    use enclave_os_common::protocol::{HttpMethod, Request};
+
+    // Build OIDC claims from auth header (same pattern as /data and /rpc/).
+    let oidc_claims = if crate::oidc_config().is_some() {
+        match verify_auth_header(http_req) {
+            Some(claims) => Some(claims),
+            None if http_req.authorization.is_some() => {
+                return HttpHandleResult::err(401, "invalid or expired token");
+            }
+            None => None,
+        }
+    } else {
+        None
+    };
+
+    let ctx = enclave_os_common::modules::RequestContext {
+        peer_cert_der: base_ctx.peer_cert_der.clone(),
+        client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
+        oidc_claims,
+    };
+
+    const PREFIX: &str = "/api/v1/mcp/tools";
+    let rest = &path[PREFIX.len()..];
+
+    // GET /api/v1/mcp/tools → list manifest.
+    if rest.is_empty() || rest == "/" {
+        if *method != HttpMethod::Get {
+            return HttpHandleResult::err(405, "GET required for /api/v1/mcp/tools");
+        }
+        let envelope = serde_json::json!({
+            "mcp_tools": {
+                "app": "",
+                "app_auth": http_req.app_auth,
+            }
+        });
+        let body = serde_json::to_vec(&envelope).unwrap_or_default();
+        let result = dispatch_and_respond(Request::Data(body), &ctx);
+        return transform_mcp_tools_response(result);
+    }
+
+    // POST /api/v1/mcp/tools/<fn> → call.
+    if !rest.starts_with('/') {
+        return HttpHandleResult::err(404, "not found");
+    }
+    let fn_name = &rest[1..];
+    if fn_name.is_empty() || fn_name.contains('/') {
+        return HttpHandleResult::err(400, "expected /api/v1/mcp/tools/<function>");
+    }
+    if *method != HttpMethod::Post {
+        return HttpHandleResult::err(
+            405,
+            "POST required for /api/v1/mcp/tools/<function>",
+        );
+    }
+
+    let body_value: serde_json::Value = if http_req.body.is_empty() {
+        serde_json::Value::Object(serde_json::Map::new())
+    } else {
+        match serde_json::from_slice(&http_req.body) {
+            Ok(v) => v,
+            Err(e) => {
+                return HttpHandleResult::err(
+                    400,
+                    &format!("invalid JSON body: {e}"),
+                );
+            }
+        }
+    };
+
+    // Allow an inline `app_auth` field on the body just like /rpc/.
+    let (params_body, app_auth) = match body_value {
+        serde_json::Value::Object(mut map) => {
+            let auth = map
+                .remove("app_auth")
+                .and_then(|v| v.as_str().map(|s| s.to_string()))
+                .or_else(|| http_req.app_auth.clone());
+            (serde_json::Value::Object(map), auth)
+        }
+        other => (other, http_req.app_auth.clone()),
+    };
+
+    let envelope = serde_json::json!({
+        "connect_call": {
+            "app": "",
+            "function": fn_name,
+            "body": params_body,
+            "app_auth": app_auth,
+        }
+    });
+    let body = serde_json::to_vec(&envelope).unwrap_or_default();
+    let result = dispatch_and_respond(Request::Data(body), &ctx);
+    transform_mcp_call_response(result)
+}
+
+/// Reshape a `WasmManagementResult::McpTools` JSON envelope into the
+/// public MCP HTTP transport contract used by confidential-ai:
+///
+/// ```json
+/// {"tools": [{"name": "...", "description": "...", "input_schema": {...}}]}
+/// ```
+///
+/// On error or non-OK statuses, returns a 400 with `{"error": "<msg>"}`.
+fn transform_mcp_tools_response(result: HttpHandleResult) -> HttpHandleResult {
+    if result.status != 200 {
+        return result;
+    }
+    let parsed: serde_json::Value = match serde_json::from_slice(&result.body) {
+        Ok(v) => v,
+        Err(_) => return result,
+    };
+    match parsed.get("status").and_then(|s| s.as_str()) {
+        Some("mcp_tools") => {
+            let tools = parsed
+                .get("manifest")
+                .and_then(|m| m.get("tools"))
+                .and_then(|t| t.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let transformed: Vec<serde_json::Value> = tools
+                .into_iter()
+                .map(|t| {
+                    let mut obj = serde_json::Map::new();
+                    if let Some(name) = t.get("name") {
+                        obj.insert("name".to_string(), name.clone());
+                    }
+                    if let Some(desc) = t.get("description") {
+                        if !desc.is_null() {
+                            obj.insert("description".to_string(), desc.clone());
+                        }
+                    }
+                    // McpTool serialises `input_schema` as `inputSchema`
+                    // (MCP-spec). Rewrite to snake-case for the HTTP contract.
+                    if let Some(schema) = t
+                        .get("inputSchema")
+                        .or_else(|| t.get("input_schema"))
+                    {
+                        obj.insert("input_schema".to_string(), schema.clone());
+                    }
+                    serde_json::Value::Object(obj)
+                })
+                .collect();
+            let out = serde_json::json!({ "tools": transformed });
+            HttpHandleResult::ok(serde_json::to_vec(&out).unwrap_or_default())
+        }
+        Some("error") | Some("not_found") => {
+            let msg = parsed
+                .get("message")
+                .and_then(|s| s.as_str())
+                .or_else(|| parsed.get("name").and_then(|s| s.as_str()))
+                .unwrap_or("error");
+            HttpHandleResult {
+                status: 400,
+                body: serde_json::to_vec(&serde_json::json!({"error": msg}))
+                    .unwrap_or_default(),
+                shutdown: false,
+                content_type: None,
+            }
+        }
+        _ => result,
+    }
+}
+
+/// Reshape a `WasmResult` JSON envelope into the bare return value(s)
+/// expected by the MCP HTTP transport.
+///
+/// - `{"status":"ok","returns":[{"type":"...","value": V}]}` → `V`.
+/// - Empty returns → `{}`.
+/// - Multiple returns → array of `value` fields.
+/// - `{"status":"error","message": M}` → 400 with `{"error": M}`.
+fn transform_mcp_call_response(result: HttpHandleResult) -> HttpHandleResult {
+    if result.status != 200 {
+        return result;
+    }
+    let parsed: serde_json::Value = match serde_json::from_slice(&result.body) {
+        Ok(v) => v,
+        Err(_) => return result,
+    };
+    match parsed.get("status").and_then(|s| s.as_str()) {
+        Some("ok") => {
+            let returns = parsed
+                .get("returns")
+                .and_then(|r| r.as_array())
+                .cloned()
+                .unwrap_or_default();
+            let value = match returns.len() {
+                0 => serde_json::json!({}),
+                1 => returns[0]
+                    .get("value")
+                    .cloned()
+                    .unwrap_or(serde_json::Value::Null),
+                _ => serde_json::Value::Array(
+                    returns
+                        .into_iter()
+                        .map(|r| {
+                            r.get("value")
+                                .cloned()
+                                .unwrap_or(serde_json::Value::Null)
+                        })
+                        .collect(),
+                ),
+            };
+            HttpHandleResult::ok(serde_json::to_vec(&value).unwrap_or_default())
+        }
+        Some("error") => {
+            let msg = parsed
+                .get("message")
+                .and_then(|s| s.as_str())
+                .unwrap_or("error");
+            HttpHandleResult {
+                status: 400,
+                body: serde_json::to_vec(&serde_json::json!({"error": msg}))
+                    .unwrap_or_default(),
+                shutdown: false,
+                content_type: None,
+            }
+        }
+        _ => result,
+    }
 }
 
 /// Dispatch a `Request::Data` to modules and convert to `HttpHandleResult`.

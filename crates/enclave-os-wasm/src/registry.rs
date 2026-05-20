@@ -682,6 +682,32 @@ impl AppRegistry {
         self.known.contains_key(name)
     }
 
+    /// Resolve an app reference, defaulting to the single known app when
+    /// `supplied` is empty.
+    ///
+    /// - `supplied` non-empty → returned as-is.
+    /// - `supplied` empty and exactly one app is known → that app's name.
+    /// - `supplied` empty and zero or more-than-one apps → `Err`.
+    ///
+    /// Used by the MCP HTTP routes so a generic `/api/v1/mcp/tools` URL
+    /// can target a single-app enclave without naming the app explicitly.
+    pub fn resolve_app(&self, supplied: &str) -> Result<String, String> {
+        if !supplied.is_empty() {
+            return Ok(supplied.to_string());
+        }
+        let names: Vec<&String> = self.known.keys().collect();
+        match names.len() {
+            0 => Err(String::from(
+                "no apps loaded; cannot resolve default app",
+            )),
+            1 => Ok(names[0].clone()),
+            _ => Err(format!(
+                "multiple apps loaded ({:?}); specify 'app' explicitly",
+                names
+            )),
+        }
+    }
+
     /// Whether an app is currently compiled in memory.
     pub fn is_loaded(&self, name: &str) -> bool {
         self.loaded.contains_key(name)
