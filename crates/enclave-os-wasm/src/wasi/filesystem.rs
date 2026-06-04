@@ -543,11 +543,17 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
             if let Some((kv_key, buf_data)) = sync_data {
                 match store.data().sealed_kv.put(kv_key.as_bytes(), &buf_data) {
                     Ok(()) => {
+                        // Bill the persisted write here: an explicit
+                        // sync-data flushes and clears `dirty`, so the
+                        // descriptor-drop write path will not re-account it.
+                        let blen = buf_data.len() as i64;
                         if let Some(FsDescriptor::File { dirty, .. }) =
                             store.data_mut().fs_descriptors.get_mut(&rep)
                         {
                             *dirty = false;
                         }
+                        store.data_mut().usage.ledger_write_calls += 1;
+                        store.data_mut().usage.ledger_write_bytes += blen;
                     }
                     Err(_) => {
                         results[0] = fs_error("io"); // io
@@ -580,11 +586,17 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
             if let Some((kv_key, buf_data)) = sync_data {
                 match store.data().sealed_kv.put(kv_key.as_bytes(), &buf_data) {
                     Ok(()) => {
+                        // Bill the persisted write here: an explicit sync
+                        // flushes and clears `dirty`, so the descriptor-drop
+                        // write path will not re-account it.
+                        let blen = buf_data.len() as i64;
                         if let Some(FsDescriptor::File { dirty, .. }) =
                             store.data_mut().fs_descriptors.get_mut(&rep)
                         {
                             *dirty = false;
                         }
+                        store.data_mut().usage.ledger_write_calls += 1;
+                        store.data_mut().usage.ledger_write_bytes += blen;
                     }
                     Err(_) => {
                         results[0] = fs_error("io");
