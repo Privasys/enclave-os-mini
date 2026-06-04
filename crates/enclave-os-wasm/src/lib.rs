@@ -316,6 +316,16 @@ impl WasmModule {
         Ok(())
     }
 
+    /// Apply or lift the host-driven billing freeze for `name`.
+    /// `Some(reason)` freezes; `None` unfreezes. Returns `true` when
+    /// the app is known. Called from the `wasm_freeze` control command.
+    pub fn set_billing_frozen(&self, name: &str, reason: Option<String>) -> Result<bool, String> {
+        let mut reg = self.registry
+            .lock()
+            .map_err(|_| String::from("registry lock poisoned"))?;
+        Ok(reg.set_billing_frozen(name, reason))
+    }
+
     /// Dispatch a parsed `WasmCall` to the appropriate app and record metrics.
     ///
     /// If the app is known but not currently compiled in memory, its
@@ -345,6 +355,15 @@ impl WasmModule {
             if registry.is_frozen(&call.app, &call.function) {
                 return WasmResult::Error {
                     message: String::from("app is awaiting initial configuration"),
+                };
+            }
+            // Billing freeze: a host-driven pause (e.g. the account's
+            // credit balance is exhausted) blocks every export until the
+            // management-service lifts it on top-up. Attestation is served
+            // outside this call path, so the chain stays verifiable.
+            if let Some(reason) = registry.billing_freeze_reason(&call.app) {
+                return WasmResult::Error {
+                    message: format!("app frozen: {}", reason),
                 };
             }
         }
@@ -1150,7 +1169,8 @@ impl EnclaveModule for WasmModule {
 
         // ── Platform OIDC role gate (load/unload/list) ──────────────
         let needs_manager = envelope.wasm_load.is_some()
-            || envelope.wasm_unload.is_some();
+            || envelope.wasm_unload.is_some()
+            || envelope.wasm_freeze.is_some();
         let needs_monitoring = envelope.wasm_list.is_some();
 
         if needs_manager {
@@ -1255,6 +1275,25 @@ impl EnclaveModule for WasmModule {
                 WasmManagementResult::Unloaded { name: unload.name }
             } else {
                 WasmManagementResult::NotFound { name: unload.name }
+            };
+            return Some(Response::Data(serialize_or_error(&mgmt_result)));
+        }
+
+        // 3b. wasm_freeze — host-driven billing freeze / unfreeze
+        if let Some(freeze) = envelope.wasm_freeze {
+            let reason = if freeze.frozen {
+                Some(freeze.reason.clone().unwrap_or_else(|| String::from("credits_exhausted")))
+            } else {
+                None
+            };
+            let mgmt_result = match self.set_billing_frozen(&freeze.name, reason.clone()) {
+                Ok(true) => WasmManagementResult::Frozen {
+                    name: freeze.name,
+                    frozen: freeze.frozen,
+                    reason,
+                },
+                Ok(false) => WasmManagementResult::NotFound { name: freeze.name },
+                Err(e) => WasmManagementResult::Error { message: e },
             };
             return Some(Response::Data(serialize_or_error(&mgmt_result)));
         }

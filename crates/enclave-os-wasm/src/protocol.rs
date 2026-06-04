@@ -90,6 +90,38 @@ pub struct WasmEnvelope {
     /// `admin` role.
     #[serde(default)]
     pub app_roles: Option<AppRolesRequest>,
+
+    /// Host-driven billing freeze for a WASM app.
+    ///
+    /// Set by the management-service when an account's credit balance is
+    /// exhausted (and cleared on top-up). Independent of the
+    /// configure-then-freeze gate: a config-complete app can still be
+    /// billing-frozen. Requires the **manager** role.
+    #[serde(default)]
+    pub wasm_freeze: Option<WasmFreeze>,
+}
+
+/// Host-driven billing freeze command.
+///
+/// ```json
+/// { "wasm_freeze": { "name": "my-app", "frozen": true, "reason": "credits_exhausted" } }
+/// ```
+///
+/// `frozen: true` pauses every billable export of the app, returning a clear
+/// runtime error carrying `reason`. `frozen: false` lifts the billing freeze.
+/// Attestation continues to be served while frozen so the chain stays
+/// verifiable. The state is in-memory only; after an enclave restart the
+/// management-service re-evaluates the balance and re-applies the freeze.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WasmFreeze {
+    /// App identifier to freeze or unfreeze.
+    pub name: String,
+    /// `true` to freeze, `false` to unfreeze.
+    pub frozen: bool,
+    /// Machine-readable freeze reason (e.g. `credits_exhausted`,
+    /// `admin_hold`). Ignored when `frozen` is `false`.
+    #[serde(default)]
+    pub reason: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -374,6 +406,18 @@ pub enum WasmManagementResult {
     Roles {
         /// Role management result.
         result: AppRolesResult,
+    },
+    /// Host-driven billing freeze state changed.
+    #[serde(rename = "frozen")]
+    Frozen {
+        /// App the freeze state was applied to.
+        name: String,
+        /// The freeze state now in effect.
+        frozen: bool,
+        /// The reason recorded when freezing (echoed back; `None` when
+        /// unfreezing).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        reason: Option<String>,
     },
 }
 

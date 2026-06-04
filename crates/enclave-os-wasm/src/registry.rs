@@ -294,6 +294,13 @@ pub struct AppRegistry {
     /// only — always reset to `false` on (re)load when `config_api`
     /// is set.
     configured: BTreeMap<String, bool>,
+    /// Per-app host-driven billing freeze (name → reason). Present
+    /// means the app is paused for billing (e.g. `credits_exhausted`)
+    /// and every export returns an error carrying the reason. Set by
+    /// the management-service over the control channel and cleared on
+    /// top-up. In-memory only — the feed re-applies it after a restart.
+    /// Independent of the `configured` config-gate.
+    billing_frozen: BTreeMap<String, String>,
 }
 
 impl AppRegistry {
@@ -307,6 +314,7 @@ impl AppRegistry {
             lru_counter: 0,
             config_api: BTreeMap::new(),
             configured: BTreeMap::new(),
+            billing_frozen: BTreeMap::new(),
         }
     }
 
@@ -566,6 +574,7 @@ impl AppRegistry {
         self.lru.remove(name);
         self.config_api.remove(name);
         self.configured.remove(name);
+        self.billing_frozen.remove(name);
         self.known.remove(name).map(|m| m.hostname)
     }
 
@@ -589,6 +598,34 @@ impl AppRegistry {
         if self.config_api.contains_key(name) {
             self.configured.insert(name.to_string(), true);
         }
+    }
+
+    /// Apply (or lift) the host-driven billing freeze for `name`.
+    ///
+    /// `Some(reason)` freezes the app (recording the reason);
+    /// `None` lifts the freeze. Returns `true` when `name` is a known
+    /// app, `false` otherwise (so the caller can report `not_found`).
+    /// Independent of the configure-then-freeze gate.
+    pub fn set_billing_frozen(&mut self, name: &str, reason: Option<String>) -> bool {
+        if !self.known.contains_key(name) {
+            return false;
+        }
+        match reason {
+            Some(r) => {
+                self.billing_frozen.insert(name.to_string(), r);
+            }
+            None => {
+                self.billing_frozen.remove(name);
+            }
+        }
+        true
+    }
+
+    /// Returns the billing-freeze reason for `name` when the app is
+    /// host-frozen, or `None` when it is billing-runnable. This is
+    /// orthogonal to [`is_frozen`](Self::is_frozen) (the config gate).
+    pub fn billing_freeze_reason(&self, name: &str) -> Option<&str> {
+        self.billing_frozen.get(name).map(|s| s.as_str())
     }
 
     /// Install (or replace) an app-defined attestation extension at
