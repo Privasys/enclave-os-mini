@@ -389,6 +389,10 @@ impl WasmModule {
         let fuel_after = prep.store.get_fuel().unwrap_or(0) as i64;
         let fuel_consumed = prep.fuel_before - fuel_after;
 
+        // Snapshot this call's billable SDK resource usage (crypto / https /
+        // sealed-KV). The AppContext is per-call, so this is the delta.
+        let sdk_usage = prep.store.data().usage.clone();
+
         let result = if let Some(e) = call_err {
             WasmResult::Error { message: format!("call failed: {}", e) }
         } else {
@@ -411,6 +415,8 @@ impl WasmModule {
                     m.record_error(&call.app, &call.function);
                 }
             }
+            // Record billable SDK resource usage (no-op if none used).
+            m.record_sdk_usage(&call.app, &sdk_usage);
         }
 
         result

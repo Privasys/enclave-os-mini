@@ -62,6 +62,9 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
                 if dirty && !buf.is_empty() {
                     let kv_key = format!("{}{}", FS_DOMAIN, key);
                     let _ = store.data().sealed_kv.put(kv_key.as_bytes(), &buf);
+                    let blen = buf.len() as i64;
+                    store.data_mut().usage.ledger_write_calls += 1;
+                    store.data_mut().usage.ledger_write_bytes += blen;
                 }
             } else {
                 store.data_mut().fs_descriptors.remove(&rep);
@@ -232,6 +235,12 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
                     }
                 }
             };
+
+            if !truncate {
+                let blen = buf.len() as i64;
+                store.data_mut().usage.ledger_read_calls += 1;
+                store.data_mut().usage.ledger_read_bytes += blen;
+            }
 
             let new_rep = store.data_mut().alloc_rep();
             store.data_mut().fs_descriptors.insert(

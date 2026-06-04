@@ -156,6 +156,48 @@ pub struct WasmAppMetrics {
     pub fuel_consumed_total: i64,
     /// Number of calls that resulted in an error.
     pub errors_total: i64,
+
+    // ── Billable SDK resource counters (schema v2) ─────────────────
+    /// Sealed-KV read operations.
+    #[serde(default)]
+    pub ledger_read_calls: i64,
+    /// Bytes read from the sealed KV store.
+    #[serde(default)]
+    pub ledger_read_bytes: i64,
+    /// Sealed-KV write operations.
+    #[serde(default)]
+    pub ledger_write_calls: i64,
+    /// Bytes written to the sealed KV store.
+    #[serde(default)]
+    pub ledger_write_bytes: i64,
+    /// Bytes hashed via crypto digest / HMAC.
+    #[serde(default)]
+    pub crypto_digest_bytes: i64,
+    /// Plaintext/ciphertext bytes processed via crypto encrypt / decrypt.
+    #[serde(default)]
+    pub crypto_encdec_bytes: i64,
+    /// Number of crypto sign calls.
+    #[serde(default)]
+    pub crypto_sign_calls: i64,
+    /// Number of crypto verify calls.
+    #[serde(default)]
+    pub crypto_verify_calls: i64,
+    /// Random bytes drawn via crypto get-random-bytes.
+    #[serde(default)]
+    pub crypto_random_bytes: i64,
+    /// Number of plain (non-RA-TLS) HTTPS fetch calls.
+    #[serde(default)]
+    pub https_plain_calls: i64,
+    /// Request+response bytes for plain HTTPS fetch calls.
+    #[serde(default)]
+    pub https_plain_bytes: i64,
+    /// Number of RA-TLS HTTPS fetch calls.
+    #[serde(default)]
+    pub https_ratls_calls: i64,
+    /// Request+response bytes for RA-TLS HTTPS fetch calls.
+    #[serde(default)]
+    pub https_ratls_bytes: i64,
+
     /// Per-function breakdown.
     pub functions: Vec<WasmFunctionMetrics>,
 }

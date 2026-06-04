@@ -177,6 +177,10 @@ impl wit::Host for AppContext {
             wit::Method::Options => "OPTIONS",
         };
 
+        // Capture billable metering inputs before `req` is consumed.
+        let is_ratls = req.ratls.is_some();
+        let req_body_len = req.body.as_deref().map(|b| b.len()).unwrap_or(0) as i64;
+
         let ratls_policy = req.ratls.map(build_ratls_policy).transpose()?;
         let custom_store = build_custom_root_store(req.ca_roots_der)?;
 
@@ -193,6 +197,17 @@ impl wit::Host for AppContext {
             root_store,
             ratls_policy.as_ref(),
         )?;
+
+        // Record billable HTTPS egress (request + response body bytes),
+        // split by transport (plain TLS vs RA-TLS).
+        let total_bytes = req_body_len + r.body.len() as i64;
+        if is_ratls {
+            self.usage.https_ratls_calls += 1;
+            self.usage.https_ratls_bytes += total_bytes;
+        } else {
+            self.usage.https_plain_calls += 1;
+            self.usage.https_plain_bytes += total_bytes;
+        }
 
         Ok(wit::Response {
             status: r.status,

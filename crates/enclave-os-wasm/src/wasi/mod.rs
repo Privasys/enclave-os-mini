@@ -32,6 +32,7 @@ use std::vec::Vec;
 use wasmtime::component::Linker;
 
 use crate::enclave_sdk::KeyStore;
+use crate::metrics::SdkUsage;
 use enclave_os_kvstore::SealedKvStore;
 use enclave_os_common::types::AEAD_KEY_SIZE;
 
@@ -184,6 +185,13 @@ pub struct AppContext {
     /// Authenticated caller's roles (from enclave role store or OIDC claims).
     pub caller_roles: Vec<String>,
 
+    // ── Billable SDK resource usage (this call only) ──────────────
+    /// Accumulates billable Enclave-OS SDK resource usage for the
+    /// current call. Merged into the persistent metrics store by the
+    /// dispatcher after the call returns. Reset per call because a fresh
+    /// `AppContext` is created for every invocation.
+    pub usage: SdkUsage,
+
     // ── Resource tracking ──────────────────────────────────────────
     /// Output-stream rep → kind.
     pub(crate) output_streams: BTreeMap<u32, OutputStreamKind>,
@@ -226,6 +234,7 @@ impl AppContext {
             sealed_kv: SealedKvStore::from_master_key_with_table(master_key, format!("app:{}", app_name).as_bytes()),
             caller_id: None,
             caller_roles: Vec::new(),
+            usage: SdkUsage::default(),
             output_streams: BTreeMap::new(),
             input_streams: BTreeMap::new(),
             tcp_sockets: BTreeMap::new(),

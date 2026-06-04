@@ -43,7 +43,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     //   algorithm: 0=SHA-256, 1=SHA-384, 2=SHA-512
     inst.func_new(
         "digest",
-        |_store: StoreContextMut<'_, AppContext>,
+        |mut store: StoreContextMut<'_, AppContext>,
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
@@ -55,6 +55,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
                 }
             };
             let data = val_to_bytes(&params[1]);
+            store.data_mut().usage.crypto_digest_bytes += data.len() as i64;
 
             let algorithm = match algo {
                 0 => &digest::SHA256,
@@ -77,7 +78,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     //      -> result<list<u8>, string>
     inst.func_new(
         "encrypt",
-        |store: StoreContextMut<'_, AppContext>,
+        |mut store: StoreContextMut<'_, AppContext>,
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
@@ -85,7 +86,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
             let iv = val_to_bytes(&params[1]);
             let aad = val_to_bytes(&params[2]);
             let plaintext = val_to_bytes(&params[3]);
-
+            store.data_mut().usage.crypto_encdec_bytes += plaintext.len() as i64;
             if iv.len() != NONCE_LEN {
                 results[0] = err_result("IV must be 12 bytes");
                 return Ok(());
@@ -130,7 +131,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     //      -> result<list<u8>, string>
     inst.func_new(
         "decrypt",
-        |store: StoreContextMut<'_, AppContext>,
+        |mut store: StoreContextMut<'_, AppContext>,
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
@@ -138,6 +139,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
             let iv = val_to_bytes(&params[1]);
             let aad = val_to_bytes(&params[2]);
             let ciphertext = val_to_bytes(&params[3]);
+            store.data_mut().usage.crypto_encdec_bytes += ciphertext.len() as i64;
 
             if iv.len() != NONCE_LEN {
                 results[0] = err_result("IV must be 12 bytes");
@@ -184,7 +186,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     //   algorithm: 0=ECDSA-P256-SHA256, 1=ECDSA-P384-SHA384
     inst.func_new(
         "sign",
-        |store: StoreContextMut<'_, AppContext>,
+        |mut store: StoreContextMut<'_, AppContext>,
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
@@ -197,6 +199,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
                 }
             };
             let data = val_to_bytes(&params[2]);
+            store.data_mut().usage.crypto_sign_calls += 1;
 
             let signing_algo = match algo {
                 0 => &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
@@ -241,7 +244,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     //      -> result<bool, string>
     inst.func_new(
         "verify",
-        |store: StoreContextMut<'_, AppContext>,
+        |mut store: StoreContextMut<'_, AppContext>,
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
@@ -255,6 +258,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
             };
             let data = val_to_bytes(&params[2]);
             let sig_bytes = val_to_bytes(&params[3]);
+            store.data_mut().usage.crypto_verify_calls += 1;
 
             let (signing_algo, verify_algo): (
                 &signature::EcdsaSigningAlgorithm,
@@ -396,7 +400,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     // func(len: u32) -> result<list<u8>, string>
     inst.func_new(
         "get-random-bytes",
-        |_store: StoreContextMut<'_, AppContext>,
+        |mut store: StoreContextMut<'_, AppContext>,
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
@@ -412,6 +416,7 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
                 results[0] = err_result("maximum 65536 bytes per call");
                 return Ok(());
             }
+            store.data_mut().usage.crypto_random_bytes += len as i64;
 
             let rng = SystemRandom::new();
             let mut buf = vec![0u8; len];
