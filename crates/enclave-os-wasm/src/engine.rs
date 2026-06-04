@@ -74,14 +74,6 @@ impl WasmEngine {
         config.wasm_multi_memory(true);
         config.wasm_simd(true);
 
-        // ── Fuel metering (compute billing) ────────────────────────
-        // Required so `store.set_fuel`/`get_fuel` succeed; without this
-        // they error out and `fuel_consumed` is always 0, leaving
-        // compute unbilled. Each call is funded with the app's
-        // per-call fuel budget (default 10M units) and the consumed
-        // delta is metered for billing.
-        config.consume_fuel(true);
-
         // ── SGX-appropriate limits ─────────────────────────────────
         // SGX Enclave Page Cache (EPC) is limited.  Conservative defaults
         // prevent a single WASM app from exhausting enclave memory.
