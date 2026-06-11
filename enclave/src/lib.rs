@@ -52,6 +52,7 @@ pub mod config_merkle;
 pub mod cpuid_cache;
 pub mod crypto;
 pub mod ecall;
+pub mod encauth;
 pub mod modules;
 pub mod ocall;
 pub mod ratls;

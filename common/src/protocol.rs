@@ -252,6 +252,12 @@ pub struct HttpRequest {
     pub body: Vec<u8>,
     /// Whether the client sent `Connection: close`.
     pub connection_close: bool,
+    /// True when the request arrived via a gateway-terminated TLS leg
+    /// (`X-Privasys-Edge: terminate`, injected by the platform gateway
+    /// after stripping any client-supplied value). Plaintext app
+    /// requests on such a leg must be refused — the gateway must never
+    /// see app data. Splice/RA-TLS traffic never carries the marker.
+    pub edge_terminated: bool,
 }
 
 /// Errors that can occur while parsing an HTTP request.
@@ -302,6 +308,7 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
     let mut privasys_session: Option<String> = None;
     let mut content_type: Option<String> = None;
     let mut connection_close = false;
+    let mut edge_terminated = false;
 
     for h in req.headers.iter() {
         if h.name.eq_ignore_ascii_case("content-length") {
@@ -333,6 +340,10 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
             if let Ok(val) = core::str::from_utf8(h.value) {
                 connection_close = val.eq_ignore_ascii_case("close");
             }
+        } else if h.name.eq_ignore_ascii_case("x-privasys-edge") {
+            if let Ok(val) = core::str::from_utf8(h.value) {
+                edge_terminated = val.trim().eq_ignore_ascii_case("terminate");
+            }
         }
         // All other headers are silently ignored.
     }
@@ -362,6 +373,7 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
             content_type,
             body,
             connection_close,
+            edge_terminated,
         },
         total,
     ))
@@ -382,6 +394,19 @@ pub fn format_http_response_with_type(
     body: &[u8],
     close: bool,
 ) -> Vec<u8> {
+    format_http_response_with_headers(status, content_type, &[], body, close)
+}
+
+/// Format an HTTP/1.1 response with extra response headers (e.g. the
+/// session-relay diagnostic `X-Privasys-EncAuth-Reject`). Header names
+/// and values containing CR/LF are skipped (response-splitting guard).
+pub fn format_http_response_with_headers(
+    status: u16,
+    content_type: &str,
+    extra_headers: &[(String, String)],
+    body: &[u8],
+    close: bool,
+) -> Vec<u8> {
     let reason = match status {
         200 => "OK",
         400 => "Bad Request",
@@ -390,15 +415,27 @@ pub fn format_http_response_with_type(
         404 => "Not Found",
         405 => "Method Not Allowed",
         413 => "Payload Too Large",
+        429 => "Too Many Requests",
         500 => "Internal Server Error",
         _ => "Unknown",
     };
 
     let conn_header = if close { "Connection: close\r\n" } else { "" };
 
+    let mut extras = String::new();
+    for (name, value) in extra_headers {
+        if name.contains(['\r', '\n']) || value.contains(['\r', '\n']) {
+            continue;
+        }
+        extras.push_str(name);
+        extras.push_str(": ");
+        extras.push_str(value);
+        extras.push_str("\r\n");
+    }
+
     let header = format!(
-        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}\r\n",
-        status, reason, content_type, body.len(), conn_header,
+        "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\n{}{}\r\n",
+        status, reason, content_type, body.len(), extras, conn_header,
     );
 
     let mut resp = header.into_bytes();

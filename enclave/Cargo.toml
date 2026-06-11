@@ -58,6 +58,10 @@ enclave-os-common = { path = "../common", features = ["crypto"] }
 #       or you get "two versions of sgx_types" errors. Use `extern crate sgx_types;` in code.
 sgx_tseal  = { git = "https://github.com/Privasys/teaclave-sgx-sdk", tag = "privasys-v0.2.0" }
 sgx_tse    = { git = "https://github.com/Privasys/teaclave-sgx-sdk", tag = "privasys-v0.2.0" }
+# sgx_tcrypto wrapper (Intel IPP): static-identity ECDH
+# (sgx_ecc256_compute_shared_dhkey) for session-relay bootstraps and
+# ECDSA verification (sgx_ecdsa_verify) for EncAuth vouchers.
+sgx_crypto = { git = "https://github.com/Privasys/teaclave-sgx-sdk", tag = "privasys-v0.2.0" }
 
 # Lightweight TLS – rustls is a pure-Rust TLS 1.3 library (Privasys fork with RA-TLS 0xFFBB extension).
 # In SGX we use ring for crypto (it has SGX support via teaclave).

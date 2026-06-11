@@ -22,9 +22,9 @@ use std::sync::Mutex;
 use std::vec::Vec;
 
 use ring::aead::{Aad, LessSafeKey, Nonce, UnboundKey, AES_256_GCM};
-use ring::agreement::{agree_ephemeral, EphemeralPrivateKey, UnparsedPublicKey, ECDH_P256};
 use ring::hmac;
 use ring::rand::SystemRandom;
+use sgx_crypto::ecc::EcKeyPair;
 
 extern crate alloc;
 
@@ -37,8 +37,12 @@ const KEY_INFO: &[u8] = b"privasys-session/v1";
 const C2S_INFO: &[u8] = b"privasys-dir/c2s";
 const S2C_INFO: &[u8] = b"privasys-dir/s2c";
 
-/// Session lifetime in seconds (1 hour).
-const SESSION_TTL_SECS: u64 = 3_600;
+/// Sliding inactivity window in seconds: every successfully
+/// authenticated sealed request extends the session by this much.
+/// Aligned with the IdP's 15-minute access-token cadence; idle sessions
+/// are swept and re-established via EncAuth silent rebind (wallet
+/// ceremony until the mini EncAuth verifier ships).
+const SESSION_TTL_SECS: u64 = 900;
 
 #[derive(Debug)]
 pub enum SessionError {
@@ -86,6 +90,31 @@ struct SessionEntry {
 
 static SESSIONS: Mutex<Option<BTreeMap<String, SessionEntry>>> = Mutex::new(None);
 static LAST_SWEEP: AtomicU64 = AtomicU64::new(0);
+
+/// Long-lived enclave identity key (crypto-contract §8): generated on
+/// first use via `sgx_tcrypto` (Intel IPP) and reused for the ECDH of
+/// every bootstrap for the life of the enclave process. EncAuth
+/// vouchers pin its public half (`enc_pub`); an enclave restart
+/// regenerates it, invalidating outstanding vouchers by design.
+static IDENTITY_KEY: Mutex<Option<EcKeyPair>> = Mutex::new(None);
+
+fn identity_keypair() -> Result<EcKeyPair, SessionError> {
+    let mut guard = IDENTITY_KEY.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(kp) = guard.as_ref() {
+        return Ok(*kp);
+    }
+    let kp = EcKeyPair::create().map_err(|_| SessionError::Crypto)?;
+    *guard = Some(kp);
+    Ok(kp)
+}
+
+/// SEC1 uncompressed (65 B, big-endian) form of the enclave identity
+/// public key. Used by the EncAuth verifier for the `enc_pub`
+/// byte-equality check.
+pub fn identity_pub_sec1() -> Result<[u8; 65], SessionError> {
+    let kp = identity_keypair()?;
+    Ok(crate::encauth::ec256_pubkey_to_sec1(&kp.public_key().public_key()))
+}
 
 fn with_table<R>(f: impl FnOnce(&mut BTreeMap<String, SessionEntry>) -> R) -> R {
     let mut guard = SESSIONS.lock().expect("sessions mutex poisoned");
@@ -136,25 +165,36 @@ pub struct Bootstrap {
     pub expires_at: u64,
 }
 
-/// Generate a fresh server P-256 keypair, derive the session key from
-/// `sdk_pub` (SEC1 uncompressed, 65 bytes), and store it in the table.
+/// Derive a fresh session key from `sdk_pub` (SEC1 uncompressed, 65
+/// bytes) against the enclave's long-lived identity key, and store it
+/// in the table.
 pub fn bootstrap(sdk_pub: &[u8], now: u64) -> Result<Bootstrap, SessionError> {
     if sdk_pub.len() != 65 || sdk_pub[0] != 0x04 {
         return Err(SessionError::InvalidPubKey);
     }
 
     let rng = SystemRandom::new();
-    let priv_key = EphemeralPrivateKey::generate(&ECDH_P256, &rng)
-        .map_err(|_| SessionError::Crypto)?;
-    let pub_key = priv_key.compute_public_key().map_err(|_| SessionError::Crypto)?;
-    let server_pub = pub_key.as_ref().to_vec();
-    if server_pub.len() != 65 {
-        return Err(SessionError::Crypto);
-    }
 
-    let peer = UnparsedPublicKey::new(&ECDH_P256, sdk_pub);
-    let shared = agree_ephemeral(priv_key, &peer, |secret| secret.to_vec())
+    // Static identity ECDH via sgx_tcrypto / IPP
+    // (`sgx_ecc256_compute_shared_dhkey`): the same enclave key serves
+    // every bootstrap so EncAuth vouchers can pin `enc_pub`. IPP
+    // validates the peer point during the computation.
+    let keypair = identity_keypair()?;
+    let peer = crate::encauth::sec1_to_ec256_pubkey(sdk_pub)
+        .ok_or(SessionError::InvalidPubKey)?;
+    let share = keypair
+        .shared_key(&peer)
         .map_err(|_| SessionError::InvalidPubKey)?;
+    // sgx_ec256_dh_shared_t is little-endian; the HKDF IKM is the
+    // big-endian X coordinate (NIST SP 800-56A / RFC 5903), matching
+    // Go crypto/ecdh, WebCrypto deriveBits, and ring.
+    let mut shared = share.shared_key().s.to_vec();
+    shared.reverse();
+
+    let server_pub = crate::encauth::ec256_pubkey_to_sec1(
+        &keypair.public_key().public_key(),
+    )
+    .to_vec();
 
     // Generate 16 random bytes; session_id is the base64url (no-padding)
     // encoding of those bytes. The HKDF salt MUST be the raw 16 bytes,
@@ -452,6 +492,10 @@ pub fn open_request(
             .map_err(|_| SessionError::Crypto)?;
         let pt_vec = pt.to_vec();
         entry.c2s_last_seen = ctr as i64;
+        // Sliding inactivity TTL: an authenticated, non-replayed request
+        // keeps the session alive. Touched only after AEAD open + counter
+        // accept so replays cannot extend a session's life.
+        entry.expires_at = now.saturating_add(SESSION_TTL_SECS);
         Ok(pt_vec)
     })
 }
@@ -574,6 +618,79 @@ pub fn is_known_session(session_id: &str, now: u64) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn hex_to_bytes(hex: &str) -> Vec<u8> {
+        (0..hex.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).unwrap())
+            .collect()
+    }
+
+    // ── Cross-implementation KATs (crypto-contract §9) ──────────────
+    //
+    // Pinned from the Go reference
+    // (enclave-os-virtual/internal/sessionrelay/kats_test.go); also
+    // verified executable against TS/WebCrypto (auth/sdk/scripts/kat.mjs).
+    // Changing any constant is a wire-format break.
+
+    const KAT_SHARED_X_HEX: &str =
+        "c8ea8e6c84d602681a335ae3a8d18d850709405564daf0cf88dbfc5b91fe4603";
+    const KAT_SID_RAW_HEX: &str = "a0a1a2a3a4a5a6a7a8a9aaabacadaeaf";
+    const KAT_AEAD_KEY_HEX: &str =
+        "175873bdd2a8c941c0cb5a4dbcd896a016976103df5c3b695ae8581d431e74b2";
+    const KAT_C2S_PREFIX_HEX: &str = "d7e246d2";
+    const KAT_S2C_PREFIX_HEX: &str = "803a6769";
+    const KAT_REQUEST_PT: &[u8] = br#"{"kat":"privasys-session-relay"}"#;
+    const KAT_RESPONSE_PT: &[u8] = br#"{"ok":true}"#;
+    const KAT_PATH: &str = "/v1/chat/completions";
+    const KAT_REQUEST_ENV_HEX: &str =
+        "a361760163637472006263745830f6868ef8c27ae5260300135329bbbb941825c36ec5b29143df5110e64cc42a98a26521ac449d50153594ffcfd35f7f92";
+    const KAT_RESPONSE_ENV_HEX: &str =
+        "a36176016363747200626374581b27445f008c6ee1a871bff6df237343c1fde2cec805bc23ca31c59c";
+
+    #[test]
+    fn hkdf_kats() {
+        let shared = hex_to_bytes(KAT_SHARED_X_HEX);
+        let sid_raw = hex_to_bytes(KAT_SID_RAW_HEX);
+        let prk = hkdf_extract(&sid_raw, &shared);
+        assert_eq!(hkdf_expand(&prk, KEY_INFO, 32), hex_to_bytes(KAT_AEAD_KEY_HEX));
+        assert_eq!(hkdf_expand(&prk, C2S_INFO, 4), hex_to_bytes(KAT_C2S_PREFIX_HEX));
+        assert_eq!(hkdf_expand(&prk, S2C_INFO, 4), hex_to_bytes(KAT_S2C_PREFIX_HEX));
+    }
+
+    #[test]
+    fn aead_framing_kats() {
+        let key_bytes = hex_to_bytes(KAT_AEAD_KEY_HEX);
+        let sid = b64url_encode(&hex_to_bytes(KAT_SID_RAW_HEX));
+        let ad = format!("POST:{}:{}", KAT_PATH, sid);
+
+        let seal = |prefix_hex: &str, pt: &[u8]| -> Vec<u8> {
+            let unbound = UnboundKey::new(&AES_256_GCM, &key_bytes).unwrap();
+            let key = LessSafeKey::new(unbound);
+            let mut nonce_bytes = [0u8; 12];
+            nonce_bytes[..4].copy_from_slice(&hex_to_bytes(prefix_hex));
+            nonce_bytes[4..].copy_from_slice(&0u64.to_be_bytes());
+            let nonce = Nonce::assume_unique_for_key(nonce_bytes);
+            let mut buf = pt.to_vec();
+            key.seal_in_place_append_tag(nonce, Aad::from(ad.as_bytes()), &mut buf)
+                .unwrap();
+            cbor_encode_envelope(0, &buf)
+        };
+
+        assert_eq!(
+            seal(KAT_C2S_PREFIX_HEX, KAT_REQUEST_PT),
+            hex_to_bytes(KAT_REQUEST_ENV_HEX),
+        );
+        assert_eq!(
+            seal(KAT_S2C_PREFIX_HEX, KAT_RESPONSE_PT),
+            hex_to_bytes(KAT_RESPONSE_ENV_HEX),
+        );
+
+        // And the production decoder must round-trip the Go envelope.
+        let (ctr, ct) = cbor_decode_envelope(&hex_to_bytes(KAT_REQUEST_ENV_HEX)).unwrap();
+        assert_eq!(ctr, 0);
+        assert_eq!(ct.len(), KAT_REQUEST_PT.len() + 16); // + GCM tag
+    }
 
     #[test]
     fn cbor_roundtrip() {

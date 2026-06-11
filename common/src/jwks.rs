@@ -153,6 +153,20 @@ impl JwksCache {
         key_to_verifier(key)
     }
 
+    /// All EC P-256 keys in the set, as SEC1 uncompressed points
+    /// (65 bytes: 04 || x || y). Used by raw-ES256 verifiers (e.g. the
+    /// EncAuth voucher's `idp_sig`, which is not a JWT and carries no
+    /// `kid`) that must try each current signing key.
+    pub fn ec_p256_keys(&self) -> Vec<Vec<u8>> {
+        self.keys
+            .iter()
+            .filter_map(|(_, k)| match k {
+                KeyType::EcP256(raw) => Some(raw.clone()),
+                KeyType::Rsa(_) => None,
+            })
+            .collect()
+    }
+
     /// Number of usable keys in the cache.
     pub fn len(&self) -> usize {
         self.keys.len()
