@@ -302,9 +302,10 @@ impl IngressServer {
                     let send_close = close || result.shutdown;
                     let ct = result.content_type.as_deref()
                         .unwrap_or("application/json");
-                    match session.send_http_response_typed(
+                    match session.send_http_response_with_headers(
                         result.status,
                         ct,
+                        &result.extra_headers,
                         &result.body,
                         send_close,
                     ) {
@@ -662,11 +663,19 @@ struct HttpHandleResult {
     shutdown: bool,
     /// Optional Content-Type override (defaults to `application/json`).
     content_type: Option<String>,
+    /// Extra response headers (e.g. `X-Privasys-EncAuth-Reject`).
+    extra_headers: Vec<(String, String)>,
 }
 
 impl HttpHandleResult {
     fn ok(body: Vec<u8>) -> Self {
-        Self { status: 200, body, shutdown: false, content_type: None }
+        Self {
+            status: 200,
+            body,
+            shutdown: false,
+            content_type: None,
+            extra_headers: Vec::new(),
+        }
     }
     fn err(status: u16, msg: &str) -> Self {
         Self {
@@ -674,10 +683,21 @@ impl HttpHandleResult {
             body: format!("{{\"error\":\"{}\"}}", msg).into_bytes(),
             shutdown: false,
             content_type: None,
+            extra_headers: Vec::new(),
         }
     }
     fn shutdown() -> Self {
-        Self { status: 200, body: b"{}".to_vec(), shutdown: true, content_type: None }
+        Self {
+            status: 200,
+            body: b"{}".to_vec(),
+            shutdown: true,
+            content_type: None,
+            extra_headers: Vec::new(),
+        }
+    }
+    fn with_header(mut self, name: &str, value: &str) -> Self {
+        self.extra_headers.push((name.to_string(), value.to_string()));
+        self
     }
 }
 
@@ -829,6 +849,16 @@ fn handle_http_request_with_session(
         .unwrap_or(false);
 
     if !is_sealed {
+        // No plaintext app traffic through intermediaries: when the
+        // platform gateway terminated the public TLS leg it marks the
+        // request with `X-Privasys-Edge: terminate` (stripping any
+        // client-supplied value first). Refuse plaintext requests on
+        // that leg except for the bootstrap endpoint (JSON by design)
+        // and operational/metadata endpoints. RA-TLS (splice) clients
+        // terminate TLS here and never carry the marker.
+        if http_req.edge_terminated && path_requires_sealed(&http_req.path) {
+            return HttpHandleResult::err(403, "sealed-transport-required");
+        }
         return handle_http_request(http_req, base_ctx);
     }
 
@@ -877,7 +907,23 @@ fn handle_http_request_with_session(
         body: sealed,
         shutdown: inner_result.shutdown,
         content_type: Some(crate::sessionrelay::SEALED_CONTENT_TYPE.to_string()),
+        extra_headers: Vec::new(),
     }
+}
+
+/// Paths that must be sealed when reached via a gateway-terminated leg.
+/// Exempt: the session bootstrap (carries only signed voucher material
+/// and public keys), operational probes, and well-known metadata.
+fn path_requires_sealed(path: &str) -> bool {
+    !matches!(
+        path,
+        "/__privasys/session-bootstrap"
+            | "/healthz"
+            | "/readyz"
+            | "/status"
+            | "/metrics"
+            | "/attestation-servers"
+    ) && !path.starts_with("/.well-known/")
 }
 
 fn http_method_str(m: &enclave_os_common::protocol::HttpMethod) -> &'static str {
@@ -898,15 +944,20 @@ fn wall_seconds_now() -> u64 {
 }
 
 /// `POST /__privasys/session-bootstrap` — returns
-/// `{"session_id":"...","enc_pub":"<base64url>","expires_at":<u64>}`.
+/// `{"session_id":"...","enc_pub":"<base64url>","expires_at":<u64>,
+///   "sub":"..."}` (`sub` only when an EncAuth voucher was accepted).
 ///
-/// Request body: `{"sdk_pub":"<base64url SEC1 uncompressed P-256>"}`.
+/// Request body: `{"sdk_pub":"<base64url SEC1 uncompressed P-256>",
+/// "encauth": { ... }}` (`encauth` optional — silent rebind, crypto-
+/// contract §8).
 fn handle_session_bootstrap(
     http_req: &enclave_os_common::protocol::HttpRequest,
 ) -> HttpHandleResult {
     #[derive(serde::Deserialize)]
     struct Req {
         sdk_pub: String,
+        #[serde(default)]
+        encauth: Option<crate::encauth::EncAuthEnvelope>,
     }
     let req: Req = match serde_json::from_slice(&http_req.body) {
         Ok(v) => v,
@@ -917,17 +968,84 @@ fn handle_session_bootstrap(
         None => return HttpHandleResult::err(400, "invalid sdk_pub base64"),
     };
     let now = wall_seconds_now();
+
+    // Optional silent rebind. On verify failure we fall through to the
+    // legacy anonymous bootstrap with a diagnostic header (mirroring
+    // the Go middleware) so the SDK knows to trigger a wallet ceremony.
+    let mut sub: Option<String> = None;
+    let mut reject: Option<String> = None;
+    if let Some(env) = req.encauth.as_ref() {
+        // Rate-limit voucher-backed attempts per sid BEFORE the
+        // signature checks (failed attempts are the abuse vector; a
+        // forged sid only throttles the forger's own bucket).
+        if let Some(sid) = crate::encauth::encauth_sid(env) {
+            if !crate::encauth::allow_rebind(&sid, now) {
+                return HttpHandleResult::err(429, "encauth rate-limited")
+                    .with_header(crate::encauth::ENCAUTH_REJECT_HEADER, "rate-limited");
+            }
+        }
+        match verify_encauth_request(env, now) {
+            Ok(payload) => sub = Some(payload.sub),
+            Err(e) => reject = Some(e.to_string()),
+        }
+    }
+
     let bs = match crate::sessionrelay::bootstrap(&sdk_pub, now) {
         Ok(b) => b,
         Err(e) => return HttpHandleResult::err(e.http_status(), e.as_str()),
     };
-    let body = format!(
-        "{{\"session_id\":\"{}\",\"enc_pub\":\"{}\",\"expires_at\":{}}}",
-        bs.session_id,
-        crate::sessionrelay::b64url_encode(&bs.enc_pub),
-        bs.expires_at,
-    );
-    HttpHandleResult::ok(body.into_bytes())
+    let body = match &sub {
+        Some(s) => format!(
+            "{{\"session_id\":\"{}\",\"enc_pub\":\"{}\",\"expires_at\":{},\"sub\":{}}}",
+            bs.session_id,
+            crate::sessionrelay::b64url_encode(&bs.enc_pub),
+            bs.expires_at,
+            serde_json::to_string(s).unwrap_or_else(|_| "\"\"".to_string()),
+        ),
+        None => format!(
+            "{{\"session_id\":\"{}\",\"enc_pub\":\"{}\",\"expires_at\":{}}}",
+            bs.session_id,
+            crate::sessionrelay::b64url_encode(&bs.enc_pub),
+            bs.expires_at,
+        ),
+    };
+    let mut result = HttpHandleResult::ok(body.into_bytes());
+    if let Some(reason) = reject {
+        result = result.with_header(crate::encauth::ENCAUTH_REJECT_HEADER, &reason);
+    }
+    result
+}
+
+/// Verify an EncAuth voucher against the IdP's JWKS and this enclave's
+/// identity key.
+///
+/// The trusted IdP keys come over egress HTTPS (WebPKI roots) from the
+/// issuer pinned in the measured OIDC config — the same trust path JWT
+/// verification uses. Without the `wasm`/egress feature there is no
+/// trusted key source and the voucher is rejected: unlike the JWT
+/// fallback (which only gates role checks), accepting an unverified
+/// voucher would mint an authenticated session.
+fn verify_encauth_request(
+    env: &crate::encauth::EncAuthEnvelope,
+    now: u64,
+) -> Result<crate::encauth::EncAuthPayload, &'static str> {
+    #[cfg(feature = "wasm")]
+    {
+        let config = crate::oidc_config().ok_or("oidc not configured")?;
+        let keys = enclave_os_wasm::jwks_fetcher::idp_ec_p256_keys(
+            &config.issuer,
+            &config.jwks_uri,
+        )
+        .map_err(|_| "idp jwks unavailable")?;
+        let enc_pub = crate::sessionrelay::identity_pub_sec1()
+            .map_err(|_| "identity key unavailable")?;
+        crate::encauth::verify_encauth(env, &keys, &enc_pub, None, now)
+    }
+    #[cfg(not(feature = "wasm"))]
+    {
+        let _ = (env, now);
+        Err("no trusted idp key source (egress disabled)")
+    }
 }
 
 /// Verify the `Authorization: Bearer` header and return OIDC claims.

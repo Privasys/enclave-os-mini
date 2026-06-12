@@ -182,3 +182,24 @@ pub fn verify_jwt_signature(
 ) -> Result<serde_json::Value, String> {
     verify_jwt_with_jwks(token, issuer, jwks_uri)
 }
+
+/// Return the IdP's current EC P-256 signing keys as SEC1 uncompressed
+/// points (65 B each), fetching/caching the JWKS as needed. Used for
+/// raw-ES256 verification (EncAuth voucher `idp_sig`), which is not a
+/// JWT and carries no `kid` — callers try each key, mirroring the Go
+/// verifier's empty-kid lookup.
+pub fn idp_ec_p256_keys(issuer: &str, jwks_uri: &str) -> Result<Vec<Vec<u8>>, String> {
+    let resolved_uri = resolve_jwks_uri(issuer, jwks_uri)?;
+    get_or_fetch_cache(&resolved_uri)?;
+
+    let store = JWKS_STORE.lock().unwrap_or_else(|e| e.into_inner());
+    let entry = store
+        .as_ref()
+        .and_then(|s| s.get(&resolved_uri))
+        .ok_or_else(|| "JWKS cache miss (should not happen)".to_string())?;
+    let keys = entry.cache.ec_p256_keys();
+    if keys.is_empty() {
+        return Err("JWKS contains no EC P-256 keys".into());
+    }
+    Ok(keys)
+}

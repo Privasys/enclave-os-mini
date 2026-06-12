@@ -217,8 +217,27 @@ impl RaTlsSession {
         body: &[u8],
         close: bool,
     ) -> Result<Vec<u8>, &'static str> {
-        let response =
-            protocol::format_http_response_with_type(status, content_type, body, close);
+        self.send_http_response_with_headers(status, content_type, &[], body, close)
+    }
+
+    /// Like [`Self::send_http_response_typed`] but with extra response
+    /// headers (e.g. the session-relay `X-Privasys-EncAuth-Reject`
+    /// diagnostic).
+    pub fn send_http_response_with_headers(
+        &mut self,
+        status: u16,
+        content_type: &str,
+        extra_headers: &[(String, String)],
+        body: &[u8],
+        close: bool,
+    ) -> Result<Vec<u8>, &'static str> {
+        let response = protocol::format_http_response_with_headers(
+            status,
+            content_type,
+            extra_headers,
+            body,
+            close,
+        );
         let mut all_output = Vec::new();
         self.write_plaintext_chunked(&response, &mut all_output)?;
         let final_output = self.collect_tls_output()?;
