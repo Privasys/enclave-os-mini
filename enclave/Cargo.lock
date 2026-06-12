@@ -460,6 +460,7 @@ dependencies = [
  "rustls-webpki 0.102.8",
  "serde",
  "serde_json",
+ "sgx_crypto",
  "sgx_tse",
  "sgx_tseal",
  "time-core",
