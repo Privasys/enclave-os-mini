@@ -24,6 +24,16 @@ on:
     tags:
       - "v*"
       - "wasm-v*"
+  # PR gate: the enclave crate only compiles inside the SGX build
+  # container, so without this the first compile of a PR's code happens
+  # on the release tag (wasm-v0.31.0 needed three tag re-points for a
+  # stale lockfile and a flavor-gated compile error). PRs build the
+  # wasm flavor end-to-end but skip the release upload.
+  pull_request:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
   workflow_dispatch:
     inputs:
       flavor:
@@ -56,6 +66,9 @@ jobs:
           if [ '${{ github.event_name }}' = 'workflow_dispatch' ]; then
               FLAVOR='${{ inputs.flavor }}'
               VERSION="${REF}"
+          elif [ '${{ github.event_name }}' = 'pull_request' ]; then
+              FLAVOR=wasm
+              VERSION="pr-${{ github.event.pull_request.number }}"
           elif [[ "${REF}" == wasm-v* ]]; then
               FLAVOR=wasm
               VERSION="${REF#wasm-}"
@@ -73,6 +86,9 @@ jobs:
   # 1. Build the Docker build-environment image (cached via GHCR)
   # ────────────────────────────────────────────────────────────────────────
   build-image:
+    # PRs reuse the cached :latest build image from GHCR instead of
+    # pushing a fresh one (no package write from PR context).
+    if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     outputs:
       image: ${{ steps.meta.outputs.tags }}
@@ -107,6 +123,7 @@ jobs:
   # ────────────────────────────────────────────────────────────────────────
   build-enclave:
     needs: [resolve, build-image]
+    if: always() && needs.resolve.result == 'success' && (needs.build-image.result == 'success' || needs.build-image.result == 'skipped')
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v6
