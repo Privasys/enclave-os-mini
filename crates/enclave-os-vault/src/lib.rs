@@ -84,7 +84,19 @@ impl EnclaveModule for VaultModule {
                 material_b64,
                 exportable,
                 policy,
-            } => handle_create(&handle, key_type, &material_b64, exportable, policy, ctx),
+            } => handle_create(
+                &handle,
+                key_type,
+                material_b64.as_deref(),
+                exportable,
+                policy,
+                ctx,
+            ),
+            VaultRequest::ProvideMaterial {
+                handle,
+                material_b64,
+                approvals,
+            } => handle_provide_material(&handle, &material_b64, &approvals, ctx),
             VaultRequest::ExportKey { handle, approvals } => {
                 handle_export(&handle, &approvals, ctx)
             }
@@ -336,7 +348,7 @@ fn normalise_profile(profile: &mut AttestationProfile) {
 fn handle_create(
     handle: &str,
     key_type: KeyType,
-    material_b64: &str,
+    material_b64: Option<&str>,
     exportable: bool,
     policy: KeyPolicy,
     ctx: &RequestContext,
@@ -365,15 +377,35 @@ fn handle_create(
     }
     let owner_sub = claims.sub.clone();
 
-    let material = match URL_SAFE_NO_PAD.decode(material_b64) {
-        Ok(b) if !b.is_empty() => b,
-        Ok(_) => return VaultResponse::Error("material must not be empty".into()),
-        Err(e) => return VaultResponse::Error(format!("bad base64: {e}")),
-    };
-
-    let public_key = match crypto::validate_material(key_type, &material) {
-        Ok(p) => p,
-        Err(e) => return VaultResponse::Error(e),
+    // Two-phase create: no material reserves the handle + policy. The
+    // policy must name someone who can fill it, or the key could never
+    // become usable.
+    let (material, public_key, pending_material) = match material_b64 {
+        Some(b64) => {
+            let material = match URL_SAFE_NO_PAD.decode(b64) {
+                Ok(b) if !b.is_empty() => b,
+                Ok(_) => return VaultResponse::Error("material must not be empty".into()),
+                Err(e) => return VaultResponse::Error(format!("bad base64: {e}")),
+            };
+            let public_key = match crypto::validate_material(key_type, &material) {
+                Ok(p) => p,
+                Err(e) => return VaultResponse::Error(e),
+            };
+            (material, public_key, false)
+        }
+        None => {
+            let grants_provide = policy.operations.iter().any(|r| {
+                r.ops.contains(&Operation::ProvideMaterial) && !r.principals.is_empty()
+            });
+            if !grants_provide {
+                return VaultResponse::Error(
+                    "two-phase create requires an OperationRule granting \
+                     ProvideMaterial (the key could never receive material)"
+                        .into(),
+                );
+            }
+            (Vec::new(), None, true)
+        }
     };
 
     let policy = normalise_policy(policy);
@@ -401,6 +433,7 @@ fn handle_create(
         key_type,
         exportable,
         material,
+        pending_material,
         public_key,
         policy,
         policy_version: 1,
@@ -416,7 +449,7 @@ fn handle_create(
         "CreateKey",
         &format!("oidc:{}", owner_sub),
         AuditDecision::Allowed,
-        "",
+        if pending_material { "pending material" } else { "" },
     ) {
         return e;
     }
@@ -434,6 +467,95 @@ fn handle_create(
     VaultResponse::KeyCreated {
         handle: handle.to_string(),
         expires_at,
+        pending_material,
+    }
+}
+
+fn handle_provide_material(
+    handle: &str,
+    material_b64: &str,
+    approvals: &[ApprovalToken],
+    ctx: &RequestContext,
+) -> VaultResponse {
+    let mut record = match load_record(handle) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    let caller = caller_str(ctx);
+    if expired(&record) {
+        let _ = audit_and_save(
+            &mut record,
+            "ProvideMaterial",
+            &caller,
+            AuditDecision::Denied,
+            "key has expired",
+        );
+        return VaultResponse::Error("key has expired".into());
+    }
+    // One-shot: a key that already has material can never be refilled,
+    // by anyone. Replacing material is a delete + re-create.
+    if !record.pending_material {
+        let _ = audit_and_save(
+            &mut record,
+            "ProvideMaterial",
+            &caller,
+            AuditDecision::Denied,
+            "key material already provided",
+        );
+        return VaultResponse::Error("key material already provided".into());
+    }
+    if let Err(e) = evaluate_op(
+        &record.policy,
+        Operation::ProvideMaterial,
+        handle,
+        approvals,
+        ctx,
+    ) {
+        let _ = audit_and_save(
+            &mut record,
+            "ProvideMaterial",
+            &caller,
+            AuditDecision::Denied,
+            &e,
+        );
+        return VaultResponse::Error(e);
+    }
+
+    let material = match URL_SAFE_NO_PAD.decode(material_b64) {
+        Ok(b) if !b.is_empty() => b,
+        Ok(_) => return VaultResponse::Error("material must not be empty".into()),
+        Err(e) => return VaultResponse::Error(format!("bad base64: {e}")),
+    };
+    let public_key = match crypto::validate_material(record.key_type, &material) {
+        Ok(p) => p,
+        Err(e) => {
+            let _ = audit_and_save(
+                &mut record,
+                "ProvideMaterial",
+                &caller,
+                AuditDecision::Denied,
+                &e,
+            );
+            return VaultResponse::Error(e);
+        }
+    };
+
+    record.material = material;
+    record.public_key = public_key;
+    record.pending_material = false;
+
+    if let Err(e) = audit_and_save(
+        &mut record,
+        "ProvideMaterial",
+        &caller,
+        AuditDecision::Allowed,
+        "",
+    ) {
+        return e;
+    }
+    VaultResponse::MaterialProvided {
+        handle: handle.to_string(),
+        expires_at: record.expires_at,
     }
 }
 
@@ -448,6 +570,11 @@ fn handle_export(
     };
     if expired(&record) {
         return VaultResponse::Error("key has expired".into());
+    }
+    if record.pending_material {
+        return VaultResponse::Error(
+            "key material not yet provided (two-phase create)".into(),
+        );
     }
     if !record.exportable {
         return VaultResponse::Error("key is not exportable".into());
@@ -690,6 +817,18 @@ fn require_op(
         );
         return Err(VaultResponse::Error("key has expired".into()));
     }
+    if record.pending_material {
+        let _ = audit_and_save(
+            &mut record,
+            op_name(op),
+            &caller_str(ctx),
+            AuditDecision::Denied,
+            "key material not yet provided",
+        );
+        return Err(VaultResponse::Error(
+            "key material not yet provided (two-phase create)".into(),
+        ));
+    }
     if record.key_type != expect_type {
         let msg = format!(
             "key {} has type {:?}, op {:?} requires {:?}",
@@ -737,6 +876,7 @@ fn op_name(op: Operation) -> &'static str {
         Operation::Sign => "Sign",
         Operation::Mac => "Mac",
         Operation::PromoteProfile => "PromoteProfile",
+        Operation::ProvideMaterial => "ProvideMaterial",
     }
 }
 

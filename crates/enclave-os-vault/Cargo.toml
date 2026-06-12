@@ -11,6 +11,11 @@ description = "vHSM-style key store for enclave-os — policy-gated keys with OI
 [lib]
 name = "enclave_os_vault"
 
+# This crate is composed into the enclave build (see enclave/Cargo.toml)
+# and is not a member of the root workspace. The empty table opts out of
+# workspace inference so `cargo check` / `cargo test` work from this dir.
+[workspace]
+
 [features]
 # Forward mock to the egress crate (accepts MOCK_QUOTE: prefixed quotes)
 mock = ["enclave-os-egress/mock"]

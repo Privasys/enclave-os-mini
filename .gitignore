@@ -32,3 +32,5 @@ Thumbs.db
 *.key
 *.crt
 *.csr
+# Standalone dev lockfile (release builds use enclave/Cargo.lock)
+crates/enclave-os-vault/Cargo.lock

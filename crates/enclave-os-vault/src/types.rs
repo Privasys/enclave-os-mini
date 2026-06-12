@@ -46,14 +46,36 @@ pub enum VaultRequest {
     /// * `Aes256GcmKey`        â€” 32 bytes of AES-256 key material.
     /// * `HmacSha256Key`       â€” 32â€“64 bytes of HMAC key material.
     /// * `P256SigningKey`      â€” PKCS#8 v1 ECDSA-P256 private key DER.
+    ///
+    /// **Two-phase create:** when `material_b64` is absent the vault
+    /// reserves the handle + policy only ("pending material"). The
+    /// policy MUST contain an [`OperationRule`] granting
+    /// [`Operation::ProvideMaterial`]; whoever that rule names (the
+    /// owner's own client, or the app TEE at first boot) fills the
+    /// material later via [`VaultRequest::ProvideMaterial`]. Until
+    /// then every key operation is denied, and the key expires on its
+    /// normal TTL if never filled.
     CreateKey {
         handle: String,
         key_type: KeyType,
         /// Base64url-encoded raw key material (sealed at rest).
-        material_b64: String,
+        /// Absent = two-phase create (see above).
+        #[serde(default)]
+        material_b64: Option<String>,
         /// Whether the material may ever leave the enclave (gates `ExportKey`).
         exportable: bool,
         policy: KeyPolicy,
+    },
+
+    /// Provide the material for a key created without it (two-phase
+    /// create). One-shot: rejected once the key has material. Gated by
+    /// an [`OperationRule`] granting [`Operation::ProvideMaterial`].
+    ProvideMaterial {
+        handle: String,
+        /// Base64url-encoded raw key material (sealed at rest).
+        material_b64: String,
+        #[serde(default)]
+        approvals: Vec<ApprovalToken>,
     },
 
     /// Export the raw key material.
@@ -191,7 +213,16 @@ pub enum VaultRequest {
 /// A vault RPC response, JSON-encoded inside `Response::Data`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum VaultResponse {
-    KeyCreated { handle: String, expires_at: u64 },
+    KeyCreated {
+        handle: String,
+        expires_at: u64,
+        /// True when the key was created without material (two-phase
+        /// create) and is waiting for `ProvideMaterial`.
+        #[serde(default)]
+        pending_material: bool,
+    },
+    /// Material accepted for a pending key (two-phase create).
+    MaterialProvided { handle: String, expires_at: u64 },
     KeyMaterial { material: Vec<u8>, expires_at: u64 },
     KeyDeleted,
     PolicyUpdated { policy_version: u32 },
@@ -301,6 +332,9 @@ pub enum Operation {
     Mac,
     /// Granted via [`VaultRequest::PromotePendingProfile`].
     PromoteProfile,
+    /// Fill the material of a pending key (two-phase create). Granted
+    /// via [`VaultRequest::ProvideMaterial`].
+    ProvideMaterial,
 }
 
 // ---------------------------------------------------------------------------
@@ -649,8 +683,13 @@ pub struct KeyRecord {
     pub exportable: bool,
     /// Sealed by the kvstore layer at rest; in plaintext in this struct
     /// only while it lives in enclave memory. Interpretation depends on
-    /// `key_type` (see [`VaultRequest::CreateKey`]).
+    /// `key_type` (see [`VaultRequest::CreateKey`]). Empty while
+    /// `pending_material` is true.
     pub material: Vec<u8>,
+    /// True for a two-phase-created key whose material has not been
+    /// provided yet. Every key operation is denied while set.
+    #[serde(default)]
+    pub pending_material: bool,
     /// Public part for asymmetric key types, derived at create time.
     /// `None` for symmetric / opaque keys.
     #[serde(default)]

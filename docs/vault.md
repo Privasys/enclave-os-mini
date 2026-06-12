@@ -73,13 +73,27 @@ the request.
 
 | RPC | Auth | Description |
 |---|---|---|
-| `CreateKey { handle, key_type, material_b64, exportable, policy }` | OIDC: must equal `policy.principals.owner` | Create a key with caller-supplied material. |
+| `CreateKey { handle, key_type, material_b64?, exportable, policy }` | OIDC: must equal `policy.principals.owner` | Create a key with caller-supplied material. Omitting `material_b64` is a **two-phase create**: the handle + policy are reserved with no material (see below). |
+| `ProvideMaterial { handle, material_b64, approvals? }` | per-key `Operation::ProvideMaterial` rule | One-shot fill of a two-phase-created key. Rejected once the key has material. |
 | `ExportKey { handle, approvals? }` | per-key `Operation::ExportKey` rule | Returns raw material. Requires `exportable == true`. |
 | `DeleteKey { handle, approvals? }` | per-key `Operation::DeleteKey` rule | Removes the key and all audit/pending state. |
 | `UpdatePolicy { handle, new_policy, approvals? }` | per-field `Mutability` (see section 3.4) | Replace the policy. |
 | `GetPolicy { handle }` | owner / auditor | Returns the current policy and `policy_version`. |
 | `GetKeyInfo { handle }` | owner / auditor | Metadata only; never material. |
 | `ListKeys` | OIDC | Lists handles whose owner is the caller. |
+
+**Two-phase create.** When `material_b64` is absent, the vault stores the
+handle + policy with `pending_material = true`. The policy MUST contain an
+`OperationRule` granting `Operation::ProvideMaterial` (otherwise the key
+could never become usable and the create is rejected). Whoever that rule
+names fills the material later — the owner's own client, or the app TEE at
+first boot (authenticating as a `Principal::Tee` over RA-TLS). Until then
+every key operation is denied with `key material not yet provided`, and the
+key expires on its normal TTL if never filled. Filling is one-shot:
+replacing material is always a delete + re-create. This is the basis of the
+developer-platform key flow: the developer creates the key record as owner
+from the portal, and the key materialises inside the app enclave without
+any owner-binding token (see the platform's enclave-upgrade plan).
 
 ### 2.2 In-enclave crypto
 
