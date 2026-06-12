@@ -1303,6 +1303,7 @@ fn handle_data_request_http(
                 body: msg,
                 shutdown: false,
                 content_type: None,
+                extra_headers: Vec::new(),
             },
             Response::Ok => HttpHandleResult::ok(b"{}".to_vec()),
             other => {
@@ -1606,6 +1607,7 @@ fn transform_mcp_tools_response(result: HttpHandleResult) -> HttpHandleResult {
                     .unwrap_or_default(),
                 shutdown: false,
                 content_type: None,
+                extra_headers: Vec::new(),
             }
         }
         _ => result,
@@ -1664,6 +1666,7 @@ fn transform_mcp_call_response(result: HttpHandleResult) -> HttpHandleResult {
                     .unwrap_or_default(),
                 shutdown: false,
                 content_type: None,
+                extra_headers: Vec::new(),
             }
         }
         _ => result,
@@ -1685,6 +1688,7 @@ fn dispatch_and_respond(
                 body: msg,
                 shutdown: false,
                 content_type: None,
+                extra_headers: Vec::new(),
             },
             Response::Ok => HttpHandleResult::ok(b"{}".to_vec()),
             other => HttpHandleResult::ok(
