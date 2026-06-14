@@ -71,6 +71,15 @@ struct Cli {
     #[arg(long, value_delimiter = ',')]
     attestation_servers: Option<Vec<String>>,
 
+    /// Path to a file holding an OIDC bearer token for the attestation
+    /// server(s). Applied to every URL in --attestation-servers, so the
+    /// enclave can authenticate its own quote-verification calls to servers
+    /// that require it (e.g. as.privasys.org, which 401s without a bearer).
+    /// The token is a runtime secret: it is NOT hashed into the config
+    /// Merkle tree (only the URL list is — see common/attestation_servers).
+    #[arg(long)]
+    attestation_token_file: Option<String>,
+
     /// OIDC issuer URL (e.g. https://privasys.id).
     /// When set (together with --oidc-audience), enables OIDC-based RBAC.
     #[arg(long)]
@@ -227,9 +236,29 @@ fn main() -> Result<()> {
     if let Some(ref servers) = cli.attestation_servers {
         info!("Attestation servers: {:?}", servers);
 
+        // Optional bearer token shared by all configured servers. Read from
+        // a file so it never appears in the process args / launch command.
+        let token: Option<String> = match cli.attestation_token_file {
+            Some(ref path) => {
+                let t = std::fs::read_to_string(path)
+                    .map_err(|e| anyhow::anyhow!("Failed to read attestation token file '{}': {}", path, e))?
+                    .trim()
+                    .to_string();
+                if t.is_empty() {
+                    anyhow::bail!("attestation token file '{}' is empty", path);
+                }
+                info!("Attestation bearer token: {} chars from {}", t.len(), path);
+                Some(t)
+            }
+            None => None,
+        };
+
         let server_objects: Vec<serde_json::Value> = servers
             .iter()
-            .map(|url| serde_json::json!({ "url": url }))
+            .map(|url| match token {
+                Some(ref t) => serde_json::json!({ "url": url, "token": t }),
+                None => serde_json::json!({ "url": url }),
+            })
             .collect();
 
         config["attestation_servers"] = serde_json::to_value(&server_objects)
