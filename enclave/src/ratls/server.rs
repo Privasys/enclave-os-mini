@@ -52,15 +52,25 @@ use rustls::{DigitallySignedStruct, DistinguishedName, Error as TlsError, Server
 /// Per-connection state. A connection progresses through:
 ///   `Pending` → `Handshaking` → `Established`
 enum SessionState {
-    /// TCP connection accepted but no TLS data received yet.
+    /// TCP connection accepted; ClientHello not yet complete.
     Pending {
         peer_addr: String,
+        /// Raw TLS bytes received so far. A ClientHello can arrive split
+        /// across several TcpData chunks (more likely now that the RA-TLS
+        /// challenge extension enlarges it); accumulate until the record
+        /// is complete before handing it to the rustls Acceptor.
+        buffered: Vec<u8>,
     },
     /// TLS handshake is in progress.
     Handshaking(RaTlsSession),
     /// TLS handshake complete, processing application data.
     Established(RaTlsSession),
 }
+
+/// Upper bound on buffered ClientHello bytes while waiting for a
+/// fragmented hello to complete. A TLS record maxes at 16 KiB; a real
+/// ClientHello (even with the RA-TLS challenge extension) is ~1-2 KiB.
+const MAX_PENDING_CLIENTHELLO: usize = 16 * 1024;
 
 // ========================================================================
 //  IngressServer
@@ -125,6 +135,7 @@ impl IngressServer {
                 );
                 self.sessions.insert(conn_id, SessionState::Pending {
                     peer_addr,
+                    buffered: Vec::new(),
                 });
             }
 
@@ -181,11 +192,14 @@ impl IngressServer {
         };
 
         match state {
-            SessionState::Pending { peer_addr } => {
-                // First TLS data — should contain the ClientHello.
-                // Parse it, generate cert, create the TLS session.
-                match self.create_session(conn_id, &peer_addr, data) {
-                    Ok(session) => {
+            SessionState::Pending { peer_addr, mut buffered } => {
+                // Accumulate TLS bytes until the ClientHello record is
+                // complete — it can arrive split across several TcpData
+                // chunks. Re-feeding the whole buffer to a fresh Acceptor
+                // each round is idempotent.
+                buffered.extend_from_slice(data);
+                match self.create_session(conn_id, &peer_addr, &buffered) {
+                    Ok(Some(session)) => {
                         if session.is_handshaking() {
                             self.sessions.insert(
                                 conn_id,
@@ -195,6 +209,24 @@ impl IngressServer {
                             self.sessions.insert(
                                 conn_id,
                                 SessionState::Established(session),
+                            );
+                        }
+                    }
+                    Ok(None) => {
+                        // Incomplete ClientHello — keep the bytes and wait
+                        // for the next TcpData. Cap the buffer so a
+                        // malformed/never-completing hello can't grow
+                        // unbounded.
+                        if buffered.len() > MAX_PENDING_CLIENTHELLO {
+                            enclave_log_error!(
+                                "ClientHello exceeded {} bytes for conn_id={}, dropping",
+                                MAX_PENDING_CLIENTHELLO, conn_id
+                            );
+                            self.send_close(conn_id);
+                        } else {
+                            self.sessions.insert(
+                                conn_id,
+                                SessionState::Pending { peer_addr, buffered },
                             );
                         }
                     }
@@ -370,24 +402,19 @@ impl IngressServer {
     /// 3. Feed the data into `rustls::server::Acceptor`.
     /// 4. Build the `ServerConnection` and wrap in `RaTlsSession`.
     /// 5. Collect and send any handshake output (ServerHello etc.).
+    /// Try to create a TLS session from the accumulated ClientHello bytes.
+    ///
+    /// Returns `Ok(None)` when `raw` does not yet hold a complete
+    /// ClientHello — the caller buffers more TcpData and retries.
     fn create_session(
         &mut self,
         conn_id: u32,
         _peer_addr: &str,
         raw: &[u8],
-    ) -> Result<RaTlsSession, String> {
-        // Parse ClientHello for challenge nonce and SNI
-        let hello = attestation::parse_client_hello(raw);
-        if let Some(ref sni) = hello.sni {
-            enclave_log_info!("SNI: {} (conn_id={})", sni, conn_id);
-        }
-
-        // Build per-connection TLS config (includes client challenge nonce)
-        let tls_result = self.tls_config_for(
-            &hello.challenge_nonce, &hello.sni,
-        )?;
-
-        // Feed the raw ClientHello into a rustls Acceptor
+    ) -> Result<Option<RaTlsSession>, String> {
+        // Feed the bytes into a rustls Acceptor and confirm the
+        // ClientHello is complete BEFORE parsing it: a partial hello would
+        // yield a truncated challenge nonce / SNI.
         let mut acceptor = Acceptor::default();
         {
             let mut cursor = std::io::Cursor::new(raw);
@@ -398,20 +425,26 @@ impl IngressServer {
             }
         }
 
-        // Try to accept
         let accepted = match acceptor.accept() {
             Ok(Some(a)) => a,
-            Ok(None) => {
-                return Err(format!(
-                    "Incomplete ClientHello for conn_id={}", conn_id
-                ));
-            }
+            Ok(None) => return Ok(None), // Incomplete — caller waits for more.
             Err(e) => {
                 return Err(format!(
                     "Acceptor error for conn_id={}: {:?}", conn_id, e
                 ));
             }
         };
+
+        // Complete ClientHello: parse it for the challenge nonce and SNI.
+        let hello = attestation::parse_client_hello(raw);
+        if let Some(ref sni) = hello.sni {
+            enclave_log_info!("SNI: {} (conn_id={})", sni, conn_id);
+        }
+
+        // Build per-connection TLS config (includes client challenge nonce)
+        let tls_result = self.tls_config_for(
+            &hello.challenge_nonce, &hello.sni,
+        )?;
 
         // Create the ServerConnection
         let server_conn = match accepted.into_connection(tls_result.config) {
@@ -437,7 +470,7 @@ impl IngressServer {
             self.send_to_proxy(conn_id, &output);
         }
 
-        Ok(session)
+        Ok(Some(session))
     }
 
     // ====================================================================
