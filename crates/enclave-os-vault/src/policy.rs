@@ -368,7 +368,42 @@ pub fn evaluate_policy_update(
             ));
         }
     }
+    // Append/strengthen-only: an UpdatePolicy may not drop an OID the key already
+    // enforces on every accepted measurement (e.g. downgrade an MR_APP key to
+    // MR_ENCLAVE by removing the app-id at 3.6). Independent of Mutability, so it
+    // holds however many approvals the caller carries. See policies-plan.md §8.
+    let old_required = key_required_oids(old);
+    let new_required = key_required_oids(new);
+    for oid in &old_required {
+        if !new_required.iter().any(|o| o == oid) {
+            return Err(format!(
+                "required OID {} cannot be dropped: required_oids are append/strengthen-only",
+                oid
+            ));
+        }
+    }
     Ok(())
+}
+
+/// The OIDs that EVERY accepted Tee profile already requires (the intersection of
+/// each profile's required-OID set). Such an OID is structurally enforced by the
+/// key: removing it from any one profile would let a matching caller bypass it.
+/// Used to keep `required_oids` append/strengthen-only across UpdatePolicy and
+/// PromotePendingProfile.
+pub(crate) fn key_required_oids(policy: &KeyPolicy) -> Vec<String> {
+    let mut profiles = policy.principals.tees.iter().filter_map(|p| match p {
+        Principal::Tee(profile) => Some(&profile.required_oids),
+        _ => None,
+    });
+    let first = match profiles.next() {
+        Some(f) => f,
+        None => return Vec::new(),
+    };
+    let mut acc: Vec<String> = first.iter().map(|r| r.oid.clone()).collect();
+    for reqs in profiles {
+        acc.retain(|oid| reqs.iter().any(|r| &r.oid == oid));
+    }
+    acc
 }
 
 fn diff_policy_fields(old: &KeyPolicy, new: &KeyPolicy) -> Vec<crate::types::PolicyField> {
