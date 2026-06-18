@@ -208,6 +208,12 @@ pub struct AppMeta {
     /// across restarts without consulting the platform.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub owners: Vec<String>,
+    /// Platform-assigned app identity (apps.id, raw 16-byte UUID). Stamped at
+    /// OID 3.6 on the per-app leaf so a vault key can be bound to THIS app
+    /// (MR_APP). `None` for apps loaded before app-id support (and for app-less
+    /// callers), which keeps the MR_ENCLAVE behaviour. See policies-plan.md.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub app_id: Option<[u8; 16]>,
 }
 
 // ---------------------------------------------------------------------------
@@ -348,6 +354,7 @@ impl AppRegistry {
         docs: Option<std::collections::BTreeMap<String, String>>,
         config_api_function: Option<String>,
         owners: Vec<String>,
+        app_id: Option<[u8; 16]>,
     ) -> Result<AppMeta, String> {
         if self.known.contains_key(name) {
             return Err(format!("app '{}' is already loaded", name));
@@ -467,6 +474,7 @@ impl AppRegistry {
             extensions: BTreeMap::new(),
             config_api_function: config_api_function.clone(),
             owners,
+            app_id,
         };
         self.known.insert(name.to_string(), meta.clone());
         // Wire the freeze gate: when a config_api function is

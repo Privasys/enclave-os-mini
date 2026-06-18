@@ -238,6 +238,14 @@ pub struct WasmLoad {
     /// belt-and-braces for misconfigured deployments.
     #[serde(default)]
     pub owners: Vec<String>,
+
+    /// Platform-assigned app identity (apps.id, a UUID string). When present,
+    /// the enclave stamps it (raw 16 bytes) at OID 3.6 on the per-app leaf so a
+    /// vault key can be sealed to THIS app (MR_APP) and a same-cwasm peer with a
+    /// different app-id cannot unseal it. Absent keeps the MR_ENCLAVE behaviour.
+    /// See .operations/enclave-vaults/policies-plan.md.
+    #[serde(default)]
+    pub app_id: Option<String>,
 }
 
 /// Configure-endpoint declaration. See [`WasmLoad::config_api`].

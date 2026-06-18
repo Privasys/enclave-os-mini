@@ -109,6 +109,18 @@ pub const APP_CODE_HASH_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 3, 2];
 /// Per-app Code Hash (dotted-string).
 pub const APP_CODE_HASH_OID_STR: &str = "1.3.6.1.4.1.65230.3.2";
 
+/// Per-app App Id — `1.3.6.1.4.1.65230.3.6`
+///
+/// The platform-assigned app identity (apps.id, raw 16-byte UUID). Pins WHICH
+/// app this leaf is, so a vault key bound to it (MR_APP sealing mode) cannot be
+/// unsealed by a same-cwasm peer with a different app-id. Stamped by the
+/// (measured) enclave, so a peer cannot forge another app's id. Aligned with
+/// enclave-os-virtual's OID 3.6 (ContainerAppId). See
+/// .operations/enclave-vaults/policies-plan.md.
+pub const APP_ID_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 3, 6];
+/// Per-app App Id (dotted-string).
+pub const APP_ID_OID_STR: &str = "1.3.6.1.4.1.65230.3.6";
+
 /// Per-app Key Source — `1.3.6.1.4.1.65230.3.4`
 ///
 /// UTF-8 string indicating the encryption key provenance for a WASM app:

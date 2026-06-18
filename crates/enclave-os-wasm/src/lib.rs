@@ -231,13 +231,14 @@ impl WasmModule {
         docs: Option<std::collections::BTreeMap<String, String>>,
         config_api_function: Option<String>,
         owners: Vec<String>,
+        app_id: Option<[u8; 16]>,
     ) -> Result<(), String> {
         // Load into the registry (compile + introspect + per-app key)
         let meta = {
             let mut reg = self.registry
                 .lock()
                 .map_err(|_| String::from("registry lock poisoned"))?;
-            reg.load_app(name, hostname, wasm_bytes, encryption_key, permissions, max_fuel, mcp_enabled, docs, config_api_function, owners)?
+            reg.load_app(name, hostname, wasm_bytes, encryption_key, permissions, max_fuel, mcp_enabled, docs, config_api_function, owners, app_id)?
         };
 
         // ── Persist to KV store ────────────────────────────────────
@@ -1249,7 +1250,8 @@ impl EnclaveModule for WasmModule {
             let max_fuel = load.max_fuel.unwrap_or(10_000_000);
             let mcp_enabled = load.mcp_enabled.unwrap_or(true);
 
-            let mgmt_result = match self.load_app(&load.name, &hostname, &load.bytes, encryption_key, load.permissions, max_fuel, mcp_enabled, load.docs, load.config_api.map(|c| c.function), load.owners) {
+            let app_id = parse_app_id(load.app_id.as_deref());
+            let mgmt_result = match self.load_app(&load.name, &hostname, &load.bytes, encryption_key, load.permissions, max_fuel, mcp_enabled, load.docs, load.config_api.map(|c| c.function), load.owners, app_id) {
                 Ok(()) => {
                     // Return the loaded app's info
                     let apps = self.list_apps();
@@ -1493,6 +1495,20 @@ impl EnclaveModule for WasmModule {
 // ---------------------------------------------------------------------------
 
 /// Build an [`AppIdentity`] from persisted metadata for CertStore registration.
+/// Parse a UUID string (with or without hyphens) into its raw 16 bytes for the
+/// OID 3.6 app-id extension. Returns `None` for empty or malformed input, which
+/// leaves the app in MR_ENCLAVE shape (the back-compat default before the
+/// platform starts sending `app_id`). See policies-plan.md.
+fn parse_app_id(s: Option<&str>) -> Option<[u8; 16]> {
+    let bytes = hex_decode(&s?.replace('-', "")).ok()?;
+    if bytes.len() != 16 {
+        return None;
+    }
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&bytes);
+    Some(out)
+}
+
 fn build_app_identity(meta: &AppMeta) -> AppIdentity {
     let mut config = vec![
         ConfigEntry {
@@ -1511,6 +1527,15 @@ fn build_app_identity(meta: &AppMeta) -> AppIdentity {
             key: format!("wasm.{}.configuration_hash", meta.name),
             value: ch.to_vec(),
             oid: Some(enclave_os_common::oids::APP_CONFIGURATION_HASH_OID),
+        });
+    }
+    // MR_APP: bind this app's leaf to its platform-assigned app-id (OID 3.6).
+    // Omitted (MR_ENCLAVE) when the platform did not supply one.
+    if let Some(ref id) = meta.app_id {
+        config.push(ConfigEntry {
+            key: format!("wasm.{}.app_id", meta.name),
+            value: id.to_vec(),
+            oid: Some(enclave_os_common::oids::APP_ID_OID),
         });
     }
     // App-defined extensions live under sub-OIDs of
