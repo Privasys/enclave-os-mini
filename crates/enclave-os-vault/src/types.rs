@@ -495,6 +495,29 @@ pub enum Condition {
         #[serde(default)]
         not_after: u64,
     },
+
+    /// The caller's OIDC bearer must prove a fresh step-up: its `amr` claim
+    /// contains every method in `required_amr` (e.g. `["webauthn"]`) and its
+    /// `iat` is within `fresh_for_seconds`. This is the IdP-verified promote
+    /// step-up (see policies-plan.md §9): the attested IdP issues a short-lived,
+    /// high-`acr` token after a wallet/passkey WebAuthn assertion.
+    ///
+    /// `operation_bound` requires the token to also be bound to THIS operation
+    /// (a `vault_op` claim over `H(handle ‖ measurement ‖ policy_version ‖ nonce
+    /// ‖ exp)`). That binding needs per-operation context not yet threaded into
+    /// condition evaluation, so while `operation_bound = true` is accepted in the
+    /// schema it currently evaluates **fail-closed** (the condition cannot be
+    /// satisfied). Authoring it into a live policy would therefore strand the op
+    /// until the binding path lands — do not author it yet. `operation_bound =
+    /// false` enforces only the `amr` + freshness step-up.
+    OidcStepUp {
+        #[serde(default)]
+        required_amr: Vec<String>,
+        #[serde(default)]
+        operation_bound: bool,
+        #[serde(default)]
+        fresh_for_seconds: u64,
+    },
 }
 
 // ---------------------------------------------------------------------------

@@ -177,17 +177,54 @@ pub struct OidcClaims {
     pub is_manager: bool,
     /// Precomputed: bearer holds either the manager or monitoring role.
     pub is_monitoring: bool,
+    /// Authentication Methods References (`amr` claim, RFC 8176): how the
+    /// subject authenticated for THIS token (e.g. `["webauthn"]`). Empty when
+    /// the claim is absent. Used by step-up conditions (e.g. the vault's
+    /// `OidcStepUp`) to require a fresh hardware/WebAuthn factor.
+    #[serde(default)]
+    pub amr: Vec<String>,
+    /// Authentication Context Class Reference (`acr` claim). `None` when absent.
+    #[serde(default)]
+    pub acr: Option<String>,
+    /// Issued-at (`iat` claim, unix seconds; 0 when absent). Lets a condition
+    /// require a *fresh* token rather than a replayed long-lived session.
+    #[serde(default)]
+    pub iat: u64,
 }
 
 impl OidcClaims {
     /// Build verified claims from a subject and the raw role strings
     /// returned by [`extract_roles`], applying the platform-role hierarchy
-    /// (manager implies monitoring).
+    /// (manager implies monitoring). Step-up fields (`amr`/`acr`/`iat`) default
+    /// to empty; set them with [`OidcClaims::with_step_up`].
     pub fn from_raw(sub: String, roles: Vec<String>, config: &OidcConfig) -> Self {
         let is_manager = roles.iter().any(|r| r == &config.manager_role);
         let is_monitoring =
             is_manager || roles.iter().any(|r| r == &config.monitoring_role);
-        Self { sub, roles, is_manager, is_monitoring }
+        Self {
+            sub,
+            roles,
+            is_manager,
+            is_monitoring,
+            amr: Vec::new(),
+            acr: None,
+            iat: 0,
+        }
+    }
+
+    /// Attach the step-up claims (`amr`/`acr`/`iat`) parsed from the JWT.
+    pub fn with_step_up(mut self, amr: Vec<String>, acr: Option<String>, iat: u64) -> Self {
+        self.amr = amr;
+        self.acr = acr;
+        self.iat = iat;
+        self
+    }
+
+    /// True iff every method in `required` is present in this token's `amr`.
+    pub fn has_amr(&self, required: &[String]) -> bool {
+        required
+            .iter()
+            .all(|r| self.amr.iter().any(|m| m.eq_ignore_ascii_case(r)))
     }
 
     /// Returns `true` if the token has the configured manager role.
@@ -269,6 +306,24 @@ fn collect_role_strings(val: &serde_json::Value, out: &mut Vec<String>) {
         }
         _ => {}
     }
+}
+
+/// Extract the `amr` (Authentication Methods References, RFC 8176) array from
+/// raw JWT claims. Returns the deduped method strings; empty when the claim is
+/// absent or not a string array.
+pub fn extract_amr(claims: &serde_json::Value) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(serde_json::Value::Array(arr)) = claims.get("amr") {
+        for item in arr {
+            if let Some(s) = item.as_str() {
+                let s = s.to_string();
+                if !out.contains(&s) {
+                    out.push(s);
+                }
+            }
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -414,5 +469,43 @@ mod tests {
         collect_role_strings(&json!(42), &mut out);
         collect_role_strings(&json!(null), &mut out);
         assert!(out.is_empty());
+    }
+
+    // -- amr / step-up -------------------------------------------------------
+
+    #[test]
+    fn extract_amr_reads_string_array_deduped() {
+        let claims = json!({"sub": "u", "amr": ["webauthn", "webauthn", "pwd"]});
+        assert_eq!(extract_amr(&claims), vec!["webauthn", "pwd"]);
+    }
+
+    #[test]
+    fn extract_amr_absent_or_malformed_is_empty() {
+        assert!(extract_amr(&json!({"sub": "u"})).is_empty());
+        assert!(extract_amr(&json!({"amr": "webauthn"})).is_empty()); // not an array
+        assert!(extract_amr(&json!({"amr": [1, 2, 3]})).is_empty()); // not strings
+    }
+
+    #[test]
+    fn has_amr_requires_all_methods_case_insensitive() {
+        let c = claims_with(&[]).with_step_up(
+            vec!["WebAuthn".into(), "pwd".into()],
+            Some("aal2".into()),
+            1000,
+        );
+        assert!(c.has_amr(&["webauthn".into()]));
+        assert!(c.has_amr(&["webauthn".into(), "pwd".into()]));
+        assert!(c.has_amr(&[])); // vacuously true
+        assert!(!c.has_amr(&["webauthn".into(), "otp".into()]));
+        assert_eq!(c.acr.as_deref(), Some("aal2"));
+        assert_eq!(c.iat, 1000);
+    }
+
+    #[test]
+    fn from_raw_defaults_step_up_fields_empty() {
+        let c = claims_with(&["x"]);
+        assert!(c.amr.is_empty());
+        assert!(c.acr.is_none());
+        assert_eq!(c.iat, 0);
     }
 }

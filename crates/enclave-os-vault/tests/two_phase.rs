@@ -112,6 +112,9 @@ fn ctx_oidc(sub: &str) -> RequestContext {
             roles: Vec::new(),
             is_manager: false,
             is_monitoring: false,
+            amr: Vec::new(),
+            acr: None,
+            iat: 0,
         }),
     }
 }
@@ -311,4 +314,79 @@ fn single_phase_create_is_unchanged() {
         VaultResponse::KeyMaterial { material: m, .. } => assert_eq!(m, material),
         other => panic!("expected KeyMaterial, got {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+//  OidcStepUp condition (promote step-up, increment 1 — inert in production)
+// ---------------------------------------------------------------------------
+
+fn ctx_with_amr(sub: &str, amr: &[&str]) -> RequestContext {
+    RequestContext {
+        peer_cert_der: None,
+        client_challenge_nonce: None,
+        oidc_claims: Some(OidcClaims {
+            sub: sub.to_string(),
+            roles: Vec::new(),
+            is_manager: false,
+            is_monitoring: false,
+            amr: amr.iter().map(|s| s.to_string()).collect(),
+            acr: None,
+            iat: 0,
+        }),
+    }
+}
+
+#[test]
+fn oidc_step_up_amr_gate() {
+    use enclave_os_vault::policy::evaluate_op;
+    use enclave_os_vault::types::Condition;
+
+    let mut policy = owner_policy("dev", vec![Operation::PromoteProfile]);
+    policy.operations[0].requires = vec![Condition::OidcStepUp {
+        required_amr: vec!["webauthn".into()],
+        operation_bound: false,
+        fresh_for_seconds: 0, // freshness skipped (no clock in unit env)
+    }];
+
+    // owner bearer carrying a webauthn step-up: allowed.
+    assert!(evaluate_op(
+        &policy,
+        Operation::PromoteProfile,
+        "h",
+        &[],
+        &ctx_with_amr("dev", &["webauthn"]),
+    )
+    .is_ok());
+
+    // same owner, no webauthn in amr: denied.
+    assert!(evaluate_op(
+        &policy,
+        Operation::PromoteProfile,
+        "h",
+        &[],
+        &ctx_with_amr("dev", &["pwd"]),
+    )
+    .is_err());
+}
+
+#[test]
+fn oidc_step_up_operation_bound_fails_closed() {
+    use enclave_os_vault::policy::evaluate_op;
+    use enclave_os_vault::types::Condition;
+
+    let mut policy = owner_policy("dev", vec![Operation::PromoteProfile]);
+    policy.operations[0].requires = vec![Condition::OidcStepUp {
+        required_amr: vec!["webauthn".into()],
+        operation_bound: true, // not yet enforceable -> must fail closed
+        fresh_for_seconds: 0,
+    }];
+
+    assert!(evaluate_op(
+        &policy,
+        Operation::PromoteProfile,
+        "h",
+        &[],
+        &ctx_with_amr("dev", &["webauthn"]),
+    )
+    .is_err());
 }

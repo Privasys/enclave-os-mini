@@ -1804,7 +1804,16 @@ fn verify_oidc_token(token: &str) -> Result<enclave_os_common::oidc::OidcClaims,
     // Extract roles
     let roles = enclave_os_common::oidc::extract_roles(&claims, config);
 
-    Ok(enclave_os_common::oidc::OidcClaims::from_raw(sub, roles, config))
+    // Step-up claims (amr/acr/iat) for conditions like the vault's OidcStepUp.
+    let amr = enclave_os_common::oidc::extract_amr(&claims);
+    let acr = claims
+        .get("acr")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let iat = claims.get("iat").and_then(|v| v.as_u64()).unwrap_or(0);
+
+    Ok(enclave_os_common::oidc::OidcClaims::from_raw(sub, roles, config)
+        .with_step_up(amr, acr, iat))
 }
 
 /// Decode base64url (no padding) to bytes.

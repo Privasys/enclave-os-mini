@@ -323,6 +323,47 @@ fn evaluate_conditions(
                     });
                 }
             }
+            Condition::OidcStepUp {
+                required_amr,
+                operation_bound,
+                fresh_for_seconds,
+            } => {
+                // Operation binding needs per-op context (the promoted
+                // measurement + policy_version + request nonce) that is not yet
+                // threaded into condition evaluation. Until it is, fail closed so
+                // a key can never be left in a state where the op-bound step-up is
+                // required but unsatisfiable. See policies-plan.md §9.
+                if *operation_bound {
+                    return Err(
+                        "OidcStepUp: operation_bound is not yet enforceable (no op-binding path); \
+                         do not author it into a live policy"
+                            .to_string(),
+                    );
+                }
+                let claims = ctx.oidc_claims.as_ref().ok_or_else(|| {
+                    "OidcStepUp: no OIDC bearer in request".to_string()
+                })?;
+                if !claims.has_amr(required_amr) {
+                    return Err(format!(
+                        "OidcStepUp: token amr {:?} does not satisfy required {:?}",
+                        claims.amr, required_amr
+                    ));
+                }
+                if *fresh_for_seconds > 0 {
+                    if claims.iat == 0 {
+                        return Err(
+                            "OidcStepUp: token has no iat; cannot prove freshness".to_string(),
+                        );
+                    }
+                    if now.saturating_sub(claims.iat) > *fresh_for_seconds {
+                        return Err(format!(
+                            "OidcStepUp: token age {}s exceeds fresh_for_seconds={}",
+                            now.saturating_sub(claims.iat),
+                            fresh_for_seconds
+                        ));
+                    }
+                }
+            }
         }
     }
     Ok(())
