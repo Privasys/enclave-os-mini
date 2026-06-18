@@ -190,6 +190,19 @@ pub struct OidcClaims {
     /// require a *fresh* token rather than a replayed long-lived session.
     #[serde(default)]
     pub iat: u64,
+    /// Expiry (`exp` claim, unix seconds; 0 when absent). Part of the
+    /// operation-binding input for `OidcStepUp { operation_bound }`.
+    #[serde(default)]
+    pub exp: u64,
+    /// `vault_op` claim: base64url(SHA-256 of the operation-binding input)
+    /// proving the step-up was performed for THIS operation. `None` when absent.
+    /// See policies-plan.md §9 for the exact input layout.
+    #[serde(default)]
+    pub vault_op: Option<String>,
+    /// `nonce` claim echoed by the IdP into the operation-binding input (an
+    /// opaque base64url string). `None` when absent.
+    #[serde(default)]
+    pub nonce: Option<String>,
 }
 
 impl OidcClaims {
@@ -209,6 +222,9 @@ impl OidcClaims {
             amr: Vec::new(),
             acr: None,
             iat: 0,
+            exp: 0,
+            vault_op: None,
+            nonce: None,
         }
     }
 

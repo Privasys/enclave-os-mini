@@ -22,6 +22,10 @@
 use std::string::String;
 use std::vec::Vec;
 
+use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use base64::Engine;
+use enclave_os_common::digest;
+use enclave_os_common::hex::hex_encode;
 use enclave_os_common::modules::RequestContext;
 use enclave_os_common::oidc::OidcClaims;
 
@@ -31,6 +35,58 @@ use crate::types::{
     ApprovalToken, AttestationProfile, Condition, KeyPolicy, Measurement, Mutability, Operation,
     OperationRule, Principal, PrincipalRef,
 };
+
+/// Domain separator for the operation-binding hash. MUST match the IdP and
+/// client implementations (policies-plan.md §9).
+const VAULT_APPROVAL_DOMAIN: &str = "privasys-vault-approval/v1";
+
+/// Per-operation binding data for `Condition::OidcStepUp { operation_bound }`.
+/// Supplied by the handler that knows the operation's target (e.g. promote),
+/// `None` for ops that have no canonical target measurement.
+pub struct OpBinding {
+    /// Hex SHA-256 of the canonical promoted profile ([`profile_binding_digest`]).
+    pub measurement_digest_hex: String,
+    /// The key's `policy_version` at the time of the operation.
+    pub policy_version: u32,
+}
+
+/// Canonical digest of an [`AttestationProfile`] for operation binding: the
+/// SHA-256 (hex) of its measurements + required OIDs, each rendered as a stable
+/// `kind:value` line, lowercased, sorted, and newline-joined. MUST be computed
+/// identically by the IdP and client. See policies-plan.md §9.
+pub fn profile_binding_digest(profile: &AttestationProfile) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    for m in &profile.measurements {
+        match m {
+            Measurement::Mrenclave(v) => parts.push(format!("mrenclave:{}", v.to_lowercase())),
+            Measurement::Mrtd(v) => parts.push(format!("mrtd:{}", v.to_lowercase())),
+        }
+    }
+    for o in &profile.required_oids {
+        parts.push(format!("oid:{}={}", o.oid, o.value.to_lowercase()));
+    }
+    parts.sort();
+    let joined = parts.join("\n");
+    hex_encode(digest::digest(&digest::SHA256, joined.as_bytes()).as_ref())
+}
+
+/// The operation-binding value the IdP stamps into `vault_op` and the vault
+/// recomputes: `base64url(SHA-256(domain \n handle \n measurement_hex \n
+/// policy_version \n nonce \n exp))`. All inputs are rendered as UTF-8 strings
+/// joined by `\n` so the hash is trivially identical across Rust/Go/TS.
+pub fn vault_op_binding(
+    handle: &str,
+    measurement_digest_hex: &str,
+    policy_version: u32,
+    nonce: &str,
+    exp: u64,
+) -> String {
+    let input = format!(
+        "{}\n{}\n{}\n{}\n{}\n{}",
+        VAULT_APPROVAL_DOMAIN, handle, measurement_digest_hex, policy_version, nonce, exp
+    );
+    URL_SAFE_NO_PAD.encode(digest::digest(&digest::SHA256, input.as_bytes()).as_ref())
+}
 
 // ---------------------------------------------------------------------------
 //  Caller role (for mutability checks)
@@ -193,6 +249,7 @@ pub fn evaluate_op(
     handle: &str,
     approvals: &[ApprovalToken],
     ctx: &RequestContext,
+    op_binding: Option<&OpBinding>,
 ) -> Result<(), String> {
     let (caller_ref, _role) = resolve_caller(policy, ctx).ok_or_else(|| {
         "caller is not in policy.principals (no OIDC subject or RA-TLS TEE \
@@ -207,7 +264,7 @@ pub fn evaluate_op(
         if !rule.ops.contains(&op) || !rule_grants_to(rule, caller_ref) {
             continue;
         }
-        match evaluate_conditions(&rule.requires, policy, op, handle, approvals, ctx) {
+        match evaluate_conditions(&rule.requires, policy, op, handle, approvals, ctx, op_binding) {
             Ok(()) => return Ok(()),
             Err(e) => last_err = Some(e),
         }
@@ -247,6 +304,7 @@ fn evaluate_conditions(
     handle: &str,
     approvals: &[ApprovalToken],
     ctx: &RequestContext,
+    op_binding: Option<&OpBinding>,
 ) -> Result<(), String> {
     let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
     for cond in conditions {
@@ -328,18 +386,6 @@ fn evaluate_conditions(
                 operation_bound,
                 fresh_for_seconds,
             } => {
-                // Operation binding needs per-op context (the promoted
-                // measurement + policy_version + request nonce) that is not yet
-                // threaded into condition evaluation. Until it is, fail closed so
-                // a key can never be left in a state where the op-bound step-up is
-                // required but unsatisfiable. See policies-plan.md §9.
-                if *operation_bound {
-                    return Err(
-                        "OidcStepUp: operation_bound is not yet enforceable (no op-binding path); \
-                         do not author it into a live policy"
-                            .to_string(),
-                    );
-                }
                 let claims = ctx.oidc_claims.as_ref().ok_or_else(|| {
                     "OidcStepUp: no OIDC bearer in request".to_string()
                 })?;
@@ -361,6 +407,41 @@ fn evaluate_conditions(
                             now.saturating_sub(claims.iat),
                             fresh_for_seconds
                         ));
+                    }
+                }
+                // Operation binding: the token's `vault_op` must equal the value
+                // recomputed from THIS operation's (handle, measurement,
+                // policy_version) plus the token's own (nonce, exp). This proves
+                // the WebAuthn step-up the IdP attests (`amr`) was performed for
+                // exactly this promote, so a stolen bearer + a captured approval
+                // cannot promote a different/forged measurement. Fail closed when
+                // the handler supplied no binding (op has no target) or the token
+                // lacks the claims. See policies-plan.md §9.
+                if *operation_bound {
+                    let binding = op_binding.ok_or_else(|| {
+                        "OidcStepUp: operation_bound required but this operation \
+                         carries no binding context"
+                            .to_string()
+                    })?;
+                    let vault_op = claims.vault_op.as_deref().ok_or_else(|| {
+                        "OidcStepUp: token has no vault_op binding claim".to_string()
+                    })?;
+                    let nonce = claims.nonce.as_deref().ok_or_else(|| {
+                        "OidcStepUp: token has no nonce claim".to_string()
+                    })?;
+                    let expected = vault_op_binding(
+                        handle,
+                        &binding.measurement_digest_hex,
+                        binding.policy_version,
+                        nonce,
+                        claims.exp,
+                    );
+                    if vault_op != expected {
+                        return Err(
+                            "OidcStepUp: vault_op does not bind this operation \
+                             (handle/measurement/policy_version/nonce/exp mismatch)"
+                                .to_string(),
+                        );
                     }
                 }
             }

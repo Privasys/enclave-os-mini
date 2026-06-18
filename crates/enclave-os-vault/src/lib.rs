@@ -510,6 +510,7 @@ fn handle_provide_material(
         handle,
         approvals,
         ctx,
+        None,
     ) {
         let _ = audit_and_save(
             &mut record,
@@ -580,7 +581,7 @@ fn handle_export(
         return VaultResponse::Error("key is not exportable".into());
     }
     let caller = caller_str(ctx);
-    match evaluate_op(&record.policy, Operation::ExportKey, handle, approvals, ctx) {
+    match evaluate_op(&record.policy, Operation::ExportKey, handle, approvals, ctx, None) {
         Ok(()) => {
             let _ = audit_and_save(
                 &mut record,
@@ -617,7 +618,7 @@ fn handle_delete(
         Err(e) => return e,
     };
     let caller = caller_str(ctx);
-    if let Err(e) = evaluate_op(&record.policy, Operation::DeleteKey, handle, approvals, ctx) {
+    if let Err(e) = evaluate_op(&record.policy, Operation::DeleteKey, handle, approvals, ctx, None) {
         let _ = audit_and_save(
             &mut record,
             "DeleteKey",
@@ -675,6 +676,7 @@ fn handle_update_policy(
         handle,
         approvals,
         ctx,
+        None,
     ) {
         let _ = audit_and_save(
             &mut record,
@@ -844,7 +846,7 @@ fn require_op(
         return Err(VaultResponse::Error(msg));
     }
     let caller = caller_str(ctx);
-    if let Err(e) = evaluate_op(&record.policy, op, handle, approvals, ctx) {
+    if let Err(e) = evaluate_op(&record.policy, op, handle, approvals, ctx, None) {
         let _ = audit_and_save(
             &mut record,
             op_name(op),
@@ -1238,12 +1240,26 @@ fn handle_promote_pending(
     };
     let caller = caller_str(ctx);
 
+    // Resolve the target pending profile up front so an `OidcStepUp`
+    // `operation_bound` condition can be checked against THIS promote's
+    // measurement + policy_version. If the id is unknown the binding is None,
+    // which makes an operation-bound step-up fail closed inside evaluate_op
+    // (and a non-bound policy still falls through to the not-found error below).
+    let pos_opt = record.pending_profiles.iter().position(|p| p.id == pending_id);
+    let op_binding = pos_opt.map(|p| crate::policy::OpBinding {
+        measurement_digest_hex: crate::policy::profile_binding_digest(
+            &record.pending_profiles[p].profile,
+        ),
+        policy_version: record.policy_version,
+    });
+
     if let Err(e) = evaluate_op(
         &record.policy,
         Operation::PromoteProfile,
         handle,
         approvals,
         ctx,
+        op_binding.as_ref(),
     ) {
         let _ = audit_and_save(
             &mut record,
@@ -1255,7 +1271,7 @@ fn handle_promote_pending(
         return VaultResponse::Error(e);
     }
 
-    let pos = match record.pending_profiles.iter().position(|p| p.id == pending_id) {
+    let pos = match pos_opt {
         Some(p) => p,
         None => {
             let msg = format!("pending profile id {} not found", pending_id);

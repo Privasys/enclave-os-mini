@@ -1804,16 +1804,30 @@ fn verify_oidc_token(token: &str) -> Result<enclave_os_common::oidc::OidcClaims,
     // Extract roles
     let roles = enclave_os_common::oidc::extract_roles(&claims, config);
 
-    // Step-up claims (amr/acr/iat) for conditions like the vault's OidcStepUp.
+    // Step-up claims (amr/acr/iat + the operation-binding exp/vault_op/nonce)
+    // for conditions like the vault's OidcStepUp.
     let amr = enclave_os_common::oidc::extract_amr(&claims);
     let acr = claims
         .get("acr")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
     let iat = claims.get("iat").and_then(|v| v.as_u64()).unwrap_or(0);
+    let exp = claims.get("exp").and_then(|v| v.as_u64()).unwrap_or(0);
+    let vault_op = claims
+        .get("vault_op")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
+    let nonce = claims
+        .get("nonce")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string());
 
-    Ok(enclave_os_common::oidc::OidcClaims::from_raw(sub, roles, config)
-        .with_step_up(amr, acr, iat))
+    let mut oc = enclave_os_common::oidc::OidcClaims::from_raw(sub, roles, config)
+        .with_step_up(amr, acr, iat);
+    oc.exp = exp;
+    oc.vault_op = vault_op;
+    oc.nonce = nonce;
+    Ok(oc)
 }
 
 /// Decode base64url (no padding) to bytes.
