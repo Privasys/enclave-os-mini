@@ -102,7 +102,8 @@ that encode the enclave's attestation data and configuration state.
 └── 3.*                              Per-app OIDs
     ├── 3.1                          App config Merkle root
     ├── 3.2                          App code hash
-    └── 3.4                          App key source
+    ├── 3.4                          App key source
+    └── 3.6                          App Id (MR_APP sealing)
 ```
 
 ### Enclave-Wide OIDs
@@ -125,6 +126,7 @@ a dedicated certificate with app-level OIDs:
 | `1.3.6.1.4.1.65230.3.1` | App Config Merkle Root | SHA-256 tree of app config | 32 bytes |
 | `1.3.6.1.4.1.65230.3.2` | App Code Hash | SHA-256 of WASM bytecode | 32 bytes |
 | `1.3.6.1.4.1.65230.3.4` | App Key Source | `"generated"` or `"byok:<fingerprint>"` | variable |
+| `1.3.6.1.4.1.65230.3.6` | App Id | Platform-assigned app identity (`apps.id`, raw UUID); pins WHICH app for MR_APP vault sealing — omitted when no app-id supplied | 16 bytes |
 
 ### Module OID Registration
 
