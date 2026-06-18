@@ -1272,12 +1272,14 @@ fn handle_promote_pending(
     // Append/strengthen-only: a promoted measurement must still carry every OID the
     // key already enforces, so a staged profile cannot silently downgrade an MR_APP
     // key to MR_ENCLAVE by omitting the app-id at 3.6. See policies-plan.md §8.
-    let established = crate::policy::key_required_oids(&record.policy);
-    let promoted_oids = &record.pending_profiles[pos].profile.required_oids;
-    if let Some(missing) = established
-        .iter()
-        .find(|oid| !promoted_oids.iter().any(|r| &r.oid == *oid))
-    {
+    let missing_oid: Option<String> = {
+        let established = crate::policy::key_required_oids(&record.policy);
+        let promoted = &record.pending_profiles[pos].profile.required_oids;
+        established
+            .into_iter()
+            .find(|oid| !promoted.iter().any(|r| &r.oid == oid))
+    };
+    if let Some(missing) = missing_oid {
         let msg = format!(
             "pending profile is missing required OID {}: required_oids are append/strengthen-only",
             missing
