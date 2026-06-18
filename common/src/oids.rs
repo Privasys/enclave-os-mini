@@ -116,7 +116,7 @@ pub const APP_CODE_HASH_OID_STR: &str = "1.3.6.1.4.1.65230.3.2";
 /// unsealed by a same-cwasm peer with a different app-id. Stamped by the
 /// (measured) enclave, so a peer cannot forge another app's id. Aligned with
 /// enclave-os-virtual's OID 3.6 (ContainerAppId). See
-/// .operations/enclave-vaults/policies-plan.md.
+/// the MR_APP / promote-step-up design.
 pub const APP_ID_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 3, 6];
 /// Per-app App Id (dotted-string).
 pub const APP_ID_OID_STR: &str = "1.3.6.1.4.1.65230.3.6";

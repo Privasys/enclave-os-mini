@@ -211,7 +211,7 @@ pub struct AppMeta {
     /// Platform-assigned app identity (apps.id, raw 16-byte UUID). Stamped at
     /// OID 3.6 on the per-app leaf so a vault key can be bound to THIS app
     /// (MR_APP). `None` for apps loaded before app-id support (and for app-less
-    /// callers), which keeps the MR_ENCLAVE behaviour. See policies-plan.md.
+    /// callers), which keeps the MR_ENCLAVE behaviour. See the MR_APP / promote-step-up design.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_id: Option<[u8; 16]>,
 }

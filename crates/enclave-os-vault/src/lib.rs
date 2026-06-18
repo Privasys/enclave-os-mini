@@ -1287,7 +1287,7 @@ fn handle_promote_pending(
     };
     // Append/strengthen-only: a promoted measurement must still carry every OID the
     // key already enforces, so a staged profile cannot silently downgrade an MR_APP
-    // key to MR_ENCLAVE by omitting the app-id at 3.6. See policies-plan.md §8.
+    // key to MR_ENCLAVE by omitting the app-id at 3.6. See the MR_APP sealing design.
     let missing_oid: Option<String> = {
         let established = crate::policy::key_required_oids(&record.policy);
         let promoted = &record.pending_profiles[pos].profile.required_oids;

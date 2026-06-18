@@ -1498,7 +1498,7 @@ impl EnclaveModule for WasmModule {
 /// Parse a UUID string (with or without hyphens) into its raw 16 bytes for the
 /// OID 3.6 app-id extension. Returns `None` for empty or malformed input, which
 /// leaves the app in MR_ENCLAVE shape (the back-compat default before the
-/// platform starts sending `app_id`). See policies-plan.md.
+/// platform starts sending `app_id`). See the MR_APP / promote-step-up design.
 fn parse_app_id(s: Option<&str>) -> Option<[u8; 16]> {
     let bytes = hex_decode(&s?.replace('-', "")).ok()?;
     if bytes.len() != 16 {

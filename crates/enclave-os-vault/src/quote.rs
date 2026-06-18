@@ -35,7 +35,7 @@ const CLAIM_OIDS: &[&str] = &[
     enclave_os_common::oids::APP_CODE_HASH_OID_STR,
     // MR_APP: the per-app id (3.6). Without it here, dissect_peer_cert would
     // drop the leaf's app-id and a policy requiring it could never match. See
-    // .operations/enclave-vaults/policies-plan.md.
+    // the MR_APP / promote-step-up design.
     enclave_os_common::oids::APP_ID_OID_STR,
 ];
 

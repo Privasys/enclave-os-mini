@@ -37,7 +37,7 @@ use crate::types::{
 };
 
 /// Domain separator for the operation-binding hash. MUST match the IdP and
-/// client implementations (policies-plan.md §9).
+/// client implementations (the vault promote-step-up design).
 const VAULT_APPROVAL_DOMAIN: &str = "privasys-vault-approval/v1";
 
 /// Per-operation binding data for `Condition::OidcStepUp { operation_bound }`.
@@ -53,7 +53,7 @@ pub struct OpBinding {
 /// Canonical digest of an [`AttestationProfile`] for operation binding: the
 /// SHA-256 (hex) of its measurements + required OIDs, each rendered as a stable
 /// `kind:value` line, lowercased, sorted, and newline-joined. MUST be computed
-/// identically by the IdP and client. See policies-plan.md §9.
+/// identically by the IdP and client. See the vault promote-step-up design.
 pub fn profile_binding_digest(profile: &AttestationProfile) -> String {
     let mut parts: Vec<String> = Vec::new();
     for m in &profile.measurements {
@@ -416,7 +416,7 @@ fn evaluate_conditions(
                 // exactly this promote, so a stolen bearer + a captured approval
                 // cannot promote a different/forged measurement. Fail closed when
                 // the handler supplied no binding (op has no target) or the token
-                // lacks the claims. See policies-plan.md §9.
+                // lacks the claims. See the vault promote-step-up design.
                 if *operation_bound {
                     let binding = op_binding.ok_or_else(|| {
                         "OidcStepUp: operation_bound required but this operation \
@@ -493,7 +493,7 @@ pub fn evaluate_policy_update(
     // Append/strengthen-only: an UpdatePolicy may not drop an OID the key already
     // enforces on every accepted measurement (e.g. downgrade an MR_APP key to
     // MR_ENCLAVE by removing the app-id at 3.6). Independent of Mutability, so it
-    // holds however many approvals the caller carries. See policies-plan.md §8.
+    // holds however many approvals the caller carries. See the MR_APP sealing design.
     let old_required = key_required_oids(old);
     let new_required = key_required_oids(new);
     for oid in &old_required {

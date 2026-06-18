@@ -243,7 +243,7 @@ pub struct WasmLoad {
     /// the enclave stamps it (raw 16 bytes) at OID 3.6 on the per-app leaf so a
     /// vault key can be sealed to THIS app (MR_APP) and a same-cwasm peer with a
     /// different app-id cannot unseal it. Absent keeps the MR_ENCLAVE behaviour.
-    /// See .operations/enclave-vaults/policies-plan.md.
+    /// See the MR_APP / promote-step-up design.
     #[serde(default)]
     pub app_id: Option<String>,
 }

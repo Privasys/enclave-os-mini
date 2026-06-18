@@ -499,7 +499,7 @@ pub enum Condition {
     /// The caller's OIDC bearer must prove a fresh step-up: its `amr` claim
     /// contains every method in `required_amr` (e.g. `["webauthn"]`) and its
     /// `iat` is within `fresh_for_seconds`. This is the IdP-verified promote
-    /// step-up (see policies-plan.md §9): the attested IdP issues a short-lived,
+    /// step-up (see the vault promote-step-up design): the attested IdP issues a short-lived,
     /// high-`acr` token after a wallet/passkey WebAuthn assertion.
     ///
     /// `operation_bound` requires the token to also be bound to THIS operation

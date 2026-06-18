@@ -196,7 +196,7 @@ pub struct OidcClaims {
     pub exp: u64,
     /// `vault_op` claim: base64url(SHA-256 of the operation-binding input)
     /// proving the step-up was performed for THIS operation. `None` when absent.
-    /// See policies-plan.md §9 for the exact input layout.
+    /// See the vault promote-step-up design for the exact input layout.
     #[serde(default)]
     pub vault_op: Option<String>,
     /// `nonce` claim echoed by the IdP into the operation-binding input (an
