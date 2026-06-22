@@ -246,6 +246,30 @@ pub struct WasmLoad {
     /// See the MR_APP / promote-step-up design.
     #[serde(default)]
     pub app_id: Option<String>,
+
+    /// Vault-backed key (Part 2): the constellation handle holding (or reserved
+    /// for) this app's KEK, e.g.
+    /// `vault:apps.privasys.org/<app-id>/storage-kek/v1`. When set, the app's KV
+    /// `encryption_key` is envelope-wrapped under a KEK reconstructed from the
+    /// constellation, so the data survives an enclave upgrade. Absent keeps the
+    /// MRENCLAVE-sealed-only behaviour.
+    #[serde(default)]
+    pub key_handle: Option<String>,
+    /// Vault constellation endpoints (`host:port` each). Untrusted: each vault
+    /// is verified by attestation at dial time.
+    #[serde(default)]
+    pub vault_endpoints: Vec<String>,
+    /// Pins the vault enclave build (64 hex chars / 32-byte MRENCLAVE).
+    #[serde(default)]
+    pub vault_mrenclave: Option<String>,
+    /// Attestation-server URL that must confirm each vault's quote.
+    #[serde(default)]
+    pub vault_attestation_server: Option<String>,
+    /// Hex-encoded DER trust anchors the vault's RA-TLS leaf chains to (the
+    /// CA the vaults are launched with). Used as the WebPKI root store for the
+    /// vault connection; the real trust is the attested quote.
+    #[serde(default)]
+    pub vault_ca_roots: Vec<String>,
 }
 
 /// Configure-endpoint declaration. See [`WasmLoad::config_api`].

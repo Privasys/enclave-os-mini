@@ -233,13 +233,14 @@ impl WasmModule {
         config_api_function: Option<String>,
         owners: Vec<String>,
         app_id: Option<[u8; 16]>,
+        vault: Option<crate::registry::VaultBacking>,
     ) -> Result<(), String> {
         // Load into the registry (compile + introspect + per-app key)
         let meta = {
             let mut reg = self.registry
                 .lock()
                 .map_err(|_| String::from("registry lock poisoned"))?;
-            reg.load_app(name, hostname, wasm_bytes, encryption_key, permissions, max_fuel, mcp_enabled, docs, config_api_function, owners, app_id)?
+            reg.load_app(name, hostname, wasm_bytes, encryption_key, permissions, max_fuel, mcp_enabled, docs, config_api_function, owners, app_id, vault)?
         };
 
         // ── Persist to KV store ────────────────────────────────────
@@ -1252,7 +1253,57 @@ impl EnclaveModule for WasmModule {
             let mcp_enabled = load.mcp_enabled.unwrap_or(true);
 
             let app_id = parse_app_id(load.app_id.as_deref());
-            let mgmt_result = match self.load_app(&load.name, &hostname, &load.bytes, encryption_key, load.permissions, max_fuel, mcp_enabled, load.docs, load.config_api.map(|c| c.function), load.owners, app_id) {
+
+            // Vault-backed key (Part 2): build the constellation backing when a
+            // key handle is present. Malformed vault config returns an error.
+            let vault = match load.key_handle.as_deref() {
+                Some(handle) if !handle.is_empty() => {
+                    let mre = match load.vault_mrenclave.as_deref().and_then(hex_decode) {
+                        Some(b) if b.len() == 32 => {
+                            let mut m = [0u8; 32];
+                            m.copy_from_slice(&b);
+                            m
+                        }
+                        _ => {
+                            return Some(Response::Data(serialize_or_error(
+                                &WasmManagementResult::Error {
+                                    message: String::from("vault_mrenclave: expected 64 hex chars"),
+                                },
+                            )));
+                        }
+                    };
+                    let mut ca_roots = Vec::new();
+                    for r in &load.vault_ca_roots {
+                        match hex_decode(r) {
+                            Some(der) => ca_roots.push(der),
+                            None => {
+                                return Some(Response::Data(serialize_or_error(
+                                    &WasmManagementResult::Error {
+                                        message: String::from("vault_ca_roots: invalid hex"),
+                                    },
+                                )));
+                            }
+                        }
+                    }
+                    Some(crate::registry::VaultBacking {
+                        cfg: crate::vaultkey::VaultConfig {
+                            endpoints: load.vault_endpoints.clone(),
+                            threshold: 0,
+                            mrenclave: mre,
+                            attestation_servers: load
+                                .vault_attestation_server
+                                .clone()
+                                .into_iter()
+                                .collect(),
+                            ca_roots_der: ca_roots,
+                        },
+                        handle: handle.to_string(),
+                    })
+                }
+                _ => None,
+            };
+
+            let mgmt_result = match self.load_app(&load.name, &hostname, &load.bytes, encryption_key, load.permissions, max_fuel, mcp_enabled, load.docs, load.config_api.map(|c| c.function), load.owners, app_id, vault) {
                 Ok(()) => {
                     // Return the loaded app's info
                     let apps = self.list_apps();

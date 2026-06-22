@@ -55,6 +55,81 @@ use crate::wasi::AppContext;
 use enclave_os_common::types::AEAD_KEY_SIZE;
 use crate::protocol::{AppPermissions, ExportedFunc, FunctionPermission, FunctionPolicy, WasmParam, WasmResult, WasmValue};
 
+/// Host-KV table holding each vault-backed app's wrapped `encryption_key`.
+/// The value is AES-256-GCM(encryption_key, KEK), so it is safe at rest on the
+/// untrusted host; only an enclave that can reconstruct the KEK can unwrap it.
+const VAULTWRAP_TABLE: &[u8] = b"vaultwrap";
+
+/// A vault-backed app's KEK source: the constellation config + the key handle.
+/// Present on `load_app` when the platform deploys the app with a
+/// `key_handle`; its KEK envelope-wraps the per-app `encryption_key` so the
+/// data survives an enclave upgrade.
+pub struct VaultBacking {
+    pub cfg: crate::vaultkey::VaultConfig,
+    pub handle: String,
+}
+
+/// Resolve a vault-backed app's `encryption_key`: reconstruct the KEK from the
+/// constellation, then unwrap the stored (host) wrapped key, or — on first
+/// load — generate (or take BYOK), wrap it under the KEK, and persist the blob.
+///
+/// The `encryption_key` (the KV DEK) itself never changes here; only how it is
+/// protected does — which is what lets the data survive an enclave upgrade and
+/// makes KEK rotation a cheap re-wrap.
+fn resolve_vault_backed_key(
+    vb: &VaultBacking,
+    code_hash: &[u8; 32],
+    app_id: Option<[u8; 16]>,
+    byok: Option<[u8; AEAD_KEY_SIZE]>,
+) -> Result<([u8; AEAD_KEY_SIZE], String), String> {
+    use enclave_os_common::aead::AeadCipher;
+    use enclave_os_common::ocall;
+
+    let kek = crate::vaultkey::resolve_or_provision(
+        &vb.cfg,
+        &vb.handle,
+        code_hash,
+        app_id.as_ref().map(|a| a.as_slice()),
+    )?;
+    let cipher = AeadCipher::from_key(kek);
+    let key_id = vb.handle.as_bytes();
+    // Bind the wrapped blob to this handle so it can't be swapped between apps.
+    let aad = vb.handle.as_bytes();
+
+    match ocall::kv_store_get(VAULTWRAP_TABLE, key_id)
+        .map_err(|e| format!("vaultkey: host kv get: {e}"))?
+    {
+        Some(blob) => {
+            let key_vec = cipher
+                .decrypt(&blob, aad)
+                .map_err(|e| format!("vaultkey: unwrap encryption_key: {e}"))?;
+            let key: [u8; AEAD_KEY_SIZE] = key_vec
+                .as_slice()
+                .try_into()
+                .map_err(|_| String::from("vaultkey: wrapped encryption_key has wrong length"))?;
+            Ok((key, format!("vault:{}", vb.handle)))
+        }
+        None => {
+            let key = match byok {
+                Some(k) => k,
+                None => {
+                    let mut k = [0u8; AEAD_KEY_SIZE];
+                    SystemRandom::new()
+                        .fill(&mut k)
+                        .map_err(|_| String::from("vaultkey: RDRAND failed generating key"))?;
+                    k
+                }
+            };
+            let blob = cipher
+                .encrypt(&key, aad)
+                .map_err(|e| format!("vaultkey: wrap encryption_key: {e}"))?;
+            ocall::kv_store_put(VAULTWRAP_TABLE, key_id, &blob)
+                .map_err(|e| format!("vaultkey: host kv put: {e}"))?;
+            Ok((key, format!("vault:{}", vb.handle)))
+        }
+    }
+}
+
 /// Owned per-invocation state produced by
 /// [`AppRegistry::prepare_call()`]. Holds everything needed to run
 /// the wasm function **without** the registry mutex held — this is
@@ -355,6 +430,7 @@ impl AppRegistry {
         config_api_function: Option<String>,
         owners: Vec<String>,
         app_id: Option<[u8; 16]>,
+        vault: Option<VaultBacking>,
     ) -> Result<AppMeta, String> {
         if self.known.contains_key(name) {
             return Err(format!("app '{}' is already loaded", name));
@@ -382,26 +458,33 @@ impl AppRegistry {
         }
 
         // ── Per-app encryption key ─────────────────────────────────
-        let (app_key, key_source) = match encryption_key {
-            Some(k) => {
-                let fingerprint = {
-                    let d = digest::digest(&digest::SHA256, &k);
-                    let mut buf = String::with_capacity(64);
-                    for b in d.as_ref() {
-                        use core::fmt::Write;
-                        let _ = write!(buf, "{:02x}", b);
-                    }
-                    buf
-                };
-                (k, format!("byok:{}", fingerprint))
-            }
-            None => {
-                let rng = SystemRandom::new();
-                let mut k = [0u8; AEAD_KEY_SIZE];
-                rng.fill(&mut k)
-                    .map_err(|_| String::from("RDRAND failed generating app encryption key"))?;
-                (k, String::from("generated"))
-            }
+        // Vault-backed apps reconstruct a KEK from the constellation and
+        // envelope-wrap the KV `encryption_key` under it (so data survives an
+        // enclave upgrade); others keep the BYOK / generated key as before.
+        let (app_key, key_source) = match &vault {
+            Some(vb) => resolve_vault_backed_key(vb, &code_hash, app_id, encryption_key)?,
+            None => match encryption_key {
+                Some(k) => {
+                    let fingerprint = {
+                        let d = digest::digest(&digest::SHA256, &k);
+                        let mut buf = String::with_capacity(64);
+                        for b in d.as_ref() {
+                            use core::fmt::Write;
+                            let _ = write!(buf, "{:02x}", b);
+                        }
+                        buf
+                    };
+                    (k, format!("byok:{}", fingerprint))
+                }
+                None => {
+                    let rng = SystemRandom::new();
+                    let mut k = [0u8; AEAD_KEY_SIZE];
+                    rng.fill(&mut k).map_err(|_| {
+                        String::from("RDRAND failed generating app encryption key")
+                    })?;
+                    (k, String::from("generated"))
+                }
+            },
         };
         // ── Introspect exports (full WIT type schema) ──────────────
         // Extract @auth annotations from docs before passing to schema builder.
