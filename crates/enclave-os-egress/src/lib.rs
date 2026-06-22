@@ -59,6 +59,8 @@ pub use client::{
     OID_ATTESTATION_SERVERS_HASH,
     MAX_RESPONSE_BODY,
     https_fetch,
+    https_fetch_mtls,
+    VaultClientCertResolver,
     mozilla_root_store,
 };
 

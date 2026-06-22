@@ -22,9 +22,11 @@ use ring::digest;
 use enclave_os_common::ocall;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
-use rustls::client::WebPkiServerVerifier;
+use rustls::client::{ResolvesClientCert, WebPkiServerVerifier};
 use rustls::crypto::ring::default_provider;
-use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::crypto::CryptoProvider;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
+use rustls::sign::CertifiedKey;
 use rustls::{
     ClientConfig, ClientConnection, DigitallySignedStruct, Error, SignatureScheme,
 };
@@ -310,6 +312,23 @@ pub fn https_fetch(
     root_store: &RootCertStore,
     ratls: Option<&RaTlsPolicy>,
 ) -> Result<HttpResponse, String> {
+    https_fetch_mtls(method, url, headers, body, root_store, ratls, None)
+}
+
+/// Like [`https_fetch`] but presents a client RA-TLS certificate, minted on
+/// demand by `client_id`, when the server requests one. This is mutual
+/// attestation: it lets an enclave authenticate to a server (e.g. an Enclave
+/// Vault) as a `Principal::Tee`, with the client quote bound to the server's
+/// RA-TLS challenge. `client_id` is only honoured for RA-TLS connections.
+pub fn https_fetch_mtls(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    root_store: &RootCertStore,
+    ratls: Option<&RaTlsPolicy>,
+    client_id: Option<&Arc<dyn VaultClientCertResolver>>,
+) -> Result<HttpResponse, String> {
     let (host, port, path) = parse_url(url)?;
 
     // Build HTTP/1.1 request.
@@ -332,7 +351,7 @@ pub fn https_fetch(
         request_bytes.extend_from_slice(b);
     }
 
-    https_request_inner(&host, port, &request_bytes, root_store, ratls)
+    https_request_inner(&host, port, &request_bytes, root_store, ratls, client_id)
 }
 
 /// Internal: perform an HTTPS request and return the full parsed response.
@@ -342,8 +361,9 @@ fn https_request_inner(
     request: &[u8],
     root_store: &RootCertStore,
     ratls: Option<&RaTlsPolicy>,
+    client_id: Option<&Arc<dyn VaultClientCertResolver>>,
 ) -> Result<HttpResponse, String> {
-    let tls_config = build_client_config(root_store, ratls)
+    let tls_config = build_client_config(root_store, ratls, client_id)
         .map_err(|e| e.to_string())?;
 
     let fd = ocall::net_tcp_connect(host, port)
@@ -438,14 +458,72 @@ fn https_request_inner(
     Ok(HttpResponse { status, headers, body })
 }
 
+// =========================================================================
+//  RA-TLS client authentication (mutual attestation)
+// =========================================================================
+
+/// Mints a client RA-TLS certificate on demand, bound to the server's
+/// challenge. Implemented by the enclave (which holds the SGX quote + CA
+/// signing material); egress stays decoupled from the attestation crate.
+///
+/// `mint` is invoked during the TLS handshake when the server (e.g. an
+/// Enclave Vault) requests a client certificate and supplies its RA-TLS
+/// challenge nonce in the `CertificateRequest` extension `0xFFBB`. The
+/// returned identity must carry an SGX quote whose `ReportData` binds to
+/// `ratls_challenge`, plus the caller's measurement OIDs, so the server's
+/// `tee_matches` policy authorises it.
+pub trait VaultClientCertResolver: Send + Sync + core::fmt::Debug {
+    /// Given the server's RA-TLS challenge nonce, return
+    /// `(cert_chain_der, pkcs8_key_der)` for the client identity, or `None`
+    /// to decline (no certificate is presented).
+    fn mint(&self, ratls_challenge: &[u8]) -> Option<(Vec<Vec<u8>>, Vec<u8>)>;
+}
+
+/// Adapter that drives a [`VaultClientCertResolver`] from rustls' client-auth
+/// hook, surfacing the server's RA-TLS challenge (fork extension `0xFFBB`).
+#[derive(Debug)]
+struct ChallengeBoundClientAuth {
+    resolver: Arc<dyn VaultClientCertResolver>,
+    provider: Arc<CryptoProvider>,
+}
+
+impl ResolvesClientCert for ChallengeBoundClientAuth {
+    fn resolve(
+        &self,
+        _root_hint_subjects: &[&[u8]],
+        _sigschemes: &[SignatureScheme],
+        ratls_challenge: Option<&[u8]>,
+    ) -> Option<Arc<CertifiedKey>> {
+        // Bidirectional challenge-response is mandatory: without the server's
+        // nonce we cannot bind a fresh quote, so decline rather than present
+        // an unbound identity.
+        let challenge = ratls_challenge?;
+        let (chain_der, pkcs8) = self.resolver.mint(challenge)?;
+        let certs: Vec<CertificateDer<'static>> =
+            chain_der.into_iter().map(CertificateDer::from).collect();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8));
+        let signing_key = self.provider.key_provider.load_private_key(key).ok()?;
+        Some(Arc::new(CertifiedKey::new(certs, signing_key)))
+    }
+
+    fn has_certs(&self) -> bool {
+        true
+    }
+}
+
 /// Build a rustls `ClientConfig` using the provided root CAs.
 ///
 /// When `ratls` is `Some`, a custom [`RaTlsVerifier`] is installed that
 /// wraps the standard WebPKI chain validation with additional RA-TLS
 /// checks (quote presence, measurements, ReportData binding).
+///
+/// When `client_id` is `Some` (only honoured for RA-TLS connections), the
+/// client presents a measurement-bound certificate minted on demand, for
+/// mutual attestation against a server that requests one (e.g. a vault).
 fn build_client_config(
     root_store: &RootCertStore,
     ratls: Option<&RaTlsPolicy>,
+    client_id: Option<&Arc<dyn VaultClientCertResolver>>,
 ) -> Result<Arc<ClientConfig>, &'static str> {
     let provider = Arc::new(default_provider());
 
@@ -464,12 +542,20 @@ fn build_client_config(
             policy: policy.clone(),
         };
 
-        let mut cfg = ClientConfig::builder_with_provider(provider)
+        let wants_client_cert = ClientConfig::builder_with_provider(provider.clone())
             .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
             .map_err(|_| "TLS config error")?
             .dangerous()
-            .with_custom_certificate_verifier(Arc::new(verifier))
-            .with_no_client_auth();
+            .with_custom_certificate_verifier(Arc::new(verifier));
+        let mut cfg = match client_id {
+            Some(resolver) => wants_client_cert.with_client_cert_resolver(Arc::new(
+                ChallengeBoundClientAuth {
+                    resolver: resolver.clone(),
+                    provider: provider.clone(),
+                },
+            )),
+            None => wants_client_cert.with_no_client_auth(),
+        };
 
         // When the policy uses challenge-response attestation, inject the
         // nonce into the ClientHello extension 0xFFBB so the remote server

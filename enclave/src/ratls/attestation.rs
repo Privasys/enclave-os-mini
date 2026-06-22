@@ -226,6 +226,51 @@ pub fn generate_app_certificate(
     })
 }
 
+/// Mint a client RA-TLS certificate for authenticating to an Enclave Vault
+/// as a `Principal::Tee`. The CA-signed leaf carries the SGX quote (its
+/// `ReportData` bound to the vault's `challenge` via
+/// `SHA-512(SHA-256(SPKI) || challenge)`) plus the app's measurement: the
+/// cwasm code hash at OID 3.2 and, when present, the app-id at OID 3.6 — the
+/// exact identity the vault's `tee_matches` authorises for a share export.
+///
+/// This is the WASM/SGX analog of the container path's
+/// `enclave-os-virtual` `vaultkey/clientcert.go` `mintIdentity`. The closure
+/// behind [`enclave_os_egress::VaultClientCertResolver`] calls this with the
+/// nonce the vault sends in its `CertificateRequest` (ext `0xFFBB`). Returns
+/// `(cert_chain_der, pkcs8_key_der)`.
+pub fn mint_vault_client_cert(
+    ca: &CaContext,
+    challenge: &[u8],
+    cwasm_code_hash: &[u8],
+    app_id: Option<&[u8]>,
+) -> Result<(Vec<Vec<u8>>, Vec<u8>), String> {
+    let mut oid_extensions: Vec<(&'static [u64], Vec<u8>)> = Vec::new();
+    oid_extensions.push((
+        enclave_os_common::oids::APP_CODE_HASH_OID,
+        cwasm_code_hash.to_vec(),
+    ));
+    // MR_APP: bind to this specific app. Omitted (MR_ENCLAVE shape) when no
+    // app-id is supplied, keeping back-compat with pre-app-id deployments.
+    if let Some(id) = app_id {
+        if !id.is_empty() {
+            oid_extensions.push((enclave_os_common::oids::APP_ID_OID, id.to_vec()));
+        }
+    }
+    let app = AppCertData {
+        hostname: String::from("vault-client"),
+        merkle_root: [0u8; 32],
+        oid_extensions,
+    };
+    let result = generate_app_certificate(
+        ca,
+        CertMode::Challenge {
+            nonce: challenge.to_vec(),
+        },
+        &app,
+    )?;
+    Ok((result.cert_chain_der, result.pkcs8_key))
+}
+
 /// Generate an ECDSA P-256 key pair and return `(pkcs8_bytes, key_pair)`.
 pub fn generate_keypair() -> Result<(Vec<u8>, EcdsaKeyPair), &'static str> {
     let rng = SystemRandom::new();
