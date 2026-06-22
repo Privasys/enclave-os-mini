@@ -8,7 +8,9 @@
 
 #![cfg_attr(feature = "sgx", no_std)]
 
-#[cfg(feature = "sgx")]
+// `alloc` is available in both the no_std (sgx) and std (host) builds, and
+// `oidc.rs` uses `alloc::` unconditionally, so the extern crate must not be
+// gated on the sgx feature (gating it broke the host build of this crate).
 extern crate alloc;
 pub mod channel;
 pub mod hex;
