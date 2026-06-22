@@ -58,13 +58,13 @@ cat build/mrenclave.txt
 | Component | Version | How |
 |-----------|---------|-----|
 | Base image | `ubuntu:24.04` | Docker image digest in Dockerfile |
-| Rust | `nightly-2025-12-01` | `rust-toolchain.toml` + Dockerfile |
+| Rust | `nightly-2026-06-21` | `rust-toolchain.toml` + Dockerfile |
 | rust-src | bundled with toolchain | `rust-toolchain.toml` |
 | GCC | 13.3.0 | Ubuntu 24.04 default |
 | Binutils/ld | 2.42 | Ubuntu 24.04 default |
 | cmake | 3.28.x | Ubuntu 24.04 default |
-| Intel SGX SDK | 2.27.100.1 | Pinned in Dockerfile |
-| Teaclave SGX SDK | privasys-v0.2.0 | Pinned in `Cargo.lock` |
+| Intel SGX SDK | 2.29.100.1 | Pinned in Dockerfile |
+| Teaclave SGX SDK | privasys-v0.4.0 | Pinned in `Cargo.lock` |
 | All Cargo deps | exact versions | `Cargo.lock` (committed) |
 
 ### Deterministic Settings

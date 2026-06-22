@@ -6,9 +6,9 @@
 
 | Dependency | Purpose | Install |
 |------------|---------|---------|
-| Rust nightly-2025-12-01 | Enclave compilation | `rustup install nightly-2025-12-01` |
-| `rust-src` component | SGX sysroot build | `rustup component add rust-src --toolchain nightly-2025-12-01` |
-| Intel SGX SDK 2.25 | `sgx_edger8r`, `sgx_sign`, runtime libs | [Intel SGX SDK](https://download.01.org/intel-sgx/latest/linux-latest/docs/) |
+| Rust nightly-2026-06-21 | Enclave compilation | `rustup install nightly-2026-06-21` |
+| `rust-src` component | SGX sysroot build | `rustup component add rust-src --toolchain nightly-2026-06-21` |
+| Intel SGX SDK 2.29 | `sgx_edger8r`, `sgx_sign`, runtime libs | [Intel SGX SDK](https://download.01.org/intel-sgx/latest/linux-latest/docs/) |
 | Intel SGX PSW | AESM service (quoting) | `apt install sgx-aesm-service libsgx-dcap-ql` |
 | CMake 3.20+ | Build system | `apt install cmake` |
 | GCC / build-essential | C compiler (EDL glue, RocksDB) | `apt install build-essential` |

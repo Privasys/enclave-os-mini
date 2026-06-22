@@ -21,11 +21,11 @@
 # GCC            13.3.0
 # Binutils/ld    2.42
 # cmake          3.28.x  (from Ubuntu repos)
-# Intel SGX SDK  2.27.100.1  (binary installer — controls sgx_sign/sgx_edger8r)
+# Intel SGX SDK  2.29.100.1  (binary installer — controls sgx_sign/sgx_edger8r)
 # SGX apt pkgs   latest from Intel repo (host-side only, don't affect MRENCLAVE)
-# Rust           nightly-2025-12-01  → rustc 1.93.0-nightly (b84478a1c)
-# LLVM           21.1.5  (bundled with rustc)
-# Teaclave SGX   privasys-v0.2.0  (pinned in Cargo.lock)
+# Rust           nightly-2026-06-21  → rustc 1.98.0-nightly (8b6558a02)
+# LLVM           22.1.7  (bundled with rustc)
+# Teaclave SGX   privasys-v0.4.0  (pinned in Cargo.lock)
 # ─────────────────────────────────────────────────────────────────────────
 
 # Pin by tag; for maximum reproducibility, replace with a digest:
@@ -84,7 +84,7 @@ RUN mkdir -p /etc/apt/keyrings \
 
 # Install SGX SDK (provides sgx_edger8r, sgx_sign, headers, link libraries)
 RUN wget -qO /tmp/sgx_sdk.bin \
-        "https://download.01.org/intel-sgx/sgx-linux/2.27/distro/ubuntu24.04-server/sgx_linux_x64_sdk_2.27.100.1.bin" \
+        "https://download.01.org/intel-sgx/sgx-linux/2.29/distro/ubuntu24.04-server/sgx_linux_x64_sdk_2.29.100.1.bin" \
     && chmod +x /tmp/sgx_sdk.bin \
     && echo "yes" | /tmp/sgx_sdk.bin --prefix=/opt/intel \
     && rm /tmp/sgx_sdk.bin
@@ -92,10 +92,10 @@ RUN wget -qO /tmp/sgx_sdk.bin \
 # ── Rust toolchain (exact nightly pinned) ────────────────────────────────
 RUN curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
     | sh -s -- -y --default-toolchain none \
-    && rustup toolchain install nightly-2025-12-01 \
+    && rustup toolchain install nightly-2026-06-21 \
          --component rust-src \
          --profile minimal \
-    && rustup default nightly-2025-12-01 \
+    && rustup default nightly-2026-06-21 \
     && rustc --version --verbose
 
 # ── Build script ─────────────────────────────────────────────────────────

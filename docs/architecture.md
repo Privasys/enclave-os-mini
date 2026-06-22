@@ -45,8 +45,8 @@ Enclave OS uses a [Privasys fork](https://github.com/privasys/teaclave-sgx-sdk)
 of the Teaclave SGX SDK, maintained on the `main` branch.  The fork tracks
 upstream with the following patches:
 
-- **Rust nightly-2025-12-01** support (updated target JSON, sysroot build)
-- **SGX SDK 2.25** compatibility
+- **Rust nightly-2026-06-21** support (updated target JSON, sysroot build)
+- **SGX SDK 2.29** compatibility
 - Fixes for `target-pointer-width` and `target-c-int-width` types in the
   `x86_64-unknown-linux-sgx.json` target specification
 

@@ -4,7 +4,7 @@
 # cmake/RustBuild.cmake
 # Helpers for building Rust crates via Cargo from CMake.
 #
-# Toolchain: nightly-2025-12-01
+# Toolchain: nightly-2026-06-21
 # Enclave target: x86_64-unknown-linux-sgx (defined in Teaclave's rustlib/)
 
 find_program(CARGO_EXECUTABLE cargo REQUIRED)
@@ -12,7 +12,7 @@ find_program(CARGO_EXECUTABLE cargo REQUIRED)
 set(RUST_ENCLAVE_TARGET "x86_64-unknown-linux-sgx" CACHE STRING
     "Rust target triple for SGX enclave builds")
 
-set(RUST_ENCLAVE_TOOLCHAIN "nightly-2025-12-01" CACHE STRING
+set(RUST_ENCLAVE_TOOLCHAIN "nightly-2026-06-21" CACHE STRING
     "Rustup toolchain name for enclave builds")
 
 # Build type mapping
@@ -88,6 +88,7 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME)
             "RUSTFLAGS=--sysroot ${SGX_SYSROOT_DIR} -C target-feature=+rdrand"
             ${CARGO_EXECUTABLE} build
                 ${CARGO_BUILD_TYPE}
+                -Zjson-target-spec
                 --locked
                 --manifest-path "${CRATE_DIR}/Cargo.toml"
                 --target "${TARGET_JSON}"
