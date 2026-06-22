@@ -60,43 +60,71 @@ use crate::protocol::{AppPermissions, ExportedFunc, FunctionPermission, Function
 /// untrusted host; only an enclave that can reconstruct the KEK can unwrap it.
 const VAULTWRAP_TABLE: &[u8] = b"vaultwrap";
 
-/// A vault-backed app's KEK source: the constellation config + the key handle.
-/// Present on `load_app` when the platform deploys the app with a
-/// `key_handle`; its KEK envelope-wraps the per-app `encryption_key` so the
-/// data survives an enclave upgrade.
+/// Instructs `load_app` to vault-back an app's `encryption_key`. The enclave
+/// owns the key end-to-end: it discovers the constellation from the directory
+/// (`mgmt_url`), self-authors the policy (owner = `owner_sub`), and creates or
+/// reconstructs the KEK. None of the secret location comes from the platform —
+/// only the opt-in plus where the directory lives.
 pub struct VaultBacking {
-    pub cfg: crate::vaultkey::VaultConfig,
+    /// Management-service base URL (the directory `GET /api/v1/vaults`).
+    pub mgmt_url: String,
+    /// Platform environment for the directory query (`dev` / `prod`).
+    pub environment: String,
+    /// App-owner `privasys.id` sub authored as the key's `Owner` principal.
+    pub owner_sub: String,
+    /// Vault key handle, derived by the caller from the app id
+    /// (`vault:apps.privasys.org/<app-id>/storage-kek/v1`).
     pub handle: String,
+    /// The enclave's sealed selection from a prior load (`AppMeta.vault_config`),
+    /// or `None` on first load (then the directory is consulted).
+    pub sealed: Option<crate::vaultkey::VaultConfig>,
 }
 
-/// Resolve a vault-backed app's `encryption_key`: reconstruct the KEK from the
-/// constellation, then unwrap the stored (host) wrapped key, or — on first
-/// load — generate (or take BYOK), wrap it under the KEK, and persist the blob.
+/// Resolve a vault-backed app's `encryption_key` (the KV DEK): reconstruct the
+/// KEK from the constellation (creating the key on first ever load), then unwrap
+/// the host-persistent wrapped DEK blob, or — when no blob exists yet — generate
+/// (or take BYOK), wrap it under the KEK, and persist the blob.
 ///
-/// The `encryption_key` (the KV DEK) itself never changes here; only how it is
-/// protected does — which is what lets the data survive an enclave upgrade and
-/// makes KEK rotation a cheap re-wrap.
+/// Returns `(dek, key_source, selection)`. The DEK never changes here; only how
+/// it is protected does — which is what lets the data survive an enclave upgrade
+/// and makes KEK rotation a cheap re-wrap. The returned `selection` is sealed
+/// into `AppMeta` by the caller.
 fn resolve_vault_backed_key(
     vb: &VaultBacking,
     code_hash: &[u8; 32],
     app_id: Option<[u8; 16]>,
     byok: Option<[u8; AEAD_KEY_SIZE]>,
-) -> Result<([u8; AEAD_KEY_SIZE], String), String> {
+) -> Result<([u8; AEAD_KEY_SIZE], String, crate::vaultkey::VaultConfig), String> {
     use enclave_os_common::aead::AeadCipher;
     use enclave_os_common::ocall;
+    use crate::vaultkey;
 
-    let kek = crate::vaultkey::resolve_or_provision(
-        &vb.cfg,
-        &vb.handle,
-        code_hash,
-        app_id.as_ref().map(|a| a.as_slice()),
-    )?;
+    let app_id_slice = app_id.as_ref().map(|a| a.as_slice());
+
+    // The selection: the sealed one if we have it, else discovered from the
+    // directory (authenticated by a challenge-bound quote, inside `discover`).
+    let cfg = match &vb.sealed {
+        Some(c) => c.clone(),
+        None => vaultkey::discover(&vb.mgmt_url, &vb.environment)?,
+    };
+
+    // Reconstruct the KEK; on first ever load (no key reserved) create it. Never
+    // create when we already had a sealed selection — that path must resolve or
+    // fail (a denial there is the upgrade gate, not a first boot).
+    let kek = match vaultkey::resolve(&cfg, &vb.handle, code_hash, app_id_slice) {
+        Ok(k) => k,
+        Err(e) if vb.sealed.is_none() && vaultkey::is_unprovisioned(&e) => {
+            vaultkey::create(&cfg, &vb.handle, &vb.owner_sub, code_hash, app_id_slice)?
+        }
+        Err(e) => return Err(e),
+    };
+
     let cipher = AeadCipher::from_key(kek);
     let key_id = vb.handle.as_bytes();
     // Bind the wrapped blob to this handle so it can't be swapped between apps.
     let aad = vb.handle.as_bytes();
 
-    match ocall::kv_store_get(VAULTWRAP_TABLE, key_id)
+    let (dek, source) = match ocall::kv_store_get(VAULTWRAP_TABLE, key_id)
         .map_err(|e| format!("vaultkey: host kv get: {e}"))?
     {
         Some(blob) => {
@@ -107,7 +135,7 @@ fn resolve_vault_backed_key(
                 .as_slice()
                 .try_into()
                 .map_err(|_| String::from("vaultkey: wrapped encryption_key has wrong length"))?;
-            Ok((key, format!("vault:{}", vb.handle)))
+            (key, format!("vault:{}", vb.handle))
         }
         None => {
             let key = match byok {
@@ -125,9 +153,11 @@ fn resolve_vault_backed_key(
                 .map_err(|e| format!("vaultkey: wrap encryption_key: {e}"))?;
             ocall::kv_store_put(VAULTWRAP_TABLE, key_id, &blob)
                 .map_err(|e| format!("vaultkey: host kv put: {e}"))?;
-            Ok((key, format!("vault:{}", vb.handle)))
+            (key, format!("vault:{}", vb.handle))
         }
-    }
+    };
+
+    Ok((dek, source, cfg))
 }
 
 /// Owned per-invocation state produced by
@@ -289,6 +319,14 @@ pub struct AppMeta {
     /// callers), which keeps the MR_ENCLAVE behaviour. See the MR_APP / promote-step-up design.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub app_id: Option<[u8; 16]>,
+    /// Vault-backed apps (Part 2): the enclave's sealed *selection* — which
+    /// constellation vaults hold this app's KEK shares, plus the pins needed to
+    /// reconstruct from them. Sensitive (it names the vaults), so it rides only
+    /// inside this MRENCLAVE-sealed metadata, never on the host or the wire. The
+    /// wrapped DEK blob lives host-side (`vaultwrap`); the KEK lives in the
+    /// vaults. `None` for non-vault-backed apps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_config: Option<crate::vaultkey::VaultConfig>,
 }
 
 // ---------------------------------------------------------------------------
@@ -461,8 +499,12 @@ impl AppRegistry {
         // Vault-backed apps reconstruct a KEK from the constellation and
         // envelope-wrap the KV `encryption_key` under it (so data survives an
         // enclave upgrade); others keep the BYOK / generated key as before.
-        let (app_key, key_source) = match &vault {
-            Some(vb) => resolve_vault_backed_key(vb, &code_hash, app_id, encryption_key)?,
+        let (app_key, key_source, vault_config) = match &vault {
+            Some(vb) => {
+                let (k, src, cfg) =
+                    resolve_vault_backed_key(vb, &code_hash, app_id, encryption_key)?;
+                (k, src, Some(cfg))
+            }
             None => match encryption_key {
                 Some(k) => {
                     let fingerprint = {
@@ -474,7 +516,7 @@ impl AppRegistry {
                         }
                         buf
                     };
-                    (k, format!("byok:{}", fingerprint))
+                    (k, format!("byok:{}", fingerprint), None)
                 }
                 None => {
                     let rng = SystemRandom::new();
@@ -482,7 +524,7 @@ impl AppRegistry {
                     rng.fill(&mut k).map_err(|_| {
                         String::from("RDRAND failed generating app encryption key")
                     })?;
-                    (k, String::from("generated"))
+                    (k, String::from("generated"), None)
                 }
             },
         };
@@ -558,6 +600,7 @@ impl AppRegistry {
             config_api_function: config_api_function.clone(),
             owners,
             app_id,
+            vault_config,
         };
         self.known.insert(name.to_string(), meta.clone());
         // Wire the freeze gate: when a config_api function is

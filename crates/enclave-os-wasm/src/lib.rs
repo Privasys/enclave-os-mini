@@ -1254,53 +1254,56 @@ impl EnclaveModule for WasmModule {
 
             let app_id = parse_app_id(load.app_id.as_deref());
 
-            // Vault-backed key (Part 2): build the constellation backing when a
-            // key handle is present. Malformed vault config returns an error.
-            let vault = match load.key_handle.as_deref() {
-                Some(handle) if !handle.is_empty() => {
-                    let mre = match load.vault_mrenclave.as_deref().and_then(hex_decode) {
-                        Some(b) if b.len() == 32 => {
-                            let mut m = [0u8; 32];
-                            m.copy_from_slice(&b);
-                            m
-                        }
-                        _ => {
-                            return Some(Response::Data(serialize_or_error(
-                                &WasmManagementResult::Error {
-                                    message: String::from("vault_mrenclave: expected 64 hex chars"),
-                                },
-                            )));
-                        }
-                    };
-                    let mut ca_roots = Vec::new();
-                    for r in &load.vault_ca_roots {
-                        match hex_decode(r) {
-                            Some(der) => ca_roots.push(der),
-                            None => {
-                                return Some(Response::Data(serialize_or_error(
-                                    &WasmManagementResult::Error {
-                                        message: String::from("vault_ca_roots: invalid hex"),
-                                    },
-                                )));
-                            }
-                        }
+            // Vault-backed key (Part 2): the enclave owns the key end-to-end. The
+            // platform supplies only the opt-in flag + where the directory lives;
+            // the enclave derives the handle from the app id, discovers the
+            // constellation itself, and self-authors the policy. `sealed` is None
+            // here (a fresh wasm_load); on replay the selection comes from AppMeta.
+            let vault = if load.vault_backed {
+                let app_id_str = match load.app_id.as_deref() {
+                    Some(s) if !s.is_empty() => s,
+                    _ => {
+                        return Some(Response::Data(serialize_or_error(
+                            &WasmManagementResult::Error {
+                                message: String::from("vault_backed requires app_id"),
+                            },
+                        )));
                     }
-                    Some(crate::registry::VaultBacking {
-                        cfg: crate::vaultkey::VaultConfig {
-                            endpoints: load.vault_endpoints.clone(),
-                            threshold: 0,
-                            mrenclave: mre,
-                            attestation_servers: load
-                                .vault_attestation_server
-                                .clone()
-                                .into_iter()
-                                .collect(),
-                            ca_roots_der: ca_roots,
-                        },
-                        handle: handle.to_string(),
-                    })
-                }
-                _ => None,
+                };
+                let mgmt_url = match load.mgmt_url.as_deref() {
+                    Some(s) if !s.is_empty() => s.to_string(),
+                    _ => {
+                        return Some(Response::Data(serialize_or_error(
+                            &WasmManagementResult::Error {
+                                message: String::from("vault_backed requires mgmt_url"),
+                            },
+                        )));
+                    }
+                };
+                let owner_sub = match load.owners.first() {
+                    Some(s) if !s.is_empty() => s.clone(),
+                    _ => {
+                        return Some(Response::Data(serialize_or_error(
+                            &WasmManagementResult::Error {
+                                message: String::from("vault_backed requires an app owner"),
+                            },
+                        )));
+                    }
+                };
+                let handle = format!("vault:apps.privasys.org/{}/storage-kek/v1", app_id_str);
+                let environment = load
+                    .environment
+                    .clone()
+                    .unwrap_or_else(|| String::from("prod"));
+                Some(crate::registry::VaultBacking {
+                    mgmt_url,
+                    environment,
+                    owner_sub,
+                    handle,
+                    sealed: None,
+                })
+            } else {
+                None
             };
 
             let mgmt_result = match self.load_app(&load.name, &hostname, &load.bytes, encryption_key, load.permissions, max_fuel, mcp_enabled, load.docs, load.config_api.map(|c| c.function), load.owners, app_id, vault) {

@@ -221,6 +221,11 @@ pub fn init_enclave(
         sealed_cfg.ca_cert_der.clone(),
         sealed_cfg.ca_key_pkcs8.clone(),
     );
+    // Attestation provider: challenge-bound quotes (to authenticate this enclave
+    // to the management-service vault directory over plain TLS) + self-MRENCLAVE
+    // (so the wasm crate can pin the running runtime when self-authoring a vault
+    // key policy). Reached from the wasm crate only via egress registration.
+    crate::vaultkey::register_attestation_provider();
 
     Ok((config, sealed_cfg))
 }

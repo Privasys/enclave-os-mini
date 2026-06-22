@@ -410,6 +410,70 @@ fn generate_sgx_quote(report_data: &[u8; 64]) -> Result<Vec<u8>, String> {
     Ok(quote)
 }
 
+/// Produce a DCAP quote binding `nonce` into ReportData, for authenticating this
+/// enclave to a non-RA-TLS verifier (the management-service vault directory). The
+/// nonce is placed in the first 32 bytes of the 64-byte ReportData (the rest is
+/// zero); the verifier reproduces the same binding from the challenge it issued.
+pub fn quote_binding_nonce(nonce: &[u8]) -> Result<Vec<u8>, String> {
+    let mut report_data = [0u8; 64];
+    let n = core::cmp::min(nonce.len(), 32);
+    report_data[..n].copy_from_slice(&nonce[..n]);
+    generate_sgx_quote(&report_data)
+}
+
+// ---------------------------------------------------------------------------
+//  Self measurement (MRENCLAVE)
+// ---------------------------------------------------------------------------
+
+/// Read this enclave's own MRENCLAVE (its code identity), for self-authoring a
+/// vault key policy that pins the running runtime as the `Tee` measurement.
+///
+/// MRENCLAVE is independent of the report target, so a local SGX report suffices.
+/// It sits at byte offset 64 of the SGX ReportBody (the first field of the
+/// Report), so we read it from the report bytes rather than depend on the SDK
+/// fork's struct field names — matching how the rest of this module treats
+/// reports and quotes as opaque bytes.
+#[cfg(not(feature = "mock"))]
+pub fn self_mrenclave() -> Result<[u8; 32], String> {
+    use sgx_types::types::{ReportData, TargetInfo};
+
+    let rpc = crate::rpc_client_ref();
+    let target_info_bytes = rpc.qe_get_target_info()
+        .map_err(|e| format!("QeGetTargetInfo RPC failed: status={}", e))?;
+    if target_info_bytes.len() != core::mem::size_of::<TargetInfo>() {
+        return Err(format!(
+            "QeGetTargetInfo: unexpected size {} (expected {})",
+            target_info_bytes.len(),
+            core::mem::size_of::<TargetInfo>()
+        ));
+    }
+    let target_info: TargetInfo = unsafe {
+        core::ptr::read_unaligned(target_info_bytes.as_ptr() as *const TargetInfo)
+    };
+    let rd = ReportData::default();
+    let report = <sgx_types::types::Report as sgx_tse::EnclaveReport>::for_target(&target_info, &rd)
+        .map_err(|e| format!("sgx_create_report failed: {:?}", e))?;
+    let report_bytes = unsafe {
+        core::slice::from_raw_parts(
+            &report as *const sgx_types::types::Report as *const u8,
+            core::mem::size_of::<sgx_types::types::Report>(),
+        )
+    };
+    const MRENCLAVE_OFFSET: usize = 64;
+    if report_bytes.len() < MRENCLAVE_OFFSET + 32 {
+        return Err(format!("self report too short: {} bytes", report_bytes.len()));
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&report_bytes[MRENCLAVE_OFFSET..MRENCLAVE_OFFSET + 32]);
+    Ok(out)
+}
+
+#[cfg(feature = "mock")]
+pub fn self_mrenclave() -> Result<[u8; 32], String> {
+    // Deterministic dummy for host/mock builds.
+    Ok([0x11u8; 32])
+}
+
 // ---------------------------------------------------------------------------
 //  Certificate building with rcgen
 // ---------------------------------------------------------------------------

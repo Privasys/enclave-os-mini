@@ -17,9 +17,11 @@
 use std::boxed::Box;
 use std::vec::Vec;
 
-use enclave_os_egress::{ClientCertIdentity, EnclaveClientCertSigner};
+use enclave_os_egress::{ClientCertIdentity, EnclaveAttestationProvider, EnclaveClientCertSigner};
 
-use crate::ratls::attestation::{mint_vault_client_cert, CaContext};
+use crate::ratls::attestation::{
+    mint_vault_client_cert, quote_binding_nonce, self_mrenclave, CaContext,
+};
 
 /// The OS's RA-TLS client-certificate signer: holds the enclave intermediary
 /// CA and mints a client cert carrying the requested app identity, with the
@@ -57,4 +59,29 @@ pub fn register_client_cert_signer(ca_cert_der: Vec<u8>, ca_key_pkcs8: Vec<u8>) 
         ca_key_pkcs8,
     }));
     enclave_os_egress::register_enclave_client_cert_signer(signer);
+}
+
+/// The OS's attestation provider: produces challenge-bound quotes (to
+/// authenticate the enclave to the management-service vault directory over plain
+/// TLS) and reports this enclave's own MRENCLAVE (so the wasm crate can pin the
+/// running runtime when self-authoring a vault key policy). The wasm crate
+/// reaches both through egress's global registration — it cannot call the
+/// attestation layer directly (the dep runs enclave → wasm).
+struct OsAttestationProvider;
+
+impl EnclaveAttestationProvider for OsAttestationProvider {
+    fn quote(&self, nonce: &[u8]) -> Option<Vec<u8>> {
+        quote_binding_nonce(nonce).ok()
+    }
+
+    fn self_mrenclave(&self) -> Option<[u8; 32]> {
+        self_mrenclave().ok()
+    }
+}
+
+/// Register the OS attestation provider once, at enclave init. Stateless, so a
+/// plain leaked unit value suffices for the `'static` egress requires.
+pub fn register_attestation_provider() {
+    let provider: &'static OsAttestationProvider = Box::leak(Box::new(OsAttestationProvider));
+    enclave_os_egress::register_enclave_attestation_provider(provider);
 }

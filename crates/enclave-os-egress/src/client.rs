@@ -492,6 +492,45 @@ pub fn register_enclave_client_cert_signer(signer: &'static dyn EnclaveClientCer
     let _ = CLIENT_CERT_SIGNER.set(signer);
 }
 
+/// Exposes the OS's attestation facts to higher crates (notably the wasm crate's
+/// vault directory client and key-policy authoring), which cannot call the
+/// attestation crate directly because the dep runs enclave→wasm.
+///
+/// Implemented by the OS (it holds the SGX quote primitive and can self-report)
+/// and registered once at enclave init via [`register_enclave_attestation_provider`].
+/// Mirrors [`EnclaveClientCertSigner`]: the OS — not the caller — produces the
+/// real measurement; a quote travels in the request body, not the TLS layer, so
+/// it authenticates the enclave to a verifier that is **not** an RA-TLS peer (in
+/// particular the management-service vault directory behind a TLS-terminating LB).
+pub trait EnclaveAttestationProvider: Send + Sync {
+    /// Return a DCAP quote whose ReportData binds `nonce`, or `None` to decline.
+    fn quote(&self, nonce: &[u8]) -> Option<Vec<u8>>;
+    /// This enclave's own runtime MRENCLAVE (code identity), for self-authoring a
+    /// vault key policy that pins the running runtime as the `Tee` measurement.
+    fn self_mrenclave(&self) -> Option<[u8; 32]>;
+}
+
+static ATTESTATION_PROVIDER: OnceLock<&'static dyn EnclaveAttestationProvider> = OnceLock::new();
+
+/// Register the OS's attestation provider. Call once during enclave init.
+/// Subsequent calls are ignored.
+pub fn register_enclave_attestation_provider(provider: &'static dyn EnclaveAttestationProvider) {
+    let _ = ATTESTATION_PROVIDER.set(provider);
+}
+
+/// Produce an attestation quote binding `nonce`, via the registered
+/// [`EnclaveAttestationProvider`]. `None` if none is registered (e.g. the host
+/// build) or it declined.
+pub fn enclave_attestation_quote(nonce: &[u8]) -> Option<Vec<u8>> {
+    ATTESTATION_PROVIDER.get().and_then(|p| p.quote(nonce))
+}
+
+/// This enclave's own runtime MRENCLAVE, via the registered
+/// [`EnclaveAttestationProvider`]. `None` if none is registered.
+pub fn enclave_self_mrenclave() -> Option<[u8; 32]> {
+    ATTESTATION_PROVIDER.get().and_then(|p| p.self_mrenclave())
+}
+
 /// Adapter that presents the enclave's client identity during the handshake,
 /// minting via the registered [`EnclaveClientCertSigner`] and binding to the
 /// server's RA-TLS challenge (fork `CertificateRequest` extension `0xFFBB`).
