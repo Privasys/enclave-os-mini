@@ -58,9 +58,10 @@ pub use client::{
     OID_CONFIG_MERKLE_ROOT, OID_EGRESS_CA_HASH, OID_WASM_APPS_HASH,
     OID_ATTESTATION_SERVERS_HASH,
     MAX_RESPONSE_BODY,
+    ClientCertIdentity,
+    EnclaveClientCertSigner,
+    register_enclave_client_cert_signer,
     https_fetch,
-    https_fetch_mtls,
-    VaultClientCertResolver,
     mozilla_root_store,
     root_store_from_der,
 };

@@ -28,16 +28,15 @@
 
 use std::format;
 use std::string::String;
-use std::sync::{Arc, OnceLock};
+use std::sync::OnceLock;
 use std::vec::Vec;
 
 use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
-use enclave_os_egress::client::root_store_from_der;
 use enclave_os_egress::{
-    https_fetch_mtls, RaTlsPolicy, ReportDataBinding, RootCertStore, TeeType,
-    VaultClientCertResolver,
+    https_fetch, root_store_from_der, ClientCertIdentity, EnclaveClientCertSigner, RaTlsPolicy,
+    ReportDataBinding, RootCertStore, TeeType,
 };
 
 use crate::ratls::attestation::{mint_vault_client_cert, CaContext};
@@ -49,6 +48,51 @@ const GENERATION_SIZE: usize = 16;
 
 /// KEK length in bytes (256-bit).
 const KEK_SIZE: usize = 32;
+
+// ===========================================================================
+//  OS client-certificate signer (registered once at enclave init)
+// ===========================================================================
+
+/// The OS's RA-TLS client-certificate signer: holds the enclave intermediary
+/// CA and mints a client cert carrying the requested app identity, with the
+/// SGX quote bound to the server's challenge (reusing
+/// [`mint_vault_client_cert`]). egress calls this via the registered
+/// [`EnclaveClientCertSigner`] hook; the CA never crosses the egress boundary,
+/// and the measurement comes from the policy the OS built, not from a caller.
+struct OsClientCertSigner {
+    ca_cert_der: Vec<u8>,
+    ca_key_pkcs8: Vec<u8>,
+}
+
+impl EnclaveClientCertSigner for OsClientCertSigner {
+    fn sign(
+        &self,
+        challenge: &[u8],
+        identity: &ClientCertIdentity,
+    ) -> Option<(Vec<Vec<u8>>, Vec<u8>)> {
+        let ca = CaContext::from_parts(self.ca_cert_der.clone(), self.ca_key_pkcs8.clone()).ok()?;
+        mint_vault_client_cert(
+            &ca,
+            challenge,
+            &identity.code_hash,
+            identity.app_id.as_deref(),
+        )
+        .ok()
+    }
+}
+
+/// Register the OS client-cert signer once, at enclave init, from the enclave
+/// CA (`SealedConfig.ca_cert_der` / `ca_key_pkcs8`). The signer is leaked to
+/// obtain the `'static` egress requires; it lives for the enclave's lifetime.
+pub fn register_client_cert_signer(ca_cert_der: Vec<u8>, ca_key_pkcs8: Vec<u8>) {
+    let signer: &'static OsClientCertSigner = std::boxed::Box::leak(std::boxed::Box::new(
+        OsClientCertSigner {
+            ca_cert_der,
+            ca_key_pkcs8,
+        },
+    ));
+    enclave_os_egress::register_enclave_client_cert_signer(signer);
+}
 
 // ===========================================================================
 //  Config
@@ -116,48 +160,18 @@ struct MaterialProvidedResp {
 }
 
 // ===========================================================================
-//  RA-TLS client identity (mutual attestation against the vault)
-// ===========================================================================
-
-/// Mints this app's vault client certificate on demand, bound to the vault's
-/// RA-TLS challenge. Implements [`VaultClientCertResolver`] (egress) so the
-/// TLS layer can present a `Principal::Tee` identity carrying the cwasm code
-/// hash (OID 3.2) and app-id (OID 3.6).
-#[derive(Debug)]
-struct AppVaultIdentity {
-    ca_cert_der: Vec<u8>,
-    ca_key_pkcs8: Vec<u8>,
-    cwasm_code_hash: Vec<u8>,
-    app_id: Option<Vec<u8>>,
-}
-
-impl VaultClientCertResolver for AppVaultIdentity {
-    fn mint(&self, ratls_challenge: &[u8]) -> Option<(Vec<Vec<u8>>, Vec<u8>)> {
-        let ca = CaContext::from_parts(self.ca_cert_der.clone(), self.ca_key_pkcs8.clone()).ok()?;
-        mint_vault_client_cert(
-            &ca,
-            ratls_challenge,
-            &self.cwasm_code_hash,
-            self.app_id.as_deref(),
-        )
-        .ok()
-    }
-}
-
-// ===========================================================================
 //  Public API
 // ===========================================================================
 
 /// Reconstruct or first-boot-provision the KEK for `handle`.
 ///
-/// `ca_cert_der` / `ca_key_pkcs8` are the enclave's intermediary CA (used to
-/// sign the client identity). `cwasm_code_hash` is the app's code hash
-/// (`sha256(cwasm)`, the OID 3.2 measurement); `app_id` is the raw app-id
-/// (OID 3.6) or `None` for the MR_ENCLAVE shape.
+/// `cwasm_code_hash` is the app's code hash (`sha256(cwasm)`, the OID 3.2
+/// measurement); `app_id` is the raw app-id (OID 3.6) or `None` for the
+/// MR_ENCLAVE shape. The mutually-attested client certificate is minted by the
+/// OS-registered [`enclave_os_egress::EnclaveClientCertSigner`] (which holds
+/// the enclave CA) from the identity placed on the policy below.
 pub fn resolve_or_provision(
     cfg: &VaultConfig,
-    ca_cert_der: &[u8],
-    ca_key_pkcs8: &[u8],
     handle: &str,
     cwasm_code_hash: &[u8],
     app_id: Option<&[u8]>,
@@ -193,14 +207,14 @@ pub fn resolve_or_provision(
         },
         expected_oids: vec![],
         attestation_servers: cfg.attestation_servers.clone(),
+        // Mutual RA-TLS: present this app's identity. The OS-registered signer
+        // mints the cert (SGX quote bound to the vault's challenge, OID 3.2/3.6)
+        // — egress never sees the CA, and nothing here is caller-injected.
+        client_identity: Some(ClientCertIdentity {
+            code_hash: cwasm_code_hash.to_vec(),
+            app_id: app_id.map(|a| a.to_vec()),
+        }),
     };
-
-    let identity: Arc<dyn VaultClientCertResolver> = Arc::new(AppVaultIdentity {
-        ca_cert_der: ca_cert_der.to_vec(),
-        ca_key_pkcs8: ca_key_pkcs8.to_vec(),
-        cwasm_code_hash: cwasm_code_hash.to_vec(),
-        app_id: app_id.map(|a| a.to_vec()),
-    });
 
     // ---- Phase 1: collect existing shares ---------------------------------
     let mut by_gen: Vec<(String, Vec<Share>)> = Vec::new();
@@ -217,7 +231,6 @@ pub fn resolve_or_provision(
             },
             &root_store,
             &policy,
-            &identity,
         ) {
             Ok(material) => match decode_share(&material) {
                 Ok((gen, share)) => push_share(&mut by_gen, gen, share),
@@ -304,7 +317,6 @@ pub fn resolve_or_provision(
                 },
                 &root_store,
                 &policy,
-                &identity,
             ) {
                 Ok(_) => {
                     acks += 1;
@@ -340,19 +352,10 @@ fn call_vault(
     req: &VaultRequest,
     root_store: &RootCertStore,
     policy: &RaTlsPolicy,
-    identity: &Arc<dyn VaultClientCertResolver>,
 ) -> Result<Vec<u8>, String> {
     let body = serde_json::to_vec(req).map_err(|e| format!("marshal request: {e}"))?;
     let url = format!("https://{endpoint}/data");
-    let resp = https_fetch_mtls(
-        "POST",
-        &url,
-        &[],
-        Some(&body),
-        root_store,
-        Some(policy),
-        Some(identity),
-    )?;
+    let resp = https_fetch("POST", &url, &[], Some(&body), root_store, Some(policy))?;
     if resp.status < 200 || resp.status >= 300 {
         return Err(format!("vault HTTP {}", resp.status));
     }

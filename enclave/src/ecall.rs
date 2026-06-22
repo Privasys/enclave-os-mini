@@ -213,6 +213,15 @@ pub fn init_enclave(
     };
     enclave_log_info!("Sealed config resolved");
 
+    // Register the OS RA-TLS client-certificate signer so outbound mutually-
+    // attested connections (e.g. fetching a vault-backed KEK) can present a
+    // measurement-bound client cert. The enclave CA never leaves the OS; egress
+    // only ever asks the signer to mint for an OS-built identity.
+    crate::vaultkey::register_client_cert_signer(
+        sealed_cfg.ca_cert_der.clone(),
+        sealed_cfg.ca_key_pkcs8.clone(),
+    );
+
     Ok((config, sealed_cfg))
 }
 

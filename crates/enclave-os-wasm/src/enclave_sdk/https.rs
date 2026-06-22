@@ -149,6 +149,8 @@ fn build_ratls_policy(p: wit::RatlsPolicy) -> Result<RaTlsPolicy, String> {
             })
             .collect(),
         attestation_servers: p.attestation_servers,
+        // App egress presents no client certificate (server attestation only).
+        client_identity: None,
     })
 }
 

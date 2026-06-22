@@ -272,6 +272,12 @@ pub struct RaTlsPolicy {
     /// };
     /// ```
     pub attestation_servers: Vec<String>,
+
+    /// Mutual RA-TLS: when `Some`, the connection presents a client
+    /// certificate carrying this (OS-derived) app identity, minted by the
+    /// registered [`EnclaveClientCertSigner`] and bound to the server's
+    /// challenge. `None` (the default) presents no client certificate.
+    pub client_identity: Option<ClientCertIdentity>,
 }
 
 /// Perform a full HTTPS request with any method, custom headers, and
@@ -312,23 +318,6 @@ pub fn https_fetch(
     root_store: &RootCertStore,
     ratls: Option<&RaTlsPolicy>,
 ) -> Result<HttpResponse, String> {
-    https_fetch_mtls(method, url, headers, body, root_store, ratls, None)
-}
-
-/// Like [`https_fetch`] but presents a client RA-TLS certificate, minted on
-/// demand by `client_id`, when the server requests one. This is mutual
-/// attestation: it lets an enclave authenticate to a server (e.g. an Enclave
-/// Vault) as a `Principal::Tee`, with the client quote bound to the server's
-/// RA-TLS challenge. `client_id` is only honoured for RA-TLS connections.
-pub fn https_fetch_mtls(
-    method: &str,
-    url: &str,
-    headers: &[(String, String)],
-    body: Option<&[u8]>,
-    root_store: &RootCertStore,
-    ratls: Option<&RaTlsPolicy>,
-    client_id: Option<&Arc<dyn VaultClientCertResolver>>,
-) -> Result<HttpResponse, String> {
     let (host, port, path) = parse_url(url)?;
 
     // Build HTTP/1.1 request.
@@ -351,7 +340,7 @@ pub fn https_fetch_mtls(
         request_bytes.extend_from_slice(b);
     }
 
-    https_request_inner(&host, port, &request_bytes, root_store, ratls, client_id)
+    https_request_inner(&host, port, &request_bytes, root_store, ratls)
 }
 
 /// Internal: perform an HTTPS request and return the full parsed response.
@@ -361,9 +350,8 @@ fn https_request_inner(
     request: &[u8],
     root_store: &RootCertStore,
     ratls: Option<&RaTlsPolicy>,
-    client_id: Option<&Arc<dyn VaultClientCertResolver>>,
 ) -> Result<HttpResponse, String> {
-    let tls_config = build_client_config(root_store, ratls, client_id)
+    let tls_config = build_client_config(root_store, ratls)
         .map_err(|e| e.to_string())?;
 
     let fd = ocall::net_tcp_connect(host, port)
@@ -462,28 +450,54 @@ fn https_request_inner(
 //  RA-TLS client authentication (mutual attestation)
 // =========================================================================
 
-/// Mints a client RA-TLS certificate on demand, bound to the server's
-/// challenge. Implemented by the enclave (which holds the SGX quote + CA
-/// signing material); egress stays decoupled from the attestation crate.
+/// The per-app measurement a client RA-TLS certificate must carry so the
+/// remote enclave (e.g. an Enclave Vault) can authorise it via OID 3.2 / 3.6.
 ///
-/// `mint` is invoked during the TLS handshake when the server (e.g. an
-/// Enclave Vault) requests a client certificate and supplies its RA-TLS
-/// challenge nonce in the `CertificateRequest` extension `0xFFBB`. The
-/// returned identity must carry an SGX quote whose `ReportData` binds to
-/// `ratls_challenge`, plus the caller's measurement OIDs, so the server's
-/// `tee_matches` policy authorises it.
-pub trait VaultClientCertResolver: Send + Sync + core::fmt::Debug {
-    /// Given the server's RA-TLS challenge nonce, return
-    /// `(cert_chain_der, pkcs8_key_der)` for the client identity, or `None`
-    /// to decline (no certificate is presented).
-    fn mint(&self, ratls_challenge: &[u8]) -> Option<(Vec<Vec<u8>>, Vec<u8>)>;
+/// These values are **derived by the OS from real enclave state** (the loaded
+/// component's code hash, the platform-assigned app id) — never supplied by an
+/// untrusted caller. A connection presents a client cert iff its
+/// [`RaTlsPolicy::client_identity`] is `Some`.
+#[derive(Debug, Clone)]
+pub struct ClientCertIdentity {
+    /// App code hash (`sha256(cwasm)`), stamped at OID 3.2.
+    pub code_hash: Vec<u8>,
+    /// App-id, stamped at OID 3.6 (MR_APP). `None` keeps the MR_ENCLAVE shape.
+    pub app_id: Option<Vec<u8>>,
 }
 
-/// Adapter that drives a [`VaultClientCertResolver`] from rustls' client-auth
-/// hook, surfacing the server's RA-TLS challenge (fork extension `0xFFBB`).
+/// Signs the enclave's RA-TLS **client** certificate for mutual attestation.
+///
+/// Implemented by the OS, which holds the SGX quote primitive and the enclave
+/// CA signing key, and registered **once** at enclave init via
+/// [`register_enclave_client_cert_signer`]. This keeps `egress` decoupled from
+/// the attestation crate: egress never sees CA material, and a caller can only
+/// name which app identity to present (via the policy) — the OS stamps the
+/// real measurement and signs.
+pub trait EnclaveClientCertSigner: Send + Sync {
+    /// Mint a client cert carrying `identity`, with the SGX quote's ReportData
+    /// bound to the server's `challenge` (ext `0xFFBB`). Returns
+    /// `(cert_chain_der, pkcs8_key_der)`, or `None` to decline.
+    fn sign(
+        &self,
+        challenge: &[u8],
+        identity: &ClientCertIdentity,
+    ) -> Option<(Vec<Vec<u8>>, Vec<u8>)>;
+}
+
+static CLIENT_CERT_SIGNER: OnceLock<&'static dyn EnclaveClientCertSigner> = OnceLock::new();
+
+/// Register the OS's client-certificate signer. Call once during enclave init,
+/// after the enclave CA is available. Subsequent calls are ignored.
+pub fn register_enclave_client_cert_signer(signer: &'static dyn EnclaveClientCertSigner) {
+    let _ = CLIENT_CERT_SIGNER.set(signer);
+}
+
+/// Adapter that presents the enclave's client identity during the handshake,
+/// minting via the registered [`EnclaveClientCertSigner`] and binding to the
+/// server's RA-TLS challenge (fork `CertificateRequest` extension `0xFFBB`).
 #[derive(Debug)]
 struct ChallengeBoundClientAuth {
-    resolver: Arc<dyn VaultClientCertResolver>,
+    identity: ClientCertIdentity,
     provider: Arc<CryptoProvider>,
 }
 
@@ -498,7 +512,8 @@ impl ResolvesClientCert for ChallengeBoundClientAuth {
         // nonce we cannot bind a fresh quote, so decline rather than present
         // an unbound identity.
         let challenge = ratls_challenge?;
-        let (chain_der, pkcs8) = self.resolver.mint(challenge)?;
+        let signer = *CLIENT_CERT_SIGNER.get()?;
+        let (chain_der, pkcs8) = signer.sign(challenge, &self.identity)?;
         let certs: Vec<CertificateDer<'static>> =
             chain_der.into_iter().map(CertificateDer::from).collect();
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8));
@@ -517,13 +532,13 @@ impl ResolvesClientCert for ChallengeBoundClientAuth {
 /// wraps the standard WebPKI chain validation with additional RA-TLS
 /// checks (quote presence, measurements, ReportData binding).
 ///
-/// When `client_id` is `Some` (only honoured for RA-TLS connections), the
-/// client presents a measurement-bound certificate minted on demand, for
-/// mutual attestation against a server that requests one (e.g. a vault).
+/// When the policy's [`RaTlsPolicy::client_identity`] is `Some`, the client
+/// presents a measurement-bound certificate minted on demand by the registered
+/// [`EnclaveClientCertSigner`], for mutual attestation against a server that
+/// requests one (e.g. a vault).
 fn build_client_config(
     root_store: &RootCertStore,
     ratls: Option<&RaTlsPolicy>,
-    client_id: Option<&Arc<dyn VaultClientCertResolver>>,
 ) -> Result<Arc<ClientConfig>, &'static str> {
     let provider = Arc::new(default_provider());
 
@@ -547,10 +562,10 @@ fn build_client_config(
             .map_err(|_| "TLS config error")?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(verifier));
-        let mut cfg = match client_id {
-            Some(resolver) => wants_client_cert.with_client_cert_resolver(Arc::new(
+        let mut cfg = match &policy.client_identity {
+            Some(identity) => wants_client_cert.with_client_cert_resolver(Arc::new(
                 ChallengeBoundClientAuth {
-                    resolver: resolver.clone(),
+                    identity: identity.clone(),
                     provider: provider.clone(),
                 },
             )),
