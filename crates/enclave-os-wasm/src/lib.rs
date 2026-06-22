@@ -1500,7 +1500,7 @@ impl EnclaveModule for WasmModule {
 /// leaves the app in MR_ENCLAVE shape (the back-compat default before the
 /// platform starts sending `app_id`). See the MR_APP / promote-step-up design.
 fn parse_app_id(s: Option<&str>) -> Option<[u8; 16]> {
-    let bytes = hex_decode(&s?.replace('-', "")).ok()?;
+    let bytes = hex_decode(&s?.replace('-', ""))?;
     if bytes.len() != 16 {
         return None;
     }
