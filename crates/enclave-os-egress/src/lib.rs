@@ -62,13 +62,14 @@ pub use client::{
     https_fetch_mtls,
     VaultClientCertResolver,
     mozilla_root_store,
+    root_store_from_der,
 };
 
 use std::sync::OnceLock;
 use std::vec::Vec;
 
 use ring::digest;
-use rustls::RootCertStore;
+pub use rustls::RootCertStore;
 
 use enclave_os_common::modules::ConfigLeaf;
 use enclave_os_common::modules::{EnclaveModule, ModuleOid, RequestContext};
