@@ -28,7 +28,7 @@ use rustls::crypto::CryptoProvider;
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime};
 use rustls::sign::CertifiedKey;
 use rustls::{
-    ClientConfig, ClientConnection, DigitallySignedStruct, Error, SignatureScheme,
+    CertificateError, ClientConfig, ClientConnection, DigitallySignedStruct, Error, SignatureScheme,
 };
 
 use x509_parser::prelude::*;
@@ -363,7 +363,7 @@ fn https_request_inner(
         .map_err(|e| format!("TLS init failed: {}", e))?;
 
     tls_handshake(fd, &mut tls_conn)
-        .map_err(|_| "TLS handshake failed".to_string())?;
+        .map_err(|e| format!("TLS handshake failed: {e}"))?;
 
     // Send the HTTP request.
     {
@@ -632,10 +632,10 @@ fn build_client_config(
 }
 
 /// Perform the TLS handshake with cursor-based multi-record reads.
-fn tls_handshake(fd: i32, tls_conn: &mut ClientConnection) -> Result<(), i32> {
+fn tls_handshake(fd: i32, tls_conn: &mut ClientConnection) -> Result<(), String> {
     loop {
         // Flush any pending outbound TLS data (e.g. ClientHello, Finished).
-        flush_tls(fd, tls_conn)?;
+        flush_tls(fd, tls_conn).map_err(|_| String::from("flush failed"))?;
 
         // In TLS 1.3 the handshake completes as soon as the client Finished
         // is flushed — there is nothing more to receive. Checking *after*
@@ -654,20 +654,22 @@ fn tls_handshake(fd: i32, tls_conn: &mut ClientConnection) -> Result<(), i32> {
                 while (cursor.position() as usize) < n {
                     match tls_conn.read_tls(&mut cursor) {
                         Ok(0) => break,
+                        // The peer-cert verifier runs inside process_new_packets,
+                        // so its rejection reason surfaces here — propagate it.
                         Ok(_) => {
-                            tls_conn.process_new_packets().map_err(|_| -1i32)?;
+                            tls_conn.process_new_packets().map_err(|e| format!("{e}"))?;
                         }
-                        Err(_) => return Err(-1i32),
+                        Err(e) => return Err(format!("read_tls: {e}")),
                     }
                 }
             }
             Ok(_) => {
                 // EOF — server closed before handshake completed.
-                return Err(-1i32);
+                return Err(String::from("server closed before handshake completed"));
             }
             Err(_) => {
                 // Read error.
-                return Err(-1i32);
+                return Err(String::from("network read error"));
             }
         }
     }
@@ -732,7 +734,7 @@ fn parse_http_response(
         .ok_or("invalid HTTP response: no header terminator")?;
 
     let header_bytes = &data[..sep];
-    let body = data[sep + 4..].to_vec();
+    let raw_body = &data[sep + 4..];
 
     let header_str = std::str::from_utf8(header_bytes)
         .map_err(|_| "invalid HTTP response: non-UTF-8 headers")?;
@@ -749,13 +751,65 @@ fn parse_http_response(
         .map_err(|_| "invalid status code")?;
 
     let mut headers = Vec::new();
+    let mut chunked = false;
     for line in lines {
         if let Some((key, value)) = line.split_once(':') {
-            headers.push((key.trim().to_string(), value.trim().to_string()));
+            let key = key.trim().to_string();
+            let value = value.trim().to_string();
+            // A reverse proxy (e.g. Caddy in front of the management-service)
+            // streams larger JSON with `Transfer-Encoding: chunked` rather than a
+            // Content-Length. We must de-chunk it; otherwise the body still
+            // carries the hex chunk-size framing and fails to parse.
+            if key.eq_ignore_ascii_case("transfer-encoding")
+                && value.to_ascii_lowercase().contains("chunked")
+            {
+                chunked = true;
+            }
+            headers.push((key, value));
         }
     }
 
+    let body = if chunked {
+        dechunk(raw_body)?
+    } else {
+        raw_body.to_vec()
+    };
+
     Ok((status, headers, body))
+}
+
+/// Decode an HTTP/1.1 chunked transfer-encoding body: a sequence of
+/// `<hex-size>[;chunk-ext]\r\n<data>\r\n` chunks ended by a `0\r\n` chunk
+/// (trailers, if any, are ignored).
+fn dechunk(mut data: &[u8]) -> Result<Vec<u8>, String> {
+    let mut out = Vec::with_capacity(data.len());
+    loop {
+        let nl = data
+            .windows(2)
+            .position(|w| w == b"\r\n")
+            .ok_or("chunked: missing size CRLF")?;
+        // Size is hex, up to an optional ';' introducing chunk extensions.
+        let size_field = &data[..nl];
+        let size_hex = size_field.split(|&b| b == b';').next().unwrap_or(size_field);
+        let size_str = std::str::from_utf8(size_hex)
+            .map_err(|_| "chunked: non-UTF-8 size")?
+            .trim();
+        let size = usize::from_str_radix(size_str, 16).map_err(|_| "chunked: bad size")?;
+        data = &data[nl + 2..];
+        if size == 0 {
+            break;
+        }
+        if data.len() < size {
+            return Err("chunked: truncated chunk data".into());
+        }
+        out.extend_from_slice(&data[..size]);
+        data = &data[size..];
+        // Consume the CRLF that terminates the chunk data.
+        if data.len() >= 2 && &data[..2] == b"\r\n" {
+            data = &data[2..];
+        }
+    }
+    Ok(out)
 }
 
 // =========================================================================
@@ -781,16 +835,27 @@ impl ServerCertVerifier for RaTlsVerifier {
         ocsp_response: &[u8],
         now: UnixTime,
     ) -> Result<ServerCertVerified, Error> {
-        // 1. Standard certificate chain validation.
-        self.inner.verify_server_cert(
+        // 1. Standard certificate chain validation (issuer, expiry, signature).
+        //    RA-TLS identity is the attestation quote, NOT the DNS/IP name: an
+        //    attested peer's leaf (e.g. a vault's, dialed by IP) commonly carries
+        //    no SAN, so a name mismatch is expected and ignored here. Every other
+        //    chain failure still rejects the handshake.
+        match self.inner.verify_server_cert(
             end_entity,
             intermediates,
             server_name,
             ocsp_response,
             now,
-        )?;
+        ) {
+            Ok(_) => {}
+            Err(Error::InvalidCertificate(
+                CertificateError::NotValidForName
+                | CertificateError::NotValidForNameContext { .. },
+            )) => {}
+            Err(e) => return Err(e),
+        }
 
-        // 2. RA-TLS attestation verification.
+        // 2. RA-TLS attestation verification (the real identity check).
         verify_ratls_cert(end_entity.as_ref(), &self.policy)
             .map_err(Error::General)?;
 
