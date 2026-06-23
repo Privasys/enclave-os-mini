@@ -217,15 +217,21 @@ pub fn init_enclave(
     // attested connections (e.g. fetching a vault-backed KEK) can present a
     // measurement-bound client cert. The enclave CA never leaves the OS; egress
     // only ever asks the signer to mint for an OS-built identity.
-    crate::vaultkey::register_client_cert_signer(
-        sealed_cfg.ca_cert_der.clone(),
-        sealed_cfg.ca_key_pkcs8.clone(),
-    );
-    // Attestation provider: challenge-bound quotes (to authenticate this enclave
-    // to the management-service vault directory over plain TLS) + self-MRENCLAVE
-    // (so the wasm crate can pin the running runtime when self-authoring a vault
-    // key policy). Reached from the wasm crate only via egress registration.
-    crate::vaultkey::register_attestation_provider();
+    //
+    // Both registrations target egress, so they are skipped on the base flavor
+    // (no egress, no vault-key path).
+    #[cfg(feature = "egress")]
+    {
+        crate::vaultkey::register_client_cert_signer(
+            sealed_cfg.ca_cert_der.clone(),
+            sealed_cfg.ca_key_pkcs8.clone(),
+        );
+        // Attestation provider: challenge-bound quotes (to authenticate this enclave
+        // to the management-service vault directory over plain TLS) + self-MRENCLAVE
+        // (so the wasm crate can pin the running runtime when self-authoring a vault
+        // key policy). Reached from the wasm crate only via egress registration.
+        crate::vaultkey::register_attestation_provider();
+    }
 
     Ok((config, sealed_cfg))
 }

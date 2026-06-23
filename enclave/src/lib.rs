@@ -59,6 +59,10 @@ pub mod ratls;
 pub mod rpc_client;
 pub mod sealed_config;
 pub mod sessionrelay;
+// vaultkey registers the RA-TLS client-cert signer + attestation provider into
+// egress, so it only compiles when egress is linked (vault/wasm/egress flavors).
+// The base flavor has no egress, hence no vault-key path.
+#[cfg(feature = "egress")]
 pub mod vaultkey;
 
 use std::sync::atomic::{AtomicBool, Ordering};
