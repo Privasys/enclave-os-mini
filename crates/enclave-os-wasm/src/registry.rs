@@ -60,18 +60,17 @@ use crate::protocol::{AppPermissions, ExportedFunc, FunctionPermission, Function
 /// untrusted host; only an enclave that can reconstruct the KEK can unwrap it.
 const VAULTWRAP_TABLE: &[u8] = b"vaultwrap";
 
-/// Instructs `load_app` to vault-back an app's `encryption_key`. The enclave
-/// owns the key end-to-end: it discovers the constellation from the directory
-/// (`mgmt_url`), self-authors the policy (owner = `owner_sub`), and creates or
-/// reconstructs the KEK. None of the secret location comes from the platform —
-/// only the opt-in plus where the directory lives.
+/// Instructs `load_app` to vault-back an app's `encryption_key`. Option C: the
+/// platform/owner RESERVES the key (`CreateKeyPending` with the owner-authored
+/// policy); the enclave only discovers the constellation from the directory
+/// (`mgmt_url`), then FILLS (first boot) + reconstructs the KEK over its Tee cert.
+/// No secret location and no owner sub come over the wire — only the opt-in plus
+/// where the directory lives.
 pub struct VaultBacking {
     /// Management-service base URL (the directory `GET /api/v1/vaults`).
     pub mgmt_url: String,
     /// Platform environment for the directory query (`dev` / `prod`).
     pub environment: String,
-    /// App-owner `privasys.id` sub authored as the key's `Owner` principal.
-    pub owner_sub: String,
     /// Vault key handle, derived by the caller from the app id
     /// (`vault:apps.privasys.org/<app-id>/storage-kek/v1`).
     pub handle: String,
@@ -108,16 +107,10 @@ fn resolve_vault_backed_key(
         None => vaultkey::discover(&vb.mgmt_url, &vb.environment)?,
     };
 
-    // Reconstruct the KEK; on first ever load (no key reserved) create it. Never
-    // create when we already had a sealed selection — that path must resolve or
-    // fail (a denial there is the upgrade gate, not a first boot).
-    let kek = match vaultkey::resolve(&cfg, &vb.handle, code_hash, app_id_slice) {
-        Ok(k) => k,
-        Err(e) if vb.sealed.is_none() && vaultkey::is_unprovisioned(&e) => {
-            vaultkey::create(&cfg, &vb.handle, &vb.owner_sub, code_hash, app_id_slice)?
-        }
-        Err(e) => return Err(e),
-    };
+    // Reconstruct the KEK; on first boot the key is reserved-but-pending (the
+    // platform reserved it) and resolve_or_provision fills it. A policy denial is
+    // the upgrade gate (fail closed), not a first boot.
+    let kek = vaultkey::resolve_or_provision(&cfg, &vb.handle, code_hash, app_id_slice)?;
 
     let cipher = AeadCipher::from_key(kek);
     let key_id = vb.handle.as_bytes();

@@ -1280,16 +1280,8 @@ impl EnclaveModule for WasmModule {
                         )));
                     }
                 };
-                let owner_sub = match load.owners.first() {
-                    Some(s) if !s.is_empty() => s.clone(),
-                    _ => {
-                        return Some(Response::Data(serialize_or_error(
-                            &WasmManagementResult::Error {
-                                message: String::from("vault_backed requires an app owner"),
-                            },
-                        )));
-                    }
-                };
+                // No owner sub needed: option C — the platform reserves the key
+                // (authoring the owner-bound policy); the enclave only fills it.
                 let handle = format!("vault:apps.privasys.org/{}/storage-kek/v1", app_id_str);
                 let environment = load
                     .environment
@@ -1298,7 +1290,6 @@ impl EnclaveModule for WasmModule {
                 Some(crate::registry::VaultBacking {
                     mgmt_url,
                     environment,
-                    owner_sub,
                     handle,
                     sealed: None,
                 })

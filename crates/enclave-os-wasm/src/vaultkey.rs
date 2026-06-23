@@ -33,9 +33,8 @@ use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
 use enclave_os_egress::{
-    enclave_attestation_quote, enclave_self_mrenclave, https_fetch, mozilla_root_store,
-    root_store_from_der, ClientCertIdentity, RaTlsPolicy, ReportDataBinding, RootCertStore,
-    TeeType,
+    enclave_attestation_quote, https_fetch, mozilla_root_store, root_store_from_der,
+    ClientCertIdentity, RaTlsPolicy, ReportDataBinding, RootCertStore, TeeType,
 };
 
 use enclave_os_common::hex::{hex_decode, hex_encode};
@@ -53,17 +52,6 @@ pub const KEK_SIZE: usize = 32;
 /// returns a very large enabled set. The directory already shuffles, so taking a
 /// prefix is the random pick.
 const MAX_SHARE_VAULTS: usize = 8;
-
-/// Dotted OIDs the per-app key policy requires on the vault client cert. These
-/// mirror `common/src/oids.rs` (`APP_CODE_HASH_OID` / `APP_ID_OID`); the values
-/// are structurally immutable, so the dotted strings are pinned here to keep the
-/// vault wire format dependency-free.
-const OID_APP_CODE_HASH: &str = "1.3.6.1.4.1.65230.3.2";
-const OID_APP_ID: &str = "1.3.6.1.4.1.65230.3.6";
-
-/// Storage-DEK TTL the policy requests (90 days), matching the container path.
-/// The running enclave re-provisions well inside this on its refresh cadence.
-const STORAGE_KEK_TTL_SECONDS: u64 = 90 * 24 * 60 * 60;
 
 // ===========================================================================
 //  Sealed selection (persisted in AppMeta, MRENCLAVE-sealed)
@@ -177,205 +165,15 @@ fn fetch_directory(mgmt_url: &str, environment: &str) -> Result<(DirConstellatio
 }
 
 // ===========================================================================
-//  Vault key policy (serde-compatible port of the Go SDK / Rust vault types)
-// ===========================================================================
-//
-//  Serialised exactly as the vault expects: struct fields are snake_case;
-//  enum variants are externally-tagged PascalCase (e.g. `{"Tee": {...}}`,
-//  `"ExportKey"`, `{"Mrenclave": "..."}`). Only the create path is needed, so
-//  these are Serialize-only.
-
-#[derive(Clone, Serialize)]
-enum KeyType {
-    RawShare,
-}
-
-#[derive(Clone, Serialize)]
-enum Operation {
-    ExportKey,
-    ProvideMaterial,
-    PromoteProfile,
-    UpdatePolicy,
-    DeleteKey,
-}
-
-#[derive(Clone, Serialize)]
-enum PolicyField {
-    Owner,
-    Tees,
-    PendingProfiles,
-    Lifecycle,
-}
-
-/// Externally-tagged: `"Owner"` / `"AnyTee"` / `{"Tee": <u32>}`.
-#[derive(Clone, Serialize)]
-enum PrincipalRef {
-    Owner,
-    AnyTee,
-}
-
-#[derive(Clone, Serialize)]
-struct OidcPrincipal {
-    issuer: String,
-    sub: String,
-}
-
-/// `{"Mrenclave": "<hex>"}` (vs `{"Mrtd": ...}` for TDX).
-#[derive(Clone, Serialize)]
-enum Measurement {
-    Mrenclave(String),
-}
-
-#[derive(Clone, Serialize)]
-struct AttestationServer {
-    url: String,
-}
-
-#[derive(Clone, Serialize)]
-struct OidRequirement {
-    oid: String,
-    value: String,
-}
-
-#[derive(Clone, Serialize)]
-struct AttestationProfile {
-    name: String,
-    measurements: Vec<Measurement>,
-    attestation_servers: Vec<AttestationServer>,
-    required_oids: Vec<OidRequirement>,
-}
-
-/// `{"Oidc": {...}}` / `{"Tee": {...}}`.
-#[derive(Clone, Serialize)]
-enum Principal {
-    Oidc(OidcPrincipal),
-    Tee(AttestationProfile),
-}
-
-#[derive(Clone, Serialize)]
-struct PrincipalSet {
-    owner: Principal,
-    tees: Vec<Principal>,
-}
-
-#[derive(Clone, Serialize)]
-struct OperationRule {
-    ops: Vec<Operation>,
-    principals: Vec<PrincipalRef>,
-}
-
-#[derive(Clone, Serialize)]
-struct Mutability {
-    owner_can: Vec<PolicyField>,
-    immutable: Vec<PolicyField>,
-}
-
-#[derive(Clone, Serialize)]
-struct Lifecycle {
-    ttl_seconds: u64,
-}
-
-#[derive(Clone, Serialize)]
-struct KeyPolicy {
-    version: u32,
-    principals: PrincipalSet,
-    operations: Vec<OperationRule>,
-    mutability: Mutability,
-    lifecycle: Lifecycle,
-}
-
-/// Mirror of the container `VaultProvisioner.EnsureReserved` policy, but with an
-/// SGX MRENCLAVE measurement (not TDX MRTD): the running runtime + the per-app
-/// OIDs 3.2/3.6 gate the data path; the app owner gates the control path.
-fn build_app_key_policy(
-    cfg: &VaultConfig,
-    owner_sub: &str,
-    code_hash: &[u8],
-    app_id: Option<&[u8]>,
-) -> Result<KeyPolicy, String> {
-    let self_mr = enclave_self_mrenclave()
-        .ok_or("no attestation provider registered (self MRENCLAVE unavailable)")?;
-
-    let mut required_oids = std::vec![OidRequirement {
-        oid: OID_APP_CODE_HASH.into(),
-        value: hex_encode(code_hash),
-    }];
-    if let Some(a) = app_id {
-        required_oids.push(OidRequirement {
-            oid: OID_APP_ID.into(),
-            value: hex_encode(a),
-        });
-    }
-
-    let profile = AttestationProfile {
-        name: String::from("wasm app / SGX"),
-        measurements: std::vec![Measurement::Mrenclave(hex_encode(&self_mr))],
-        attestation_servers: cfg
-            .attestation_servers
-            .iter()
-            .map(|u| AttestationServer { url: u.clone() })
-            .collect(),
-        required_oids,
-    };
-
-    Ok(KeyPolicy {
-        version: 1,
-        principals: PrincipalSet {
-            // The app owner holds the key (privasys.id sub). The platform SA is
-            // deliberately absent from every slot.
-            owner: Principal::Oidc(OidcPrincipal {
-                issuer: cfg.oidc_issuer.clone(),
-                sub: owner_sub.into(),
-            }),
-            tees: std::vec![Principal::Tee(profile)],
-        },
-        operations: std::vec![
-            // Data path: the running app TEE fills + reconstructs its own DEK.
-            OperationRule {
-                ops: std::vec![Operation::ProvideMaterial, Operation::ExportKey],
-                principals: std::vec![PrincipalRef::AnyTee],
-            },
-            // Control path: only the owner promotes a new measurement (upgrade)
-            // or mutates/deletes the key.
-            OperationRule {
-                ops: std::vec![
-                    Operation::PromoteProfile,
-                    Operation::UpdatePolicy,
-                    Operation::DeleteKey
-                ],
-                principals: std::vec![PrincipalRef::Owner],
-            },
-        ],
-        mutability: Mutability {
-            owner_can: std::vec![
-                PolicyField::Tees,
-                PolicyField::PendingProfiles,
-                PolicyField::Lifecycle
-            ],
-            immutable: std::vec![PolicyField::Owner],
-        },
-        lifecycle: Lifecycle {
-            ttl_seconds: STORAGE_KEK_TTL_SECONDS,
-        },
-    })
-}
-
-// ===========================================================================
 //  Vault wire types (subset of the HSM protocol — POST /data, JSON)
 // ===========================================================================
 
-/// Externally-tagged to match the server's `VaultRequest` enum.
+/// Externally-tagged to match the server's `VaultRequest` enum. The enclave only
+/// FILLS (`ProvideMaterial`) + reconstructs (`ExportKey`) — the platform/owner
+/// reserves the key (`CreateKeyPending`, owner-authored policy). Option C: the
+/// vault `handle_create` requires an OIDC owner the enclave doesn't have.
 #[derive(Serialize)]
 enum VaultRequest {
-    CreateKey {
-        handle: String,
-        key_type: KeyType,
-        /// `None` = two-phase reserve (handle + policy, material later).
-        #[serde(skip_serializing_if = "Option::is_none")]
-        material_b64: Option<String>,
-        exportable: bool,
-        policy: KeyPolicy,
-    },
     ExportKey {
         handle: String,
     },
@@ -392,8 +190,6 @@ struct VaultResponse {
     key_material: Option<KeyMaterialResp>,
     #[serde(rename = "MaterialProvided")]
     material_provided: Option<MaterialProvidedResp>,
-    #[serde(rename = "KeyCreated")]
-    key_created: Option<KeyCreatedResp>,
     #[serde(rename = "Error")]
     error: Option<String>,
 }
@@ -407,13 +203,6 @@ struct KeyMaterialResp {
 struct MaterialProvidedResp {
     #[allow(dead_code)]
     handle: String,
-}
-
-#[derive(Deserialize)]
-struct KeyCreatedResp {
-    #[allow(dead_code)]
-    #[serde(default)]
-    expires_at: u64,
 }
 
 // ===========================================================================
@@ -458,21 +247,18 @@ pub fn discover(mgmt_url: &str, environment: &str) -> Result<VaultConfig, String
     })
 }
 
-/// Classifies a [`resolve`] error as "no key exists yet" (safe to [`create`]) vs
-/// any other failure (a denial, a transport error — must NOT fall through to a
-/// create, which could split generations or mask a real problem).
-pub fn is_unprovisioned(err: &str) -> bool {
-    let s = err.to_lowercase();
-    s.contains("no share group meets threshold") && !s.contains("not authorised")
-}
 
-/// First-ever creation: self-author the policy, two-phase `CreateKey` (reserve)
-/// + `ProvideMaterial` a Shamir share to each selected vault, returning the KEK.
-
-/// Later loads: reconstruct the KEK from the sealed selection. Fails CLOSED on a
-/// policy denial (the upgrade gate) — the owner must promote this measurement
-/// first; a fill here would split generations and corrupt the key.
-pub fn resolve(
+/// Resolve the KEK from the constellation, FILLING it on first boot if the key
+/// is reserved-but-pending (option C: the platform/owner reserved the handle +
+/// policy via `CreateKeyPending`; the enclave only fills + reconstructs over its
+/// Tee RA-TLS cert). Mirrors the container `vaultkey.ResolveOrProvision`:
+///   - a quorum of same-generation shares → reconstruct + return;
+///   - any policy denial → fail CLOSED (the upgrade gate; never fill, which would
+///     split generations and corrupt the key);
+///   - uniformly pending → generate a KEK, Shamir-split, `ProvideMaterial` one
+///     share per vault, return once ≥k acked;
+///   - not reserved anywhere → error (the platform must reserve it before deploy).
+pub fn resolve_or_provision(
     cfg: &VaultConfig,
     handle: &str,
     code_hash: &[u8],
@@ -482,11 +268,21 @@ pub fn resolve(
         return Err("vaultkey: sealed config has no vault endpoints".into());
     }
     let threshold = cfg.threshold();
+    if threshold > cfg.endpoints.len() {
+        return Err(format!(
+            "vaultkey: threshold {} exceeds {} endpoints",
+            threshold,
+            cfg.endpoints.len()
+        ));
+    }
     let root_store = root_store_from_der(cfg.ca_roots_der.iter().cloned())
         .map_err(|e| format!("vaultkey: bad CA roots: {e}"))?;
     let policy = build_ratls_policy(cfg, code_hash, app_id)?;
 
+    // ---- Phase 1: try to collect existing shares ------------------------
     let mut by_gen: Vec<(String, Vec<Share>)> = Vec::new();
+    let mut pending = 0usize;
+    let mut not_found = 0usize;
     let mut denied = 0usize;
     let mut last_err: Option<String> = None;
 
@@ -505,7 +301,11 @@ pub fn resolve(
             },
             Err(e) => {
                 let s = e.to_lowercase();
-                if s.contains("policy.principals") {
+                if s.contains("not yet provided") {
+                    pending += 1;
+                } else if s.contains("key not found") {
+                    not_found += 1;
+                } else if s.contains("policy.principals") {
                     denied += 1;
                 } else {
                     last_err = Some(e);
@@ -515,10 +315,11 @@ pub fn resolve(
     }
 
     if let Some(best) = best_group(&by_gen, threshold) {
-        let kek = shamir_reconstruct(best)?;
-        return to_kek(kek);
+        return to_kek(shamir_reconstruct(best)?);
     }
 
+    // Fail CLOSED on the gate: the key exists but this measurement isn't
+    // authorised. Never fall through to a Phase-2 fill (would split generations).
     if denied > 0 {
         return Err(format!(
             "vaultkey: key {handle:?} exists but this measurement is not authorised to \
@@ -527,69 +328,21 @@ pub fn resolve(
             cfg.endpoints.len()
         ));
     }
-    Err(format!(
-        "vaultkey: cannot reconstruct {handle:?} (no share group meets threshold {threshold}); \
-         last error: {last_err:?}"
-    ))
-}
 
-/// Reserve (two-phase `CreateKey`) the self-authored policy on each selected
-/// vault, then generate a KEK, Shamir-split it, and `ProvideMaterial` one share
-/// per vault. Returns the KEK once ≥k vaults hold a share. Call only after a
-/// [`resolve`] reports the key [`is_unprovisioned`].
-pub fn create(
-    cfg: &VaultConfig,
-    handle: &str,
-    owner_sub: &str,
-    code_hash: &[u8],
-    app_id: Option<&[u8]>,
-) -> Result<[u8; KEK_SIZE], String> {
-    if owner_sub.is_empty() {
-        return Err("vaultkey: no app-owner sub; refusing to author an owner-less key".into());
-    }
-    let threshold = cfg.threshold();
-    if threshold > cfg.endpoints.len() {
-        return Err(format!(
-            "vaultkey: threshold {} exceeds {} endpoints",
-            threshold,
-            cfg.endpoints.len()
-        ));
-    }
-    let root_store = root_store_from_der(cfg.ca_roots_der.iter().cloned())
-        .map_err(|e| format!("vaultkey: bad CA roots: {e}"))?;
-    let policy = build_ratls_policy(cfg, code_hash, app_id)?;
-    let key_policy = build_app_key_policy(cfg, owner_sub, code_hash, app_id)?;
-
-    // ---- Phase A: reserve handle + policy on each vault -------------------
-    let mut reserved = 0usize;
-    let mut last_err: Option<String> = None;
-    for ep in &cfg.endpoints {
-        match call_vault(
-            ep,
-            &VaultRequest::CreateKey {
-                handle: handle.into(),
-                key_type: KeyType::RawShare,
-                material_b64: None,
-                exportable: true,
-                policy: key_policy.clone(),
-            },
-            &root_store,
-            &policy,
-        ) {
-            Ok(_) => reserved += 1,
-            Err(e) if e.to_lowercase().contains("already exists") => reserved += 1,
-            Err(e) => last_err = Some(e),
+    if pending == 0 {
+        if not_found == cfg.endpoints.len() {
+            return Err(format!(
+                "vaultkey: handle {handle:?} is not reserved on any vault (the platform must \
+                 reserve it before deploy)"
+            ));
         }
-    }
-    if reserved < threshold {
         return Err(format!(
-            "vaultkey: reserved {handle:?} on only {reserved}/{} vaults (need {threshold}); \
-             last error: {last_err:?}",
-            cfg.endpoints.len()
+            "vaultkey: cannot reconstruct {handle:?} (no share group meets threshold \
+             {threshold}) and no vault reports pending material; last error: {last_err:?}"
         ));
     }
 
-    // ---- Phase B: generate + fill ----------------------------------------
+    // ---- Phase 2: first boot — generate the KEK + fill the reserved key --
     let rng = SystemRandom::new();
     let mut kek = [0u8; KEK_SIZE];
     rng.fill(&mut kek).map_err(|_| "vaultkey: rng (kek)")?;
@@ -714,7 +467,7 @@ fn call_vault(
     if let Some(km) = vr.key_material {
         return Ok(km.material);
     }
-    if vr.material_provided.is_some() || vr.key_created.is_some() {
+    if vr.material_provided.is_some() {
         return Ok(Vec::new());
     }
     Err("vault: unexpected response (no KeyMaterial/MaterialProvided/KeyCreated/Error)".into())
