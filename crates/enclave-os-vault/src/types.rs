@@ -348,6 +348,12 @@ pub enum Principal {
     ///
     /// `required_roles` is matched against the resolved roles in the
     /// caller's verified bearer token. Empty means any role is fine.
+    ///
+    /// If `sub` is **empty** the principal is *role-only*: it matches any
+    /// subject that holds all `required_roles` (which must be non-empty). This
+    /// is how a key names a set of callers by role — e.g. an app's team via the
+    /// `privasys-platform:app:<id>:approver` role — without rewriting the policy
+    /// when membership changes. See [`crate::policy::oidc_matches`].
     Oidc {
         issuer: String,
         sub: String,

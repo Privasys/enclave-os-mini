@@ -142,14 +142,30 @@ pub fn resolve_caller(
     None
 }
 
-/// `Principal::Oidc` match: same sub + all required roles present.
+/// `Principal::Oidc` match.
+///
+/// Two modes:
+///   - **subject-bound** (`sub` set): the caller's `sub` must match exactly AND
+///     every `required_roles` entry must be present.
+///   - **role-only** (`sub` empty): matches ANY subject that holds all
+///     `required_roles`. This lets a policy name a *set* of callers by role
+///     (e.g. an app's team via `privasys-platform:app:<id>:approver`) so the
+///     policy never has to change as the membership changes.
+///
+/// Safety guard: an empty `sub` with empty `required_roles` would match every
+/// caller, which is never the intent — it is refused.
 fn oidc_matches(principal: &Principal, claims: &OidcClaims) -> bool {
     match principal {
         Principal::Oidc {
             issuer: _,
             sub,
             required_roles,
-        } => sub == &claims.sub && has_required_roles(claims, required_roles),
+        } => {
+            if sub.is_empty() {
+                return !required_roles.is_empty() && has_required_roles(claims, required_roles);
+            }
+            sub == &claims.sub && has_required_roles(claims, required_roles)
+        }
         Principal::Tee(_) | Principal::Fido2 { .. } => false,
     }
 }
@@ -566,6 +582,66 @@ fn operations_eq(a: &[OperationRule], b: &[OperationRule]) -> bool {
 }
 fn mutability_eq(a: &Mutability, b: &Mutability) -> bool {
     a == b
+}
+
+#[cfg(test)]
+mod oidc_match_tests {
+    use super::*;
+    use enclave_os_common::oidc::OidcClaims;
+
+    fn claims(sub: &str, roles: &[&str]) -> OidcClaims {
+        OidcClaims {
+            sub: sub.into(),
+            roles: roles.iter().map(|s| s.to_string()).collect(),
+            is_manager: false,
+            is_monitoring: false,
+            amr: Vec::new(),
+            acr: None,
+            iat: 0,
+            exp: 0,
+            vault_op: None,
+            nonce: None,
+        }
+    }
+
+    fn oidc(sub: &str, roles: &[&str]) -> Principal {
+        Principal::Oidc {
+            issuer: "https://privasys.id".into(),
+            sub: sub.into(),
+            required_roles: roles.iter().map(|s| s.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn subject_bound_requires_exact_sub() {
+        let p = oidc("user-1", &[]);
+        assert!(oidc_matches(&p, &claims("user-1", &[])));
+        assert!(!oidc_matches(&p, &claims("user-2", &[])));
+    }
+
+    #[test]
+    fn subject_bound_also_requires_roles() {
+        let role = "privasys-platform:app:abc:approver";
+        let p = oidc("user-1", &[role]);
+        assert!(oidc_matches(&p, &claims("user-1", &[role])));
+        assert!(!oidc_matches(&p, &claims("user-1", &[])));
+    }
+
+    #[test]
+    fn role_only_matches_any_sub_holding_the_role() {
+        let role = "privasys-platform:app:abc:approver";
+        let p = oidc("", &[role]);
+        assert!(oidc_matches(&p, &claims("user-1", &[role])));
+        assert!(oidc_matches(&p, &claims("user-2", &[role])));
+        assert!(!oidc_matches(&p, &claims("user-3", &["other:role"])));
+    }
+
+    #[test]
+    fn role_only_with_no_roles_never_matches() {
+        let p = oidc("", &[]);
+        assert!(!oidc_matches(&p, &claims("user-1", &[])));
+        assert!(!oidc_matches(&p, &claims("user-1", &["anything"])));
+    }
 }
 
 
