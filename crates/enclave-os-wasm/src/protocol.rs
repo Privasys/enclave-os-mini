@@ -257,7 +257,7 @@ pub struct WasmLoad {
     #[serde(default)]
     pub vault_backed: bool,
     /// Management-service base URL the enclave queries for the vault directory
-    /// (`GET /api/v1/vaults`, authenticated by a challenge-bound quote). Only
+    /// (`GET /api/v1/vaults`, authenticated by a timestamp-bound quote). Only
     /// meaningful when `vault_backed` is true.
     #[serde(default)]
     pub mgmt_url: Option<String>,

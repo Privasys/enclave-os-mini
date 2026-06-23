@@ -102,7 +102,7 @@ fn resolve_vault_backed_key(
     let app_id_slice = app_id.as_ref().map(|a| a.as_slice());
 
     // The selection: the sealed one if we have it, else discovered from the
-    // directory (authenticated by a challenge-bound quote, inside `discover`).
+    // directory (authenticated by a timestamp-bound quote, inside `discover`).
     let cfg = match &vb.sealed {
         Some(c) => c.clone(),
         None => vaultkey::discover(&vb.mgmt_url, &vb.environment)?,

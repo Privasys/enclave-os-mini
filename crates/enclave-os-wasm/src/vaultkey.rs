@@ -8,7 +8,7 @@
 //! reserves the key, names the handle, or learns which vaults hold the shares.
 //!
 //! - [`create`] — first load. Call the directory (authenticated by a
-//!   challenge-bound SGX quote, NOT a host credential), randomly pick K vaults,
+//!   timestamp-bound SGX quote, NOT a host credential), randomly pick K vaults,
 //!   **self-author the key policy** (owner = app owner OIDC; `Tee` = this
 //!   enclave's own runtime MRENCLAVE + the per-app OIDs 3.2/3.6), `CreateKey`
 //!   (two-phase reserve) + `ProvideMaterial` a Shamir share to each, and return
@@ -136,41 +136,29 @@ struct DirVault {
     port: u16,
 }
 
-#[derive(Deserialize)]
-struct ChallengeResponse {
-    /// Hex nonce the enclave binds into its quote's ReportData.
-    nonce: String,
-}
-
 /// Fetch the active constellation + a shuffled vault list, authenticating to the
-/// management-service by a fresh challenge-bound SGX quote. Two round-trips: GET
-/// a nonce, then GET the directory presenting the quote in a header (the quote
-/// rides in the request, not the TLS layer, so it survives the LB).
+/// management-service by a fresh, timestamp-bound SGX quote. No challenge
+/// round-trip: the directory is a read-only phonebook (the SDK re-verifies every
+/// vault's own quote regardless), so binding a coarse timestamp — which lets the
+/// server bound replay to a small window — is sufficient. The quote rides in a
+/// request header, not the TLS layer, so it survives the TLS-terminating LB.
 fn fetch_directory(mgmt_url: &str, environment: &str) -> Result<(DirConstellation, Vec<DirVault>), String> {
     let base = mgmt_url.trim_end_matches('/');
     // mgmt-service has a normal (publicly-trusted) TLS cert — verify it against
     // the Mozilla roots; no RA-TLS policy (it is not an attested peer).
     let roots = mozilla_root_store();
 
-    // 1. Challenge.
-    let ch_url = format!("{base}/api/v1/enclave/vault-challenge");
-    let ch_resp = https_fetch("GET", &ch_url, &[], None, roots, None)?;
-    if ch_resp.status < 200 || ch_resp.status >= 300 {
-        return Err(format!("vault-challenge HTTP {}", ch_resp.status));
-    }
-    let ch: ChallengeResponse =
-        serde_json::from_slice(&ch_resp.body).map_err(|e| format!("decode challenge: {e}"))?;
-    let nonce = hex_decode(&ch.nonce).ok_or("vault-challenge nonce is not hex")?;
-
-    // 2. Quote bound to the nonce (produced by the OS attestation provider).
-    let quote = enclave_attestation_quote(&nonce)
+    // Bind the current time (big-endian u64) into the quote's ReportData; send
+    // the same value in a header so the server can check freshness and confirm
+    // the quote is not a replay of an older one.
+    let ts = enclave_os_common::ocall::get_current_time().unwrap_or(0);
+    let quote = enclave_attestation_quote(&ts.to_be_bytes())
         .ok_or("no attestation provider registered (cannot authenticate to directory)")?;
     let quote_b64 = b64url_nopad_encode(&quote);
 
-    // 3. Directory, presenting the quote.
     let dir_url = format!("{base}/api/v1/vaults?environment={environment}");
     let headers = std::vec![
-        (String::from("X-Attestation-Nonce"), ch.nonce.clone()),
+        (String::from("X-Attestation-Timestamp"), format!("{ts}")),
         (String::from("X-Attestation-Quote"), quote_b64),
     ];
     let resp = https_fetch("GET", &dir_url, &headers, None, roots, None)?;
