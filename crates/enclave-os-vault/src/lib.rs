@@ -1030,15 +1030,17 @@ fn handle_issue_approval(
             );
         }
     };
+    // Match the caller to a manager principal the same way op evaluation does:
+    // a subject-bound manager by exact sub, a role-based manager by role. This
+    // lets a role-holder issue an approval token for a role-based (co-sign)
+    // manager even though no manager pins their sub.
     let mgr_idx = match record
         .policy
         .principals
         .managers
         .iter()
-        .position(|p| match p {
-            Principal::Oidc { sub, .. } => sub == &claims.sub,
-            _ => false,
-        }) {
+        .position(|p| policy::oidc_matches(p, claims))
+    {
         Some(i) => i as u32,
         None => {
             let msg = "caller is not an OIDC manager of this key".to_string();
@@ -1071,7 +1073,7 @@ fn handle_issue_approval(
             Ok(s) => s,
             Err(_) => return VaultResponse::Error("kv store lock poisoned".into()),
         };
-        match signing::issue_approval_token(&mut store, handle, op, mgr_idx, now, ttl) {
+        match signing::issue_approval_token(&mut store, handle, op, mgr_idx, &claims.sub, now, ttl) {
             Ok(t) => t,
             Err(e) => return VaultResponse::Error(e),
         }

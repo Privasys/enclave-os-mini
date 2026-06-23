@@ -76,11 +76,16 @@ pub(crate) fn load_or_init_public_key(
 // ---------------------------------------------------------------------------
 
 /// Sign an [`ApprovalToken`] for the given (handle, op, manager) triple.
+///
+/// `approver_sub` is the OIDC `sub` of the manager who authenticated to
+/// request the token; it is recorded in the claims so a role-based
+/// [`Condition::ManagerApproval`] can enforce separation of duties.
 pub(crate) fn issue_approval_token(
     store: &mut SealedKvStore,
     handle: &str,
     op: Operation,
     manager: u32,
+    approver_sub: &str,
     iat: u64,
     ttl_seconds: u64,
 ) -> Result<ApprovalToken, String> {
@@ -90,6 +95,7 @@ pub(crate) fn issue_approval_token(
         handle: handle.to_string(),
         op,
         manager,
+        approver_sub: approver_sub.to_string(),
         iat,
         exp: iat.saturating_add(ttl_seconds),
     };
@@ -109,18 +115,20 @@ pub(crate) fn issue_approval_token(
 ///   1. ES256 signature verification against the vault's signing key,
 ///   2. `iss == ISSUER`,
 ///   3. `handle` / `op` / `manager` claims match,
-///   4. `manager_sub` claim matches the OIDC sub of the named manager
-///      (this is enforced indirectly: a token can only be issued by the
-///      vault for a manager who has authenticated, so we pin the manager
-///      *index* and let the policy lookup catch reshuffles),
-///   5. `now <= exp`,
-///   6. `now - iat <= fresh_for_seconds`.
+///   4. the manager *index* is pinned (a token can only be issued by the
+///      vault for a manager who has authenticated, so the policy lookup
+///      catches reshuffles),
+///   5. if `distinct_from` is `Some(proposer_sub)` (role-based co-sign /
+///      separation of duties), the token's `approver_sub` must be present
+///      and different from the proposer's sub,
+///   6. `now <= exp`,
+///   7. `now - iat <= fresh_for_seconds`.
 pub(crate) fn verify_approval_token(
     token: &ApprovalToken,
     handle: &str,
     op: Operation,
     manager: u32,
-    _manager_sub: &str,
+    distinct_from: Option<&str>,
     fresh_for_seconds: u64,
     now: u64,
 ) -> Result<(), String> {
@@ -158,6 +166,17 @@ pub(crate) fn verify_approval_token(
             "manager mismatch (token={}, expected={})",
             claims.manager, manager
         ));
+    }
+    if let Some(proposer_sub) = distinct_from {
+        if claims.approver_sub.is_empty() {
+            return Err("co-sign required but token carries no approver_sub".into());
+        }
+        if claims.approver_sub == proposer_sub {
+            return Err(format!(
+                "co-sign requires a second approver (approver_sub '{}' == proposer)",
+                claims.approver_sub
+            ));
+        }
     }
     if now > claims.exp {
         return Err(format!("expired (now={}, exp={})", now, claims.exp));

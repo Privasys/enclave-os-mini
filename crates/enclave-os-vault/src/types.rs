@@ -553,6 +553,14 @@ pub struct ApprovalClaims {
     pub op: Operation,
     /// Index into `principals.managers` of the issuing manager.
     pub manager: u32,
+    /// OIDC `sub` of the human/manager who authenticated to issue this
+    /// token. For a subject-bound manager this equals that manager's
+    /// pinned `sub`; for a role-based manager (empty `sub`, matched by
+    /// role) it is whichever role-holder authenticated. Used to enforce
+    /// separation-of-duties co-sign: a role-based [`Condition::ManagerApproval`]
+    /// requires `approver_sub != proposer_sub`.
+    #[serde(default)]
+    pub approver_sub: String,
     /// Issued at (unix seconds).
     pub iat: u64,
     /// Expires at (unix seconds).

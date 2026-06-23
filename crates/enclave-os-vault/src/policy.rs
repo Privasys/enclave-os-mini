@@ -154,7 +154,7 @@ pub fn resolve_caller(
 ///
 /// Safety guard: an empty `sub` with empty `required_roles` would match every
 /// caller, which is never the intent — it is refused.
-fn oidc_matches(principal: &Principal, claims: &OidcClaims) -> bool {
+pub(crate) fn oidc_matches(principal: &Principal, claims: &OidcClaims) -> bool {
     match principal {
         Principal::Oidc {
             issuer: _,
@@ -371,6 +371,26 @@ fn evaluate_conditions(
                         )
                     }
                 };
+                // A role-based manager (empty sub, matched by role) names a *set*
+                // of approvers, so the approval must come from a DIFFERENT person
+                // than whoever is driving this operation: separation-of-duties
+                // co-sign. We pass the proposer's sub so the token's approver_sub
+                // is checked to differ. A subject-bound manager is distinct by
+                // construction, so no co-sign check applies (distinct_from = None).
+                let distinct_from: Option<&str> = if mgr_sub.is_empty() {
+                    match ctx.oidc_claims.as_ref() {
+                        Some(c) => Some(c.sub.as_str()),
+                        None => {
+                            return Err(
+                                "ManagerApproval: role-based co-sign requires an \
+                                 authenticated OIDC proposer"
+                                    .to_string(),
+                            )
+                        }
+                    }
+                } else {
+                    None
+                };
                 let mut accepted = false;
                 let mut last_err: Option<String> = None;
                 for token in approvals {
@@ -379,7 +399,7 @@ fn evaluate_conditions(
                         handle,
                         op,
                         mgr_idx,
-                        mgr_sub,
+                        distinct_from,
                         *fresh_for_seconds,
                         now,
                     ) {
