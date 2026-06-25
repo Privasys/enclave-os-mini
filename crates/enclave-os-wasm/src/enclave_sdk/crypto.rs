@@ -47,9 +47,9 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let algo = match &params[0] {
-                Val::U32(v) => *v,
-                _ => {
+            let algo = match algo_index(&params[0], &["sha256", "sha384", "sha512"]) {
+                Some(v) => v,
+                None => {
                     results[0] = err_result("invalid algorithm parameter");
                     return Ok(());
                 }
@@ -191,9 +191,9 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
          params: &[Val],
          results: &mut [Val]| {
             let key_name = val_to_string(&params[0]);
-            let algo = match &params[1] {
-                Val::U32(v) => *v,
-                _ => {
+            let algo = match algo_index(&params[1], &["ecdsa-p256-sha256", "ecdsa-p384-sha384"]) {
+                Some(v) => v,
+                None => {
                     results[0] = err_result("invalid algorithm parameter");
                     return Ok(());
                 }
@@ -249,9 +249,9 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
          params: &[Val],
          results: &mut [Val]| {
             let key_name = val_to_string(&params[0]);
-            let algo = match &params[1] {
-                Val::U32(v) => *v,
-                _ => {
+            let algo = match algo_index(&params[1], &["ecdsa-p256-sha256", "ecdsa-p384-sha384"]) {
+                Some(v) => v,
+                None => {
                     results[0] = err_result("invalid algorithm parameter");
                     return Ok(());
                 }
@@ -317,9 +317,9 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
          params: &[Val],
          results: &mut [Val]| {
             let key_name = val_to_string(&params[0]);
-            let algo = match &params[1] {
-                Val::U32(v) => *v,
-                _ => {
+            let algo = match algo_index(&params[1], &["hmac-sha256", "hmac-sha384", "hmac-sha512"]) {
+                Some(v) => v,
+                None => {
                     results[0] = err_result("invalid algorithm parameter");
                     return Ok(());
                 }
@@ -361,9 +361,9 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
          params: &[Val],
          results: &mut [Val]| {
             let key_name = val_to_string(&params[0]);
-            let algo = match &params[1] {
-                Val::U32(v) => *v,
-                _ => {
+            let algo = match algo_index(&params[1], &["hmac-sha256", "hmac-sha384", "hmac-sha512"]) {
+                Some(v) => v,
+                None => {
                     results[0] = err_result("invalid algorithm parameter");
                     return Ok(());
                 }
@@ -438,6 +438,21 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
 // =========================================================================
 //  Val helpers
 // =========================================================================
+
+/// Resolve an algorithm-enum argument to its ordinal discriminant.
+///
+/// The WIT contract types `digest`/`sign`/`hmac` algorithms as `enum`s,
+/// which wasmtime delivers to host functions as `Val::Enum(<kebab-case
+/// case-name>)` — not as integers. We map the case name to its ordinal
+/// using the WIT-declared order. For backward-compatibility (older
+/// callers / direct integer encodings) we also accept a raw `Val::U32`.
+fn algo_index(val: &Val, names: &[&str]) -> Option<u32> {
+    match val {
+        Val::Enum(name) => names.iter().position(|n| *n == name).map(|i| i as u32),
+        Val::U32(v) => Some(*v),
+        _ => None,
+    }
+}
 
 fn val_to_string(val: &Val) -> String {
     match val {
