@@ -14,6 +14,13 @@
 //! | Symmetric | 32 random bytes | AES-256-GCM encrypt/decrypt |
 //! | Signing | ECDSA PKCS#8 | sign/verify (P-256, P-384) |
 //! | HMAC | 32/48/64 random bytes | HMAC-SHA-256/384/512 |
+//!
+//! The generated bindings (`Host` trait, algorithm enums) come from the
+//! single `bindgen!` invocation in [`super::crypto`] — the `keystore`
+//! interface `use`s crypto's `sign-algorithm` / `hmac-algorithm`, so the two
+//! share one type set. This module only implements the [`Host`] trait.
+//!
+//! [`Host`]: super::crypto::keystore_wit::Host
 
 use std::collections::BTreeMap;
 use std::string::String;
@@ -22,9 +29,9 @@ use std::vec::Vec;
 use ring::rand::{SecureRandom, SystemRandom};
 use ring::signature::{self, EcdsaKeyPair, KeyPair};
 
-use wasmtime::component::{Linker, Val};
-use wasmtime::StoreContextMut;
+use wasmtime::component::{HasSelf, Linker};
 
+use super::crypto::{crypto_wit, keystore_wit};
 use super::AppContext;
 
 /// KV domain prefix for persisted key material.
@@ -61,12 +68,12 @@ impl KeyStore {
         }
     }
 
-    /// Check if a key with the given name exists.
+    /// Whether a key with the given name exists.
     pub fn exists(&self, name: &str) -> bool {
         self.keys.contains_key(name)
     }
 
-    /// Retrieve a symmetric key by name.  Returns `None` if absent or wrong type.
+    /// Get raw bytes of a symmetric key, if present and of that type.
     pub fn get_symmetric(&self, name: &str) -> Option<Vec<u8>> {
         match self.keys.get(name) {
             Some(KeyMaterial::Symmetric(k)) => Some(k.clone()),
@@ -74,7 +81,7 @@ impl KeyStore {
         }
     }
 
-    /// Retrieve a signing key (PKCS#8) by name.  Returns `None` if absent or wrong type.
+    /// Get PKCS#8 bytes of a signing key, if present and of that type.
     pub fn get_signing(&self, name: &str) -> Option<Vec<u8>> {
         match self.keys.get(name) {
             Some(KeyMaterial::Signing(k)) => Some(k.clone()),
@@ -82,7 +89,7 @@ impl KeyStore {
         }
     }
 
-    /// Retrieve an HMAC key by name.  Returns `None` if absent or wrong type.
+    /// Get raw bytes of an HMAC key, if present and of that type.
     pub fn get_hmac(&self, name: &str) -> Option<Vec<u8>> {
         match self.keys.get(name) {
             Some(KeyMaterial::Hmac(k)) => Some(k.clone()),
@@ -90,32 +97,32 @@ impl KeyStore {
         }
     }
 
-    /// Insert or overwrite a symmetric key.
+    /// Insert a symmetric key.
     pub fn insert_symmetric(&mut self, name: String, key: Vec<u8>) {
         self.keys.insert(name, KeyMaterial::Symmetric(key));
     }
 
-    /// Insert or overwrite a signing key (PKCS#8).
+    /// Insert a signing key (PKCS#8).
     pub fn insert_signing(&mut self, name: String, key: Vec<u8>) {
         self.keys.insert(name, KeyMaterial::Signing(key));
     }
 
-    /// Insert or overwrite an HMAC key.
+    /// Insert an HMAC key.
     pub fn insert_hmac(&mut self, name: String, key: Vec<u8>) {
         self.keys.insert(name, KeyMaterial::Hmac(key));
     }
 
-    /// Remove a key by name.  Returns `true` if it existed.
+    /// Remove a key; returns whether it existed.
     pub fn remove(&mut self, name: &str) -> bool {
         self.keys.remove(name).is_some()
     }
 
-    /// Get a clone of the raw key material by name (for sealing/persistence).
+    /// Get a clone of the raw key material (for persistence).
     pub fn get_raw(&self, name: &str) -> Option<KeyMaterial> {
         self.keys.get(name).cloned()
     }
 
-    /// Number of keys in the store.
+    /// Number of keys held.
     pub fn len(&self) -> usize {
         self.keys.len()
     }
@@ -169,398 +176,175 @@ fn deserialize_key_material(data: &[u8]) -> Option<KeyMaterial> {
 }
 
 // =========================================================================
-//  privasys:enclave-os/keystore@0.1.0
+//  Host trait implementation — privasys:enclave-os/keystore@0.1.0
 // =========================================================================
+
+impl keystore_wit::Host for AppContext {
+    fn generate_symmetric_key(&mut self, key_name: String) -> Result<(), String> {
+        if key_name.is_empty() {
+            return Err("key name cannot be empty".into());
+        }
+        if self.keystore.exists(&key_name) {
+            return Err("key already exists".into());
+        }
+
+        let rng = SystemRandom::new();
+        let mut key_bytes = [0u8; 32]; // AES-256
+        rng.fill(&mut key_bytes).map_err(|_| "RNG failed".to_string())?;
+        self.keystore.insert_symmetric(key_name, key_bytes.to_vec());
+        Ok(())
+    }
+
+    fn generate_signing_key(
+        &mut self,
+        key_name: String,
+        algorithm: crypto_wit::SignAlgorithm,
+    ) -> Result<(), String> {
+        if key_name.is_empty() {
+            return Err("key name cannot be empty".into());
+        }
+        if self.keystore.exists(&key_name) {
+            return Err("key already exists".into());
+        }
+
+        let signing_algo = match algorithm {
+            crypto_wit::SignAlgorithm::EcdsaP256Sha256 => {
+                &signature::ECDSA_P256_SHA256_ASN1_SIGNING
+            }
+            crypto_wit::SignAlgorithm::EcdsaP384Sha384 => {
+                &signature::ECDSA_P384_SHA384_ASN1_SIGNING
+            }
+        };
+
+        let rng = SystemRandom::new();
+        let pkcs8 = EcdsaKeyPair::generate_pkcs8(signing_algo, &rng)
+            .map_err(|_| "key generation failed".to_string())?;
+        self.keystore
+            .insert_signing(key_name, pkcs8.as_ref().to_vec());
+        Ok(())
+    }
+
+    fn generate_hmac_key(
+        &mut self,
+        key_name: String,
+        algorithm: crypto_wit::HmacAlgorithm,
+    ) -> Result<(), String> {
+        if key_name.is_empty() {
+            return Err("key name cannot be empty".into());
+        }
+        if self.keystore.exists(&key_name) {
+            return Err("key already exists".into());
+        }
+
+        let key_len = match algorithm {
+            crypto_wit::HmacAlgorithm::HmacSha256 => 32usize, // SHA-256 key
+            crypto_wit::HmacAlgorithm::HmacSha384 => 48usize, // SHA-384
+            crypto_wit::HmacAlgorithm::HmacSha512 => 64usize, // SHA-512
+        };
+
+        let rng = SystemRandom::new();
+        let mut key_bytes = vec![0u8; key_len];
+        rng.fill(&mut key_bytes).map_err(|_| "RNG failed".to_string())?;
+        self.keystore.insert_hmac(key_name, key_bytes);
+        Ok(())
+    }
+
+    fn import_symmetric_key(&mut self, key_name: String, raw_key: Vec<u8>) -> Result<(), String> {
+        if key_name.is_empty() {
+            return Err("key name cannot be empty".into());
+        }
+        if self.keystore.exists(&key_name) {
+            return Err("key already exists".into());
+        }
+        if raw_key.len() != 32 {
+            return Err("AES-256 key must be exactly 32 bytes".into());
+        }
+
+        self.keystore.insert_symmetric(key_name, raw_key);
+        Ok(())
+    }
+
+    fn export_public_key(&mut self, key_name: String) -> Result<Vec<u8>, String> {
+        let pkcs8 = self
+            .keystore
+            .get_signing(&key_name)
+            .ok_or_else(|| "key not found or not a signing key".to_string())?;
+
+        // Try P-256 first, then P-384.
+        let rng = SystemRandom::new();
+        let public_key = if let Ok(kp) =
+            EcdsaKeyPair::from_pkcs8(&signature::ECDSA_P256_SHA256_ASN1_SIGNING, &pkcs8, &rng)
+        {
+            kp.public_key().as_ref().to_vec()
+        } else if let Ok(kp) =
+            EcdsaKeyPair::from_pkcs8(&signature::ECDSA_P384_SHA384_ASN1_SIGNING, &pkcs8, &rng)
+        {
+            kp.public_key().as_ref().to_vec()
+        } else {
+            return Err("failed to extract public key".into());
+        };
+
+        Ok(public_key)
+    }
+
+    fn delete_key(&mut self, key_name: String) -> Result<(), String> {
+        if self.keystore.remove(&key_name) {
+            Ok(())
+        } else {
+            Err("key not found".into())
+        }
+    }
+
+    fn key_exists(&mut self, key_name: String) -> Result<bool, String> {
+        Ok(self.keystore.exists(&key_name))
+    }
+
+    fn persist_key(&mut self, key_name: String) -> Result<(), String> {
+        let material = self
+            .keystore
+            .get_raw(&key_name)
+            .ok_or_else(|| "key not found".to_string())?;
+        let encoded = serialize_key_material(&material);
+        // Store in host KV (encrypted by sealed_kv).
+        let kv_key = format!("{}{}", KEY_KV_DOMAIN, key_name);
+        self.sealed_kv
+            .put(kv_key.as_bytes(), &encoded)
+            .map_err(|_| "KV store write failed".to_string())?;
+        Ok(())
+    }
+
+    fn load_key(&mut self, key_name: String) -> Result<(), String> {
+        if self.keystore.exists(&key_name) {
+            return Err("key already exists in memory".into());
+        }
+
+        // Read encrypted blob from host KV (decrypted by sealed_kv).
+        let kv_key = format!("{}{}", KEY_KV_DOMAIN, key_name);
+        let encoded = match self.sealed_kv.get(kv_key.as_bytes()) {
+            Ok(Some(data)) => data,
+            Ok(None) => return Err("no persisted key with that name".into()),
+            Err(_) => return Err("KV store read failed".into()),
+        };
+
+        // Deserialize and insert into KeyStore.
+        match deserialize_key_material(&encoded) {
+            Some(KeyMaterial::Symmetric(k)) => {
+                self.keystore.insert_symmetric(key_name, k);
+                Ok(())
+            }
+            Some(KeyMaterial::Signing(k)) => {
+                self.keystore.insert_signing(key_name, k);
+                Ok(())
+            }
+            Some(KeyMaterial::Hmac(k)) => {
+                self.keystore.insert_hmac(key_name, k);
+                Ok(())
+            }
+            None => Err("corrupted key data".into()),
+        }
+    }
+}
 
 pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
-    let mut inst = linker.instance("privasys:enclave-os/keystore@0.1.0")?;
-
-    // ── generate-symmetric-key ─────────────────────────────────────
-    // func(key-name: string) -> result<_, string>
-    inst.func_new(
-        "generate-symmetric-key",
-        |mut store: StoreContextMut<'_, AppContext>,
-         _func_type: wasmtime::component::types::ComponentFunc,
-         params: &[Val],
-         results: &mut [Val]| {
-            let name = val_to_string(&params[0]);
-            if name.is_empty() {
-                results[0] = err_result("key name cannot be empty");
-                return Ok(());
-            }
-            if store.data().keystore.exists(&name) {
-                results[0] = err_result("key already exists");
-                return Ok(());
-            }
-
-            let rng = SystemRandom::new();
-            let mut key_bytes = [0u8; 32]; // AES-256
-            match rng.fill(&mut key_bytes) {
-                Ok(()) => {
-                    store
-                        .data_mut()
-                        .keystore
-                        .insert_symmetric(name, key_bytes.to_vec());
-                    results[0] = ok_unit();
-                }
-                Err(_) => {
-                    results[0] = err_result("RNG failed");
-                }
-            }
-            Ok(())
-        },
-    )?;
-
-    // ── generate-signing-key ───────────────────────────────────────
-    // func(key-name: string, algorithm: u32) -> result<_, string>
-    //   algorithm: 0=ECDSA-P256-SHA256, 1=ECDSA-P384-SHA384
-    inst.func_new(
-        "generate-signing-key",
-        |mut store: StoreContextMut<'_, AppContext>,
-         _func_type: wasmtime::component::types::ComponentFunc,
-         params: &[Val],
-         results: &mut [Val]| {
-            let name = val_to_string(&params[0]);
-            let algo = match algo_index(&params[1], &["ecdsa-p256-sha256", "ecdsa-p384-sha384"]) {
-                Some(v) => v,
-                None => {
-                    results[0] = err_result("invalid algorithm parameter");
-                    return Ok(());
-                }
-            };
-
-            if name.is_empty() {
-                results[0] = err_result("key name cannot be empty");
-                return Ok(());
-            }
-            if store.data().keystore.exists(&name) {
-                results[0] = err_result("key already exists");
-                return Ok(());
-            }
-
-            let signing_algo = match algo {
-                0 => &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
-                1 => &signature::ECDSA_P384_SHA384_ASN1_SIGNING,
-                _ => {
-                    results[0] = err_result("unsupported algorithm");
-                    return Ok(());
-                }
-            };
-
-            let rng = SystemRandom::new();
-            let pkcs8 = match EcdsaKeyPair::generate_pkcs8(signing_algo, &rng) {
-                Ok(p) => p,
-                Err(_) => {
-                    results[0] = err_result("key generation failed");
-                    return Ok(());
-                }
-            };
-
-            store
-                .data_mut()
-                .keystore
-                .insert_signing(name, pkcs8.as_ref().to_vec());
-            results[0] = ok_unit();
-            Ok(())
-        },
-    )?;
-
-    // ── generate-hmac-key ──────────────────────────────────────────
-    // func(key-name: string, algorithm: u32) -> result<_, string>
-    //   algorithm: 0=HMAC-SHA256 (32B), 1=HMAC-SHA384 (48B), 2=HMAC-SHA512 (64B)
-    inst.func_new(
-        "generate-hmac-key",
-        |mut store: StoreContextMut<'_, AppContext>,
-         _func_type: wasmtime::component::types::ComponentFunc,
-         params: &[Val],
-         results: &mut [Val]| {
-            let name = val_to_string(&params[0]);
-            let algo = match algo_index(&params[1], &["hmac-sha256", "hmac-sha384", "hmac-sha512"]) {
-                Some(v) => v,
-                None => {
-                    results[0] = err_result("invalid algorithm parameter");
-                    return Ok(());
-                }
-            };
-
-            if name.is_empty() {
-                results[0] = err_result("key name cannot be empty");
-                return Ok(());
-            }
-            if store.data().keystore.exists(&name) {
-                results[0] = err_result("key already exists");
-                return Ok(());
-            }
-
-            let key_len = match algo {
-                0 => 32usize,  // SHA-256 block = 64, key = 32 is standard
-                1 => 48usize,  // SHA-384
-                2 => 64usize,  // SHA-512
-                _ => {
-                    results[0] = err_result("unsupported HMAC algorithm");
-                    return Ok(());
-                }
-            };
-
-            let rng = SystemRandom::new();
-            let mut key_bytes = vec![0u8; key_len];
-            match rng.fill(&mut key_bytes) {
-                Ok(()) => {
-                    store.data_mut().keystore.insert_hmac(name, key_bytes);
-                    results[0] = ok_unit();
-                }
-                Err(_) => {
-                    results[0] = err_result("RNG failed");
-                }
-            }
-            Ok(())
-        },
-    )?;
-
-    // ── import-symmetric-key ───────────────────────────────────────
-    // func(key-name: string, raw-key: list<u8>) -> result<_, string>
-    inst.func_new(
-        "import-symmetric-key",
-        |mut store: StoreContextMut<'_, AppContext>,
-         _func_type: wasmtime::component::types::ComponentFunc,
-         params: &[Val],
-         results: &mut [Val]| {
-            let name = val_to_string(&params[0]);
-            let raw_key = val_to_bytes(&params[1]);
-
-            if name.is_empty() {
-                results[0] = err_result("key name cannot be empty");
-                return Ok(());
-            }
-            if store.data().keystore.exists(&name) {
-                results[0] = err_result("key already exists");
-                return Ok(());
-            }
-            if raw_key.len() != 32 {
-                results[0] = err_result("AES-256 key must be exactly 32 bytes");
-                return Ok(());
-            }
-
-            store.data_mut().keystore.insert_symmetric(name, raw_key);
-            results[0] = ok_unit();
-            Ok(())
-        },
-    )?;
-
-    // ── export-public-key ──────────────────────────────────────────
-    // func(key-name: string) -> result<list<u8>, string>
-    inst.func_new(
-        "export-public-key",
-        |store: StoreContextMut<'_, AppContext>,         _func_type: wasmtime::component::types::ComponentFunc,         params: &[Val],
-         results: &mut [Val]| {
-            let name = val_to_string(&params[0]);
-
-            let pkcs8 = match store.data().keystore.get_signing(&name) {
-                Some(k) => k,
-                None => {
-                    results[0] = err_result("key not found or not a signing key");
-                    return Ok(());
-                }
-            };
-
-            // Try P-256 first, then P-384.
-            let rng = SystemRandom::new();
-            let public_key = if let Ok(kp) = EcdsaKeyPair::from_pkcs8(
-                &signature::ECDSA_P256_SHA256_ASN1_SIGNING,
-                &pkcs8,
-                &rng,
-            ) {
-                kp.public_key().as_ref().to_vec()
-            } else if let Ok(kp) = EcdsaKeyPair::from_pkcs8(
-                &signature::ECDSA_P384_SHA384_ASN1_SIGNING,
-                &pkcs8,
-                &rng,
-            ) {
-                kp.public_key().as_ref().to_vec()
-            } else {
-                results[0] = err_result("failed to extract public key");
-                return Ok(());
-            };
-
-            results[0] = ok_bytes(&public_key);
-            Ok(())
-        },
-    )?;
-
-    // ── delete-key ─────────────────────────────────────────────────
-    // func(key-name: string) -> result<_, string>
-    inst.func_new(
-        "delete-key",
-        |mut store: StoreContextMut<'_, AppContext>,
-         _func_type: wasmtime::component::types::ComponentFunc,
-         params: &[Val],
-         results: &mut [Val]| {
-            let name = val_to_string(&params[0]);
-            if store.data_mut().keystore.remove(&name) {
-                results[0] = ok_unit();
-            } else {
-                results[0] = err_result("key not found");
-            }
-            Ok(())
-        },
-    )?;
-
-    // ── key-exists ─────────────────────────────────────────────────
-    // func(key-name: string) -> result<bool, string>
-    inst.func_new(
-        "key-exists",
-        |store: StoreContextMut<'_, AppContext>,         _func_type: wasmtime::component::types::ComponentFunc,         params: &[Val],
-         results: &mut [Val]| {
-            let name = val_to_string(&params[0]);
-            let exists = store.data().keystore.exists(&name);
-            results[0] = ok_bool(exists);
-            Ok(())
-        },
-    )?;
-
-    // ── persist-key ────────────────────────────────────────────────
-    // func(key-name: string) -> result<_, string>
-    //
-    // Seals the key material with MRENCLAVE policy and stores the
-    // ciphertext in the host KV store under the app's namespace.
-    inst.func_new(
-        "persist-key",
-        |store: StoreContextMut<'_, AppContext>,         _func_type: wasmtime::component::types::ComponentFunc,         params: &[Val],
-         results: &mut [Val]| {
-            let name = val_to_string(&params[0]);
-
-            // Serialize the key material.
-            let material = match store.data().keystore.get_raw(&name) {
-                Some(m) => m,
-                None => {
-                    results[0] = err_result("key not found");
-                    return Ok(());
-                }
-            };
-            let encoded = serialize_key_material(&material);
-            // Store in host KV (encrypted by sealed_kv).
-            let kv_key = format!("{}{}", KEY_KV_DOMAIN, name);
-            match store.data().sealed_kv.put(kv_key.as_bytes(), &encoded) {
-                Ok(()) => {
-                    results[0] = ok_unit();
-                }
-                Err(_) => {
-                    results[0] = err_result("KV store write failed");
-                }
-            }
-            Ok(())
-        },
-    )?;
-
-    // ── load-key ───────────────────────────────────────────────────
-    // func(key-name: string) -> result<_, string>
-    //
-    // Loads a previously persisted key from the host KV store,
-    // unseals it, and inserts it into the in-memory KeyStore.
-    inst.func_new(
-        "load-key",
-        |mut store: StoreContextMut<'_, AppContext>,
-         _func_type: wasmtime::component::types::ComponentFunc,
-         params: &[Val],
-         results: &mut [Val]| {
-            let name = val_to_string(&params[0]);
-
-            if store.data().keystore.exists(&name) {
-                results[0] = err_result("key already exists in memory");
-                return Ok(());
-            }
-
-            // Read encrypted blob from host KV (decrypted by sealed_kv).
-            let kv_key = format!("{}{}", KEY_KV_DOMAIN, name);
-            let encoded = match store.data().sealed_kv.get(kv_key.as_bytes()) {
-                Ok(Some(data)) => data,
-                Ok(None) => {
-                    results[0] = err_result("no persisted key with that name");
-                    return Ok(());
-                }
-                Err(_) => {
-                    results[0] = err_result("KV store read failed");
-                    return Ok(());
-                }
-            };
-
-            // Deserialize and insert into KeyStore.
-            match deserialize_key_material(&encoded) {
-                Some(KeyMaterial::Symmetric(k)) => {
-                    store.data_mut().keystore.insert_symmetric(name, k);
-                    results[0] = ok_unit();
-                }
-                Some(KeyMaterial::Signing(k)) => {
-                    store.data_mut().keystore.insert_signing(name, k);
-                    results[0] = ok_unit();
-                }
-                Some(KeyMaterial::Hmac(k)) => {
-                    store.data_mut().keystore.insert_hmac(name, k);
-                    results[0] = ok_unit();
-                }
-                None => {
-                    results[0] = err_result("corrupted key data");
-                }
-            }
-            Ok(())
-        },
-    )?;
-
-    Ok(())
-}
-
-// =========================================================================
-//  Val helpers
-// =========================================================================
-
-fn val_to_string(val: &Val) -> String {
-    match val {
-        Val::String(s) => s.to_string(),
-        _ => String::new(),
-    }
-}
-
-/// Resolve an algorithm-enum argument to its ordinal discriminant.
-///
-/// The WIT contract types `sign`/`hmac` algorithms as `enum`s, which
-/// wasmtime delivers to host functions as `Val::Enum(<kebab-case
-/// case-name>)`. We map the case name to its ordinal using the
-/// WIT-declared order, and accept a raw `Val::U32` for back-compat.
-fn algo_index(val: &Val, names: &[&str]) -> Option<u32> {
-    match val {
-        Val::Enum(name) => names.iter().position(|n| *n == name).map(|i| i as u32),
-        Val::U32(v) => Some(*v),
-        _ => None,
-    }
-}
-
-fn val_to_bytes(val: &Val) -> Vec<u8> {
-    match val {
-        Val::List(items) => items
-            .iter()
-            .filter_map(|v| match v {
-                Val::U8(b) => Some(*b),
-                _ => None,
-            })
-            .collect(),
-        _ => Vec::new(),
-    }
-}
-
-fn ok_unit() -> Val {
-    Val::Result(Ok(None))
-}
-
-fn ok_bytes(data: &[u8]) -> Val {
-    Val::Result(Ok(Some(Box::new(Val::List(
-        data.iter().map(|b| Val::U8(*b)).collect::<Vec<_>>().into(),
-    )))))
-}
-
-fn ok_bool(v: bool) -> Val {
-    Val::Result(Ok(Some(Box::new(Val::Bool(v)))))
-}
-
-fn err_result(msg: &str) -> Val {
-    Val::Result(Err(Some(Box::new(Val::String(msg.into())))))
+    keystore_wit::add_to_linker::<_, HasSelf<_>>(linker, |s| s)
 }
