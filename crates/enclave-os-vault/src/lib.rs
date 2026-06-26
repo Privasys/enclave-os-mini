@@ -16,6 +16,7 @@
 
 pub mod audit;
 pub mod crypto;
+pub mod grant;
 pub mod policy;
 pub mod quote;
 pub mod signing;
@@ -35,8 +36,8 @@ use crate::policy::{evaluate_op, evaluate_policy_update, resolve_caller, CallerR
 
 use crate::types::{
     ApprovalToken, AttestationProfile, AuditDecision, KeyInfo, KeyListEntry, KeyPolicy, KeyRecord,
-    KeyType, Operation, PendingProfile, PendingProfileSource, PolicyField, Principal,
-    VaultRequest, VaultResponse, DEFAULT_APPROVAL_TOKEN_TTL_SECONDS, DEFAULT_KEY_TTL_SECONDS,
+    KeyType, Operation, PendingProfile, PendingProfileSource, PolicyField, Principal, VaultRequest,
+    VaultResponse, DEFAULT_APPROVAL_TOKEN_TTL_SECONDS, DEFAULT_KEY_TTL_SECONDS,
     MAX_APPROVAL_TOKEN_TTL_SECONDS, MAX_KEY_TTL_SECONDS,
 };
 
@@ -80,23 +81,9 @@ impl EnclaveModule for VaultModule {
         let resp = match vault_req {
             VaultRequest::CreateKey {
                 handle,
-                key_type,
                 material_b64,
-                exportable,
-                policy,
-            } => handle_create(
-                &handle,
-                key_type,
-                material_b64.as_deref(),
-                exportable,
-                policy,
-                ctx,
-            ),
-            VaultRequest::ProvideMaterial {
-                handle,
-                material_b64,
-                approvals,
-            } => handle_provide_material(&handle, &material_b64, &approvals, ctx),
+                grant,
+            } => handle_create(&handle, &material_b64, &grant, ctx),
             VaultRequest::ExportKey { handle, approvals } => {
                 handle_export(&handle, &approvals, ctx)
             }
@@ -168,9 +155,7 @@ impl EnclaveModule for VaultModule {
                 profile,
                 source,
             } => handle_stage_pending(&handle, profile, source, ctx),
-            VaultRequest::ListPendingProfiles { handle } => {
-                handle_list_pending(&handle, ctx)
-            }
+            VaultRequest::ListPendingProfiles { handle } => handle_list_pending(&handle, ctx),
             VaultRequest::PromotePendingProfile {
                 handle,
                 pending_id,
@@ -202,11 +187,7 @@ fn owner_index_key(owner_sub: &str) -> Vec<u8> {
     format!("index:{}", owner_sub).into_bytes()
 }
 
-fn add_to_owner_index(
-    store: &SealedKvStore,
-    owner_sub: &str,
-    handle: &str,
-) -> Result<(), String> {
+fn add_to_owner_index(store: &SealedKvStore, owner_sub: &str, handle: &str) -> Result<(), String> {
     let key = owner_index_key(owner_sub);
     let mut handles: Vec<String> = match store.get(&key) {
         Ok(Some(b)) => serde_json::from_slice(&b).unwrap_or_default(),
@@ -347,10 +328,8 @@ fn normalise_profile(profile: &mut AttestationProfile) {
 
 fn handle_create(
     handle: &str,
-    key_type: KeyType,
-    material_b64: Option<&str>,
-    exportable: bool,
-    policy: KeyPolicy,
+    material_b64: &str,
+    grant_jwt: &str,
     ctx: &RequestContext,
 ) -> VaultResponse {
     if handle.is_empty() {
@@ -362,54 +341,40 @@ fn handle_create(
         );
     }
 
-    let claims = match ctx.oidc_claims.as_ref() {
-        Some(c) => c,
-        None => {
-            return VaultResponse::Error(
-                "OIDC authentication required to create a key".into(),
-            )
-        }
-    };
-    if !owner_matches_oidc(&policy.principals.owner, claims) {
-        return VaultResponse::Error(
-            "caller's OIDC identity does not match policy.principals.owner".into(),
-        );
-    }
-    let owner_sub = claims.sub.clone();
-
-    // Two-phase create: no material reserves the handle + policy. The
-    // policy must name someone who can fill it, or the key could never
-    // become usable.
-    let (material, public_key, pending_material) = match material_b64 {
-        Some(b64) => {
-            let material = match URL_SAFE_NO_PAD.decode(b64) {
-                Ok(b) if !b.is_empty() => b,
-                Ok(_) => return VaultResponse::Error("material must not be empty".into()),
-                Err(e) => return VaultResponse::Error(format!("bad base64: {e}")),
-            };
-            let public_key = match crypto::validate_material(key_type, &material) {
-                Ok(p) => p,
-                Err(e) => return VaultResponse::Error(e),
-            };
-            (material, public_key, false)
-        }
-        None => {
-            let grants_provide = policy.operations.iter().any(|r| {
-                r.ops.contains(&Operation::ProvideMaterial) && !r.principals.is_empty()
-            });
-            if !grants_provide {
-                return VaultResponse::Error(
-                    "two-phase create requires an OperationRule granting \
-                     ProvideMaterial (the key could never receive material)"
-                        .into(),
-                );
-            }
-            (Vec::new(), None, true)
-        }
-    };
-
-    let policy = normalise_policy(policy);
     let now = now_secs();
+    let grant = match crate::grant::verify_grant(grant_jwt, ctx, now) {
+        Ok(g) => g,
+        Err(e) => return VaultResponse::Error(e),
+    };
+
+    // The handle must fall under the grant's scope.
+    if handle != grant.scope && !handle.starts_with(&format!("{}/", grant.scope)) {
+        return VaultResponse::Error(format!(
+            "handle '{handle}' is outside the grant scope '{}'",
+            grant.scope
+        ));
+    }
+
+    // The granted policy must be owned by the grant subject.
+    if owner_oidc_sub(&grant.policy.principals.owner).as_deref() != Some(grant.sub.as_str()) {
+        return VaultResponse::Error("grant policy owner does not match the grant subject".into());
+    }
+
+    let key_type = grant.key_type;
+    let exportable = grant.exportable;
+    let owner_sub = grant.sub.clone();
+
+    let material = match URL_SAFE_NO_PAD.decode(material_b64) {
+        Ok(b) if !b.is_empty() => b,
+        Ok(_) => return VaultResponse::Error("material must not be empty".into()),
+        Err(e) => return VaultResponse::Error(format!("bad base64: {e}")),
+    };
+    let public_key = match crypto::validate_material(key_type, &material) {
+        Ok(p) => p,
+        Err(e) => return VaultResponse::Error(e),
+    };
+
+    let policy = normalise_policy(grant.policy);
     let expires_at = now.saturating_add(policy.lifecycle.ttl_seconds);
 
     let kv = match kv() {
@@ -433,7 +398,6 @@ fn handle_create(
         key_type,
         exportable,
         material,
-        pending_material,
         public_key,
         policy,
         policy_version: 1,
@@ -447,9 +411,9 @@ fn handle_create(
     if let Err(e) = audit_and_save(
         &mut record,
         "CreateKey",
-        &format!("oidc:{}", owner_sub),
+        &caller_str(ctx),
         AuditDecision::Allowed,
-        if pending_material { "pending material" } else { "" },
+        &format!("owner={owner_sub}"),
     ) {
         return e;
     }
@@ -467,121 +431,29 @@ fn handle_create(
     VaultResponse::KeyCreated {
         handle: handle.to_string(),
         expires_at,
-        pending_material,
     }
 }
 
-fn handle_provide_material(
-    handle: &str,
-    material_b64: &str,
-    approvals: &[ApprovalToken],
-    ctx: &RequestContext,
-) -> VaultResponse {
-    let mut record = match load_record(handle) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
-    let caller = caller_str(ctx);
-    if expired(&record) {
-        let _ = audit_and_save(
-            &mut record,
-            "ProvideMaterial",
-            &caller,
-            AuditDecision::Denied,
-            "key has expired",
-        );
-        return VaultResponse::Error("key has expired".into());
-    }
-    // One-shot: a key that already has material can never be refilled,
-    // by anyone. Replacing material is a delete + re-create.
-    if !record.pending_material {
-        let _ = audit_and_save(
-            &mut record,
-            "ProvideMaterial",
-            &caller,
-            AuditDecision::Denied,
-            "key material already provided",
-        );
-        return VaultResponse::Error("key material already provided".into());
-    }
-    if let Err(e) = evaluate_op(
-        &record.policy,
-        Operation::ProvideMaterial,
-        handle,
-        approvals,
-        ctx,
-        None,
-    ) {
-        let _ = audit_and_save(
-            &mut record,
-            "ProvideMaterial",
-            &caller,
-            AuditDecision::Denied,
-            &e,
-        );
-        return VaultResponse::Error(e);
-    }
-
-    let material = match URL_SAFE_NO_PAD.decode(material_b64) {
-        Ok(b) if !b.is_empty() => b,
-        Ok(_) => return VaultResponse::Error("material must not be empty".into()),
-        Err(e) => return VaultResponse::Error(format!("bad base64: {e}")),
-    };
-    let public_key = match crypto::validate_material(record.key_type, &material) {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = audit_and_save(
-                &mut record,
-                "ProvideMaterial",
-                &caller,
-                AuditDecision::Denied,
-                &e,
-            );
-            return VaultResponse::Error(e);
-        }
-    };
-
-    record.material = material;
-    record.public_key = public_key;
-    record.pending_material = false;
-
-    if let Err(e) = audit_and_save(
-        &mut record,
-        "ProvideMaterial",
-        &caller,
-        AuditDecision::Allowed,
-        "",
-    ) {
-        return e;
-    }
-    VaultResponse::MaterialProvided {
-        handle: handle.to_string(),
-        expires_at: record.expires_at,
-    }
-}
-
-fn handle_export(
-    handle: &str,
-    approvals: &[ApprovalToken],
-    ctx: &RequestContext,
-) -> VaultResponse {
+fn handle_export(handle: &str, approvals: &[ApprovalToken], ctx: &RequestContext) -> VaultResponse {
     let mut record = match load_record(handle) {
         Ok(r) => r,
         Err(e) => return e,
     };
     if expired(&record) {
         return VaultResponse::Error("key has expired".into());
-    }
-    if record.pending_material {
-        return VaultResponse::Error(
-            "key material not yet provided (two-phase create)".into(),
-        );
     }
     if !record.exportable {
         return VaultResponse::Error("key is not exportable".into());
     }
     let caller = caller_str(ctx);
-    match evaluate_op(&record.policy, Operation::ExportKey, handle, approvals, ctx, None) {
+    match evaluate_op(
+        &record.policy,
+        Operation::ExportKey,
+        handle,
+        approvals,
+        ctx,
+        None,
+    ) {
         Ok(()) => {
             let _ = audit_and_save(
                 &mut record,
@@ -596,36 +468,27 @@ fn handle_export(
             }
         }
         Err(e) => {
-            let _ = audit_and_save(
-                &mut record,
-                "ExportKey",
-                &caller,
-                AuditDecision::Denied,
-                &e,
-            );
+            let _ = audit_and_save(&mut record, "ExportKey", &caller, AuditDecision::Denied, &e);
             VaultResponse::Error(e)
         }
     }
 }
 
-fn handle_delete(
-    handle: &str,
-    approvals: &[ApprovalToken],
-    ctx: &RequestContext,
-) -> VaultResponse {
+fn handle_delete(handle: &str, approvals: &[ApprovalToken], ctx: &RequestContext) -> VaultResponse {
     let mut record = match load_record(handle) {
         Ok(r) => r,
         Err(e) => return e,
     };
     let caller = caller_str(ctx);
-    if let Err(e) = evaluate_op(&record.policy, Operation::DeleteKey, handle, approvals, ctx, None) {
-        let _ = audit_and_save(
-            &mut record,
-            "DeleteKey",
-            &caller,
-            AuditDecision::Denied,
-            &e,
-        );
+    if let Err(e) = evaluate_op(
+        &record.policy,
+        Operation::DeleteKey,
+        handle,
+        approvals,
+        ctx,
+        None,
+    ) {
+        let _ = audit_and_save(&mut record, "DeleteKey", &caller, AuditDecision::Denied, &e);
         return VaultResponse::Error(e);
     }
 
@@ -638,7 +501,13 @@ fn handle_delete(
     // is about to disappear, so the audit chain for this key dies too.
     // That's acceptable: deletion is final and auditors should snapshot
     // the log before it goes.
-    let _ = audit_and_save(&mut record, "DeleteKey", &caller, AuditDecision::Allowed, "");
+    let _ = audit_and_save(
+        &mut record,
+        "DeleteKey",
+        &caller,
+        AuditDecision::Allowed,
+        "",
+    );
 
     let kv = match kv() {
         Ok(k) => k,
@@ -689,11 +558,7 @@ fn handle_update_policy(
     }
     let role = match resolve_caller(&record.policy, ctx) {
         Some((_pref, role)) => role,
-        None => {
-            return VaultResponse::Error(
-                "caller is not in policy.principals".into(),
-            )
-        }
+        None => return VaultResponse::Error("caller is not in policy.principals".into()),
     };
     let new_policy = normalise_policy(new_policy);
     if let Err(e) = evaluate_policy_update(&record.policy, &new_policy, role) {
@@ -760,9 +625,7 @@ fn handle_get_info(handle: &str, ctx: &RequestContext) -> VaultResponse {
 fn handle_list(ctx: &RequestContext) -> VaultResponse {
     let claims = match ctx.oidc_claims.as_ref() {
         Some(c) => c,
-        None => {
-            return VaultResponse::Error("OIDC authentication required to list keys".into())
-        }
+        None => return VaultResponse::Error("OIDC authentication required to list keys".into()),
     };
     let owner_sub = &claims.sub;
 
@@ -819,18 +682,6 @@ fn require_op(
         );
         return Err(VaultResponse::Error("key has expired".into()));
     }
-    if record.pending_material {
-        let _ = audit_and_save(
-            &mut record,
-            op_name(op),
-            &caller_str(ctx),
-            AuditDecision::Denied,
-            "key material not yet provided",
-        );
-        return Err(VaultResponse::Error(
-            "key material not yet provided (two-phase create)".into(),
-        ));
-    }
     if record.key_type != expect_type {
         let msg = format!(
             "key {} has type {:?}, op {:?} requires {:?}",
@@ -847,13 +698,7 @@ fn require_op(
     }
     let caller = caller_str(ctx);
     if let Err(e) = evaluate_op(&record.policy, op, handle, approvals, ctx, None) {
-        let _ = audit_and_save(
-            &mut record,
-            op_name(op),
-            &caller,
-            AuditDecision::Denied,
-            &e,
-        );
+        let _ = audit_and_save(&mut record, op_name(op), &caller, AuditDecision::Denied, &e);
         return Err(VaultResponse::Error(e));
     }
     if let Err(e) = audit_and_save(
@@ -878,7 +723,6 @@ fn op_name(op: Operation) -> &'static str {
         Operation::Sign => "Sign",
         Operation::Mac => "Mac",
         Operation::PromoteProfile => "PromoteProfile",
-        Operation::ProvideMaterial => "ProvideMaterial",
     }
 }
 
@@ -890,11 +734,16 @@ fn handle_wrap(
     approvals: &[ApprovalToken],
     ctx: &RequestContext,
 ) -> VaultResponse {
-    let record =
-        match require_op(handle, Operation::Wrap, KeyType::Aes256GcmKey, approvals, ctx) {
-            Ok(r) => r,
-            Err(e) => return e,
-        };
+    let record = match require_op(
+        handle,
+        Operation::Wrap,
+        KeyType::Aes256GcmKey,
+        approvals,
+        ctx,
+    ) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
     let plaintext = match URL_SAFE_NO_PAD.decode(plaintext_b64) {
         Ok(b) => b,
         Err(e) => return VaultResponse::Error(format!("plaintext base64: {e}")),
@@ -927,11 +776,16 @@ fn handle_unwrap(
     approvals: &[ApprovalToken],
     ctx: &RequestContext,
 ) -> VaultResponse {
-    let record =
-        match require_op(handle, Operation::Unwrap, KeyType::Aes256GcmKey, approvals, ctx) {
-            Ok(r) => r,
-            Err(e) => return e,
-        };
+    let record = match require_op(
+        handle,
+        Operation::Unwrap,
+        KeyType::Aes256GcmKey,
+        approvals,
+        ctx,
+    ) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
     let ciphertext = match URL_SAFE_NO_PAD.decode(ciphertext_b64) {
         Ok(b) => b,
         Err(e) => return VaultResponse::Error(format!("ciphertext base64: {e}")),
@@ -959,11 +813,16 @@ fn handle_sign(
     approvals: &[ApprovalToken],
     ctx: &RequestContext,
 ) -> VaultResponse {
-    let record =
-        match require_op(handle, Operation::Sign, KeyType::P256SigningKey, approvals, ctx) {
-            Ok(r) => r,
-            Err(e) => return e,
-        };
+    let record = match require_op(
+        handle,
+        Operation::Sign,
+        KeyType::P256SigningKey,
+        approvals,
+        ctx,
+    ) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
     let message = match URL_SAFE_NO_PAD.decode(message_b64) {
         Ok(b) => b,
         Err(e) => return VaultResponse::Error(format!("message base64: {e}")),
@@ -983,11 +842,16 @@ fn handle_mac(
     approvals: &[ApprovalToken],
     ctx: &RequestContext,
 ) -> VaultResponse {
-    let record =
-        match require_op(handle, Operation::Mac, KeyType::HmacSha256Key, approvals, ctx) {
-            Ok(r) => r,
-            Err(e) => return e,
-        };
+    let record = match require_op(
+        handle,
+        Operation::Mac,
+        KeyType::HmacSha256Key,
+        approvals,
+        ctx,
+    ) {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
     let message = match URL_SAFE_NO_PAD.decode(message_b64) {
         Ok(b) => b,
         Err(e) => return VaultResponse::Error(format!("message base64: {e}")),
@@ -1073,7 +937,8 @@ fn handle_issue_approval(
             Ok(s) => s,
             Err(_) => return VaultResponse::Error("kv store lock poisoned".into()),
         };
-        match signing::issue_approval_token(&mut store, handle, op, mgr_idx, &claims.sub, now, ttl) {
+        match signing::issue_approval_token(&mut store, handle, op, mgr_idx, &claims.sub, now, ttl)
+        {
             Ok(t) => t,
             Err(e) => return VaultResponse::Error(e),
         }
@@ -1117,16 +982,11 @@ fn handle_read_audit(
         Ok(s) => s,
         Err(_) => return VaultResponse::Error("kv store lock poisoned".into()),
     };
-    let (entries, next_seq) = match audit::read(
-        &store,
-        handle,
-        record.audit_next_seq,
-        since_seq,
-        limit,
-    ) {
-        Ok(p) => p,
-        Err(e) => return VaultResponse::Error(e),
-    };
+    let (entries, next_seq) =
+        match audit::read(&store, handle, record.audit_next_seq, since_seq, limit) {
+            Ok(p) => p,
+            Err(e) => return VaultResponse::Error(e),
+        };
     VaultResponse::AuditLog { entries, next_seq }
 }
 
@@ -1247,7 +1107,10 @@ fn handle_promote_pending(
     // measurement + policy_version. If the id is unknown the binding is None,
     // which makes an operation-bound step-up fail closed inside evaluate_op
     // (and a non-bound policy still falls through to the not-found error below).
-    let pos_opt = record.pending_profiles.iter().position(|p| p.id == pending_id);
+    let pos_opt = record
+        .pending_profiles
+        .iter()
+        .position(|p| p.id == pending_id);
     let op_binding = pos_opt.map(|p| crate::policy::OpBinding {
         measurement_digest_hex: crate::policy::profile_binding_digest(
             &record.pending_profiles[p].profile,
@@ -1334,11 +1197,7 @@ fn handle_promote_pending(
     }
 }
 
-fn handle_revoke_pending(
-    handle: &str,
-    pending_id: u32,
-    ctx: &RequestContext,
-) -> VaultResponse {
+fn handle_revoke_pending(handle: &str, pending_id: u32, ctx: &RequestContext) -> VaultResponse {
     let mut record = match load_record(handle) {
         Ok(r) => r,
         Err(e) => return e,
@@ -1385,20 +1244,6 @@ fn handle_revoke_pending(
 
 fn expired(record: &KeyRecord) -> bool {
     now_secs() > record.expires_at
-}
-
-fn owner_matches_oidc(
-    owner: &Principal,
-    claims: &enclave_os_common::oidc::OidcClaims,
-) -> bool {
-    match owner {
-        Principal::Oidc {
-            issuer: _,
-            sub,
-            required_roles,
-        } => sub == &claims.sub && policy::has_required_roles(claims, required_roles),
-        Principal::Tee(_) | Principal::Fido2 { .. } => false,
-    }
 }
 
 fn owner_oidc_sub(owner: &Principal) -> Option<String> {

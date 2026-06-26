@@ -51,6 +51,7 @@
 
 pub mod client;
 pub mod attestation;
+pub mod jwks;
 
 // Re-export RA-TLS verification types for convenience.
 pub use client::{

@@ -60,20 +60,23 @@ use crate::protocol::{AppPermissions, ExportedFunc, FunctionPermission, Function
 /// untrusted host; only an enclave that can reconstruct the KEK can unwrap it.
 const VAULTWRAP_TABLE: &[u8] = b"vaultwrap";
 
-/// Instructs `load_app` to vault-back an app's `encryption_key`. Option C: the
-/// platform/owner RESERVES the key (`CreateKeyPending` with the owner-authored
-/// policy); the enclave only discovers the constellation from the directory
-/// (`mgmt_url`), then FILLS (first boot) + reconstructs the KEK over its Tee cert.
-/// No secret location and no owner sub come over the wire — only the opt-in plus
-/// where the directory lives.
+/// Instructs `load_app` to vault-back an app's `encryption_key`. The platform
+/// authors the owner-bound policy and delivers it as a key-creation grant; the
+/// enclave discovers the constellation from the directory (`mgmt_url`), then on
+/// first boot CREATES the key with the grant + reconstructs the KEK over its Tee
+/// cert. No secret location comes over the wire — only the opt-in, the directory
+/// location, and the grant.
 pub struct VaultBacking {
     /// Management-service base URL (the directory `GET /api/v1/vaults`).
     pub mgmt_url: String,
     /// Platform environment for the directory query (`dev` / `prod`).
     pub environment: String,
     /// Vault key handle, derived by the caller from the app id
-    /// (`vault:apps.privasys.org/<app-id>/storage-kek/v1`).
+    /// (`apps.privasys.org/<app-id>/storage-kek/v1`).
     pub handle: String,
+    /// Platform-minted key-creation grant (JWT), presented to create the key on
+    /// first boot. Empty once the key exists.
+    pub grant: String,
     /// The enclave's sealed selection from a prior load (`AppMeta.vault_config`),
     /// or `None` on first load (then the directory is consulted).
     pub sealed: Option<crate::vaultkey::VaultConfig>,
@@ -107,10 +110,10 @@ fn resolve_vault_backed_key(
         None => vaultkey::discover(&vb.mgmt_url, &vb.environment)?,
     };
 
-    // Reconstruct the KEK; on first boot the key is reserved-but-pending (the
-    // platform reserved it) and resolve_or_provision fills it. A policy denial is
-    // the upgrade gate (fail closed), not a first boot.
-    let kek = vaultkey::resolve_or_provision(&cfg, &vb.handle, code_hash, app_id_slice)?;
+    // Reconstruct the KEK; on first boot resolve_or_provision creates the key with
+    // the platform-minted grant. A policy denial is the upgrade gate (fail closed),
+    // not a first boot.
+    let kek = vaultkey::resolve_or_provision(&cfg, &vb.handle, &vb.grant, code_hash, app_id_slice)?;
 
     let cipher = AeadCipher::from_key(kek);
     let key_id = vb.handle.as_bytes();

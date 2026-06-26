@@ -3,21 +3,19 @@
 
 //! Vault-backed KEK lifecycle for WASM apps (Part 2 of the key-rotation work).
 //!
-//! In the settled model the **app-enclave owns its vault key end-to-end**. The
-//! management-service is only the **directory** (`GET /api/v1/vaults`); it never
-//! reserves the key, names the handle, or learns which vaults hold the shares.
+//! The management-service is the **directory** (`GET /api/v1/vaults`) and the
+//! authority that authors the owner-bound policy: at deploy it asks the IdP to
+//! sign the policy into a **key-creation grant** (scoped to the app, bound to
+//! this enclave's attested app-id) and delivers it in `wasm_load`. The enclave
+//! holds the material; it never sees the directory's secrets and the directory
+//! never learns which vaults hold the shares.
 //!
-//! - [`create`] — first load. Call the directory (authenticated by a
-//!   timestamp-bound SGX quote, NOT a host credential), randomly pick K vaults,
-//!   **self-author the key policy** (owner = app owner OIDC; `Tee` = this
-//!   enclave's own runtime MRENCLAVE + the per-app OIDs 3.2/3.6), `CreateKey`
-//!   (two-phase reserve) + `ProvideMaterial` a Shamir share to each, and return
-//!   the resulting [`VaultConfig`] (the *selection*) for the caller to seal in
-//!   `AppMeta` (MRENCLAVE-sealed). The KEK is returned in TEE memory only.
-//! - [`resolve`] — every later load on the same runtime. Reconstruct the KEK
-//!   from the sealed selection: dial each vault, `ExportKey`, Shamir-combine the
-//!   largest same-generation quorum. Fails CLOSED on a policy denial (the
-//!   upgrade gate) so a stale measurement never splits the key's generations.
+//! - [`discover`] picks K vaults from the active constellation.
+//! - [`resolve_or_provision`] — on first boot, generate the KEK, Shamir-split
+//!   it, and `CreateKey` one share per vault presenting the grant; on later
+//!   loads, dial each vault, `ExportKey`, and Shamir-combine the largest
+//!   same-generation quorum. Fails CLOSED on a policy denial (the upgrade gate)
+//!   so a stale measurement never splits the key's generations.
 //!
 //! The client certificate presented to each vault is minted by the OS-owned
 //! [`enclave_os_egress::EnclaveClientCertSigner`]; the directory quote by the
@@ -40,7 +38,7 @@ use enclave_os_egress::{
 use enclave_os_common::hex::{hex_decode, hex_encode};
 
 /// Length of the per-generation tag prefixed to each share payload. A one-shot
-/// `ProvideMaterial` retry must never split generations, so each share carries a
+/// `CreateKey` retry must never split generations, so each share carries a
 /// random 16-byte generation id; reconstruction groups by it.
 const GENERATION_SIZE: usize = 16;
 
@@ -130,7 +128,10 @@ struct DirVault {
 /// vault's own quote regardless), so binding a coarse timestamp — which lets the
 /// server bound replay to a small window — is sufficient. The quote rides in a
 /// request header, not the TLS layer, so it survives the TLS-terminating LB.
-fn fetch_directory(mgmt_url: &str, environment: &str) -> Result<(DirConstellation, Vec<DirVault>), String> {
+fn fetch_directory(
+    mgmt_url: &str,
+    environment: &str,
+) -> Result<(DirConstellation, Vec<DirVault>), String> {
     let base = mgmt_url.trim_end_matches('/');
     // mgmt-service has a normal (publicly-trusted) TLS cert — verify it against
     // the Mozilla roots; no RA-TLS policy (it is not an attested peer).
@@ -168,18 +169,19 @@ fn fetch_directory(mgmt_url: &str, environment: &str) -> Result<(DirConstellatio
 //  Vault wire types (subset of the HSM protocol — POST /data, JSON)
 // ===========================================================================
 
-/// Externally-tagged to match the server's `VaultRequest` enum. The enclave only
-/// FILLS (`ProvideMaterial`) + reconstructs (`ExportKey`) — the platform/owner
-/// reserves the key (`CreateKeyPending`, owner-authored policy). Option C: the
-/// vault `handle_create` requires an OIDC owner the enclave doesn't have.
+/// Externally-tagged to match the server's `VaultRequest` enum. The enclave
+/// reconstructs (`ExportKey`) and, on first boot, creates the key in one call
+/// (`CreateKey`) presenting the platform-minted grant, which carries the
+/// owner-authored policy.
 #[derive(Serialize)]
 enum VaultRequest {
     ExportKey {
         handle: String,
     },
-    ProvideMaterial {
+    CreateKey {
         handle: String,
         material_b64: String,
+        grant: String,
     },
 }
 
@@ -188,8 +190,8 @@ enum VaultRequest {
 struct VaultResponse {
     #[serde(rename = "KeyMaterial")]
     key_material: Option<KeyMaterialResp>,
-    #[serde(rename = "MaterialProvided")]
-    material_provided: Option<MaterialProvidedResp>,
+    #[serde(rename = "KeyCreated")]
+    key_created: Option<KeyCreatedResp>,
     #[serde(rename = "Error")]
     error: Option<String>,
 }
@@ -200,7 +202,7 @@ struct KeyMaterialResp {
 }
 
 #[derive(Deserialize)]
-struct MaterialProvidedResp {
+struct KeyCreatedResp {
     #[allow(dead_code)]
     handle: String,
 }
@@ -247,20 +249,19 @@ pub fn discover(mgmt_url: &str, environment: &str) -> Result<VaultConfig, String
     })
 }
 
-
-/// Resolve the KEK from the constellation, FILLING it on first boot if the key
-/// is reserved-but-pending (option C: the platform/owner reserved the handle +
-/// policy via `CreateKeyPending`; the enclave only fills + reconstructs over its
-/// Tee RA-TLS cert). Mirrors the container `vaultkey.ResolveOrProvision`:
+/// Resolve the KEK from the constellation, CREATING it on first boot with the
+/// platform-minted `grant` (which carries the owner-authored policy). Mirrors the
+/// container `vaultkey.ResolveOrProvision`:
 ///   - a quorum of same-generation shares → reconstruct + return;
-///   - any policy denial → fail CLOSED (the upgrade gate; never fill, which would
-///     split generations and corrupt the key);
-///   - uniformly pending → generate a KEK, Shamir-split, `ProvideMaterial` one
-///     share per vault, return once ≥k acked;
-///   - not reserved anywhere → error (the platform must reserve it before deploy).
+///   - any policy denial → fail CLOSED (the upgrade gate; never create, which
+///     would split generations and corrupt the key);
+///   - uniformly absent → generate a KEK, Shamir-split, `CreateKey` one share per
+///     vault with the grant, return once ≥k acked;
+///   - a partial/unreachable set → error (never create, could split generations).
 pub fn resolve_or_provision(
     cfg: &VaultConfig,
     handle: &str,
+    grant: &str,
     code_hash: &[u8],
     app_id: Option<&[u8]>,
 ) -> Result<[u8; KEK_SIZE], String> {
@@ -281,7 +282,6 @@ pub fn resolve_or_provision(
 
     // ---- Phase 1: try to collect existing shares ------------------------
     let mut by_gen: Vec<(String, Vec<Share>)> = Vec::new();
-    let mut pending = 0usize;
     let mut not_found = 0usize;
     let mut denied = 0usize;
     let mut last_err: Option<String> = None;
@@ -301,9 +301,7 @@ pub fn resolve_or_provision(
             },
             Err(e) => {
                 let s = e.to_lowercase();
-                if s.contains("not yet provided") {
-                    pending += 1;
-                } else if s.contains("key not found") {
+                if s.contains("key not found") {
                     not_found += 1;
                 } else if s.contains("policy.principals") {
                     denied += 1;
@@ -319,7 +317,7 @@ pub fn resolve_or_provision(
     }
 
     // Fail CLOSED on the gate: the key exists but this measurement isn't
-    // authorised. Never fall through to a Phase-2 fill (would split generations).
+    // authorised. Never fall through to a create (would split generations).
     if denied > 0 {
         return Err(format!(
             "vaultkey: key {handle:?} exists but this measurement is not authorised to \
@@ -329,20 +327,23 @@ pub fn resolve_or_provision(
         ));
     }
 
-    if pending == 0 {
-        if not_found == cfg.endpoints.len() {
-            return Err(format!(
-                "vaultkey: handle {handle:?} is not reserved on any vault (the platform must \
-                 reserve it before deploy)"
-            ));
-        }
+    // First boot requires a clean slate: every vault must agree the handle is
+    // absent. A partial set (shares below quorum, or an unreachable vault) is not
+    // a first boot — creating a fresh generation could split the key.
+    if not_found != cfg.endpoints.len() {
         return Err(format!(
             "vaultkey: cannot reconstruct {handle:?} (no share group meets threshold \
-             {threshold}) and no vault reports pending material; last error: {last_err:?}"
+             {threshold}) and not every vault reports the handle absent; last error: {last_err:?}"
+        ));
+    }
+    if grant.is_empty() {
+        return Err(format!(
+            "vaultkey: handle {handle:?} does not exist and no key-creation grant was supplied \
+             (the platform must mint one at deploy)"
         ));
     }
 
-    // ---- Phase 2: first boot — generate the KEK + fill the reserved key --
+    // ---- Phase 2: first boot — generate the KEK + create the key --------
     let rng = SystemRandom::new();
     let mut kek = [0u8; KEK_SIZE];
     rng.fill(&mut kek).map_err(|_| "vaultkey: rng (kek)")?;
@@ -359,9 +360,10 @@ pub fn resolve_or_provision(
         for _ in 0..2 {
             match call_vault(
                 ep,
-                &VaultRequest::ProvideMaterial {
+                &VaultRequest::CreateKey {
                     handle: handle.into(),
                     material_b64: b64url_nopad_encode(&payload),
+                    grant: grant.into(),
                 },
                 &root_store,
                 &policy,
@@ -370,7 +372,7 @@ pub fn resolve_or_provision(
                     acks += 1;
                     break;
                 }
-                Err(e) if e.to_lowercase().contains("already provided") => break,
+                Err(e) if e.to_lowercase().contains("already exists") => break,
                 Err(_) => {}
             }
         }
@@ -445,8 +447,8 @@ fn build_ratls_policy(
 // ===========================================================================
 
 /// Send one `VaultRequest` and return the exported key material (`ExportKey`) or
-/// an empty vec (acked `CreateKey` / `ProvideMaterial`). A vault `Error` is
-/// returned as `Err` so the caller can classify it.
+/// an empty vec (acked `CreateKey`). A vault `Error` is returned as `Err` so the
+/// caller can classify it.
 fn call_vault(
     endpoint: &str,
     req: &VaultRequest,
@@ -467,10 +469,10 @@ fn call_vault(
     if let Some(km) = vr.key_material {
         return Ok(km.material);
     }
-    if vr.material_provided.is_some() {
+    if vr.key_created.is_some() {
         return Ok(Vec::new());
     }
-    Err("vault: unexpected response (no KeyMaterial/MaterialProvided/KeyCreated/Error)".into())
+    Err("vault: unexpected response (no KeyMaterial/KeyCreated/Error)".into())
 }
 
 // ===========================================================================
@@ -657,7 +659,7 @@ fn shamir_reconstruct(shares: &[Share]) -> Result<Vec<u8>, String> {
 }
 
 // ===========================================================================
-//  base64url (no padding) — for ProvideMaterial.material_b64 + the directory
+//  base64url (no padding) — for CreateKey.material_b64 + the directory
 //  quote header (server decodes URL_SAFE_NO_PAD); dependency-free.
 // ===========================================================================
 

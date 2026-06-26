@@ -73,8 +73,7 @@ the request.
 
 | RPC | Auth | Description |
 |---|---|---|
-| `CreateKey { handle, key_type, material_b64?, exportable, policy }` | OIDC: must equal `policy.principals.owner` | Create a key with caller-supplied material. Omitting `material_b64` is a **two-phase create**: the handle + policy are reserved with no material (see below). |
-| `ProvideMaterial { handle, material_b64, approvals? }` | per-key `Operation::ProvideMaterial` rule | One-shot fill of a two-phase-created key. Rejected once the key has material. |
+| `CreateKey { handle, material_b64, grant }` | IdP-issued grant bound to the caller (see below) | Create a key in a single call. The grant carries the owner, scope, key type, exportable flag and full policy; the caller supplies the material. |
 | `ExportKey { handle, approvals? }` | per-key `Operation::ExportKey` rule | Returns raw material. Requires `exportable == true`. |
 | `DeleteKey { handle, approvals? }` | per-key `Operation::DeleteKey` rule | Removes the key and all audit/pending state. |
 | `UpdatePolicy { handle, new_policy, approvals? }` | per-field `Mutability` (see section 3.4) | Replace the policy. |
@@ -82,18 +81,18 @@ the request.
 | `GetKeyInfo { handle }` | owner / auditor | Metadata only; never material. |
 | `ListKeys` | OIDC | Lists handles whose owner is the caller. |
 
-**Two-phase create.** When `material_b64` is absent, the vault stores the
-handle + policy with `pending_material = true`. The policy MUST contain an
-`OperationRule` granting `Operation::ProvideMaterial` (otherwise the key
-could never become usable and the create is rejected). Whoever that rule
-names fills the material later — the owner's own client, or the app TEE at
-first boot (authenticating as a `Principal::Tee` over RA-TLS). Until then
-every key operation is denied with `key material not yet provided`, and the
-key expires on its normal TTL if never filled. Filling is one-shot:
-replacing material is always a delete + re-create. This is the basis of the
-developer-platform key flow: the developer creates the key record as owner
-from the portal, and the key materialises inside the app enclave without
-any owner-binding token (see the platform's enclave-upgrade plan).
+**Grant-based create.** A caller that holds the material but is not the
+owner (an app TEE, or a CLI agent acting for a user) creates a key in one
+call by presenting an IdP-issued **key-creation grant** (a JWT,
+`aud = privasys-vault-keycreate`). The grant carries the owner, the scope,
+the key type, the exportable flag and the full policy; the vault verifies it
+against the IdP JWKS and binds it to the caller's mutual-RA-TLS certificate:
+either the attested app-id (OID 3.6) equals the scope's app-id, or a
+holder-of-key `cnf` (`x5t#S256`) matches the caller's leaf. The handle must
+fall under the grant's scope, and the policy's owner must equal the grant
+subject. This is the basis of the developer-platform key flow: the platform
+authors the owner-bound policy and mints the grant; the key materialises
+inside the app enclave, which never has to be the owner.
 
 ### 2.2 In-enclave crypto
 

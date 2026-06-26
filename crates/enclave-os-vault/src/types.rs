@@ -1,4 +1,4 @@
-﻿// Copyright (c) Privasys. All rights reserved.
+// Copyright (c) Privasys. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
 //! Vault wire protocol, policy schema and persisted records.
@@ -38,44 +38,29 @@ pub const DEFAULT_APPROVAL_TOKEN_TTL_SECONDS: u64 = 5 * 60;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum VaultRequest {
     // --- Key management ---------------------------------------------------
-    /// Create a new key with caller-supplied material.
+    /// Create a key with caller-supplied material, authorised by a `grant`.
     ///
-    /// The caller's OIDC identity must match `policy.principals.owner`.
-    /// `material_b64` interpretation depends on `key_type`:
-    /// * `RawShare`            â€” opaque bytes (a Shamir share).
-    /// * `Aes256GcmKey`        â€” 32 bytes of AES-256 key material.
-    /// * `HmacSha256Key`       â€” 32â€“64 bytes of HMAC key material.
-    /// * `P256SigningKey`      â€” PKCS#8 v1 ECDSA-P256 private key DER.
+    /// `grant` is an IdP-issued JWT (`aud = privasys-vault-keycreate`) carrying
+    /// the owner (`sub`), `scope`, `key_type`, `exportable` and `policy`. The
+    /// caller (an app TEE or CLI agent) authenticates by mutual RA-TLS and
+    /// supplies only the handle + material. `material_b64` matches the grant's
+    /// `key_type`:
+    /// * `RawShare`            — opaque bytes (a Shamir share).
+    /// * `Aes256GcmKey`        — 32 bytes of AES-256 key material.
+    /// * `HmacSha256Key`       — 32â€“64 bytes of HMAC key material.
+    /// * `P256SigningKey`      — PKCS#8 v1 ECDSA-P256 private key DER.
     ///
-    /// **Two-phase create:** when `material_b64` is absent the vault
-    /// reserves the handle + policy only ("pending material"). The
-    /// policy MUST contain an [`OperationRule`] granting
-    /// [`Operation::ProvideMaterial`]; whoever that rule names (the
-    /// owner's own client, or the app TEE at first boot) fills the
-    /// material later via [`VaultRequest::ProvideMaterial`]. Until
-    /// then every key operation is denied, and the key expires on its
-    /// normal TTL if never filled.
+    /// The vault verifies the grant, binds it to the caller (attested app-id at
+    /// OID 3.6 == grant scope, or holder-of-key `cnf`), then stores the key with
+    /// the granted `key_type` / `exportable` / `policy` and `owner = grant.sub`.
+    /// (See the key-creation-grant design.)
     CreateKey {
-        handle: String,
-        key_type: KeyType,
-        /// Base64url-encoded raw key material (sealed at rest).
-        /// Absent = two-phase create (see above).
-        #[serde(default)]
-        material_b64: Option<String>,
-        /// Whether the material may ever leave the enclave (gates `ExportKey`).
-        exportable: bool,
-        policy: KeyPolicy,
-    },
-
-    /// Provide the material for a key created without it (two-phase
-    /// create). One-shot: rejected once the key has material. Gated by
-    /// an [`OperationRule`] granting [`Operation::ProvideMaterial`].
-    ProvideMaterial {
         handle: String,
         /// Base64url-encoded raw key material (sealed at rest).
         material_b64: String,
-        #[serde(default)]
-        approvals: Vec<ApprovalToken>,
+        /// IdP-issued grant (JWT) carrying owner, scope, key_type, exportable
+        /// and policy.
+        grant: String,
     },
 
     /// Export the raw key material.
@@ -216,19 +201,23 @@ pub enum VaultResponse {
     KeyCreated {
         handle: String,
         expires_at: u64,
-        /// True when the key was created without material (two-phase
-        /// create) and is waiting for `ProvideMaterial`.
-        #[serde(default)]
-        pending_material: bool,
     },
-    /// Material accepted for a pending key (two-phase create).
-    MaterialProvided { handle: String, expires_at: u64 },
-    KeyMaterial { material: Vec<u8>, expires_at: u64 },
+    KeyMaterial {
+        material: Vec<u8>,
+        expires_at: u64,
+    },
     KeyDeleted,
-    PolicyUpdated { policy_version: u32 },
-    Policy { policy: KeyPolicy, policy_version: u32 },
+    PolicyUpdated {
+        policy_version: u32,
+    },
+    Policy {
+        policy: KeyPolicy,
+        policy_version: u32,
+    },
     KeyInfo(KeyInfo),
-    KeyList { keys: Vec<KeyListEntry> },
+    KeyList {
+        keys: Vec<KeyListEntry>,
+    },
 
     Wrapped {
         ciphertext: Vec<u8>,
@@ -296,7 +285,7 @@ pub struct KeyListEntry {
 
 /// What kind of key material this handle holds.
 ///
-/// Each variant maps 1:1 to the operations it supports â€” see
+/// Each variant maps 1:1 to the operations it supports — see
 /// [`Operation`] and the `Wrap`/`Sign`/`Mac` RPCs in [`VaultRequest`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum KeyType {
@@ -320,7 +309,7 @@ pub enum KeyType {
 /// Namespace operations (`CreateKey`, `ListKeys`, `IssueApprovalToken`,
 /// `ReadAuditLog`, `StagePendingProfile`, `ListPendingProfiles`,
 /// `RevokePendingProfile`) are not policy-gated and have no variant
-/// here â€” they have their own auth rules baked in.
+/// here — they have their own auth rules baked in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Operation {
     ExportKey,
@@ -332,9 +321,6 @@ pub enum Operation {
     Mac,
     /// Granted via [`VaultRequest::PromotePendingProfile`].
     PromoteProfile,
-    /// Fill the material of a pending key (two-phase create). Granted
-    /// via [`VaultRequest::ProvideMaterial`].
-    ProvideMaterial,
 }
 
 // ---------------------------------------------------------------------------
@@ -720,13 +706,8 @@ pub struct KeyRecord {
     pub exportable: bool,
     /// Sealed by the kvstore layer at rest; in plaintext in this struct
     /// only while it lives in enclave memory. Interpretation depends on
-    /// `key_type` (see [`VaultRequest::CreateKey`]). Empty while
-    /// `pending_material` is true.
+    /// `key_type` (see [`VaultRequest::CreateKey`]).
     pub material: Vec<u8>,
-    /// True for a two-phase-created key whose material has not been
-    /// provided yet. Every key operation is denied while set.
-    #[serde(default)]
-    pub pending_material: bool,
     /// Public part for asymmetric key types, derived at create time.
     /// `None` for symmetric / opaque keys.
     #[serde(default)]

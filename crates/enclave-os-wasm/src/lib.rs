@@ -1260,16 +1260,6 @@ impl EnclaveModule for WasmModule {
             // constellation itself, and self-authors the policy. `sealed` is None
             // here (a fresh wasm_load); on replay the selection comes from AppMeta.
             let vault = if load.vault_backed {
-                let app_id_str = match load.app_id.as_deref() {
-                    Some(s) if !s.is_empty() => s,
-                    _ => {
-                        return Some(Response::Data(serialize_or_error(
-                            &WasmManagementResult::Error {
-                                message: String::from("vault_backed requires app_id"),
-                            },
-                        )));
-                    }
-                };
                 let mgmt_url = match load.mgmt_url.as_deref() {
                     Some(s) if !s.is_empty() => s.to_string(),
                     _ => {
@@ -1280,9 +1270,25 @@ impl EnclaveModule for WasmModule {
                         )));
                     }
                 };
-                // No owner sub needed: option C — the platform reserves the key
-                // (authoring the owner-bound policy); the enclave only fills it.
-                let handle = format!("vault:apps.privasys.org/{}/storage-kek/v1", app_id_str);
+                // The handle is namespaced by the app-id (OID 3.6, the undashed
+                // hex of the 16 id bytes) so it falls under the grant scope
+                // `apps.privasys.org/<app-id>`; this must match the platform's
+                // minted grant exactly. The owner-bound policy is carried in the
+                // grant, not authored here.
+                let app_id_bytes = match app_id {
+                    Some(b) => b,
+                    None => {
+                        return Some(Response::Data(serialize_or_error(
+                            &WasmManagementResult::Error {
+                                message: String::from("vault_backed requires a valid app_id"),
+                            },
+                        )));
+                    }
+                };
+                let handle = format!(
+                    "apps.privasys.org/{}/storage-kek/v1",
+                    enclave_os_common::hex::hex_encode(&app_id_bytes)
+                );
                 let environment = load
                     .environment
                     .clone()
@@ -1291,6 +1297,7 @@ impl EnclaveModule for WasmModule {
                     mgmt_url,
                     environment,
                     handle,
+                    grant: load.key_creation_grant.clone().unwrap_or_default(),
                     sealed: None,
                 })
             } else {

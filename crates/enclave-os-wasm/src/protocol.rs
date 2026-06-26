@@ -250,10 +250,12 @@ pub struct WasmLoad {
     /// Vault-backed key opt-in (Part 2). When true, the app's KV `encryption_key`
     /// is envelope-wrapped under a KEK the **enclave itself** provisions from the
     /// Enclave Vault constellation, so the data survives an enclave upgrade. The
-    /// platform supplies only this flag — never the handle, vaults, or any secret
-    /// location: the enclave discovers the constellation via the directory
-    /// (`mgmt_url`), derives the handle from `app_id`, self-authors the policy
-    /// (owner = `owners[0]`), and seals the resulting selection in `AppMeta`.
+    /// platform supplies this flag, the directory location (`mgmt_url`), and a
+    /// key-creation grant — never the vaults or any secret. The enclave discovers
+    /// the constellation via the directory, derives the handle from `app_id`, and
+    /// on first boot creates the key with the grant (the owner-bound policy is
+    /// authored platform-side and carried in the grant); it seals the resulting
+    /// selection in `AppMeta`.
     #[serde(default)]
     pub vault_backed: bool,
     /// Management-service base URL the enclave queries for the vault directory
@@ -265,6 +267,11 @@ pub struct WasmLoad {
     /// `prod` when absent. Only meaningful when `vault_backed` is true.
     #[serde(default)]
     pub environment: Option<String>,
+    /// Key-creation grant (JWT) the enclave presents to create the key on first
+    /// boot. Only meaningful when `vault_backed` is true; unused once the key
+    /// exists.
+    #[serde(default)]
+    pub key_creation_grant: Option<String>,
 }
 
 /// Configure-endpoint declaration. See [`WasmLoad::config_api`].
