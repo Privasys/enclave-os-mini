@@ -159,6 +159,63 @@ fn resolve_vault_backed_key(
     Ok((dek, source, cfg))
 }
 
+/// Rotate a vault-backed app's storage KEK: re-wrap the `encryption_key` (the KV
+/// DEK) from the OLD key generation to a NEW one on the same constellation.
+///
+/// This is the WASM analog of the container's LUKS keyslot re-key: the DEK never
+/// changes, so the sealed KV (encrypted under the DEK) is untouched — only the
+/// KEK that protects the host-side wrapped DEK blob advances. The old KEK is
+/// reconstructed by EXPORT (it exists, so no grant is needed); the new KEK is
+/// reconstructed by CREATE with the owner-minted `new_grant`. The freshly wrapped
+/// blob is stored under the new handle (AAD-bound to it) and the old blob is
+/// retired. The vault retires the old KEK generation separately (owner-proxied),
+/// after which the old blob is permanently un-unwrappable.
+fn rotate_vault_backed_key(
+    cfg: &crate::vaultkey::VaultConfig,
+    old_handle: &str,
+    new_handle: &str,
+    new_grant: &str,
+    code_hash: &[u8; 32],
+    app_id: Option<[u8; 16]>,
+) -> Result<(), String> {
+    use crate::vaultkey;
+    use enclave_os_common::aead::AeadCipher;
+    use enclave_os_common::ocall;
+
+    let app_id_slice = app_id.as_ref().map(|a| a.as_slice());
+
+    // Old KEK: the key already exists, so export it (a grant is only needed to
+    // CREATE). A policy denial here is the upgrade gate, not a first boot.
+    let old_kek = vaultkey::resolve_or_provision(cfg, old_handle, "", code_hash, app_id_slice)?;
+    // New KEK: create the new generation with the owner-minted grant.
+    let new_kek =
+        vaultkey::resolve_or_provision(cfg, new_handle, new_grant, code_hash, app_id_slice)?;
+
+    let old_cipher = AeadCipher::from_key(old_kek);
+    let new_cipher = AeadCipher::from_key(new_kek);
+
+    // Unwrap the DEK from the old blob (AAD-bound to the old handle).
+    let blob = ocall::kv_store_get(VAULTWRAP_TABLE, old_handle.as_bytes())
+        .map_err(|e| format!("vaultkey: host kv get: {e}"))?
+        .ok_or_else(|| format!("vaultkey: no wrapped key at handle {old_handle}"))?;
+    let dek = old_cipher
+        .decrypt(&blob, old_handle.as_bytes())
+        .map_err(|e| format!("vaultkey: unwrap encryption_key (old KEK): {e}"))?;
+
+    // Re-wrap under the new KEK (AAD-bound to the new handle) and persist before
+    // retiring the old blob, so a crash mid-rotation never loses the only copy.
+    let new_blob = new_cipher
+        .encrypt(&dek, new_handle.as_bytes())
+        .map_err(|e| format!("vaultkey: wrap encryption_key (new KEK): {e}"))?;
+    ocall::kv_store_put(VAULTWRAP_TABLE, new_handle.as_bytes(), &new_blob)
+        .map_err(|e| format!("vaultkey: host kv put: {e}"))?;
+
+    // Retire the old wrapped blob (best-effort; the vault retires the old KEK
+    // generation, which is what actually makes the old blob unrecoverable).
+    let _ = ocall::kv_store_delete(VAULTWRAP_TABLE, old_handle.as_bytes());
+    Ok(())
+}
+
 /// Owned per-invocation state produced by
 /// [`AppRegistry::prepare_call()`]. Holds everything needed to run
 /// the wasm function **without** the registry mutex held — this is
@@ -325,6 +382,15 @@ pub struct AppMeta {
     /// vaults. `None` for non-vault-backed apps.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vault_config: Option<crate::vaultkey::VaultConfig>,
+    /// Vault-backed apps (Part 2): the handle of the app's CURRENT key
+    /// generation (`apps.privasys.org/<app-id>/storage-kek/v<N>`). Sealed so a
+    /// key rotation that advances the generation survives an enclave restart: a
+    /// same-MRENCLAVE replay reads the DEK straight from this sealed metadata,
+    /// while a fresh load (upgrade) takes the live handle from the platform.
+    /// `None` for non-vault-backed apps (and apps sealed before rotation support,
+    /// which keeps the derived-`v1` behaviour).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vault_handle: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -604,6 +670,7 @@ impl AppRegistry {
             owners,
             app_id,
             vault_config,
+            vault_handle: vault.as_ref().map(|vb| vb.handle.clone()),
         };
         self.known.insert(name.to_string(), meta.clone());
         // Wire the freeze gate: when a config_api function is
@@ -648,6 +715,58 @@ impl AppRegistry {
             self.configured.insert(meta.name.clone(), false);
         }
         self.known.insert(meta.name.clone(), meta);
+    }
+
+    /// Rotate a vault-backed app's storage KEK to `new_handle`, re-wrapping the
+    /// DEK under the new generation and advancing the app's sealed handle.
+    ///
+    /// Returns the updated [`AppMeta`] so the caller can re-seal it to the KV.
+    /// The DEK and the sealed KV are untouched — only the KEK that protects the
+    /// host-side wrapped DEK advances (a cheap re-wrap, like the container's LUKS
+    /// keyslot re-key). `mgmt_url`/`environment` are only consulted if the app has
+    /// no sealed selection to reuse.
+    pub fn rotate_vault_key(
+        &mut self,
+        name: &str,
+        new_handle: &str,
+        new_grant: &str,
+        mgmt_url: &str,
+        environment: &str,
+    ) -> Result<AppMeta, String> {
+        let meta = self
+            .known
+            .get(name)
+            .ok_or_else(|| format!("app '{name}' is not known"))?;
+        let old_handle = meta
+            .vault_handle
+            .clone()
+            .ok_or_else(|| format!("app '{name}' is not vault-backed (no sealed handle)"))?;
+        if old_handle == new_handle {
+            return Err(format!(
+                "rotate: new handle equals the current handle {new_handle}"
+            ));
+        }
+        let cfg = match &meta.vault_config {
+            Some(c) => c.clone(),
+            None => crate::vaultkey::discover(mgmt_url, environment)?,
+        };
+        let code_hash = meta.code_hash;
+        let app_id = meta.app_id;
+
+        rotate_vault_backed_key(&cfg, &old_handle, new_handle, new_grant, &code_hash, app_id)?;
+
+        // Advance the sealed handle (the DEK and vault_config are unchanged).
+        let source = format!("vault:{new_handle}");
+        let updated = {
+            let m = self.known.get_mut(name).expect("known checked above");
+            m.vault_handle = Some(new_handle.to_string());
+            m.key_source = source.clone();
+            m.clone()
+        };
+        if let Some(la) = self.loaded.get_mut(name) {
+            la.key_source = source;
+        }
+        Ok(updated)
     }
 
     /// Compile a known-but-unloaded app from its WASM bytes.

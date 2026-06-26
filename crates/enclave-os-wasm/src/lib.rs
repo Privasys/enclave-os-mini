@@ -1247,7 +1247,8 @@ impl EnclaveModule for WasmModule {
         // ── Platform OIDC role gate (load/unload/list) ──────────────
         let needs_manager = envelope.wasm_load.is_some()
             || envelope.wasm_unload.is_some()
-            || envelope.wasm_freeze.is_some();
+            || envelope.wasm_freeze.is_some()
+            || envelope.wasm_rotate_key.is_some();
         let needs_monitoring = envelope.wasm_list.is_some();
 
         if needs_manager {
@@ -1363,10 +1364,19 @@ impl EnclaveModule for WasmModule {
                         )));
                     }
                 };
-                let handle = format!(
-                    "apps.privasys.org/{}/storage-kek/v1",
-                    enclave_os_common::hex::hex_encode(&app_id_bytes)
-                );
+                // The platform supplies the current-generation handle (it is the
+                // courier, not the trust root: the owner-minted grant authorises
+                // it and the vault enforces it falls under this app's scope
+                // against the attested app-id on the RA-TLS leaf — mirroring how
+                // the container manager already takes the platform's handle).
+                // Absent, we derive the v1 generation (pre-rotation behaviour).
+                let handle = match load.key_handle.as_deref() {
+                    Some(h) if !h.is_empty() => h.to_string(),
+                    _ => format!(
+                        "apps.privasys.org/{}/storage-kek/v1",
+                        enclave_os_common::hex::hex_encode(&app_id_bytes)
+                    ),
+                };
                 let environment = load
                     .environment
                     .clone()
@@ -1444,6 +1454,47 @@ impl EnclaveModule for WasmModule {
                     reason,
                 },
                 Ok(false) => WasmManagementResult::NotFound { name: freeze.name },
+                Err(e) => WasmManagementResult::Error { message: e },
+            };
+            return Some(Response::Data(serialize_or_error(&mgmt_result)));
+        }
+
+        // 3c. wasm_rotate_key — rotate a vault-backed app's storage KEK
+        if let Some(rot) = envelope.wasm_rotate_key {
+            let mgmt_url = rot.mgmt_url.clone().unwrap_or_default();
+            let environment = rot
+                .environment
+                .clone()
+                .unwrap_or_else(|| String::from("prod"));
+            // Re-wrap under the registry lock, then re-seal the advanced metadata
+            // with the lock released (persist_meta_to_kv re-enters `self`).
+            let result = {
+                let mut registry = match self.registry.lock() {
+                    Ok(r) => r,
+                    Err(_) => {
+                        return Some(Response::Data(serialize_or_error(
+                            &WasmManagementResult::Error {
+                                message: String::from("registry lock poisoned"),
+                            },
+                        )));
+                    }
+                };
+                registry.rotate_vault_key(
+                    &rot.name,
+                    &rot.new_handle,
+                    &rot.new_key_creation_grant,
+                    &mgmt_url,
+                    &environment,
+                )
+            };
+            let mgmt_result = match result {
+                Ok(updated) => {
+                    self.persist_meta_to_kv(&rot.name, &updated);
+                    WasmManagementResult::Rotated {
+                        name: rot.name,
+                        handle: rot.new_handle,
+                    }
+                }
                 Err(e) => WasmManagementResult::Error { message: e },
             };
             return Some(Response::Data(serialize_or_error(&mgmt_result)));

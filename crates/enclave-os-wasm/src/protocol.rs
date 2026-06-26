@@ -99,6 +99,52 @@ pub struct WasmEnvelope {
     /// billing-frozen. Requires the **manager** role.
     #[serde(default)]
     pub wasm_freeze: Option<WasmFreeze>,
+
+    /// Rotate a vault-backed app's storage KEK to a new generation.
+    ///
+    /// A cheap re-wrap, never a re-encrypt: the enclave reconstructs the old KEK
+    /// (export) and the new KEK (create, with the supplied grant) from the same
+    /// constellation, unwraps the app's `encryption_key` (the KV DEK) under the
+    /// old KEK and re-wraps it under the new one, then advances the app's sealed
+    /// handle. The sealed KV (encrypted with the unchanged DEK) is never touched.
+    /// Requires the **manager** role.
+    #[serde(default)]
+    pub wasm_rotate_key: Option<WasmRotateKey>,
+}
+
+/// Rotate a vault-backed app's storage KEK to a new key generation.
+///
+/// ```json
+/// {
+///   "wasm_rotate_key": {
+///     "name": "my-app",
+///     "new_handle": "apps.privasys.org/<app-id>/storage-kek/v2",
+///     "new_key_creation_grant": "<jwt>",
+///     "mgmt_url": "https://manage.privasys.org",
+///     "environment": "prod"
+///   }
+/// }
+/// ```
+///
+/// The old handle is the app's currently sealed generation; only the new handle
+/// and its owner-minted grant come in here. Both KEKs are reconstructed from the
+/// same constellation the app is already sealed to.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WasmRotateKey {
+    /// App identifier to rotate.
+    pub name: String,
+    /// The new-generation key handle (typically `…/storage-kek/v<N+1>`).
+    pub new_handle: String,
+    /// Owner-minted key-creation grant (JWT) authorising creation of the new
+    /// generation on the constellation.
+    pub new_key_creation_grant: String,
+    /// Management-service base URL for the vault directory, used only if the app
+    /// has no sealed selection to reuse.
+    #[serde(default)]
+    pub mgmt_url: Option<String>,
+    /// Platform environment for the directory query (`dev` / `prod`).
+    #[serde(default)]
+    pub environment: Option<String>,
 }
 
 /// Host-driven billing freeze command.
@@ -272,6 +318,19 @@ pub struct WasmLoad {
     /// exists.
     #[serde(default)]
     pub key_creation_grant: Option<String>,
+    /// Vault key handle (the current generation), supplied by the platform.
+    ///
+    /// The platform is the courier of the handle, not the trust root: the
+    /// owner-minted grant is what authorises it, and the vault enforces that the
+    /// handle falls under this app's scope (`apps.privasys.org/<app-id>`) against
+    /// the attested app-id on the RA-TLS leaf. When absent, the enclave falls
+    /// back to deriving `apps.privasys.org/<app-id>/storage-kek/v1` (the v1
+    /// generation), preserving the pre-rotation behaviour. After a key rotation
+    /// the platform supplies the advanced generation (`…/v<N>`) here so an
+    /// upgrade re-wrap unwraps the DEK under the live KEK. Only meaningful when
+    /// `vault_backed` is true.
+    #[serde(default)]
+    pub key_handle: Option<String>,
 }
 
 /// Configure-endpoint declaration. See [`WasmLoad::config_api`].
@@ -452,6 +511,14 @@ pub enum WasmManagementResult {
         /// unfreezing).
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
+    },
+    /// A vault-backed app's storage KEK was rotated to a new generation.
+    #[serde(rename = "rotated")]
+    Rotated {
+        /// App whose key was rotated.
+        name: String,
+        /// The new-generation handle now in effect.
+        handle: String,
     },
 }
 
