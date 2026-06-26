@@ -82,15 +82,20 @@ use std::sync::Mutex;
 use std::sync::OnceLock;
 use std::vec::Vec;
 
-use ring::digest;
 use enclave_os_common::hex::hex_decode;
-use enclave_os_common::modules::{AppIdentity, ConfigEntry, ConfigLeaf, EnclaveModule, ModuleOid, RequestContext};
+use enclave_os_common::modules::{
+    AppIdentity, ConfigEntry, ConfigLeaf, EnclaveModule, ModuleOid, RequestContext,
+};
 use enclave_os_common::protocol::{Request, Response};
 use enclave_os_common::types::AEAD_KEY_SIZE;
+use ring::digest;
 
-use crate::protocol::{AppPermissions, FunctionPolicy, WasmCall, WasmEnvelope, WasmManagementResult, WasmResult, WasmSchemaRequest};
-use crate::protocol::{AppRolesAction, AppRolesResult, UserRoles};
 use crate::metrics::WasmMetricsStore;
+use crate::protocol::{
+    AppPermissions, FunctionPolicy, WasmCall, WasmEnvelope, WasmManagementResult, WasmResult,
+    WasmSchemaRequest,
+};
+use crate::protocol::{AppRolesAction, AppRolesResult, UserRoles};
 use crate::registry::AppRegistry;
 
 // ---------------------------------------------------------------------------
@@ -171,7 +176,8 @@ impl WasmModule {
                                     Ok(meta) => {
                                         enclave_os_common::enclave_log_info!(
                                             "Restored persisted WASM app: {} (hostname={})",
-                                            meta.name, meta.hostname,
+                                            meta.name,
+                                            meta.hostname,
                                         );
                                         // NOTE: do NOT call register_app_identity() here.
                                         // The CertStore is initialised later in
@@ -185,7 +191,8 @@ impl WasmModule {
                                     Err(e) => {
                                         enclave_os_common::enclave_log_error!(
                                             "Failed to deserialise metadata for app '{}': {}",
-                                            name, e,
+                                            name,
+                                            e,
                                         );
                                     }
                                 }
@@ -237,10 +244,24 @@ impl WasmModule {
     ) -> Result<(), String> {
         // Load into the registry (compile + introspect + per-app key)
         let meta = {
-            let mut reg = self.registry
+            let mut reg = self
+                .registry
                 .lock()
                 .map_err(|_| String::from("registry lock poisoned"))?;
-            reg.load_app(name, hostname, wasm_bytes, encryption_key, permissions, max_fuel, mcp_enabled, docs, config_api_function, owners, app_id, vault)?
+            reg.load_app(
+                name,
+                hostname,
+                wasm_bytes,
+                encryption_key,
+                permissions,
+                max_fuel,
+                mcp_enabled,
+                docs,
+                config_api_function,
+                owners,
+                app_id,
+                vault,
+            )?
         };
 
         // ── Persist to KV store ────────────────────────────────────
@@ -258,7 +279,8 @@ impl WasmModule {
     /// store, then unregisters its identity from the global
     /// [`CertStore`](cert_store::CertStore).
     pub fn unload_app(&self, name: &str) -> bool {
-        let hostname = self.registry
+        let hostname = self
+            .registry
             .lock()
             .ok()
             .and_then(|mut r| r.remove_app(name));
@@ -291,9 +313,15 @@ impl WasmModule {
     ///
     /// Called by the `set-attestation-extension` host function in the
     /// `privasys:enclave-os/attestation@0.1.0` SDK interface.
-    pub fn set_attestation_extension(&self, name: &str, arc_suffix: u32, value: Vec<u8>) -> Result<(), String> {
+    pub fn set_attestation_extension(
+        &self,
+        name: &str,
+        arc_suffix: u32,
+        value: Vec<u8>,
+    ) -> Result<(), String> {
         let updated_meta = {
-            let mut reg = self.registry
+            let mut reg = self
+                .registry
                 .lock()
                 .map_err(|_| String::from("registry lock poisoned"))?;
             reg.set_extension(name, arc_suffix, value)
@@ -312,7 +340,8 @@ impl WasmModule {
     /// declared `config_api` or is already configured). Called by
     /// the `set-config-complete` host function.
     pub fn mark_configured(&self, name: &str) -> Result<(), String> {
-        let mut reg = self.registry
+        let mut reg = self
+            .registry
             .lock()
             .map_err(|_| String::from("registry lock poisoned"))?;
         reg.mark_configured(name);
@@ -323,7 +352,8 @@ impl WasmModule {
     /// `Some(reason)` freezes; `None` unfreezes. Returns `true` when
     /// the app is known. Called from the `wasm_freeze` control command.
     pub fn set_billing_frozen(&self, name: &str, reason: Option<String>) -> Result<bool, String> {
-        let mut reg = self.registry
+        let mut reg = self
+            .registry
             .lock()
             .map_err(|_| String::from("registry lock poisoned"))?;
         Ok(reg.set_billing_frozen(name, reason))
@@ -388,7 +418,13 @@ impl WasmModule {
             };
             let caller_id = auth.as_ref().and_then(|a| a.user_id.clone());
             let caller_roles = auth.map(|a| a.roles).unwrap_or_default();
-            registry.prepare_call(&call.app, &call.function, &call.params, caller_id, caller_roles)
+            registry.prepare_call(
+                &call.app,
+                &call.function,
+                &call.params,
+                caller_id,
+                caller_roles,
+            )
         };
 
         let mut prep = match prep {
@@ -406,7 +442,10 @@ impl WasmModule {
 
         // Execute the wasm function WITHOUT the registry mutex held.
         let mut results = vec![wasmtime::component::Val::Bool(false); prep.result_count];
-        let call_err = prep.func.call(&mut prep.store, &prep.val_params, &mut results).err();
+        let call_err = prep
+            .func
+            .call(&mut prep.store, &prep.val_params, &mut results)
+            .err();
         prep.store.data_mut().flush_logs();
         let fuel_after = prep.store.get_fuel().unwrap_or(0) as i64;
         let fuel_consumed = prep.fuel_before - fuel_after;
@@ -416,10 +455,14 @@ impl WasmModule {
         let sdk_usage = prep.store.data().usage.clone();
 
         let result = if let Some(e) = call_err {
-            WasmResult::Error { message: format!("call failed: {}", e) }
+            WasmResult::Error {
+                message: format!("call failed: {}", e),
+            }
         } else {
-            let returns: Vec<protocol::WasmValue> =
-                results.iter().map(crate::registry::val_to_wasm_value).collect();
+            let returns: Vec<protocol::WasmValue> = results
+                .iter()
+                .map(crate::registry::val_to_wasm_value)
+                .collect();
             WasmResult::Ok { returns }
         };
 
@@ -576,7 +619,9 @@ impl WasmModule {
                 let err = WasmResult::Error {
                     message: format!(
                         "authentication required: function '{}' on app '{}' requires {}",
-                        call.function, call.app, auth_methods_description(&permissions),
+                        call.function,
+                        call.app,
+                        auth_methods_description(&permissions),
                     ),
                 };
                 return Err(Response::Data(serialize_or_error(&err)));
@@ -646,7 +691,8 @@ impl WasmModule {
                 let err = WasmManagementResult::Error {
                     message: format!(
                         "authentication required: schema for app '{}' requires {}",
-                        req.app, auth_methods_description(&permissions),
+                        req.app,
+                        auth_methods_description(&permissions),
                     ),
                 };
                 return Some(Response::Data(serialize_or_error(&err)));
@@ -669,7 +715,9 @@ impl WasmModule {
 
         // Role → check intersection.
         if !permissions.schema_roles.is_empty() {
-            let has_role = caller_roles.iter().any(|r| permissions.schema_roles.contains(r));
+            let has_role = caller_roles
+                .iter()
+                .any(|r| permissions.schema_roles.contains(r));
             if !has_role {
                 let err = WasmManagementResult::Error {
                     message: format!(
@@ -689,10 +737,7 @@ impl WasmModule {
     /// Authenticates the caller, checks admin privileges for admin-only
     /// actions, and delegates to `enclave_os_app_auth` for the actual
     /// role operations.
-    fn handle_app_roles(
-        &self,
-        req: &crate::protocol::AppRolesRequest,
-    ) -> WasmManagementResult {
+    fn handle_app_roles(&self, req: &crate::protocol::AppRolesRequest) -> WasmManagementResult {
         // Feature gate: app-auth must be enabled.
         #[cfg(not(feature = "app-auth"))]
         {
@@ -812,22 +857,20 @@ impl WasmModule {
                         Err(e) => WasmManagementResult::Error { message: e },
                     }
                 }
-                AppRolesAction::ListUsers => {
-                    match enclave_os_app_auth::list_users(&role_store) {
-                        Ok(users) => WasmManagementResult::Roles {
-                            result: AppRolesResult::Users {
-                                users: users
-                                    .into_iter()
-                                    .map(|(h, r)| UserRoles {
-                                        user_handle: h,
-                                        roles: r,
-                                    })
-                                    .collect(),
-                            },
+                AppRolesAction::ListUsers => match enclave_os_app_auth::list_users(&role_store) {
+                    Ok(users) => WasmManagementResult::Roles {
+                        result: AppRolesResult::Users {
+                            users: users
+                                .into_iter()
+                                .map(|(h, r)| UserRoles {
+                                    user_handle: h,
+                                    roles: r,
+                                })
+                                .collect(),
                         },
-                        Err(e) => WasmManagementResult::Error { message: e },
-                    }
-                }
+                    },
+                    Err(e) => WasmManagementResult::Error { message: e },
+                },
                 AppRolesAction::GetDefaultRoles => {
                     match enclave_os_app_auth::get_default_roles(&role_store) {
                         Ok(roles) => WasmManagementResult::Roles {
@@ -858,25 +901,37 @@ impl WasmModule {
         call: &crate::protocol::ConnectCall,
     ) -> Result<WasmCall, String> {
         // Look up the function schema from the known map.
-        let registry = self.registry.lock()
+        let registry = self
+            .registry
+            .lock()
             .map_err(|_| String::from("registry lock poisoned"))?;
         let resolved_app = registry.resolve_app(&call.app)?;
-        let meta = registry.get_known(&resolved_app)
+        let meta = registry
+            .get_known(&resolved_app)
             .ok_or_else(|| format!("app '{}' is not loaded", resolved_app))?;
-        let schema = meta.schema.as_ref()
+        let schema = meta
+            .schema
+            .as_ref()
             .ok_or_else(|| format!("app '{}' has no schema — try reloading it", resolved_app))?;
-        let func = schema.find_function(&call.function)
-            .ok_or_else(|| format!(
+        let func = schema.find_function(&call.function).ok_or_else(|| {
+            format!(
                 "function '{}' not found in app '{}'. Available: [{}]",
                 call.function,
                 resolved_app,
-                schema.functions.iter().map(|f| f.name.as_str())
-                    .chain(schema.interfaces.iter().flat_map(|i| {
-                        i.functions.iter().map(move |f| f.name.as_str())
-                    }))
+                schema
+                    .functions
+                    .iter()
+                    .map(|f| f.name.as_str())
+                    .chain(
+                        schema
+                            .interfaces
+                            .iter()
+                            .flat_map(|i| { i.functions.iter().map(move |f| f.name.as_str()) })
+                    )
                     .collect::<Vec<_>>()
                     .join(", "),
-            ))?;
+            )
+        })?;
 
         // Convert named JSON fields to positional WasmParam values.
         let body = call.body.as_object();
@@ -940,7 +995,9 @@ impl WasmModule {
         if let Ok(meta_json) = serde_json::to_vec(meta) {
             if let Err(e) = kv.put(&kv_meta_key(name), &meta_json) {
                 enclave_os_common::enclave_log_error!(
-                    "KV: failed to persist metadata for app '{}': {}", name, e,
+                    "KV: failed to persist metadata for app '{}': {}",
+                    name,
+                    e,
                 );
             }
         }
@@ -948,7 +1005,9 @@ impl WasmModule {
         // Store WASM bytes
         if let Err(e) = kv.put(&kv_bytes_key(name), wasm_bytes) {
             enclave_os_common::enclave_log_error!(
-                "KV: failed to persist bytes for app '{}': {}", name, e,
+                "KV: failed to persist bytes for app '{}': {}",
+                name,
+                e,
             );
         }
 
@@ -969,7 +1028,9 @@ impl WasmModule {
         if let Ok(meta_json) = serde_json::to_vec(meta) {
             if let Err(e) = kv.put(&kv_meta_key(name), &meta_json) {
                 enclave_os_common::enclave_log_error!(
-                    "KV: failed to update metadata for app '{}': {}", name, e,
+                    "KV: failed to update metadata for app '{}': {}",
+                    name,
+                    e,
                 );
             }
         }
@@ -995,7 +1056,8 @@ impl WasmModule {
 
     /// Rewrite the KV manifest from the current `known` map.
     fn update_kv_manifest(&self, kv: &enclave_os_kvstore::SealedKvStore) {
-        let names: Vec<String> = self.registry
+        let names: Vec<String> = self
+            .registry
             .lock()
             .map(|r| {
                 r.all_code_hashes()
@@ -1007,9 +1069,7 @@ impl WasmModule {
 
         if let Ok(manifest_json) = serde_json::to_vec(&names) {
             if let Err(e) = kv.put(KV_MANIFEST, &manifest_json) {
-                enclave_os_common::enclave_log_error!(
-                    "KV: failed to update WASM manifest: {}", e,
-                );
+                enclave_os_common::enclave_log_error!("KV: failed to update WASM manifest: {}", e,);
             }
         }
     }
@@ -1022,7 +1082,9 @@ impl WasmModule {
     fn ensure_app_loaded(&self, name: &str) -> Result<(), String> {
         // Quick check — no KV access needed if already compiled.
         {
-            let reg = self.registry.lock()
+            let reg = self
+                .registry
+                .lock()
                 .map_err(|_| String::from("registry lock poisoned"))?;
             if reg.is_loaded(name) {
                 return Ok(());
@@ -1036,7 +1098,8 @@ impl WasmModule {
         let wasm_bytes = {
             let kv = enclave_os_kvstore::kv_store()
                 .ok_or_else(|| format!("KV store unavailable — cannot lazy-load app '{}'", name))?;
-            let kv = kv.lock()
+            let kv = kv
+                .lock()
                 .map_err(|_| String::from("KV store lock poisoned"))?;
             kv.get(&kv_bytes_key(name))
                 .map_err(|e| format!("KV read failed for app '{}': {}", name, e))?
@@ -1044,7 +1107,9 @@ impl WasmModule {
         };
 
         // Compile and insert into loaded map
-        let mut reg = self.registry.lock()
+        let mut reg = self
+            .registry
+            .lock()
             .map_err(|_| String::from("registry lock poisoned"))?;
         reg.ensure_loaded(name, &wasm_bytes)
     }
@@ -1088,7 +1153,9 @@ pub fn global() -> Option<&'static WasmModule> {
 pub struct WasmModuleHandle(pub &'static WasmModule);
 
 impl EnclaveModule for WasmModuleHandle {
-    fn name(&self) -> &str { self.0.name() }
+    fn name(&self) -> &str {
+        self.0.name()
+    }
     fn handle(&self, req: &Request, ctx: &RequestContext) -> Option<Response> {
         self.0.handle(req, ctx)
     }
@@ -1098,7 +1165,9 @@ impl EnclaveModule for WasmModuleHandle {
     fn custom_oids(&self) -> Vec<enclave_os_common::modules::ModuleOid> {
         self.0.custom_oids()
     }
-    fn app_identities(&self) -> Vec<AppIdentity> { self.0.app_identities() }
+    fn app_identities(&self) -> Vec<AppIdentity> {
+        self.0.app_identities()
+    }
     fn enrich_metrics(&self, m: &mut enclave_os_common::protocol::EnclaveMetrics) {
         self.0.enrich_metrics(m)
     }
@@ -1122,10 +1191,13 @@ impl EnclaveModule for WasmModule {
             Err(_) => return Vec::new(),
         };
 
-        registry.all_code_hashes()
+        registry
+            .all_code_hashes()
             .iter()
             .filter_map(|(name, _)| {
-                registry.get_known(name).map(|meta| build_app_identity(meta))
+                registry
+                    .get_known(name)
+                    .map(|meta| build_app_identity(meta))
             })
             .collect()
     }
@@ -1159,7 +1231,9 @@ impl EnclaveModule for WasmModule {
             Ok(e) => e,
             Err(e) => {
                 // Log if the payload looks like a WASM envelope but failed to parse.
-                if data.len() > 10 && (data.starts_with(b"{\"wasm_") || data.starts_with(b"{ \"wasm_")) {
+                if data.len() > 10
+                    && (data.starts_with(b"{\"wasm_") || data.starts_with(b"{ \"wasm_"))
+                {
                     enclave_os_common::enclave_log_error!(
                         "WasmModule: envelope parse failed ({} bytes): {}",
                         data.len(),
@@ -1181,13 +1255,15 @@ impl EnclaveModule for WasmModule {
                 if !claims.has_manager() {
                     let err = serde_json::to_vec(&WasmManagementResult::Error {
                         message: String::from("manager role required"),
-                    }).unwrap_or_default();
+                    })
+                    .unwrap_or_default();
                     return Some(Response::Data(err));
                 }
             } else if enclave_os_common::oidc::is_oidc_configured() {
                 let err = serde_json::to_vec(&WasmManagementResult::Error {
                     message: String::from("OIDC authentication required (manager role)"),
-                }).unwrap_or_default();
+                })
+                .unwrap_or_default();
                 return Some(Response::Data(err));
             }
         } else if needs_monitoring {
@@ -1195,13 +1271,15 @@ impl EnclaveModule for WasmModule {
                 if !claims.has_monitoring() {
                     let err = serde_json::to_vec(&WasmManagementResult::Error {
                         message: String::from("monitoring role required"),
-                    }).unwrap_or_default();
+                    })
+                    .unwrap_or_default();
                     return Some(Response::Data(err));
                 }
             } else if enclave_os_common::oidc::is_oidc_configured() {
                 let err = serde_json::to_vec(&WasmManagementResult::Error {
                     message: String::from("OIDC authentication required (monitoring role)"),
-                }).unwrap_or_default();
+                })
+                .unwrap_or_default();
                 return Some(Response::Data(err));
             }
         }
@@ -1304,7 +1382,20 @@ impl EnclaveModule for WasmModule {
                 None
             };
 
-            let mgmt_result = match self.load_app(&load.name, &hostname, &load.bytes, encryption_key, load.permissions, max_fuel, mcp_enabled, load.docs, load.config_api.map(|c| c.function), load.owners, app_id, vault) {
+            let mgmt_result = match self.load_app(
+                &load.name,
+                &hostname,
+                &load.bytes,
+                encryption_key,
+                load.permissions,
+                max_fuel,
+                mcp_enabled,
+                load.docs,
+                load.config_api.map(|c| c.function),
+                load.owners,
+                app_id,
+                vault,
+            ) {
                 Ok(()) => {
                     // Return the loaded app's info
                     let apps = self.list_apps();
@@ -1337,7 +1428,12 @@ impl EnclaveModule for WasmModule {
         // 3b. wasm_freeze — host-driven billing freeze / unfreeze
         if let Some(freeze) = envelope.wasm_freeze {
             let reason = if freeze.frozen {
-                Some(freeze.reason.clone().unwrap_or_else(|| String::from("credits_exhausted")))
+                Some(
+                    freeze
+                        .reason
+                        .clone()
+                        .unwrap_or_else(|| String::from("credits_exhausted")),
+                )
             } else {
                 None
             };
@@ -1391,7 +1487,9 @@ impl EnclaveModule for WasmModule {
                         ),
                     },
                 },
-                None => WasmManagementResult::NotFound { name: schema_req.app.clone() },
+                None => WasmManagementResult::NotFound {
+                    name: schema_req.app.clone(),
+                },
             };
             return Some(Response::Data(serialize_or_error(&mgmt_result)));
         }
@@ -1439,25 +1537,19 @@ impl EnclaveModule for WasmModule {
             };
             let mgmt_result = match registry.get_known(&resolved_app) {
                 Some(meta) => match &meta.schema {
-                    Some(s) if s.mcp_enabled => {
-                        WasmManagementResult::McpTools {
-                            manifest: s.to_mcp_manifest(),
-                        }
-                    }
+                    Some(s) if s.mcp_enabled => WasmManagementResult::McpTools {
+                        manifest: s.to_mcp_manifest(),
+                    },
                     Some(_) => WasmManagementResult::Error {
-                        message: format!(
-                            "MCP is disabled for app '{}'",
-                            resolved_app,
-                        ),
+                        message: format!("MCP is disabled for app '{}'", resolved_app,),
                     },
                     None => WasmManagementResult::Error {
-                        message: format!(
-                            "app '{}' has no schema — try reloading it",
-                            resolved_app,
-                        ),
+                        message: format!("app '{}' has no schema — try reloading it", resolved_app,),
                     },
                 },
-                None => WasmManagementResult::NotFound { name: resolved_app.clone() },
+                None => WasmManagementResult::NotFound {
+                    name: resolved_app.clone(),
+                },
             };
             return Some(Response::Data(serialize_or_error(&mgmt_result)));
         }
@@ -1596,8 +1688,7 @@ fn build_app_identity(meta: &AppMeta) -> AppIdentity {
     // The parent OID carries the WIT-derived configuration hash; the
     // sub-arc carries opaque values installed at runtime by the app.
     for (arc_suffix, value) in &meta.extensions {
-        let mut full_oid: Vec<u64> =
-            enclave_os_common::oids::APP_CONFIGURATION_HASH_OID.to_vec();
+        let mut full_oid: Vec<u64> = enclave_os_common::oids::APP_CONFIGURATION_HASH_OID.to_vec();
         full_oid.push(*arc_suffix as u64);
         // Leak to obtain a 'static slice. Acceptable: extensions are
         // monotonically added and the registry lives for the
@@ -1645,30 +1736,38 @@ fn json_to_wasm_param(
     ty: &crate::protocol::WitType,
     name: &str,
 ) -> Result<crate::protocol::WasmParam, String> {
-    use crate::protocol::{WitType, WasmParam};
+    use crate::protocol::{WasmParam, WitType};
     match ty {
-        WitType::Bool => val.as_bool()
+        WitType::Bool => val
+            .as_bool()
             .map(WasmParam::Bool)
             .ok_or_else(|| format!("param '{}': expected bool", name)),
-        WitType::U8 | WitType::U16 | WitType::U32 => val.as_u64()
+        WitType::U8 | WitType::U16 | WitType::U32 => val
+            .as_u64()
             .map(|n| WasmParam::U32(n as u32))
             .ok_or_else(|| format!("param '{}': expected unsigned integer", name)),
-        WitType::U64 => val.as_u64()
+        WitType::U64 => val
+            .as_u64()
             .map(WasmParam::U64)
             .ok_or_else(|| format!("param '{}': expected u64", name)),
-        WitType::S8 | WitType::S16 | WitType::S32 => val.as_i64()
+        WitType::S8 | WitType::S16 | WitType::S32 => val
+            .as_i64()
             .map(|n| WasmParam::S32(n as i32))
             .ok_or_else(|| format!("param '{}': expected signed integer", name)),
-        WitType::S64 => val.as_i64()
+        WitType::S64 => val
+            .as_i64()
             .map(WasmParam::S64)
             .ok_or_else(|| format!("param '{}': expected s64", name)),
-        WitType::Float32 => val.as_f64()
+        WitType::Float32 => val
+            .as_f64()
             .map(|n| WasmParam::F32(n as f32))
             .ok_or_else(|| format!("param '{}': expected float", name)),
-        WitType::Float64 => val.as_f64()
+        WitType::Float64 => val
+            .as_f64()
             .map(WasmParam::F64)
             .ok_or_else(|| format!("param '{}': expected float", name)),
-        WitType::String | WitType::Char => val.as_str()
+        WitType::String | WitType::Char => val
+            .as_str()
             .map(|s| WasmParam::String(s.to_string()))
             .ok_or_else(|| format!("param '{}': expected string", name)),
         WitType::List { element } if matches!(element.as_ref(), WitType::U8) => {
@@ -1676,29 +1775,39 @@ fn json_to_wasm_param(
             if let Some(s) = val.as_str() {
                 Ok(WasmParam::Bytes(s.as_bytes().to_vec()))
             } else if let Some(arr) = val.as_array() {
-                let bytes: Result<Vec<u8>, String> = arr.iter()
-                    .map(|v| v.as_u64()
-                        .map(|n| n as u8)
-                        .ok_or_else(|| format!("param '{}': list<u8> element not a u8", name)))
+                let bytes: Result<Vec<u8>, String> = arr
+                    .iter()
+                    .map(|v| {
+                        v.as_u64()
+                            .map(|n| n as u8)
+                            .ok_or_else(|| format!("param '{}': list<u8> element not a u8", name))
+                    })
                     .collect();
                 Ok(WasmParam::Bytes(bytes?))
             } else {
-                Err(format!("param '{}': expected string or byte array for list<u8>", name))
+                Err(format!(
+                    "param '{}': expected string or byte array for list<u8>",
+                    name
+                ))
             }
         }
         WitType::List { element } => {
-            let arr = val.as_array()
+            let arr = val
+                .as_array()
                 .ok_or_else(|| format!("param '{}': expected array for list type", name))?;
-            let items: Result<Vec<WasmParam>, String> = arr.iter()
+            let items: Result<Vec<WasmParam>, String> = arr
+                .iter()
                 .enumerate()
                 .map(|(i, v)| json_to_wasm_param(v, element, &format!("{}[{}]", name, i)))
                 .collect();
             Ok(WasmParam::List(items?))
         }
         WitType::Record { fields } => {
-            let obj = val.as_object()
+            let obj = val
+                .as_object()
                 .ok_or_else(|| format!("param '{}': expected object for record type", name))?;
-            let rec: Result<Vec<(String, WasmParam)>, String> = fields.iter()
+            let rec: Result<Vec<(String, WasmParam)>, String> = fields
+                .iter()
                 .map(|f| {
                     let v = obj.get(&f.name).unwrap_or(&serde_json::Value::Null);
                     let p = json_to_wasm_param(v, &f.ty, &format!("{}.{}", name, f.name))?;
@@ -1708,12 +1817,15 @@ fn json_to_wasm_param(
             Ok(WasmParam::Record(rec?))
         }
         WitType::Enum { names } => {
-            let s = val.as_str()
+            let s = val
+                .as_str()
                 .ok_or_else(|| format!("param '{}': expected string for enum type", name))?;
             if !names.contains(&s.to_string()) {
                 return Err(format!(
                     "param '{}': unknown enum case '{}', expected one of: [{}]",
-                    name, s, names.join(", "),
+                    name,
+                    s,
+                    names.join(", "),
                 ));
             }
             Ok(WasmParam::Enum(s.to_string()))
@@ -1736,32 +1848,44 @@ fn json_to_wasm_param(
                 }
             } else if let Some(obj) = val.as_object() {
                 if obj.len() != 1 {
-                    return Err(format!("param '{}': variant object must have exactly one key", name));
+                    return Err(format!(
+                        "param '{}': variant object must have exactly one key",
+                        name
+                    ));
                 }
                 let (case_name, payload) = obj.iter().next().unwrap();
-                let case = cases.iter().find(|c| &c.name == case_name)
-                    .ok_or_else(|| format!("param '{}': unknown variant case '{}'", name, case_name))?;
+                let case = cases.iter().find(|c| &c.name == case_name).ok_or_else(|| {
+                    format!("param '{}': unknown variant case '{}'", name, case_name)
+                })?;
                 match &case.ty {
                     Some(ty) => {
-                        let p = json_to_wasm_param(payload, ty, &format!("{}.{}", name, case_name))?;
+                        let p =
+                            json_to_wasm_param(payload, ty, &format!("{}.{}", name, case_name))?;
                         Ok(WasmParam::Variant(case_name.clone(), Some(Box::new(p))))
                     }
                     None => Ok(WasmParam::Variant(case_name.clone(), None)),
                 }
             } else {
-                Err(format!("param '{}': expected string or object for variant type", name))
+                Err(format!(
+                    "param '{}': expected string or object for variant type",
+                    name
+                ))
             }
         }
         WitType::Tuple { elements } => {
-            let arr = val.as_array()
+            let arr = val
+                .as_array()
                 .ok_or_else(|| format!("param '{}': expected array for tuple type", name))?;
             if arr.len() != elements.len() {
                 return Err(format!(
                     "param '{}': tuple expects {} elements, got {}",
-                    name, elements.len(), arr.len(),
+                    name,
+                    elements.len(),
+                    arr.len(),
                 ));
             }
-            let items: Result<Vec<WasmParam>, String> = arr.iter()
+            let items: Result<Vec<WasmParam>, String> = arr
+                .iter()
                 .zip(elements.iter())
                 .enumerate()
                 .map(|(i, (v, t))| json_to_wasm_param(v, t, &format!("{}.{}", name, i)))
@@ -1769,12 +1893,16 @@ fn json_to_wasm_param(
             Ok(WasmParam::Tuple(items?))
         }
         WitType::Flags { names } => {
-            let arr = val.as_array()
-                .ok_or_else(|| format!("param '{}': expected array of strings for flags type", name))?;
-            let flags: Result<Vec<String>, String> = arr.iter()
-                .map(|v| v.as_str()
-                    .map(|s| s.to_string())
-                    .ok_or_else(|| format!("param '{}': flag must be a string", name)))
+            let arr = val.as_array().ok_or_else(|| {
+                format!("param '{}': expected array of strings for flags type", name)
+            })?;
+            let flags: Result<Vec<String>, String> = arr
+                .iter()
+                .map(|v| {
+                    v.as_str()
+                        .map(|s| s.to_string())
+                        .ok_or_else(|| format!("param '{}': flag must be a string", name))
+                })
                 .collect();
             let flags = flags?;
             for f in &flags {
@@ -1789,18 +1917,29 @@ fn json_to_wasm_param(
             if let Some(obj) = val.as_object() {
                 if let Some(ok_val) = obj.get("ok") {
                     let p = match ok {
-                        Some(ty) => Some(Box::new(json_to_wasm_param(ok_val, ty, &format!("{}.ok", name))?)),
+                        Some(ty) => Some(Box::new(json_to_wasm_param(
+                            ok_val,
+                            ty,
+                            &format!("{}.ok", name),
+                        )?)),
                         None => None,
                     };
                     Ok(WasmParam::Variant("ok".to_string(), p))
                 } else if let Some(err_val) = obj.get("err") {
                     let p = match err {
-                        Some(ty) => Some(Box::new(json_to_wasm_param(err_val, ty, &format!("{}.err", name))?)),
+                        Some(ty) => Some(Box::new(json_to_wasm_param(
+                            err_val,
+                            ty,
+                            &format!("{}.err", name),
+                        )?)),
                         None => None,
                     };
                     Ok(WasmParam::Variant("err".to_string(), p))
                 } else {
-                    Err(format!("param '{}': result must have 'ok' or 'err' key", name))
+                    Err(format!(
+                        "param '{}': result must have 'ok' or 'err' key",
+                        name
+                    ))
                 }
             } else {
                 Err(format!("param '{}': expected object for result type", name))
@@ -1855,10 +1994,12 @@ fn build_app_role_store(
 ) -> Option<enclave_os_kvstore::SealedKvStore> {
     let meta = registry.get_known(app_name)?;
     let table = format!("app:{}", app_name);
-    Some(enclave_os_kvstore::SealedKvStore::from_master_key_with_table(
-        meta.encryption_key,
-        table.as_bytes(),
-    ))
+    Some(
+        enclave_os_kvstore::SealedKvStore::from_master_key_with_table(
+            meta.encryption_key,
+            table.as_bytes(),
+        ),
+    )
 }
 
 /// Verify an app-level auth token, trying FIDO2 then OIDC as appropriate.
@@ -1882,16 +2023,23 @@ fn verify_auth_token(
                     #[cfg(feature = "app-auth")]
                     {
                         match role_store {
-                            Some(store) => enclave_os_app_auth::get_user_roles_with_bootstrap(
-                                store, &user_id,
-                            ).unwrap_or_default(),
+                            Some(store) => {
+                                enclave_os_app_auth::get_user_roles_with_bootstrap(store, &user_id)
+                                    .unwrap_or_default()
+                            }
                             None => Vec::new(),
                         }
                     }
                     #[cfg(not(feature = "app-auth"))]
-                    { let _ = role_store; Vec::new() }
+                    {
+                        let _ = role_store;
+                        Vec::new()
+                    }
                 };
-                return Ok(AuthResult { roles, user_id: Some(user_id) });
+                return Ok(AuthResult {
+                    roles,
+                    user_id: Some(user_id),
+                });
             }
             Err(e) => {
                 // If OIDC is also available, fall through silently.
@@ -1917,7 +2065,10 @@ fn verify_auth_token(
     // Try OIDC JWT verification.
     if let Some(oidc) = &permissions.oidc {
         let (roles, sub) = verify_app_token(token, oidc)?;
-        return Ok(AuthResult { roles, user_id: sub });
+        return Ok(AuthResult {
+            roles,
+            user_id: sub,
+        });
     }
 
     Err("no authentication method available for this app".into())
@@ -1936,24 +2087,27 @@ fn verify_app_token(
     oidc: &crate::protocol::AppOidcConfig,
 ) -> Result<(Vec<String>, Option<String>), String> {
     // Verify ES256 signature via JWKS (rejects alg:none, fetches/caches keys)
-    let claims: serde_json::Value = crate::jwks_fetcher::verify_jwt_signature(
-        token,
-        &oidc.issuer,
-        &oidc.jwks_uri,
-    )?;
+    let claims: serde_json::Value =
+        crate::jwks_fetcher::verify_jwt_signature(token, &oidc.issuer, &oidc.jwks_uri)?;
 
     // Validate issuer
-    let iss = claims.get("iss")
+    let iss = claims
+        .get("iss")
         .and_then(|v| v.as_str())
         .ok_or_else(|| "JWT missing 'iss' claim".to_string())?;
     if iss != oidc.issuer {
-        return Err(format!("JWT issuer '{}' != expected '{}'", iss, oidc.issuer));
+        return Err(format!(
+            "JWT issuer '{}' != expected '{}'",
+            iss, oidc.issuer
+        ));
     }
 
     // Validate audience
     let aud_ok = match claims.get("aud") {
         Some(serde_json::Value::String(s)) => s == &oidc.audience,
-        Some(serde_json::Value::Array(arr)) => arr.iter().any(|v| v.as_str() == Some(&oidc.audience)),
+        Some(serde_json::Value::Array(arr)) => {
+            arr.iter().any(|v| v.as_str() == Some(&oidc.audience))
+        }
         _ => false,
     };
     if !aud_ok {
@@ -1969,7 +2123,8 @@ fn verify_app_token(
     }
 
     // Extract subject (user identity).
-    let sub = claims.get("sub")
+    let sub = claims
+        .get("sub")
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
@@ -2016,11 +2171,14 @@ fn collect_role_strings(val: &serde_json::Value, out: &mut Vec<String>) {
 /// Decode base64url (no padding) to bytes.
 #[allow(dead_code)]
 fn base64_url_decode(input: &str) -> Result<Vec<u8>, String> {
-    let standard: String = input.chars().map(|c| match c {
-        '-' => '+',
-        '_' => '/',
-        c => c,
-    }).collect();
+    let standard: String = input
+        .chars()
+        .map(|c| match c {
+            '-' => '+',
+            '_' => '/',
+            c => c,
+        })
+        .collect();
 
     let padded = match standard.len() % 4 {
         2 => format!("{}==", standard),
@@ -2035,8 +2193,9 @@ fn base64_url_decode(input: &str) -> Result<Vec<u8>, String> {
         if chunk.len() != 4 {
             return Err("invalid base64 length".into());
         }
-        let vals: Result<Vec<u8>, String> = chunk.iter().map(|&b| {
-            match b {
+        let vals: Result<Vec<u8>, String> = chunk
+            .iter()
+            .map(|&b| match b {
                 b'A'..=b'Z' => Ok(b - b'A'),
                 b'a'..=b'z' => Ok(b - b'a' + 26),
                 b'0'..=b'9' => Ok(b - b'0' + 52),
@@ -2044,8 +2203,8 @@ fn base64_url_decode(input: &str) -> Result<Vec<u8>, String> {
                 b'/' => Ok(63),
                 b'=' => Ok(0),
                 _ => Err(format!("invalid base64 char: {}", b as char)),
-            }
-        }).collect();
+            })
+            .collect();
         let vals = vals?;
         result.push((vals[0] << 2) | (vals[1] >> 4));
         if chunk[2] != b'=' {

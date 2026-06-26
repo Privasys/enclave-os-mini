@@ -21,8 +21,7 @@ use wasmtime::component::{Linker, Resource};
 use wasmtime::StoreContextMut;
 
 use super::{
-    AppContext, InputStreamKind, InputStreamRes, OutputStreamKind,
-    OutputStreamRes, PollableRes,
+    AppContext, InputStreamKind, InputStreamRes, OutputStreamKind, OutputStreamRes, PollableRes,
 };
 
 // =========================================================================
@@ -238,9 +237,7 @@ fn add_cli_env(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
     // initial-cwd: func() -> option<string>
     inst.func_wrap(
         "initial-cwd",
-        |_store: StoreContextMut<'_, AppContext>, _params: ()| {
-            Ok((Option::<String>::None,))
-        },
+        |_store: StoreContextMut<'_, AppContext>, _params: ()| Ok((Option::<String>::None,)),
     )?;
 
     Ok(())

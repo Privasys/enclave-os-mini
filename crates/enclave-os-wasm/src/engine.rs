@@ -91,20 +91,17 @@ impl WasmEngine {
         // ── No CoW / no disk-backed images ─────────────────────────
         config.memory_init_cow(false);
 
-        let engine = Engine::new(&config).map_err(|e| {
-            format!("wasmtime engine init failed: {}", e)
-        })?;
+        let engine =
+            Engine::new(&config).map_err(|e| format!("wasmtime engine init failed: {}", e))?;
 
         // ── Build Linker with WASI host functions ──────────────────
         let mut linker = Linker::<AppContext>::new(&engine);
-        crate::wasi::add_wasi_to_linker(&mut linker).map_err(|e| {
-            format!("WASI linker setup failed: {}", e)
-        })?;
+        crate::wasi::add_wasi_to_linker(&mut linker)
+            .map_err(|e| format!("WASI linker setup failed: {}", e))?;
 
         // ── Register Enclave OS SDK interfaces ─────────────────────
-        crate::enclave_sdk::add_to_linker(&mut linker).map_err(|e| {
-            format!("Enclave SDK linker setup failed: {}", e)
-        })?;
+        crate::enclave_sdk::add_to_linker(&mut linker)
+            .map_err(|e| format!("Enclave SDK linker setup failed: {}", e))?;
 
         Ok(Self { engine, linker })
     }
@@ -135,9 +132,8 @@ impl WasmEngine {
         // SAFETY: pre-compiled bytes come from the trusted build pipeline.
         // The enclave verifies the code hash before loading.
         unsafe {
-            Component::deserialize(&self.engine, precompiled_bytes).map_err(|e| {
-                format!("WASM deserialization failed: {}", e)
-            })
+            Component::deserialize(&self.engine, precompiled_bytes)
+                .map_err(|e| format!("WASM deserialization failed: {}", e))
         }
     }
 
@@ -147,7 +143,12 @@ impl WasmEngine {
     /// wasm-visible state (memories, tables, globals, app context).
     /// The `app_name` is used to namespace all KV store operations.
     /// `fuel` sets the per-call fuel budget.
-    pub fn new_store(&self, app_name: &str, master_key: [u8; AEAD_KEY_SIZE], fuel: u64) -> Store<AppContext> {
+    pub fn new_store(
+        &self,
+        app_name: &str,
+        master_key: [u8; AEAD_KEY_SIZE],
+        fuel: u64,
+    ) -> Store<AppContext> {
         let host = AppContext::with_app(app_name, master_key);
         let mut store = Store::new(&self.engine, host);
 
@@ -169,9 +170,10 @@ impl WasmEngine {
         component: &Component,
     ) -> Result<(Store<AppContext>, wasmtime::component::Instance), String> {
         let mut store = self.new_store(app_name, master_key, fuel);
-        let instance = self.linker.instantiate(&mut store, component).map_err(|e| {
-            format!("WASM instantiation failed: {}", e)
-        })?;
+        let instance = self
+            .linker
+            .instantiate(&mut store, component)
+            .map_err(|e| format!("WASM instantiation failed: {}", e))?;
         Ok((store, instance))
     }
 
@@ -179,10 +181,7 @@ impl WasmEngine {
     ///
     /// Returns `(function_name, param_count, result_count)` for each
     /// exported function at the root level and within exported instances.
-    pub fn discover_exports(
-        &self,
-        component: &Component,
-    ) -> Vec<(String, usize, usize)> {
+    pub fn discover_exports(&self, component: &Component) -> Vec<(String, usize, usize)> {
         use wasmtime::component::types::ComponentItem;
 
         let ty = component.component_type();
@@ -307,7 +306,8 @@ fn func_type_to_schema(
     func_ty: &wasmtime::component::types::ComponentFunc,
     docs: &BTreeMap<String, String>,
 ) -> crate::protocol::FunctionSchema {
-    let params = func_ty.params()
+    let params = func_ty
+        .params()
         .map(|(pname, ty)| {
             let desc = docs.get(&format!("param:{}.{}", name, pname)).cloned();
             crate::protocol::ParamSchema {
@@ -317,7 +317,8 @@ fn func_type_to_schema(
             }
         })
         .collect();
-    let results = func_ty.results()
+    let results = func_ty
+        .results()
         .enumerate()
         .map(|(i, ty)| crate::protocol::ParamSchema {
             name: format!("ret{}", i),
@@ -335,8 +336,8 @@ fn func_type_to_schema(
 
 /// Convert a wasmtime Component Model [`Type`] to a serialisable [`WitType`].
 fn wit_type_from(ty: &wasmtime::component::types::Type) -> crate::protocol::WitType {
-    use wasmtime::component::types::Type;
     use crate::protocol::WitType;
+    use wasmtime::component::types::Type;
 
     match ty {
         Type::Bool => WitType::Bool,
@@ -356,7 +357,8 @@ fn wit_type_from(ty: &wasmtime::component::types::Type) -> crate::protocol::WitT
             element: Box::new(wit_type_from(&l.ty())),
         },
         Type::Record(r) => WitType::Record {
-            fields: r.fields()
+            fields: r
+                .fields()
                 .map(|f| crate::protocol::FieldSchema {
                     name: f.name.to_string(),
                     ty: wit_type_from(&f.ty),
@@ -367,7 +369,8 @@ fn wit_type_from(ty: &wasmtime::component::types::Type) -> crate::protocol::WitT
             elements: t.types().map(|ty| wit_type_from(&ty)).collect(),
         },
         Type::Variant(v) => WitType::Variant {
-            cases: v.cases()
+            cases: v
+                .cases()
                 .map(|c| crate::protocol::CaseSchema {
                     name: c.name.to_string(),
                     ty: c.ty.map(|t| wit_type_from(&t)),

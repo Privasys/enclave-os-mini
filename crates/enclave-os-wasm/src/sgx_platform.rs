@@ -190,7 +190,8 @@ pub unsafe extern "C" fn wasmtime_mmap_new(
         } else {
             enclave_os_common::enclave_log_info!(
                 "[sgx_platform] mmap: code pool alloc {} bytes at {:p}",
-                aligned, ptr
+                aligned,
+                ptr
             );
             ptr
         }
@@ -198,7 +199,8 @@ pub unsafe extern "C" fn wasmtime_mmap_new(
         let ptr = heap_alloc_pages(aligned);
         enclave_os_common::enclave_log_info!(
             "[sgx_platform] mmap: heap alloc {} bytes at {:p}",
-            aligned, ptr
+            aligned,
+            ptr
         );
         ptr
     };
@@ -235,12 +237,14 @@ pub unsafe extern "C" fn wasmtime_munmap(ptr: *mut u8, size: usize) -> i32 {
         // The memory stays allocated until enclave teardown.
         enclave_os_common::enclave_log_info!(
             "[sgx_platform] munmap: code pool page {:p} ({} bytes) — retained",
-            ptr, aligned
+            ptr,
+            aligned
         );
     } else {
         enclave_os_common::enclave_log_info!(
             "[sgx_platform] munmap: heap dealloc {:p} ({} bytes)",
-            ptr, aligned
+            ptr,
+            aligned
         );
         heap_dealloc_pages(ptr, aligned);
     }
@@ -253,16 +257,15 @@ pub unsafe extern "C" fn wasmtime_munmap(ptr: *mut u8, size: usize) -> i32 {
 /// Wasmtime calls this to set code pages to RX after writing code,
 /// but since our pool is already RWX, no action is needed.
 #[no_mangle]
-pub unsafe extern "C" fn wasmtime_mprotect(
-    ptr: *mut u8,
-    size: usize,
-    prot_flags: u32,
-) -> i32 {
+pub unsafe extern "C" fn wasmtime_mprotect(ptr: *mut u8, size: usize, prot_flags: u32) -> i32 {
     let aligned = page_align(size);
     let in_pool = is_code_pool(ptr);
     enclave_os_common::enclave_log_info!(
         "[sgx_platform] mprotect: addr={:p} size={} prot={} pool={} (no-op)",
-        ptr, aligned, prot_flags, in_pool
+        ptr,
+        aligned,
+        prot_flags,
+        in_pool
     );
     0
 }

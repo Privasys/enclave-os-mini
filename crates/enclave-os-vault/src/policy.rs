@@ -177,9 +177,9 @@ pub fn has_required_roles(claims: &OidcClaims, required_roles: &[String]) -> boo
     if required_roles.is_empty() {
         return true;
     }
-    required_roles.iter().all(|r| {
-        claims.roles.iter().any(|c| c.eq_ignore_ascii_case(r))
-    })
+    required_roles
+        .iter()
+        .all(|r| claims.roles.iter().any(|c| c.eq_ignore_ascii_case(r)))
 }
 
 /// Verify that the peer cert satisfies a given `AttestationProfile`.
@@ -224,8 +224,7 @@ pub(crate) fn tee_matches(
     }
 
     // 4. Challenge binding.
-    if verify_challenge_binding(&evidence.evidence, &evidence.pubkey_raw, challenge_nonce)
-        .is_err()
+    if verify_challenge_binding(&evidence.evidence, &evidence.pubkey_raw, challenge_nonce).is_err()
     {
         return false;
     }
@@ -280,7 +279,15 @@ pub fn evaluate_op(
         if !rule.ops.contains(&op) || !rule_grants_to(rule, caller_ref) {
             continue;
         }
-        match evaluate_conditions(&rule.requires, policy, op, handle, approvals, ctx, op_binding) {
+        match evaluate_conditions(
+            &rule.requires,
+            policy,
+            op,
+            handle,
+            approvals,
+            ctx,
+            op_binding,
+        ) {
             Ok(()) => return Ok(()),
             Err(e) => last_err = Some(e),
         }
@@ -330,10 +337,16 @@ fn evaluate_conditions(
                 not_after,
             } => {
                 if *not_before != 0 && now < *not_before {
-                    return Err(format!("TimeWindow: now={} before not_before={}", now, not_before));
+                    return Err(format!(
+                        "TimeWindow: now={} before not_before={}",
+                        now, not_before
+                    ));
                 }
                 if *not_after != 0 && now > *not_after {
-                    return Err(format!("TimeWindow: now={} after not_after={}", now, not_after));
+                    return Err(format!(
+                        "TimeWindow: now={} after not_after={}",
+                        now, not_after
+                    ));
                 }
             }
             Condition::AttestationMatches(profile) => {
@@ -357,10 +370,7 @@ fn evaluate_conditions(
                     .managers
                     .get(mgr_idx as usize)
                     .ok_or_else(|| {
-                        format!(
-                            "ManagerApproval: manager index {} out of range",
-                            mgr_idx
-                        )
+                        format!("ManagerApproval: manager index {} out of range", mgr_idx)
                     })?;
                 let mgr_sub = match mgr {
                     Principal::Oidc { sub, .. } => sub.as_str(),
@@ -381,11 +391,9 @@ fn evaluate_conditions(
                     match ctx.oidc_claims.as_ref() {
                         Some(c) => Some(c.sub.as_str()),
                         None => {
-                            return Err(
-                                "ManagerApproval: role-based co-sign requires an \
+                            return Err("ManagerApproval: role-based co-sign requires an \
                                  authenticated OIDC proposer"
-                                    .to_string(),
-                            )
+                                .to_string())
                         }
                     }
                 } else {
@@ -422,9 +430,10 @@ fn evaluate_conditions(
                 operation_bound,
                 fresh_for_seconds,
             } => {
-                let claims = ctx.oidc_claims.as_ref().ok_or_else(|| {
-                    "OidcStepUp: no OIDC bearer in request".to_string()
-                })?;
+                let claims = ctx
+                    .oidc_claims
+                    .as_ref()
+                    .ok_or_else(|| "OidcStepUp: no OIDC bearer in request".to_string())?;
                 if !claims.has_amr(required_amr) {
                     return Err(format!(
                         "OidcStepUp: token amr {:?} does not satisfy required {:?}",
@@ -434,7 +443,7 @@ fn evaluate_conditions(
                 if *fresh_for_seconds > 0 {
                     if claims.iat == 0 {
                         return Err(
-                            "OidcStepUp: token has no iat; cannot prove freshness".to_string(),
+                            "OidcStepUp: token has no iat; cannot prove freshness".to_string()
                         );
                     }
                     if now.saturating_sub(claims.iat) > *fresh_for_seconds {
@@ -462,9 +471,10 @@ fn evaluate_conditions(
                     let vault_op = claims.vault_op.as_deref().ok_or_else(|| {
                         "OidcStepUp: token has no vault_op binding claim".to_string()
                     })?;
-                    let nonce = claims.nonce.as_deref().ok_or_else(|| {
-                        "OidcStepUp: token has no nonce claim".to_string()
-                    })?;
+                    let nonce = claims
+                        .nonce
+                        .as_deref()
+                        .ok_or_else(|| "OidcStepUp: token has no nonce claim".to_string())?;
                     let expected = vault_op_binding(
                         handle,
                         &binding.measurement_digest_hex,
@@ -473,11 +483,9 @@ fn evaluate_conditions(
                         claims.exp,
                     );
                     if vault_op != expected {
-                        return Err(
-                            "OidcStepUp: vault_op does not bind this operation \
+                        return Err("OidcStepUp: vault_op does not bind this operation \
                              (handle/measurement/policy_version/nonce/exp mismatch)"
-                                .to_string(),
-                        );
+                            .to_string());
                     }
                 }
             }
@@ -663,5 +671,3 @@ mod oidc_match_tests {
         assert!(!oidc_matches(&p, &claims("user-1", &["anything"])));
     }
 }
-
-

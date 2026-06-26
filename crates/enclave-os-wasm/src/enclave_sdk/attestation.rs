@@ -76,7 +76,8 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     // ── set-config-complete ────────────────────────────────────────
     inst.func_wrap(
         "set-config-complete",
-        |store: StoreContextMut<'_, AppContext>, (): ()|
+        |store: StoreContextMut<'_, AppContext>,
+         (): ()|
          -> wasmtime::Result<(Result<(), String>,)> {
             let app_name = store.data().app_name.clone();
             let module = match crate::global() {

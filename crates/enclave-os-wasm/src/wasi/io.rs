@@ -17,10 +17,7 @@
 use wasmtime::component::{Linker, Resource, ResourceType};
 use wasmtime::{AsContextMut, StoreContextMut};
 
-use super::{
-    AppContext, InputStreamRes, IoErrorRes,
-    OutputStreamRes, PollableRes,
-};
+use super::{AppContext, InputStreamRes, IoErrorRes, OutputStreamRes, PollableRes};
 
 // =========================================================================
 //  wasi:io/error@0.2.0
@@ -30,10 +27,14 @@ pub fn add_io_error(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Err
     let mut inst = linker.instance("wasi:io/error@0.2.0")?;
 
     // ── resource: error ────────────────────────────────────────────
-    inst.resource("error", ResourceType::host::<IoErrorRes>(), |mut store, rep| {
-        store.data_mut().errors.remove(&rep);
-        Ok(())
-    })?;
+    inst.resource(
+        "error",
+        ResourceType::host::<IoErrorRes>(),
+        |mut store, rep| {
+            store.data_mut().errors.remove(&rep);
+            Ok(())
+        },
+    )?;
 
     // [method]error.to-debug-string: func() -> string
     inst.func_wrap(
@@ -87,8 +88,7 @@ pub fn add_io_poll(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Erro
     // poll: func(in: list<borrow<pollable>>) -> list<u32>
     inst.func_wrap(
         "poll",
-        |_store: StoreContextMut<'_, AppContext>,
-         (pollables,): (Vec<Resource<PollableRes>>,)| {
+        |_store: StoreContextMut<'_, AppContext>, (pollables,): (Vec<Resource<PollableRes>>,)| {
             // All pollables are ready → return all indices.
             let ready: Vec<u32> = (0..pollables.len() as u32).collect();
             Ok((ready,))
@@ -184,7 +184,10 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
                     results[0] = Val::Result(Ok(Some(Box::new(Val::List(list.into())))));
                 }
                 Err(_) => {
-                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
+                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant(
+                        "closed".to_string(),
+                        None,
+                    )))));
                 }
             }
             Ok(())
@@ -204,11 +207,13 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
 
             match store.data_mut().read_stream(rep, len) {
                 Ok(bytes) => {
-                    results[0] =
-                        Val::Result(Ok(Some(Box::new(Val::U64(bytes.len() as u64)))));
+                    results[0] = Val::Result(Ok(Some(Box::new(Val::U64(bytes.len() as u64)))));
                 }
                 Err(_) => {
-                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
+                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant(
+                        "closed".to_string(),
+                        None,
+                    )))));
                 }
             }
             Ok(())
@@ -228,11 +233,13 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
 
             match store.data_mut().read_stream(rep, len) {
                 Ok(bytes) => {
-                    results[0] =
-                        Val::Result(Ok(Some(Box::new(Val::U64(bytes.len() as u64)))));
+                    results[0] = Val::Result(Ok(Some(Box::new(Val::U64(bytes.len() as u64)))));
                 }
                 Err(_) => {
-                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
+                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant(
+                        "closed".to_string(),
+                        None,
+                    )))));
                 }
             }
             Ok(())
@@ -242,8 +249,7 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
     // [method]input-stream.subscribe: func() -> pollable
     inst.func_wrap(
         "[method]input-stream.subscribe",
-        |mut store: StoreContextMut<'_, AppContext>,
-         (_self,): (Resource<InputStreamRes>,)| {
+        |mut store: StoreContextMut<'_, AppContext>, (_self,): (Resource<InputStreamRes>,)| {
             let rep = store.data_mut().alloc_rep();
             Ok((Resource::<PollableRes>::new_own(rep),))
         },
@@ -267,7 +273,10 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
                 // Report 64 KiB writable (generous buffer).
                 results[0] = Val::Result(Ok(Some(Box::new(Val::U64(65536)))));
             } else {
-                results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
+                results[0] = Val::Result(Err(Some(Box::new(Val::Variant(
+                    "closed".to_string(),
+                    None,
+                )))));
             }
             Ok(())
         },
@@ -289,7 +298,10 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
                     results[0] = Val::Result(Ok(None)); // result<_, _>::ok(())
                 }
                 Err(_) => {
-                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
+                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant(
+                        "closed".to_string(),
+                        None,
+                    )))));
                 }
             }
             Ok(())
@@ -312,7 +324,10 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
                     results[0] = Val::Result(Ok(None));
                 }
                 Err(_) => {
-                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
+                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant(
+                        "closed".to_string(),
+                        None,
+                    )))));
                 }
             }
             Ok(())
@@ -349,8 +364,7 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
     // [method]output-stream.subscribe: func() -> pollable
     inst.func_wrap(
         "[method]output-stream.subscribe",
-        |mut store: StoreContextMut<'_, AppContext>,
-         (_self,): (Resource<OutputStreamRes>,)| {
+        |mut store: StoreContextMut<'_, AppContext>, (_self,): (Resource<OutputStreamRes>,)| {
             let rep = store.data_mut().alloc_rep();
             Ok((Resource::<PollableRes>::new_own(rep),))
         },
@@ -371,7 +385,10 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
             match store.data_mut().write_stream(rep, &zeroes) {
                 Ok(()) => results[0] = Val::Result(Ok(None)),
                 Err(_) => {
-                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
+                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant(
+                        "closed".to_string(),
+                        None,
+                    )))));
                 }
             }
             Ok(())
@@ -393,7 +410,10 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
             match store.data_mut().write_stream(rep, &zeroes) {
                 Ok(()) => results[0] = Val::Result(Ok(None)),
                 Err(_) => {
-                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
+                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant(
+                        "closed".to_string(),
+                        None,
+                    )))));
                 }
             }
             Ok(())
@@ -416,18 +436,23 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
             let data = match store.data_mut().read_stream(in_rep, len) {
                 Ok(d) => d,
                 Err(_) => {
-                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
+                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant(
+                        "closed".to_string(),
+                        None,
+                    )))));
                     return Ok(());
                 }
             };
             let written = data.len();
             match store.data_mut().write_stream(out_rep, &data) {
                 Ok(()) => {
-                    results[0] =
-                        Val::Result(Ok(Some(Box::new(Val::U64(written as u64)))));
+                    results[0] = Val::Result(Ok(Some(Box::new(Val::U64(written as u64)))));
                 }
                 Err(_) => {
-                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
+                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant(
+                        "closed".to_string(),
+                        None,
+                    )))));
                 }
             }
             Ok(())
@@ -449,18 +474,23 @@ pub fn add_io_streams(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::E
             let data = match store.data_mut().read_stream(in_rep, len) {
                 Ok(d) => d,
                 Err(_) => {
-                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
+                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant(
+                        "closed".to_string(),
+                        None,
+                    )))));
                     return Ok(());
                 }
             };
             let written = data.len();
             match store.data_mut().write_stream(out_rep, &data) {
                 Ok(()) => {
-                    results[0] =
-                        Val::Result(Ok(Some(Box::new(Val::U64(written as u64)))));
+                    results[0] = Val::Result(Ok(Some(Box::new(Val::U64(written as u64)))));
                 }
                 Err(_) => {
-                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant("closed".to_string(), None)))));
+                    results[0] = Val::Result(Err(Some(Box::new(Val::Variant(
+                        "closed".to_string(),
+                        None,
+                    )))));
                 }
             }
             Ok(())
@@ -487,7 +517,10 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
 // =========================================================================
 
 /// Extract the resource representation (u32) from a `Val::Resource`.
-fn resource_rep<T: 'static>(val: &wasmtime::component::Val, store: impl wasmtime::AsContextMut) -> Result<u32, wasmtime::Error> {
+fn resource_rep<T: 'static>(
+    val: &wasmtime::component::Val,
+    store: impl wasmtime::AsContextMut,
+) -> Result<u32, wasmtime::Error> {
     match val {
         wasmtime::component::Val::Resource(any) => {
             let res = wasmtime::component::Resource::<T>::try_from_resource_any(*any, store)?;

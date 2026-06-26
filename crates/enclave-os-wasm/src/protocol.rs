@@ -789,7 +789,10 @@ pub enum AppRolesAction {
     GetRoles { user_handle: String },
     /// Assign roles to a user (admin required).
     #[serde(rename = "set_roles")]
-    SetRoles { user_handle: String, roles: Vec<String> },
+    SetRoles {
+        user_handle: String,
+        roles: Vec<String>,
+    },
     /// Remove all roles from a user (admin required).
     #[serde(rename = "remove_roles")]
     RemoveRoles { user_handle: String },
@@ -1033,7 +1036,10 @@ fn function_to_mcp_tool(name: &str, func: &FunctionSchema) -> McpTool {
         let mut schema = wit_type_to_json_schema(&p.ty);
         if let Some(ref desc) = p.description {
             if let serde_json::Value::Object(ref mut m) = schema {
-                m.insert("description".into(), serde_json::Value::String(desc.clone()));
+                m.insert(
+                    "description".into(),
+                    serde_json::Value::String(desc.clone()),
+                );
             }
         }
         properties.insert(p.name.clone(), schema);
@@ -1060,8 +1066,14 @@ fn function_to_mcp_tool(name: &str, func: &FunctionSchema) -> McpTool {
 fn wit_type_to_json_schema(ty: &WitType) -> serde_json::Value {
     match ty {
         WitType::Bool => serde_json::json!({ "type": "boolean" }),
-        WitType::U8 | WitType::U16 | WitType::U32 | WitType::U64
-        | WitType::S8 | WitType::S16 | WitType::S32 | WitType::S64 => {
+        WitType::U8
+        | WitType::U16
+        | WitType::U32
+        | WitType::U64
+        | WitType::S8
+        | WitType::S16
+        | WitType::S32
+        | WitType::S64 => {
             serde_json::json!({ "type": "integer" })
         }
         WitType::Float32 | WitType::Float64 => {
@@ -1107,9 +1119,8 @@ fn wit_type_to_json_schema(ty: &WitType) -> serde_json::Value {
             })
         }
         WitType::Tuple { elements } => {
-            let items: Vec<serde_json::Value> = elements.iter()
-                .map(wit_type_to_json_schema)
-                .collect();
+            let items: Vec<serde_json::Value> =
+                elements.iter().map(wit_type_to_json_schema).collect();
             serde_json::json!({
                 "type": "array",
                 "prefixItems": items,
@@ -1121,7 +1132,8 @@ fn wit_type_to_json_schema(ty: &WitType) -> serde_json::Value {
             "enum": names,
         }),
         WitType::Variant { cases } => {
-            let one_of: Vec<serde_json::Value> = cases.iter()
+            let one_of: Vec<serde_json::Value> = cases
+                .iter()
                 .map(|c| {
                     if let Some(ref t) = c.ty {
                         serde_json::json!({

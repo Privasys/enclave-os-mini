@@ -105,8 +105,8 @@ pub fn verify_challenge_binding(
     let nonce = nonce.ok_or_else(|| {
         "TLS challenge nonce missing; bidirectional challenge-response is required".to_string()
     })?;
-    let actual = extract_report_data(evidence)
-        .map_err(|e| format!("report_data extraction: {e}"))?;
+    let actual =
+        extract_report_data(evidence).map_err(|e| format!("report_data extraction: {e}"))?;
     let spki = build_p256_spki_der(pubkey_raw);
     let expected = compute_report_data_hash(&spki, nonce);
     if actual[..] != expected.as_ref()[..] {

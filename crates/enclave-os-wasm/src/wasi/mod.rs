@@ -33,8 +33,8 @@ use wasmtime::component::Linker;
 
 use crate::enclave_sdk::KeyStore;
 use crate::metrics::SdkUsage;
-use enclave_os_kvstore::SealedKvStore;
 use enclave_os_common::types::AEAD_KEY_SIZE;
+use enclave_os_kvstore::SealedKvStore;
 
 // ---------------------------------------------------------------------------
 //  Resource marker types (phantom — only used for Resource<T> type tagging)
@@ -83,7 +83,10 @@ pub enum InputStreamKind {
     Stdin,
     TcpSocket(i32),
     /// In-memory buffer with current read position.
-    Buffer { data: Vec<u8>, pos: usize },
+    Buffer {
+        data: Vec<u8>,
+        pos: usize,
+    },
     Empty,
 }
 
@@ -231,7 +234,10 @@ impl AppContext {
             env_vars: Vec::new(),
             args: Vec::new(),
             keystore: KeyStore::new(),
-            sealed_kv: SealedKvStore::from_master_key_with_table(master_key, format!("app:{}", app_name).as_bytes()),
+            sealed_kv: SealedKvStore::from_master_key_with_table(
+                master_key,
+                format!("app:{}", app_name).as_bytes(),
+            ),
             caller_id: None,
             caller_roles: Vec::new(),
             usage: SdkUsage::default(),
@@ -378,9 +384,7 @@ impl AppContext {
 ///
 /// This populates the standard WASI namespaces so that WASM components
 /// targeting `wasi:cli/run@0.2.0` (wasip2) can be instantiated.
-pub fn add_wasi_to_linker(
-    linker: &mut Linker<AppContext>,
-) -> Result<(), wasmtime::Error> {
+pub fn add_wasi_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
     io::add_to_linker(linker)?;
     cli::add_to_linker(linker)?;
     sockets::add_to_linker(linker)?;

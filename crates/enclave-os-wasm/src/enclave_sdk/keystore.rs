@@ -190,7 +190,8 @@ impl keystore_wit::Host for AppContext {
 
         let rng = SystemRandom::new();
         let mut key_bytes = [0u8; 32]; // AES-256
-        rng.fill(&mut key_bytes).map_err(|_| "RNG failed".to_string())?;
+        rng.fill(&mut key_bytes)
+            .map_err(|_| "RNG failed".to_string())?;
         self.keystore.insert_symmetric(key_name, key_bytes.to_vec());
         Ok(())
     }
@@ -244,7 +245,8 @@ impl keystore_wit::Host for AppContext {
 
         let rng = SystemRandom::new();
         let mut key_bytes = vec![0u8; key_len];
-        rng.fill(&mut key_bytes).map_err(|_| "RNG failed".to_string())?;
+        rng.fill(&mut key_bytes)
+            .map_err(|_| "RNG failed".to_string())?;
         self.keystore.insert_hmac(key_name, key_bytes);
         Ok(())
     }

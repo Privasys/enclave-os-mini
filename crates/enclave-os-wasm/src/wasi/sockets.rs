@@ -29,8 +29,8 @@ use wasmtime::component::{Linker, Resource, ResourceType, Val};
 use wasmtime::{AsContextMut, StoreContextMut};
 
 use super::{
-    AppContext, InputStreamKind, InputStreamRes, NetworkRes,
-    OutputStreamKind, OutputStreamRes, TcpSocketRes, TcpSocketState,
+    AppContext, InputStreamKind, InputStreamRes, NetworkRes, OutputStreamKind, OutputStreamRes,
+    TcpSocketRes, TcpSocketState,
 };
 
 // =========================================================================
@@ -233,8 +233,7 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
                 .input_streams
                 .insert(in_rep, InputStreamKind::TcpSocket(fd));
             let in_res = Resource::<InputStreamRes>::new_own(in_rep);
-            let in_any =
-                wasmtime::component::ResourceAny::try_from_resource(in_res, &mut store)?;
+            let in_any = wasmtime::component::ResourceAny::try_from_resource(in_res, &mut store)?;
 
             let out_rep = store.data_mut().alloc_rep();
             store
@@ -242,8 +241,7 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
                 .output_streams
                 .insert(out_rep, OutputStreamKind::TcpSocket(fd));
             let out_res = Resource::<OutputStreamRes>::new_own(out_rep);
-            let out_any =
-                wasmtime::component::ResourceAny::try_from_resource(out_res, &mut store)?;
+            let out_any = wasmtime::component::ResourceAny::try_from_resource(out_res, &mut store)?;
 
             // result<tuple<input-stream, output-stream>, error-code>
             results[0] = Val::Result(Ok(Some(Box::new(Val::Tuple(
@@ -318,10 +316,7 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
             let mut new_state = TcpSocketState::new();
             new_state.fd = Some(client_fd);
             new_state.connected = true;
-            store
-                .data_mut()
-                .tcp_sockets
-                .insert(new_sock_rep, new_state);
+            store.data_mut().tcp_sockets.insert(new_sock_rep, new_state);
             let sock_res = Resource::<TcpSocketRes>::new_own(new_sock_rep);
             let sock_any =
                 wasmtime::component::ResourceAny::try_from_resource(sock_res, &mut store)?;
@@ -333,8 +328,7 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
                 .input_streams
                 .insert(in_rep, InputStreamKind::TcpSocket(client_fd));
             let in_res = Resource::<InputStreamRes>::new_own(in_rep);
-            let in_any =
-                wasmtime::component::ResourceAny::try_from_resource(in_res, &mut store)?;
+            let in_any = wasmtime::component::ResourceAny::try_from_resource(in_res, &mut store)?;
 
             let out_rep = store.data_mut().alloc_rep();
             store
@@ -342,8 +336,7 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
                 .output_streams
                 .insert(out_rep, OutputStreamKind::TcpSocket(client_fd));
             let out_res = Resource::<OutputStreamRes>::new_own(out_rep);
-            let out_any =
-                wasmtime::component::ResourceAny::try_from_resource(out_res, &mut store)?;
+            let out_any = wasmtime::component::ResourceAny::try_from_resource(out_res, &mut store)?;
 
             results[0] = Val::Result(Ok(Some(Box::new(Val::Tuple(
                 vec![
@@ -420,8 +413,7 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
     // ── subscribe ──────────────────────────────────────────────────
     inst.func_wrap(
         "[method]tcp-socket.subscribe",
-        |mut store: StoreContextMut<'_, AppContext>,
-         (_self,): (Resource<TcpSocketRes>,)| {
+        |mut store: StoreContextMut<'_, AppContext>, (_self,): (Resource<TcpSocketRes>,)| {
             let rep = store.data_mut().alloc_rep();
             Ok((Resource::<super::PollableRes>::new_own(rep),))
         },
@@ -488,7 +480,10 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
 // =========================================================================
 
 /// Extract resource rep from a Val.
-fn io_rep<T: 'static>(val: &Val, store: impl wasmtime::AsContextMut) -> Result<u32, wasmtime::Error> {
+fn io_rep<T: 'static>(
+    val: &Val,
+    store: impl wasmtime::AsContextMut,
+) -> Result<u32, wasmtime::Error> {
     match val {
         Val::Resource(any) => {
             let res = wasmtime::component::Resource::<T>::try_from_resource_any(*any, store)?;
@@ -575,10 +570,7 @@ fn make_ipv4_address(a: u8, b: u8, c: u8, d: u8, port: u16) -> Val {
         "ipv4".to_string(),
         Some(Box::new(Val::Record(
             vec![
-                (
-                    "port".into(),
-                    Val::U16(port),
-                ),
+                ("port".into(), Val::U16(port)),
                 (
                     "address".into(),
                     Val::Tuple(vec![Val::U8(a), Val::U8(b), Val::U8(c), Val::U8(d)].into()),

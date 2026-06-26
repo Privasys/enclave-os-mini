@@ -56,13 +56,17 @@ pub fn parse_package_docs(wasm_bytes: &[u8]) -> BTreeMap<String, String> {
                 let name_bytes_start = name_start + name_leb_size;
                 let name_bytes_end = name_bytes_start + name_len;
                 if name_bytes_end <= wasm_bytes.len() {
-                    if let Ok(name) = core::str::from_utf8(&wasm_bytes[name_bytes_start..name_bytes_end]) {
+                    if let Ok(name) =
+                        core::str::from_utf8(&wasm_bytes[name_bytes_start..name_bytes_end])
+                    {
                         if name == "package-docs" {
                             let payload_start = name_bytes_end;
                             let payload_end = section_end;
                             if payload_end <= wasm_bytes.len() {
                                 let payload = &wasm_bytes[payload_start..payload_end];
-                                if let Ok(map) = serde_json::from_slice::<serde_json::Value>(payload) {
+                                if let Ok(map) =
+                                    serde_json::from_slice::<serde_json::Value>(payload)
+                                {
                                     normalise_package_docs(&map, &mut docs);
                                 }
                             }
@@ -90,10 +94,7 @@ pub fn parse_package_docs(wasm_bytes: &[u8]) -> BTreeMap<String, String> {
 /// We also accept the simpler flat format:
 /// - `"hello"` → function doc
 /// - `"hello.name"` → parameter doc
-pub fn normalise_package_docs(
-    val: &serde_json::Value,
-    docs: &mut BTreeMap<String, String>,
-) {
+pub fn normalise_package_docs(val: &serde_json::Value, docs: &mut BTreeMap<String, String>) {
     let obj = match val.as_object() {
         Some(o) => o,
         None => return,
@@ -183,8 +184,14 @@ mod tests {
         });
         let mut docs = BTreeMap::new();
         normalise_package_docs(&json, &mut docs);
-        assert_eq!(docs.get("param:analyse-data.values").unwrap(), "The data points.");
-        assert_eq!(docs.get("param:analyse-data.config").unwrap(), "Output configuration.");
+        assert_eq!(
+            docs.get("param:analyse-data.values").unwrap(),
+            "The data points."
+        );
+        assert_eq!(
+            docs.get("param:analyse-data.config").unwrap(),
+            "Output configuration."
+        );
     }
 
     #[test]
@@ -257,7 +264,10 @@ mod tests {
 
         let docs = parse_package_docs(&wasm);
         assert_eq!(docs.get("func:hello").unwrap(), "Greet the caller.");
-        assert_eq!(docs.get("param:analyse-data.values").unwrap(), "Input data.");
+        assert_eq!(
+            docs.get("param:analyse-data.values").unwrap(),
+            "Input data."
+        );
     }
 
     #[test]

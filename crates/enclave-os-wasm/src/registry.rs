@@ -46,14 +46,17 @@ use std::vec::Vec;
 
 use ring::digest;
 use ring::rand::{SecureRandom, SystemRandom};
-use serde::{Serialize, Deserialize};
-use wasmtime::Store;
+use serde::{Deserialize, Serialize};
 use wasmtime::component::{Component, Func, Val};
+use wasmtime::Store;
 
 use crate::engine::WasmEngine;
+use crate::protocol::{
+    AppPermissions, ExportedFunc, FunctionPermission, FunctionPolicy, WasmParam, WasmResult,
+    WasmValue,
+};
 use crate::wasi::AppContext;
 use enclave_os_common::types::AEAD_KEY_SIZE;
-use crate::protocol::{AppPermissions, ExportedFunc, FunctionPermission, FunctionPolicy, WasmParam, WasmResult, WasmValue};
 
 /// Host-KV table holding each vault-backed app's wrapped `encryption_key`.
 /// The value is AES-256-GCM(encryption_key, KEK), so it is safe at rest on the
@@ -97,9 +100,9 @@ fn resolve_vault_backed_key(
     app_id: Option<[u8; 16]>,
     byok: Option<[u8; AEAD_KEY_SIZE]>,
 ) -> Result<([u8; AEAD_KEY_SIZE], String, crate::vaultkey::VaultConfig), String> {
+    use crate::vaultkey;
     use enclave_os_common::aead::AeadCipher;
     use enclave_os_common::ocall;
-    use crate::vaultkey;
 
     let app_id_slice = app_id.as_ref().map(|a| a.as_slice());
 
@@ -252,10 +255,9 @@ fn merge_auth_from_docs(
             perms.default_policy = policy;
             perms.default_roles = roles;
         } else {
-            perms.functions.insert(
-                name.to_string(),
-                FunctionPermission { policy, roles },
-            );
+            perms
+                .functions
+                .insert(name.to_string(), FunctionPermission { policy, roles });
         }
     }
 
@@ -486,9 +488,12 @@ impl AppRegistry {
         // service already reported a successful deployment.
         {
             let mut probe_store = self.engine.new_store(name, [0u8; AEAD_KEY_SIZE], 1);
-            self.engine.linker().instantiate(&mut probe_store, &component).map_err(|e| {
-                format!("component failed trial instantiation (linker error): {}", e)
-            })?;
+            self.engine
+                .linker()
+                .instantiate(&mut probe_store, &component)
+                .map_err(|e| {
+                    format!("component failed trial instantiation (linker error): {}", e)
+                })?;
         }
 
         // ── Per-app encryption key ─────────────────────────────────
@@ -517,9 +522,8 @@ impl AppRegistry {
                 None => {
                     let rng = SystemRandom::new();
                     let mut k = [0u8; AEAD_KEY_SIZE];
-                    rng.fill(&mut k).map_err(|_| {
-                        String::from("RDRAND failed generating app encryption key")
-                    })?;
+                    rng.fill(&mut k)
+                        .map_err(|_| String::from("RDRAND failed generating app encryption key"))?;
                     (k, String::from("generated"), None)
                 }
             },
@@ -541,14 +545,16 @@ impl AppRegistry {
             Some(name) => Some(name.clone()),
             None => config_api_function,
         };
-        let mut schema = self.engine.discover_exports_typed(name, hostname, &component, Some(wasm_bytes), docs);
+        let mut schema =
+            self.engine
+                .discover_exports_typed(name, hostname, &component, Some(wasm_bytes), docs);
         schema.mcp_enabled = mcp_enabled;
         let exports = schema.to_exports_map();
 
         if exports.is_empty() {
             return Err(format!(
                 "app '{}' has no exported functions — is it a valid Component?",
-                name, 
+                name,
             ));
         }
 
@@ -563,7 +569,8 @@ impl AppRegistry {
             }
             let canonical = serde_json::to_vec(&ConfigDigestInput {
                 permissions: permissions.as_ref(),
-            }).expect("config digest input must be serialisable");
+            })
+            .expect("config digest input must be serialisable");
             let h = digest::digest(&digest::SHA256, &canonical);
             let mut out = [0u8; 32];
             out.copy_from_slice(h.as_ref());
@@ -655,7 +662,9 @@ impl AppRegistry {
             return Ok(());
         }
 
-        let meta = self.known.get(name)
+        let meta = self
+            .known
+            .get(name)
             .ok_or_else(|| format!("unknown app: '{}'", name))?
             .clone();
 
@@ -667,7 +676,13 @@ impl AppRegistry {
         let (exports, new_schema) = if let Some(ref s) = meta.schema {
             (s.to_exports_map(), None)
         } else {
-            let s = self.engine.discover_exports_typed(&meta.name, &meta.hostname, &component, Some(wasm_bytes), None);
+            let s = self.engine.discover_exports_typed(
+                &meta.name,
+                &meta.hostname,
+                &component,
+                Some(wasm_bytes),
+                None,
+            );
             let e = s.to_exports_map();
             (e, Some(s))
         };
@@ -679,18 +694,21 @@ impl AppRegistry {
             }
         }
 
-        self.loaded.insert(name.to_string(), LoadedApp {
-            name: meta.name,
-            hostname: meta.hostname,
-            code_hash: meta.code_hash,
-            encryption_key: meta.encryption_key,
-            key_source: meta.key_source,
-            component,
-            exports,
-            permissions: meta.permissions,
-            configuration_hash: meta.configuration_hash,
-            max_fuel: meta.max_fuel,
-        });
+        self.loaded.insert(
+            name.to_string(),
+            LoadedApp {
+                name: meta.name,
+                hostname: meta.hostname,
+                code_hash: meta.code_hash,
+                encryption_key: meta.encryption_key,
+                key_source: meta.key_source,
+                component,
+                exports,
+                permissions: meta.permissions,
+                configuration_hash: meta.configuration_hash,
+                max_fuel: meta.max_fuel,
+            },
+        );
         self.touch(name);
         self.evict_if_needed();
         Ok(())
@@ -762,7 +780,12 @@ impl AppRegistry {
     /// arc `1.3.6.1.4.1.65230.3.5.{arc_suffix}`. Returns the updated
     /// metadata so the caller can re-register the app identity with
     /// the global CertStore. Persistence to KV is the caller's job.
-    pub fn set_extension(&mut self, name: &str, arc_suffix: u32, value: Vec<u8>) -> Option<AppMeta> {
+    pub fn set_extension(
+        &mut self,
+        name: &str,
+        arc_suffix: u32,
+        value: Vec<u8>,
+    ) -> Option<AppMeta> {
         let meta = self.known.get_mut(name)?;
         meta.extensions.insert(arc_suffix, value);
         Some(meta.clone())
@@ -776,7 +799,9 @@ impl AppRegistry {
         self.known
             .values()
             .map(|meta| {
-                let exports = self.loaded.get(&meta.name)
+                let exports = self
+                    .loaded
+                    .get(&meta.name)
                     .map(|app| app.exported_funcs())
                     .unwrap_or_default();
                 crate::protocol::AppInfo {
@@ -785,7 +810,9 @@ impl AppRegistry {
                     code_hash: enclave_os_common::hex::hex_encode(&meta.code_hash),
                     key_source: meta.key_source.clone(),
                     exports,
-                    configuration_hash: meta.configuration_hash.map(|h| enclave_os_common::hex::hex_encode(&h)),
+                    configuration_hash: meta
+                        .configuration_hash
+                        .map(|h| enclave_os_common::hex::hex_encode(&h)),
                     max_fuel: meta.max_fuel,
                     loaded: self.loaded.contains_key(&meta.name),
                 }
@@ -825,7 +852,9 @@ impl AppRegistry {
 
     /// Get the configuration hash for a known app (for OID 3.5 attestation).
     pub fn app_configuration_hash(&self, name: &str) -> Option<&[u8; 32]> {
-        self.known.get(name).and_then(|m| m.configuration_hash.as_ref())
+        self.known
+            .get(name)
+            .and_then(|m| m.configuration_hash.as_ref())
     }
 
     /// Get the permissions policy for a known app (for call-time enforcement).
@@ -864,9 +893,7 @@ impl AppRegistry {
         }
         let names: Vec<&String> = self.known.keys().collect();
         match names.len() {
-            0 => Err(String::from(
-                "no apps loaded; cannot resolve default app",
-            )),
+            0 => Err(String::from("no apps loaded; cannot resolve default app")),
             1 => Ok(names[0].clone()),
             _ => Err(format!(
                 "multiple apps loaded ({:?}); specify 'app' explicitly",
@@ -934,7 +961,12 @@ impl AppRegistry {
         }
 
         // ── Instantiate ────────────────────────────────────────────
-        let (mut store, instance) = match self.engine.instantiate(app_name, app.encryption_key, app.max_fuel, &app.component) {
+        let (mut store, instance) = match self.engine.instantiate(
+            app_name,
+            app.encryption_key,
+            app.max_fuel,
+            &app.component,
+        ) {
             Ok(pair) => pair,
             Err(e) => {
                 return Err(WasmResult::Error {
@@ -976,10 +1008,7 @@ impl AppRegistry {
                 Some(_) => {
                     // The index resolved the instance; now get the function within it.
                     // We need to look up the function export under the interface.
-                    match app
-                        .component
-                        .get_export_index(Some(&iface_idx), func_name)
-                    {
+                    match app.component.get_export_index(Some(&iface_idx), func_name) {
                         Some(func_idx) => match instance.get_func(&mut store, &func_idx) {
                             Some(f) => f,
                             None => {
@@ -1003,10 +1032,7 @@ impl AppRegistry {
                 }
                 None => {
                     // Try the nested lookup approach
-                    match app
-                        .component
-                        .get_export_index(Some(&iface_idx), func_name)
-                    {
+                    match app.component.get_export_index(Some(&iface_idx), func_name) {
                         Some(func_idx) => match instance.get_func(&mut store, &func_idx) {
                             Some(f) => f,
                             None => {
@@ -1050,11 +1076,7 @@ impl AppRegistry {
         // ── Determine expected result count ────────────────────────
         // For dynamic dispatch (Func, not TypedFunc) we look up the
         // declared result count from the exports map.
-        let result_count = app
-            .exports
-            .get(function)
-            .map(|&(_, r)| r)
-            .unwrap_or(0);
+        let result_count = app.exports.get(function).map(|&(_, r)| r).unwrap_or(0);
 
         // Hand off to the caller; wasm execution must happen with the
         // registry mutex released so host functions can re-enter.
@@ -1078,7 +1100,9 @@ impl AppRegistry {
     /// Evict the least-recently-used compiled app if over the limit.
     fn evict_if_needed(&mut self) {
         while self.loaded.len() > MAX_LOADED_APPS {
-            let oldest = self.lru.iter()
+            let oldest = self
+                .lru
+                .iter()
                 .filter(|(name, _)| self.loaded.contains_key(name.as_str()))
                 .min_by_key(|(_, &counter)| counter)
                 .map(|(name, _)| name.clone());
@@ -1116,18 +1140,19 @@ fn param_to_val(p: &WasmParam) -> Val {
         WasmParam::List(items) => {
             Val::List(items.iter().map(param_to_val).collect::<Vec<_>>().into())
         }
-        WasmParam::Record(fields) => {
-            Val::Record(fields.iter()
+        WasmParam::Record(fields) => Val::Record(
+            fields
+                .iter()
                 .map(|(n, v)| (n.clone(), param_to_val(v)))
-                .collect::<Vec<_>>().into())
-        }
+                .collect::<Vec<_>>()
+                .into(),
+        ),
         WasmParam::Enum(name) => Val::Enum(name.clone()),
-        WasmParam::Option(inner) => {
-            Val::Option(inner.as_ref().map(|v| Box::new(param_to_val(v))))
-        }
-        WasmParam::Variant(name, payload) => {
-            Val::Variant(name.clone(), payload.as_ref().map(|v| Box::new(param_to_val(v))))
-        }
+        WasmParam::Option(inner) => Val::Option(inner.as_ref().map(|v| Box::new(param_to_val(v)))),
+        WasmParam::Variant(name, payload) => Val::Variant(
+            name.clone(),
+            payload.as_ref().map(|v| Box::new(param_to_val(v))),
+        ),
         WasmParam::Tuple(items) => {
             Val::Tuple(items.iter().map(param_to_val).collect::<Vec<_>>().into())
         }
@@ -1194,8 +1219,12 @@ fn val_to_json(v: &Val) -> serde_json::Value {
         Val::U32(n) => Value::Number((*n as u64).into()),
         Val::S64(n) => Value::Number((*n).into()),
         Val::U64(n) => Value::Number((*n).into()),
-        Val::Float32(f) => Number::from_f64(*f as f64).map(Value::Number).unwrap_or(Value::Null),
-        Val::Float64(f) => Number::from_f64(*f).map(Value::Number).unwrap_or(Value::Null),
+        Val::Float32(f) => Number::from_f64(*f as f64)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
+        Val::Float64(f) => Number::from_f64(*f)
+            .map(Value::Number)
+            .unwrap_or(Value::Null),
         Val::String(s) => Value::String(s.to_string()),
         Val::Char(c) => Value::String(c.to_string()),
         Val::List(items) => Value::Array(items.iter().map(val_to_json).collect()),

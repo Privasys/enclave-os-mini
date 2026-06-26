@@ -53,12 +53,10 @@ pub(crate) fn validate_material(
         KeyType::P256SigningKey => {
             // material is PKCS#8 v1; parse to derive the public key.
             let rng = SystemRandom::new();
-            let kp = EcdsaKeyPair::from_pkcs8(
-                &ECDSA_P256_SHA256_FIXED_SIGNING,
-                material,
-                &rng,
-            )
-            .map_err(|_| "P256SigningKey material is not a valid PKCS#8 P-256 key".to_string())?;
+            let kp = EcdsaKeyPair::from_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, material, &rng)
+                .map_err(|_| {
+                    "P256SigningKey material is not a valid PKCS#8 P-256 key".to_string()
+                })?;
             Ok(Some(kp.public_key().as_ref().to_vec()))
         }
     }
@@ -98,8 +96,8 @@ pub(crate) fn aes_gcm_seal(
         }
     };
 
-    let unbound = UnboundKey::new(&AES_256_GCM, key_bytes)
-        .map_err(|_| "invalid AES-256 key".to_string())?;
+    let unbound =
+        UnboundKey::new(&AES_256_GCM, key_bytes).map_err(|_| "invalid AES-256 key".to_string())?;
     let key = LessSafeKey::new(unbound);
     let nonce = Nonce::assume_unique_for_key(nonce_bytes);
     let mut in_out = plaintext.to_vec();
@@ -124,8 +122,8 @@ pub(crate) fn aes_gcm_open(
     }
     let mut nonce_bytes = [0u8; NONCE_LEN];
     nonce_bytes.copy_from_slice(iv);
-    let unbound = UnboundKey::new(&AES_256_GCM, key_bytes)
-        .map_err(|_| "invalid AES-256 key".to_string())?;
+    let unbound =
+        UnboundKey::new(&AES_256_GCM, key_bytes).map_err(|_| "invalid AES-256 key".to_string())?;
     let key = LessSafeKey::new(unbound);
     let nonce = Nonce::assume_unique_for_key(nonce_bytes);
     let mut in_out = ciphertext.to_vec();

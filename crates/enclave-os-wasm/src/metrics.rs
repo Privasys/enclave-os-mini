@@ -277,9 +277,11 @@ impl WasmMetricsStore {
 
     /// Save the current metrics to the sealed KV store.
     pub fn save(&self) -> Result<(), String> {
-        let kv = enclave_os_kvstore::kv_store()
-            .ok_or_else(|| "KV store not initialised".to_string())?;
-        let kv = kv.lock().map_err(|_| "KV store lock poisoned".to_string())?;
+        let kv =
+            enclave_os_kvstore::kv_store().ok_or_else(|| "KV store not initialised".to_string())?;
+        let kv = kv
+            .lock()
+            .map_err(|_| "KV store lock poisoned".to_string())?;
         let mut snapshot = self.clone();
         snapshot.schema_version = SNAPSHOT_SCHEMA_VERSION;
         let data = snapshot.to_bytes()?;
@@ -289,9 +291,11 @@ impl WasmMetricsStore {
     /// Load metrics from the sealed KV store, merging into the current
     /// counters (additive — preserves any calls recorded since boot).
     pub fn load(&mut self) -> Result<bool, String> {
-        let kv = enclave_os_kvstore::kv_store()
-            .ok_or_else(|| "KV store not initialised".to_string())?;
-        let kv = kv.lock().map_err(|_| "KV store lock poisoned".to_string())?;
+        let kv =
+            enclave_os_kvstore::kv_store().ok_or_else(|| "KV store not initialised".to_string())?;
+        let kv = kv
+            .lock()
+            .map_err(|_| "KV store lock poisoned".to_string())?;
 
         match kv.get(METRICS_KV_KEY)? {
             Some(data) => {

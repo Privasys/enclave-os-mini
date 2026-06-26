@@ -36,9 +36,7 @@ pub(crate) const ISSUER: &str = "enclave-os-vault";
 /// first call.
 ///
 /// Caller must already hold the KV mutex.
-pub(crate) fn load_or_init_keypair(
-    store: &mut SealedKvStore,
-) -> Result<EcdsaKeyPair, String> {
+pub(crate) fn load_or_init_keypair(store: &mut SealedKvStore) -> Result<EcdsaKeyPair, String> {
     let rng = SystemRandom::new();
     let pkcs8 = match store
         .get(SIGNING_KEY_KV)
@@ -46,11 +44,8 @@ pub(crate) fn load_or_init_keypair(
     {
         Some(b) => b,
         None => {
-            let doc = EcdsaKeyPair::generate_pkcs8(
-                &ECDSA_P256_SHA256_FIXED_SIGNING,
-                &rng,
-            )
-            .map_err(|_| "generate vault signing key failed".to_string())?;
+            let doc = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_FIXED_SIGNING, &rng)
+                .map_err(|_| "generate vault signing key failed".to_string())?;
             let bytes = doc.as_ref().to_vec();
             store
                 .put(SIGNING_KEY_KV, &bytes)
@@ -65,9 +60,7 @@ pub(crate) fn load_or_init_keypair(
 
 /// Return only the raw uncompressed public key (65 bytes, `04 || x || y`).
 /// Caller must already hold the KV mutex.
-pub(crate) fn load_or_init_public_key(
-    store: &mut SealedKvStore,
-) -> Result<Vec<u8>, String> {
+pub(crate) fn load_or_init_public_key(store: &mut SealedKvStore) -> Result<Vec<u8>, String> {
     Ok(load_or_init_keypair(store)?.public_key().as_ref().to_vec())
 }
 
@@ -134,8 +127,8 @@ pub(crate) fn verify_approval_token(
 ) -> Result<(), String> {
     // 1. Look up our own public key from the sealed KV.
     let public_key = {
-        let kv = enclave_os_kvstore::kv_store()
-            .ok_or_else(|| "kv store not initialised".to_string())?;
+        let kv =
+            enclave_os_kvstore::kv_store().ok_or_else(|| "kv store not initialised".to_string())?;
         let mut store = kv
             .lock()
             .map_err(|_| "kv store lock poisoned".to_string())?;

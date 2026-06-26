@@ -36,7 +36,9 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     // ── get-caller-id ──────────────────────────────────────────────
     inst.func_wrap(
         "get-caller-id",
-        |store: StoreContextMut<'_, AppContext>, (): ()| -> wasmtime::Result<(Result<String, String>,)> {
+        |store: StoreContextMut<'_, AppContext>,
+         (): ()|
+         -> wasmtime::Result<(Result<String, String>,)> {
             let ctx = store.data();
             match &ctx.caller_id {
                 Some(id) => Ok((Ok(id.clone()),)),
@@ -48,7 +50,9 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     // ── get-my-roles ───────────────────────────────────────────────
     inst.func_wrap(
         "get-my-roles",
-        |store: StoreContextMut<'_, AppContext>, (): ()| -> wasmtime::Result<(Result<Vec<String>, String>,)> {
+        |store: StoreContextMut<'_, AppContext>,
+         (): ()|
+         -> wasmtime::Result<(Result<Vec<String>, String>,)> {
             let ctx = store.data();
             if ctx.caller_id.is_none() {
                 return Ok((Err("not authenticated".into()),));
@@ -60,7 +64,9 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     // ── list-users ─────────────────────────────────────────────────
     inst.func_wrap(
         "list-users",
-        |store: StoreContextMut<'_, AppContext>, (): ()| -> wasmtime::Result<(Result<Vec<(String, Vec<String>)>, String>,)> {
+        |store: StoreContextMut<'_, AppContext>,
+         (): ()|
+         -> wasmtime::Result<(Result<Vec<(String, Vec<String>)>, String>,)> {
             let ctx = store.data();
 
             // Require admin or user-management role.
@@ -86,7 +92,9 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     // ── get-user-roles ─────────────────────────────────────────────
     inst.func_wrap(
         "get-user-roles",
-        |store: StoreContextMut<'_, AppContext>, (user_id,): (String,)| -> wasmtime::Result<(Result<Vec<String>, String>,)> {
+        |store: StoreContextMut<'_, AppContext>,
+         (user_id,): (String,)|
+         -> wasmtime::Result<(Result<Vec<String>, String>,)> {
             let ctx = store.data();
 
             if !has_any_role(&ctx.caller_roles, &["admin", "user-management"]) {
@@ -112,7 +120,9 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     // ── set-user-roles ─────────────────────────────────────────────
     inst.func_wrap(
         "set-user-roles",
-        |store: StoreContextMut<'_, AppContext>, (user_id, roles): (String, Vec<String>)| -> wasmtime::Result<(Result<String, String>,)> {
+        |store: StoreContextMut<'_, AppContext>,
+         (user_id, roles): (String, Vec<String>)|
+         -> wasmtime::Result<(Result<String, String>,)> {
             let ctx = store.data();
 
             if !ctx.caller_roles.contains(&"admin".to_string()) {
@@ -138,7 +148,9 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     // ── remove-user-roles ──────────────────────────────────────────
     inst.func_wrap(
         "remove-user-roles",
-        |store: StoreContextMut<'_, AppContext>, (user_id,): (String,)| -> wasmtime::Result<(Result<String, String>,)> {
+        |store: StoreContextMut<'_, AppContext>,
+         (user_id,): (String,)|
+         -> wasmtime::Result<(Result<String, String>,)> {
             let ctx = store.data();
 
             if !ctx.caller_roles.contains(&"admin".to_string()) {

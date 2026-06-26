@@ -35,9 +35,8 @@ use wasmtime::component::{Linker, Resource, ResourceType, Val};
 use wasmtime::{AsContextMut, StoreContextMut};
 
 use super::{
-    DescriptorRes, DirEntryStreamRes, DirEntryStreamState, FsDescriptor,
-    AppContext, InputStreamKind, InputStreamRes, OutputStreamKind,
-    OutputStreamRes, PollableRes,
+    AppContext, DescriptorRes, DirEntryStreamRes, DirEntryStreamState, FsDescriptor,
+    InputStreamKind, InputStreamRes, OutputStreamKind, OutputStreamRes, PollableRes,
 };
 
 /// KV key domain for all filesystem entries (used with `AppContext::kv_key`).
@@ -56,8 +55,9 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
         ResourceType::host::<DescriptorRes>(),
         |mut store, rep| {
             // On drop, flush dirty files to KV store.
-            if let Some(FsDescriptor::File { key, buf, dirty, .. }) =
-                store.data_mut().fs_descriptors.remove(&rep)
+            if let Some(FsDescriptor::File {
+                key, buf, dirty, ..
+            }) = store.data_mut().fs_descriptors.remove(&rep)
             {
                 if dirty && !buf.is_empty() {
                     let kv_key = format!("{}{}", FS_DOMAIN, key);
@@ -155,16 +155,16 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
             // Check if path exists as a file in KV store.
             match store.data().sealed_kv.get(kv_key.as_bytes()) {
                 Ok(Some(data)) => {
-                    results[0] = Val::Result(Ok(Some(Box::new(
-                        make_descriptor_stat("regular-file", data.len() as u64),
-                    ))));
+                    results[0] = Val::Result(Ok(Some(Box::new(make_descriptor_stat(
+                        "regular-file",
+                        data.len() as u64,
+                    )))));
                 }
                 _ => {
                     // Might be a directory (prefix). We can't verify, so
                     // assume directory with size 0.
-                    results[0] = Val::Result(Ok(Some(Box::new(
-                        make_descriptor_stat("directory", 0),
-                    ))));
+                    results[0] =
+                        Val::Result(Ok(Some(Box::new(make_descriptor_stat("directory", 0)))));
                 }
             }
             Ok(())
@@ -204,12 +204,10 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
             if is_dir {
                 // Open as directory descriptor.
                 let new_rep = store.data_mut().alloc_rep();
-                store.data_mut().fs_descriptors.insert(
-                    new_rep,
-                    FsDescriptor::Directory {
-                        prefix: full_path,
-                    },
-                );
+                store
+                    .data_mut()
+                    .fs_descriptors
+                    .insert(new_rep, FsDescriptor::Directory { prefix: full_path });
                 let res = Resource::<DescriptorRes>::new_own(new_rep);
                 let any = wasmtime::component::ResourceAny::try_from_resource(res, &mut store)?;
                 results[0] = Val::Result(Ok(Some(Box::new(Val::Resource(any)))));
@@ -287,10 +285,10 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
 
             // Create an input-stream backed by the file data.
             let is_rep = store.data_mut().alloc_rep();
-            store.data_mut().input_streams.insert(
-                is_rep,
-                InputStreamKind::Buffer { data: buf, pos: 0 },
-            );
+            store
+                .data_mut()
+                .input_streams
+                .insert(is_rep, InputStreamKind::Buffer { data: buf, pos: 0 });
 
             let res = Resource::<InputStreamRes>::new_own(is_rep);
             let any = wasmtime::component::ResourceAny::try_from_resource(res, &mut store)?;
@@ -387,9 +385,8 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
                     let at_end = end >= buf.len();
 
                     // result<tuple<list<u8>, bool>, error-code>
-                    let list_val = Val::List(
-                        data.into_iter().map(Val::U8).collect::<Vec<_>>().into(),
-                    );
+                    let list_val =
+                        Val::List(data.into_iter().map(Val::U8).collect::<Vec<_>>().into());
                     results[0] = Val::Result(Ok(Some(Box::new(Val::Tuple(
                         vec![list_val, Val::Bool(at_end)].into(),
                     )))));
@@ -415,18 +412,14 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
             let offset = val_u64(&params[2]) as usize;
 
             match store.data_mut().fs_descriptors.get_mut(&rep) {
-                Some(FsDescriptor::File {
-                    buf, dirty, ..
-                }) => {
+                Some(FsDescriptor::File { buf, dirty, .. }) => {
                     *dirty = true;
                     let end = offset + data.len();
                     if end > buf.len() {
                         buf.resize(end, 0);
                     }
                     buf[offset..end].copy_from_slice(&data);
-                    results[0] = Val::Result(Ok(Some(Box::new(
-                        Val::U64(data.len() as u64),
-                    ))));
+                    results[0] = Val::Result(Ok(Some(Box::new(Val::U64(data.len() as u64)))));
                 }
                 _ => {
                     results[0] = fs_error("bad-descriptor");
@@ -505,15 +498,12 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
                         ]
                         .into(),
                     );
-                    results[0] = Val::Result(Ok(Some(Box::new(
-                        Val::Option(Some(Box::new(record))),
-                    ))));
+                    results[0] =
+                        Val::Result(Ok(Some(Box::new(Val::Option(Some(Box::new(record)))))));
                 }
                 None => {
                     // End of stream.
-                    results[0] = Val::Result(Ok(Some(Box::new(
-                        Val::Option(None),
-                    ))));
+                    results[0] = Val::Result(Ok(Some(Box::new(Val::Option(None)))));
                 }
             }
             Ok(())
@@ -532,10 +522,15 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          results: &mut [Val]| {
             let rep = resource_rep::<DescriptorRes>(&params[0], store.as_context_mut())?;
             // Extract data to sync (immutable borrow).
-            let sync_data = if let Some(FsDescriptor::File { key, buf, dirty, .. }) =
-                store.data().fs_descriptors.get(&rep)
+            let sync_data = if let Some(FsDescriptor::File {
+                key, buf, dirty, ..
+            }) = store.data().fs_descriptors.get(&rep)
             {
-                if *dirty { Some((format!("{}{}", FS_DOMAIN, key), buf.clone())) } else { None }
+                if *dirty {
+                    Some((format!("{}{}", FS_DOMAIN, key), buf.clone()))
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -575,10 +570,15 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          results: &mut [Val]| {
             let rep = resource_rep::<DescriptorRes>(&params[0], store.as_context_mut())?;
             // Extract data to sync (immutable borrow).
-            let sync_data = if let Some(FsDescriptor::File { key, buf, dirty, .. }) =
-                store.data().fs_descriptors.get(&rep)
+            let sync_data = if let Some(FsDescriptor::File {
+                key, buf, dirty, ..
+            }) = store.data().fs_descriptors.get(&rep)
             {
-                if *dirty { Some((format!("{}{}", FS_DOMAIN, key), buf.clone())) } else { None }
+                if *dirty {
+                    Some((format!("{}{}", FS_DOMAIN, key), buf.clone()))
+                } else {
+                    None
+                }
             } else {
                 None
             };
@@ -618,9 +618,10 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _params: &[Val],
          results: &mut [Val]| {
             // Return read+write flags
-            results[0] = Val::Result(Ok(Some(Box::new(Val::Flags(
-                vec!["read".to_string(), "write".to_string()],
-            )))));
+            results[0] = Val::Result(Ok(Some(Box::new(Val::Flags(vec![
+                "read".to_string(),
+                "write".to_string(),
+            ])))));
             Ok(())
         },
     )?;
@@ -628,8 +629,7 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
     // ── [method]descriptor.subscribe ───────────────────────────────
     inst.func_wrap(
         "[method]descriptor.subscribe",
-        |mut store: StoreContextMut<'_, AppContext>,
-         (_self,): (Resource<DescriptorRes>,)| {
+        |mut store: StoreContextMut<'_, AppContext>, (_self,): (Resource<DescriptorRes>,)| {
             let rep = store.data_mut().alloc_rep();
             Ok((Resource::<PollableRes>::new_own(rep),))
         },
@@ -642,8 +642,10 @@ fn add_types(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
          _func_type: wasmtime::component::types::ComponentFunc,
          params: &[Val],
          results: &mut [Val]| {
-            let a = resource_rep::<DescriptorRes>(&params[0], store.as_context_mut()).unwrap_or(u32::MAX);
-            let b = resource_rep::<DescriptorRes>(&params[1], store.as_context_mut()).unwrap_or(u32::MAX - 1);
+            let a = resource_rep::<DescriptorRes>(&params[0], store.as_context_mut())
+                .unwrap_or(u32::MAX);
+            let b = resource_rep::<DescriptorRes>(&params[1], store.as_context_mut())
+                .unwrap_or(u32::MAX - 1);
             results[0] = Val::Bool(a == b);
             Ok(())
         },
@@ -711,12 +713,10 @@ fn add_preopens(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> 
          _params: &[Val],
          results: &mut [Val]| {
             let rep = store.data_mut().alloc_rep();
-            store.data_mut().fs_descriptors.insert(
-                rep,
-                FsDescriptor::Directory {
-                    prefix: "/".into(),
-                },
-            );
+            store
+                .data_mut()
+                .fs_descriptors
+                .insert(rep, FsDescriptor::Directory { prefix: "/".into() });
 
             let res = Resource::<DescriptorRes>::new_own(rep);
             let any = wasmtime::component::ResourceAny::try_from_resource(res, &mut store)?;
@@ -724,11 +724,7 @@ fn add_preopens(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> 
             // list<tuple<descriptor, string>>
             results[0] = Val::List(
                 vec![Val::Tuple(
-                    vec![
-                        Val::Resource(any),
-                        Val::String("/".into()),
-                    ]
-                    .into(),
+                    vec![Val::Resource(any), Val::String("/".into())].into(),
                 )]
                 .into(),
             );
@@ -755,7 +751,10 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
 // =========================================================================
 
 /// Extract resource rep from a Val.
-fn resource_rep<T: 'static>(val: &Val, store: impl wasmtime::AsContextMut) -> Result<u32, wasmtime::Error> {
+fn resource_rep<T: 'static>(
+    val: &Val,
+    store: impl wasmtime::AsContextMut,
+) -> Result<u32, wasmtime::Error> {
     match val {
         Val::Resource(any) => {
             let res = wasmtime::component::Resource::<T>::try_from_resource_any(*any, store)?;
@@ -807,18 +806,9 @@ fn make_descriptor_stat(dtype: &str, size: u64) -> Val {
             ("type".into(), Val::Enum(dtype.to_string())),
             ("link-count".into(), Val::U64(1)),
             ("size".into(), Val::U64(size)),
-            (
-                "data-access-timestamp".into(),
-                Val::Option(None),
-            ),
-            (
-                "data-modification-timestamp".into(),
-                Val::Option(None),
-            ),
-            (
-                "status-change-timestamp".into(),
-                Val::Option(None),
-            ),
+            ("data-access-timestamp".into(), Val::Option(None)),
+            ("data-modification-timestamp".into(), Val::Option(None)),
+            ("status-change-timestamp".into(), Val::Option(None)),
         ]
         .into(),
     )

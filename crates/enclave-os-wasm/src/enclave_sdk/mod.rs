@@ -28,8 +28,8 @@
 //! enclave_sdk::add_to_linker(&mut linker)?;
 //! ```
 
-pub mod auth;
 pub mod attestation;
+pub mod auth;
 pub mod crypto;
 pub mod https;
 pub mod keystore;
