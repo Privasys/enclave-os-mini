@@ -140,3 +140,44 @@ fn oidc_step_up_operation_bound() {
     let noop = ctx_step_up("dev", &["webauthn"], None, Some(nonce), exp);
     assert!(evaluate_op(&policy, Operation::PromoteProfile, handle, &[], &noop, Some(&binding)).is_err());
 }
+
+#[test]
+fn oidc_step_up_export_operation_bound() {
+    use enclave_os_vault::policy::{evaluate_op, vault_op_binding, OpBinding};
+    use enclave_os_vault::types::Condition;
+
+    // An exportable user key whose ExportKey rule requires an operation-bound
+    // WebAuthn step-up. Export has no target measurement, so the binding's
+    // measurement slot is empty — exactly what handle_export supplies.
+    let mut policy = owner_policy("dev", vec![Operation::ExportKey]);
+    policy.operations[0].requires = vec![Condition::OidcStepUp {
+        required_amr: vec!["webauthn".into()],
+        operation_bound: true,
+        fresh_for_seconds: 0,
+    }];
+
+    let handle = "users/dev/my-secret";
+    let version = 1u32;
+    let nonce = "n0nce";
+    let exp = 0u64;
+    let binding = OpBinding {
+        measurement_digest_hex: String::new(),
+        policy_version: version,
+    };
+
+    // Correct export-bound token (empty measurement) -> allowed.
+    let good = vault_op_binding(handle, "", version, nonce, exp);
+    let ok = ctx_step_up("dev", &["webauthn"], Some(&good), Some(nonce), exp);
+    assert!(evaluate_op(&policy, Operation::ExportKey, handle, &[], &ok, Some(&binding)).is_ok());
+
+    // A token bound to a non-empty measurement (e.g. a captured promote
+    // approval for the same handle) -> denied. Export and promote can never
+    // share a binding.
+    let promote = vault_op_binding(handle, "abc123", version, nonce, exp);
+    let bad = ctx_step_up("dev", &["webauthn"], Some(&promote), Some(nonce), exp);
+    assert!(evaluate_op(&policy, Operation::ExportKey, handle, &[], &bad, Some(&binding)).is_err());
+
+    // operation_bound but no vault_op on the token -> fail closed.
+    let noop = ctx_step_up("dev", &["webauthn"], None, Some(nonce), exp);
+    assert!(evaluate_op(&policy, Operation::ExportKey, handle, &[], &noop, Some(&binding)).is_err());
+}
