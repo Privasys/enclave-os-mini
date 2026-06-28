@@ -59,7 +59,11 @@ pub fn profile_binding_digest(profile: &AttestationProfile) -> String {
     for m in &profile.measurements {
         match m {
             Measurement::Mrenclave(v) => parts.push(format!("mrenclave:{}", v.to_lowercase())),
-            Measurement::Mrtd(v) => parts.push(format!("mrtd:{}", v.to_lowercase())),
+            Measurement::Tdx { mrtd, rtmr1, rtmr2 } => {
+                parts.push(format!("mrtd:{}", mrtd.to_lowercase()));
+                parts.push(format!("rtmr1:{}", rtmr1.to_lowercase()));
+                parts.push(format!("rtmr2:{}", rtmr2.to_lowercase()));
+            }
         }
     }
     for o in &profile.required_oids {
@@ -244,9 +248,24 @@ pub(crate) fn tee_matches(
 
 fn measurement_matches(identity: &crate::quote::QuoteIdentity, allowed: &[Measurement]) -> bool {
     let m = identity.measurement.to_lowercase();
+    // OR across the allowed list (supports old+new build during a promote
+    // window); AND within a TDX entry — MRTD *and* both image-derived RTMRs must
+    // match, since MRTD alone (the TD firmware) does not identify the guest build.
     allowed.iter().any(|am| match (am, identity.tee) {
-        (Measurement::Mrenclave(s), TeeType::Sgx) => s == &m,
-        (Measurement::Mrtd(s), TeeType::Tdx) => s == &m,
+        (Measurement::Mrenclave(s), TeeType::Sgx) => s.to_lowercase() == m,
+        (Measurement::Tdx { mrtd, rtmr1, rtmr2 }, TeeType::Tdx) => {
+            let r1 = match identity.rtmr1.as_deref() {
+                Some(v) => v.to_lowercase(),
+                None => return false,
+            };
+            let r2 = match identity.rtmr2.as_deref() {
+                Some(v) => v.to_lowercase(),
+                None => return false,
+            };
+            mrtd.to_lowercase() == m
+                && rtmr1.to_lowercase() == r1
+                && rtmr2.to_lowercase() == r2
+        }
         _ => false,
     })
 }
@@ -669,5 +688,90 @@ mod oidc_match_tests {
         let p = oidc("", &[]);
         assert!(!oidc_matches(&p, &claims("user-1", &[])));
         assert!(!oidc_matches(&p, &claims("user-1", &["anything"])));
+    }
+}
+
+#[cfg(test)]
+mod measurement_match_tests {
+    use super::*;
+    use crate::quote::QuoteIdentity;
+
+    fn tdx(mrtd: &str, rtmr1: &str, rtmr2: &str) -> QuoteIdentity {
+        QuoteIdentity {
+            tee: TeeType::Tdx,
+            measurement: mrtd.into(),
+            mrsigner: None,
+            rtmr1: Some(rtmr1.into()),
+            rtmr2: Some(rtmr2.into()),
+        }
+    }
+
+    fn tdx_policy(mrtd: &str, rtmr1: &str, rtmr2: &str) -> Vec<Measurement> {
+        vec![Measurement::Tdx {
+            mrtd: mrtd.into(),
+            rtmr1: rtmr1.into(),
+            rtmr2: rtmr2.into(),
+        }]
+    }
+
+    #[test]
+    fn tdx_requires_mrtd_and_both_rtmrs() {
+        let pol = tdx_policy("aa", "bb", "cc");
+        assert!(measurement_matches(&tdx("aa", "bb", "cc"), &pol));
+        // Same firmware MRTD but a different enclave-os-virtual build (RTMR1/2
+        // differ) MUST be rejected — that is the whole point of this change.
+        assert!(!measurement_matches(&tdx("aa", "xx", "yy"), &pol));
+        assert!(!measurement_matches(&tdx("aa", "bb", "zz"), &pol)); // wrong rtmr2
+        assert!(!measurement_matches(&tdx("aa", "zz", "cc"), &pol)); // wrong rtmr1
+        assert!(!measurement_matches(&tdx("zz", "bb", "cc"), &pol)); // wrong mrtd
+    }
+
+    #[test]
+    fn tdx_match_is_case_insensitive() {
+        assert!(measurement_matches(&tdx("aa", "bb", "cc"), &tdx_policy("AA", "BB", "CC")));
+    }
+
+    #[test]
+    fn tdx_quote_missing_rtmrs_is_rejected() {
+        let pol = tdx_policy("aa", "bb", "cc");
+        let mut id = tdx("aa", "bb", "cc");
+        id.rtmr1 = None;
+        assert!(!measurement_matches(&id, &pol));
+    }
+
+    #[test]
+    fn or_across_allowed_builds_but_not_mixed() {
+        // Promote window: old + new build both authorised.
+        let pol = vec![
+            Measurement::Tdx { mrtd: "aa".into(), rtmr1: "b1".into(), rtmr2: "c1".into() },
+            Measurement::Tdx { mrtd: "aa".into(), rtmr1: "b2".into(), rtmr2: "c2".into() },
+        ];
+        assert!(measurement_matches(&tdx("aa", "b1", "c1"), &pol));
+        assert!(measurement_matches(&tdx("aa", "b2", "c2"), &pol));
+        // A frankenstein mix of the two builds' registers must not match.
+        assert!(!measurement_matches(&tdx("aa", "b1", "c2"), &pol));
+    }
+
+    #[test]
+    fn sgx_path_unaffected() {
+        let pol = vec![Measurement::Mrenclave("dd".into())];
+        let sgx = QuoteIdentity {
+            tee: TeeType::Sgx,
+            measurement: "dd".into(),
+            mrsigner: None,
+            rtmr1: None,
+            rtmr2: None,
+        };
+        assert!(measurement_matches(&sgx, &pol));
+        assert!(!measurement_matches(
+            &QuoteIdentity {
+                tee: TeeType::Sgx,
+                measurement: "ee".into(),
+                mrsigner: None,
+                rtmr1: None,
+                rtmr2: None
+            },
+            &pol
+        ));
     }
 }

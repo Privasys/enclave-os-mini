@@ -49,9 +49,17 @@ pub const SGX_MRSIGNER_SIZE: usize = 32;
 /// offset = 48 + 320 = 368.
 pub const SGX_REPORT_DATA_OFFSET: usize = 368;
 
-// TDX v4 report body offsets (relative to quote start).
+// TDX v4 report body offsets (relative to quote start). The 48-byte registers
+// follow MRTD@184: MRCONFIGID, MROWNER, MROWNERCONFIG, then RTMR0..3. On our GCP
+// TDX platform MRTD is the TD firmware (per-platform) and RTMR1/RTMR2 are
+// 100% image-derived (RTMR1 = EFI/UKI boot path, RTMR2 = dm-verity root hash) —
+// these are what identify the enclave-os-virtual build. See
+// .operations/platform/cvm-images.md. All within TDX_QUOTE_MIN_SIZE (584).
 pub const TDX_MRTD_OFFSET: usize = 184;
 pub const TDX_MRTD_SIZE: usize = 48;
+pub const TDX_RTMR_SIZE: usize = 48;
+pub const TDX_RTMR1_OFFSET: usize = 424;
+pub const TDX_RTMR2_OFFSET: usize = 472;
 
 /// Offset of the 64-byte `ReportData` field within a TDX v4 quote.
 ///
@@ -91,6 +99,12 @@ pub struct QuoteIdentity {
     pub measurement: String,
     /// Hex-encoded MRSIGNER (SGX only, 64 hex chars).
     pub mrsigner: Option<String>,
+    /// Hex-encoded RTMR1 / RTMR2 (TDX only, 96 hex chars each). These carry the
+    /// image-derived measurement of the enclave-os-virtual build (boot path +
+    /// dm-verity root) and are what a key policy pins to identify the platform
+    /// build. `None` for SGX.
+    pub rtmr1: Option<String>,
+    pub rtmr2: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -131,6 +145,8 @@ fn parse_sgx_quote(evidence: &[u8]) -> Result<QuoteIdentity, String> {
         tee: TeeType::Sgx,
         measurement: hex_encode(mrenclave),
         mrsigner: Some(hex_encode(mrsigner)),
+        rtmr1: None,
+        rtmr2: None,
     })
 }
 
@@ -144,11 +160,15 @@ fn parse_tdx_quote(evidence: &[u8]) -> Result<QuoteIdentity, String> {
     }
 
     let mrtd = &evidence[TDX_MRTD_OFFSET..TDX_MRTD_OFFSET + TDX_MRTD_SIZE];
+    let rtmr1 = &evidence[TDX_RTMR1_OFFSET..TDX_RTMR1_OFFSET + TDX_RTMR_SIZE];
+    let rtmr2 = &evidence[TDX_RTMR2_OFFSET..TDX_RTMR2_OFFSET + TDX_RTMR_SIZE];
 
     Ok(QuoteIdentity {
         tee: TeeType::Tdx,
         measurement: hex_encode(mrtd),
         mrsigner: None,
+        rtmr1: Some(hex_encode(rtmr1)),
+        rtmr2: Some(hex_encode(rtmr2)),
     })
 }
 

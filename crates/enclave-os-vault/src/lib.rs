@@ -307,8 +307,11 @@ fn normalise_policy(mut policy: KeyPolicy) -> KeyPolicy {
 fn normalise_profile(profile: &mut AttestationProfile) {
     for m in &mut profile.measurements {
         match m {
-            crate::types::Measurement::Mrenclave(s) | crate::types::Measurement::Mrtd(s) => {
-                *s = s.to_lowercase();
+            crate::types::Measurement::Mrenclave(s) => *s = s.to_lowercase(),
+            crate::types::Measurement::Tdx { mrtd, rtmr1, rtmr2 } => {
+                *mrtd = mrtd.to_lowercase();
+                *rtmr1 = rtmr1.to_lowercase();
+                *rtmr2 = rtmr2.to_lowercase();
             }
         }
     }

@@ -420,8 +420,16 @@ pub struct AttestationProfile {
 pub enum Measurement {
     /// SGX MRENCLAVE, hex-encoded (lowercase, 64 chars).
     Mrenclave(String),
-    /// TDX MRTD, hex-encoded (lowercase, 96 chars).
-    Mrtd(String),
+    /// TDX identity. `mrtd` is the TD firmware (per-platform); `rtmr1`/`rtmr2`
+    /// are the image-derived registers (EFI/UKI boot path + dm-verity root) that
+    /// identify the enclave-os-virtual build. All three are pinned and must
+    /// match (MRTD alone is insufficient — it does not capture the guest image).
+    /// All hex-encoded lowercase, 96 chars each.
+    Tdx {
+        mrtd: String,
+        rtmr1: String,
+        rtmr2: String,
+    },
 }
 
 /// An attestation server endpoint, optionally pinned by SPKI hash.
