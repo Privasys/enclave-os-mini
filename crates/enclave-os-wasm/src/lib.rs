@@ -466,6 +466,32 @@ impl WasmModule {
             WasmResult::Ok { returns }
         };
 
+        // Auto-lift the configure-then-freeze gate: a successful return from the
+        // app's declared config_api function lifts the gate, mirroring the
+        // container manager (which lifts on the first 2xx). Apps no longer need
+        // to call `set-config-complete`. A WIT-level Err return does NOT lift
+        // (the configure failed), matching "a non-2xx response does not lift".
+        if let WasmResult::Ok { .. } = result {
+            let wit_err = matches!(
+                results.first(),
+                Some(wasmtime::component::Val::Result(Err(_)))
+            );
+            if !wit_err {
+                let is_config_fn = self
+                    .registry
+                    .lock()
+                    .ok()
+                    .and_then(|r| {
+                        r.config_api_function(&call.app)
+                            .map(|f| f == call.function.as_str())
+                    })
+                    .unwrap_or(false);
+                if is_config_fn {
+                    let _ = self.mark_configured(&call.app);
+                }
+            }
+        }
+
         // Record fuel metrics.
         if let Ok(mut m) = self.metrics.lock() {
             match &result {

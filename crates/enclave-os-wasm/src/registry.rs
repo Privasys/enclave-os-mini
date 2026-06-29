@@ -867,6 +867,13 @@ impl AppRegistry {
         }
     }
 
+    /// The app's declared configure function name, if any. Used to
+    /// auto-lift the freeze gate when that function returns successfully
+    /// (so apps no longer need to call `set-config-complete`).
+    pub fn config_api_function(&self, name: &str) -> Option<&str> {
+        self.config_api.get(name).map(|s| s.as_str())
+    }
+
     /// Apply (or lift) the host-driven billing freeze for `name`.
     ///
     /// `Some(reason)` freezes the app (recording the reason);
