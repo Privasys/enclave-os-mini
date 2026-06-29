@@ -73,7 +73,11 @@ pub struct EncAuthPayload {
     pub v: u64,
     pub sub: String,
     pub sid: String,
-    pub app_id: Vec<u8>,
+    /// CBOR key 4, named `app_id` in the wire format (crypto-contract
+    /// §8.1). NOT the static OID 3.6 app-id; it is the SHA-256 of the
+    /// workload OIDs (3.1/3.2/3.3/3.4), so it moves with the OID 3.2 code
+    /// hash. Integer key 4 is unchanged by this rename.
+    pub workload_digest: Vec<u8>,
     pub enc_meas: Vec<u8>,
     pub enc_pub: Vec<u8>,
     pub quote_hash: Vec<u8>,
@@ -225,7 +229,7 @@ fn decode_encauth_payload(buf: &[u8]) -> Option<EncAuthPayload> {
         v: 0,
         sub: String::new(),
         sid: String::new(),
-        app_id: Vec::new(),
+        workload_digest: Vec::new(),
         enc_meas: Vec::new(),
         enc_pub: Vec::new(),
         quote_hash: Vec::new(),
@@ -243,7 +247,7 @@ fn decode_encauth_payload(buf: &[u8]) -> Option<EncAuthPayload> {
             1 => out.v = take_uint(buf, &mut p)?,
             2 => out.sub = take_tstr(buf, &mut p)?,
             3 => out.sid = take_tstr(buf, &mut p)?,
-            4 => out.app_id = take_bstr(buf, &mut p)?,
+            4 => out.workload_digest = take_bstr(buf, &mut p)?,
             5 => out.enc_meas = take_bstr(buf, &mut p)?,
             6 => out.enc_pub = take_bstr(buf, &mut p)?,
             7 => out.quote_hash = take_bstr(buf, &mut p)?,
@@ -264,7 +268,7 @@ fn decode_encauth_payload(buf: &[u8]) -> Option<EncAuthPayload> {
     if out.hw_pub.len() != 65 || out.hw_pub[0] != 0x04 {
         return None;
     }
-    if out.app_id.len() != 32 || out.enc_meas.len() != 32 || out.quote_hash.len() != 32 {
+    if out.workload_digest.len() != 32 || out.enc_meas.len() != 32 || out.quote_hash.len() != 32 {
         return None;
     }
     Some(out)
@@ -438,7 +442,7 @@ mod tests {
         buf.push(0x01); buf.push(0x01); // 1: v = 1
         buf.push(0x02); buf.extend_from_slice(&[0x63, b's', b'u', b'b']); // 2: "sub"
         buf.push(0x03); buf.extend_from_slice(&[0x63, b's', b'i', b'd']); // 3: "sid"
-        buf.push(0x04); bstr32(&mut buf, 0xA1); // 4: app_id
+        buf.push(0x04); bstr32(&mut buf, 0xA1); // 4: workload_digest
         buf.push(0x05); bstr32(&mut buf, 0xA2); // 5: enc_meas
         buf.push(0x06); bstr65(&mut buf, 0xA3); // 6: enc_pub
         buf.push(0x07); bstr32(&mut buf, 0xA4); // 7: quote_hash
@@ -450,7 +454,7 @@ mod tests {
         assert_eq!(p.v, 1);
         assert_eq!(p.sub, "sub");
         assert_eq!(p.sid, "sid");
-        assert_eq!(p.app_id, [0xA1; 32]);
+        assert_eq!(p.workload_digest, [0xA1; 32]);
         assert_eq!(p.not_before, 0x65000000);
         assert_eq!(p.not_after, 0x66000000);
         assert_eq!(p.enc_pub[0], 0x04);
@@ -512,7 +516,7 @@ mod tests {
         assert_eq!(p.v, 1);
         assert_eq!(p.sub, "kat-user");
         assert_eq!(p.sid, "kat-sid");
-        assert_eq!(p.app_id, [0xA1; 32]);
+        assert_eq!(p.workload_digest, [0xA1; 32]);
         assert_eq!(p.enc_meas, [0xE1; 32]);
         assert_eq!(p.quote_hash, [0xB2; 32]);
         assert_eq!(p.enc_pub, kat_hex(KAT_ENC_PUB_HEX));
