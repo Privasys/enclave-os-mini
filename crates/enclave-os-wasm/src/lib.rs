@@ -1614,9 +1614,16 @@ impl EnclaveModule for WasmModule {
             };
             let mgmt_result = match registry.get_known(&resolved_app) {
                 Some(meta) => match &meta.schema {
-                    Some(s) if s.mcp_enabled => WasmManagementResult::McpTools {
-                        manifest: s.to_mcp_manifest(),
-                    },
+                    Some(s) if s.mcp_enabled => {
+                        let mut manifest = s.to_mcp_manifest();
+                        // The configure function (config_api) is owner-only setup,
+                        // not a model-callable tool — exclude it from the MCP tool
+                        // list offered to assistants.
+                        if let Some(cfg_fn) = registry.config_api_function(&resolved_app) {
+                            manifest.tools.retain(|t| t.name != cfg_fn);
+                        }
+                        WasmManagementResult::McpTools { manifest }
+                    }
                     Some(_) => WasmManagementResult::Error {
                         message: format!("MCP is disabled for app '{}'", resolved_app,),
                     },
