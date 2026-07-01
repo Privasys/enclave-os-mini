@@ -44,3 +44,8 @@ x509-parser = "0.16"
 # ECDSA-P256 (Sign + ApprovalToken issue/verify). Same version as the
 # rest of the workspace; pulled transitively via enclave-os-common too.
 ring = "0.17"
+
+# Pure-Rust P-256 for PRE-HASH ECDSA signing (CKM_ECDSA / TLS): ring's ECDSA
+# only signs messages (hashes internally), so raw digest signing needs this.
+# Deterministic (RFC 6979), so no entropy is drawn in-enclave.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "pkcs8"] }

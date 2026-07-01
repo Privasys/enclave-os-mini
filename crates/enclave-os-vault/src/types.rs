@@ -124,11 +124,16 @@ pub enum VaultRequest {
         approvals: Vec<ApprovalToken>,
     },
 
-    /// ECDSA-P256-SHA256 sign with a `KeyType::P256SigningKey`.
-    /// Returns IEEE-P1363 fixed-length 64-byte signature.
+    /// ECDSA-P256 sign with a `KeyType::P256SigningKey`. Returns an IEEE-P1363
+    /// fixed-length 64-byte signature. By default the vault hashes the message
+    /// (ECDSA-P256-SHA256); when `prehashed` is set, `message_b64` is a 32-byte
+    /// SHA-256 digest that is signed directly (raw ECDSA, no re-hash) — what
+    /// PKCS#11 `CKM_ECDSA` and TLS stacks send.
     Sign {
         handle: String,
         message_b64: String,
+        #[serde(default)]
+        prehashed: bool,
         #[serde(default)]
         approvals: Vec<ApprovalToken>,
     },

@@ -130,8 +130,9 @@ impl EnclaveModule for VaultModule {
             VaultRequest::Sign {
                 handle,
                 message_b64,
+                prehashed,
                 approvals,
-            } => handle_sign(&handle, &message_b64, &approvals, ctx),
+            } => handle_sign(&handle, &message_b64, prehashed, &approvals, ctx),
             VaultRequest::Mac {
                 handle,
                 message_b64,
@@ -823,6 +824,7 @@ fn handle_unwrap(
 fn handle_sign(
     handle: &str,
     message_b64: &str,
+    prehashed: bool,
     approvals: &[ApprovalToken],
     ctx: &RequestContext,
 ) -> VaultResponse {
@@ -840,7 +842,14 @@ fn handle_sign(
         Ok(b) => b,
         Err(e) => return VaultResponse::Error(format!("message base64: {e}")),
     };
-    match crypto::p256_sign(&record.material, &message) {
+    // prehashed: `message` is a 32-byte SHA-256 digest, signed raw (CKM_ECDSA);
+    // otherwise the vault hashes the message (ECDSA-P256-SHA256).
+    let result = if prehashed {
+        crypto::p256_sign_prehash(&record.material, &message)
+    } else {
+        crypto::p256_sign(&record.material, &message)
+    };
+    match result {
         Ok(signature) => VaultResponse::Signature {
             signature,
             alg: "ES256",

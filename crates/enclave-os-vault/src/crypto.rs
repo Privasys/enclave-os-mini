@@ -147,6 +147,31 @@ pub(crate) fn p256_sign(pkcs8: &[u8], message: &[u8]) -> Result<Vec<u8>, String>
     Ok(sig.as_ref().to_vec())
 }
 
+/// Sign a caller-supplied 32-byte SHA-256 digest directly (raw ECDSA-P256, no
+/// re-hash) — what PKCS#11 `CKM_ECDSA` and TLS stacks need. `ring`'s ECDSA only
+/// signs messages (hashes internally), so this uses the RustCrypto `p256`/`ecdsa`
+/// stack, which supports pre-hash signing. Deterministic (RFC 6979) nonces, so no
+/// entropy is drawn. Returns the IEEE-P1363 fixed 64-byte r||s signature — the same
+/// shape as [`p256_sign`].
+pub(crate) fn p256_sign_prehash(pkcs8: &[u8], digest: &[u8]) -> Result<Vec<u8>, String> {
+    use p256::ecdsa::signature::hazmat::PrehashSigner;
+    use p256::ecdsa::{Signature, SigningKey};
+    use p256::pkcs8::DecodePrivateKey;
+
+    if digest.len() != 32 {
+        return Err(format!(
+            "prehash sign requires a 32-byte SHA-256 digest, got {}",
+            digest.len()
+        ));
+    }
+    let sk = SigningKey::from_pkcs8_der(pkcs8)
+        .map_err(|_| "parse signing key (pkcs8) failed".to_string())?;
+    let sig: Signature = sk
+        .sign_prehash(digest)
+        .map_err(|_| "ECDSA prehash sign failed".to_string())?;
+    Ok(sig.to_bytes().to_vec())
+}
+
 // ---------------------------------------------------------------------------
 //  Mac (HMAC-SHA-256)
 // ---------------------------------------------------------------------------
