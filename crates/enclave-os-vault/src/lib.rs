@@ -72,10 +72,14 @@ impl EnclaveModule for VaultModule {
             Request::Data(d) => d,
             _ => return None,
         };
+        eprintln!("VDBG raw={}", String::from_utf8_lossy(data));
 
         let vault_req: VaultRequest = match serde_json::from_slice(data) {
             Ok(r) => r,
-            Err(_) => return None,
+            Err(e) => {
+                eprintln!("VDBG deser err={}", e);
+                return None;
+            }
         };
 
         let resp = match vault_req {
@@ -828,6 +832,7 @@ fn handle_sign(
     approvals: &[ApprovalToken],
     ctx: &RequestContext,
 ) -> VaultResponse {
+    eprintln!("VDBG handle_sign prehashed={}", prehashed);
     let record = match require_op(
         handle,
         Operation::Sign,
