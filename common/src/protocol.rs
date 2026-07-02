@@ -248,6 +248,12 @@ pub struct HttpRequest {
     pub privasys_session: Option<String>,
     /// Value of the `Content-Type` header (lowercased), if present.
     pub content_type: Option<String>,
+    /// Value of the `Host` header (lowercased, port stripped), if present.
+    /// The platform gateway routes to a workload by its hostname
+    /// (`<app>.apps-*.privasys.org`), so on a multi-app enclave this is
+    /// how a request that doesn't name the app explicitly (e.g. the
+    /// MCP-over-HTTP shim's bare `GET /api/v1/mcp/tools`) is disambiguated.
+    pub host: Option<String>,
     /// Request body (empty for GET).
     pub body: Vec<u8>,
     /// Whether the client sent `Connection: close`.
@@ -307,6 +313,7 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
     let mut app_auth: Option<String> = None;
     let mut privasys_session: Option<String> = None;
     let mut content_type: Option<String> = None;
+    let mut host: Option<String> = None;
     let mut connection_close = false;
     let mut edge_terminated = false;
 
@@ -328,6 +335,16 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
         } else if h.name.eq_ignore_ascii_case("content-type") {
             if let Ok(val) = core::str::from_utf8(h.value) {
                 content_type = Some(val.trim().to_ascii_lowercase());
+            }
+        } else if h.name.eq_ignore_ascii_case("host") {
+            if let Ok(val) = core::str::from_utf8(h.value) {
+                // Lowercase + strip any :port so callers can match on the
+                // bare hostname.
+                let v = val.trim().to_ascii_lowercase();
+                let v = v.split(':').next().unwrap_or("").to_string();
+                if !v.is_empty() {
+                    host = Some(v);
+                }
             }
         } else if h.name.eq_ignore_ascii_case("x-app-auth") {
             if let Ok(val) = core::str::from_utf8(h.value) {
@@ -371,6 +388,7 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
             app_auth,
             privasys_session,
             content_type,
+            host,
             body,
             connection_close,
             edge_terminated,
@@ -509,7 +527,19 @@ mod tests {
         assert_eq!(req.path, "/healthz");
         assert!(req.body.is_empty());
         assert!(req.authorization.is_none());
+        assert_eq!(req.host.as_deref(), Some("localhost"));
         assert_eq!(consumed, raw.len());
+    }
+
+    #[test]
+    fn test_parse_host_header_lowercased_port_stripped() {
+        let raw = b"GET /api/v1/mcp/tools HTTP/1.1\r\nHost: Web-Search-Brave.apps-test.privasys.org:443\r\n\r\n";
+        let (req, _) = parse_http_request(raw).unwrap();
+        // Lowercased and :port stripped so the shim can take the first label.
+        assert_eq!(
+            req.host.as_deref(),
+            Some("web-search-brave.apps-test.privasys.org")
+        );
     }
 
     #[test]

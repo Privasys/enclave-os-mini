@@ -1478,6 +1478,26 @@ fn handle_rpc_request(
 /// The single loaded app is resolved inside the WASM module so callers don't
 /// need to know the app name. The MCP-spec `inputSchema` field is rewritten
 /// to snake-case `input_schema` to match the public MCP HTTP contract.
+/// Derive the target app name from the request's Host header: the platform
+/// gateway routes `<app>.apps-<env>.privasys.org` to this enclave, so the
+/// first DNS label is the app. Returns "" when there is no usable Host
+/// (e.g. a bare-IP or localhost probe), which makes `resolve_app` fall back
+/// to the single-loaded-app behaviour — so single-app enclaves keep working
+/// with no Host, while multi-app enclaves disambiguate correctly.
+fn app_from_host(http_req: &enclave_os_common::protocol::HttpRequest) -> String {
+    match &http_req.host {
+        Some(h) => {
+            let label = h.split('.').next().unwrap_or("");
+            if label.is_empty() || label == "localhost" {
+                String::new()
+            } else {
+                label.to_string()
+            }
+        }
+        None => String::new(),
+    }
+}
+
 fn handle_mcp_tools_request(
     method: &enclave_os_common::protocol::HttpMethod,
     path: &str,
@@ -1515,7 +1535,7 @@ fn handle_mcp_tools_request(
         }
         let envelope = serde_json::json!({
             "mcp_tools": {
-                "app": "",
+                "app": app_from_host(http_req),
                 "app_auth": http_req.app_auth,
             }
         });
@@ -1567,7 +1587,7 @@ fn handle_mcp_tools_request(
 
     let envelope = serde_json::json!({
         "connect_call": {
-            "app": "",
+            "app": app_from_host(http_req),
             "function": fn_name,
             "body": params_body,
             "app_auth": app_auth,
