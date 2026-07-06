@@ -681,6 +681,11 @@ impl AppRegistry {
             app_id,
             vault_config,
             vault_handle: vault.as_ref().map(|vb| vb.handle.clone()),
+            // A brand-new load starts unconfigured; the marker is set + persisted
+            // by mark_configured on a successful configure. A same-MRENCLAVE
+            // replay restores the persisted value via register_known instead of
+            // reaching this literal.
+            config_complete: false,
         };
         self.known.insert(name.to_string(), meta.clone());
         // Wire the freeze gate: when a config_api function is declared, the app
