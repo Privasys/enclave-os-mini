@@ -391,6 +391,16 @@ pub struct AppMeta {
     /// which keeps the derived-`v1` behaviour).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vault_handle: Option<String>,
+    /// Whether the app has completed its initial configuration. Persisted so the
+    /// freeze gate is NOT re-armed on a restart whose KV survived (a
+    /// same-MRENCLAVE replay, or a vault-backed KV recovered after an
+    /// upgrade+promote): the app already holds its secrets in its KV, so
+    /// re-supplying them is unnecessary. When the KV is genuinely lost (a
+    /// non-vault-backed app whose MRENCLAVE changed), there is no persisted
+    /// AppMeta at all, so the app reloads fresh and re-arms — the correct
+    /// behaviour. Defaults false for apps sealed before this field existed.
+    #[serde(default)]
+    pub config_complete: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -673,11 +683,14 @@ impl AppRegistry {
             vault_handle: vault.as_ref().map(|vb| vb.handle.clone()),
         };
         self.known.insert(name.to_string(), meta.clone());
-        // Wire the freeze gate: when a config_api function is
-        // declared, the app is frozen until set-config-complete.
+        // Wire the freeze gate: when a config_api function is declared, the app
+        // is frozen until configured — UNLESS its KV already carries a persisted
+        // config_complete marker (a same-MRENCLAVE replay, or a vault-recovered
+        // KV after an upgrade+promote), in which case the app already holds its
+        // secrets and must not be re-frozen.
         if let Some(ref f) = config_api_function {
             self.config_api.insert(name.to_string(), f.clone());
-            self.configured.insert(name.to_string(), false);
+            self.configured.insert(name.to_string(), meta.config_complete);
         }
 
         self.loaded.insert(
@@ -707,12 +720,15 @@ impl AppRegistry {
     /// KV store.  The component stays uncompiled until the first
     /// `wasm_call` triggers [`ensure_loaded()`](Self::ensure_loaded).
     pub fn register_known(&mut self, meta: AppMeta) {
-        // Re-arm the freeze gate on every restart: an app that was
-        // configured before reboot must reconfigure (re-supply its
-        // secrets) before serving traffic again.
+        // Restore the freeze gate from the sealed KV. An app that persisted a
+        // config_complete marker keeps its configured state across the restart
+        // (its secrets survived in its own KV — vault-backed KVs even survive an
+        // enclave upgrade once the owner promotes the new measurement). Only an
+        // app that never completed configuration (or whose KV did not survive,
+        // in which case there is no AppMeta here at all) re-arms frozen.
         if let Some(ref f) = meta.config_api_function {
             self.config_api.insert(meta.name.clone(), f.clone());
-            self.configured.insert(meta.name.clone(), false);
+            self.configured.insert(meta.name.clone(), meta.config_complete);
         }
         self.known.insert(meta.name.clone(), meta);
     }
@@ -859,12 +875,21 @@ impl AppRegistry {
         }
     }
 
-    /// Flip the in-memory freeze flag for `name` to `true`. No-op when
-    /// the app has no declared `config_api` or is already configured.
-    pub fn mark_configured(&mut self, name: &str) {
-        if self.config_api.contains_key(name) {
-            self.configured.insert(name.to_string(), true);
+    /// Flip the freeze flag for `name` to configured. Also persists the marker
+    /// on the app's sealed `AppMeta` (returned so the caller writes it to KV) so
+    /// a restart whose KV survives does not re-freeze the app. No-op / returns
+    /// None when the app has no declared `config_api`.
+    pub fn mark_configured(&mut self, name: &str) -> Option<AppMeta> {
+        if !self.config_api.contains_key(name) {
+            return None;
         }
+        self.configured.insert(name.to_string(), true);
+        let meta = self.known.get_mut(name)?;
+        if meta.config_complete {
+            return None; // already persisted; nothing to write
+        }
+        meta.config_complete = true;
+        Some(meta.clone())
     }
 
     /// The app's declared configure function name, if any. Used to

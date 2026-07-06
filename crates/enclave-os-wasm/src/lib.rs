@@ -340,11 +340,19 @@ impl WasmModule {
     /// declared `config_api` or is already configured). Called by
     /// the `set-config-complete` host function.
     pub fn mark_configured(&self, name: &str) -> Result<(), String> {
-        let mut reg = self
-            .registry
-            .lock()
-            .map_err(|_| String::from("registry lock poisoned"))?;
-        reg.mark_configured(name);
+        let updated_meta = {
+            let mut reg = self
+                .registry
+                .lock()
+                .map_err(|_| String::from("registry lock poisoned"))?;
+            reg.mark_configured(name)
+        };
+        // Persist the config_complete marker to the sealed KV so a restart whose
+        // KV survives (same-MRENCLAVE replay, or a vault-recovered KV after an
+        // upgrade+promote) does not re-freeze the app. None => nothing changed.
+        if let Some(meta) = updated_meta {
+            self.persist_meta_to_kv(name, &meta);
+        }
         Ok(())
     }
 
