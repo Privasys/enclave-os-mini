@@ -1029,6 +1029,15 @@ impl AppRegistry {
             .unwrap_or_default()
     }
 
+    /// Platform-assigned app identity (apps.id, raw 16 bytes) from the
+    /// load payload, or `None` for pre-MR_APP loads. Hex-encoded it is
+    /// the OID 3.6 value and the app-id segment of the per-app config
+    /// role (`<audience>:app:<hex>:owner|admin`) the configure-authz
+    /// gate checks.
+    pub fn app_id(&self, name: &str) -> Option<[u8; 16]> {
+        self.known.get(name).and_then(|m| m.app_id)
+    }
+
     /// Whether an app is known (persisted) but not necessarily compiled.
     pub fn is_known(&self, name: &str) -> bool {
         self.known.contains_key(name)

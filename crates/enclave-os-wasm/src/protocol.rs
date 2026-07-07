@@ -800,11 +800,15 @@ pub enum FunctionPolicy {
     Authenticated,
     /// A valid OIDC token with at least one of the specified roles.
     Role,
-    /// Restricted to the app *owner* (the deployer). Enforced at the
-    /// platform OIDC layer using the same `manager` role required to
-    /// invoke `wasm_load`/`wasm_unload`. Used for the `@config-api`
-    /// configure entrypoint so that an unconfigured app cannot be
-    /// initialised by an unauthenticated public caller.
+    /// Restricted to the app's owners team: the caller's `app_auth`
+    /// bearer must yield a `sub` on the per-app owners list shipped in
+    /// `wasm_load.owners` (NOT the platform `manager` role — managers
+    /// can deploy any app, but an app's private functions belong to its
+    /// team). Note the `@config-api` function is gated independently of
+    /// this annotation (the configure-authz standard): it always
+    /// requires the per-app config role
+    /// `<audience>:app:<app-id-hex>:owner|admin` on a platform bearer,
+    /// with owners-team membership as the transitional fallback.
     Owner,
 }
 

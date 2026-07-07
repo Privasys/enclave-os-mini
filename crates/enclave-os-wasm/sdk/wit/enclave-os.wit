@@ -302,9 +302,14 @@ interface auth {
 /// export runs successfully and the app calls
 /// `set-config-complete`, every other export returns the runtime
 /// error `"app is awaiting initial configuration"`. The
-/// `@config-api` export is also implicitly *owner-only*: only the
-/// deployer (a caller bearing the platform `manager` role) can
-/// invoke it, regardless of any `@auth` annotation.
+/// `@config-api` export is also implicitly gated to the app's
+/// owners and admins (the configure-authz standard), regardless of
+/// any `@auth` annotation: the caller's platform bearer must carry
+/// the per-app config role `<audience>:app:<app-id>:owner|admin`
+/// (granted/revoked by the platform on team changes), with
+/// owners-team membership as the transitional fallback. The
+/// platform `manager` role is NOT sufficient — managers deploy
+/// apps, but configuring one is private to its team.
 ///
 /// Typical flow:
 ///   1. The deployer installs the app (`wasm_load`).

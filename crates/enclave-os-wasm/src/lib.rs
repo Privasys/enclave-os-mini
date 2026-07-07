@@ -545,6 +545,23 @@ impl WasmModule {
                 message: String::from("registry lock poisoned"),
             }))
         })?;
+        // Configure-authz standard: the @config-api function is
+        // owner/admin-gated on EVERY call — regardless of the app's
+        // (possibly absent) permissions block or auth annotation, and
+        // regardless of frozen state (reconfiguring a running app is
+        // equally privileged). The freeze gate decides WHICH function
+        // runs while frozen; this decides WHO may call it.
+        if registry.config_api_function(&call.app) == Some(call.function.as_str()) {
+            let owners = registry.app_owners(&call.app);
+            let app_id = registry.app_id(&call.app);
+            let permissions = registry.app_permissions(&call.app).cloned();
+            let role_store = build_app_role_store(&registry, &call.app);
+            drop(registry);
+            return self
+                .check_configure_authz(call, owners, app_id, permissions.as_ref(), role_store.as_ref())
+                .map(Some);
+        }
+
         let permissions = match registry.app_permissions(&call.app) {
             Some(p) => p.clone(),
             None => return Ok(None), // No permissions → public access.
@@ -693,6 +710,125 @@ impl WasmModule {
         }
 
         Ok(Some(auth)) // Permitted with auth context.
+    }
+
+    /// Authorize a call to the app's `@config-api` function — the
+    /// configure-authz standard.
+    ///
+    /// Primary: the caller's `app_auth` bearer verifies against the
+    /// PLATFORM issuer and carries the per-app config role
+    /// `<audience>:app:<app-id-hex>:owner|admin` (granted/revoked live by
+    /// the control plane on team changes — no redeploy). Transitional
+    /// fallback: a verified platform `sub` on the owners team. Legacy
+    /// fallback: the pre-standard Owner behaviour (FIDO2/app-OIDC
+    /// verification + owners membership) while clients migrate. Loads
+    /// carrying neither an app id nor an owners team are admitted with a
+    /// log — enforcement becomes possible when the platform redeploys
+    /// them with the new payload. Everything else fails closed.
+    fn check_configure_authz(
+        &self,
+        call: &WasmCall,
+        owners: Vec<String>,
+        app_id: Option<[u8; 16]>,
+        permissions: Option<&AppPermissions>,
+        role_store: Option<&enclave_os_kvstore::SealedKvStore>,
+    ) -> Result<AuthResult, Response> {
+        let deny = |message: String| Response::Data(serialize_or_error(&WasmResult::Error { message }));
+
+        if app_id.is_none() && owners.is_empty() {
+            enclave_os_common::enclave_log_info!(
+                "configure gate: app '{}' has neither app_id nor owners (legacy load) — admitting",
+                call.app
+            );
+            return Ok(AuthResult {
+                roles: Vec::new(),
+                user_id: None,
+            });
+        }
+
+        let token = match call.app_auth.as_deref() {
+            Some(t) => t,
+            None => {
+                return Err(deny(format!(
+                    "configure is owner/admin-only: function '{}' on app '{}' requires the caller's platform OIDC bearer in app_auth",
+                    call.function, call.app,
+                )))
+            }
+        };
+
+        // Primary: platform-issuer token + per-app config role.
+        if let Some(cfg) = enclave_os_common::oidc::global_oidc_config() {
+            let platform = crate::protocol::AppOidcConfig {
+                issuer: cfg.issuer.clone(),
+                jwks_uri: cfg.jwks_uri.clone(),
+                audience: cfg.audience.clone(),
+                roles_claim: cfg.role_claim.clone(),
+            };
+            if let Ok((roles, sub)) = verify_app_token(token, &platform) {
+                if let Some(id) = app_id {
+                    let hexid = enclave_os_common::hex::hex_encode(&id);
+                    let owner_role = format!("{}:app:{}:owner", cfg.audience, hexid);
+                    let admin_role = format!("{}:app:{}:admin", cfg.audience, hexid);
+                    if roles.iter().any(|r| r == &owner_role || r == &admin_role) {
+                        enclave_os_common::enclave_log_info!(
+                            "configure gate: app '{}' authorized by config role (sub={})",
+                            call.app,
+                            sub.as_deref().unwrap_or("?")
+                        );
+                        return Ok(AuthResult {
+                            roles,
+                            user_id: sub,
+                        });
+                    }
+                }
+                // Transitional: verified platform sub on the owners team
+                // (token predates the config-role backfill).
+                if let Some(s) = sub.as_deref() {
+                    if owners.iter().any(|o| o == s) {
+                        enclave_os_common::enclave_log_info!(
+                            "configure gate: app '{}' authorized by owners-list fallback (sub={} carries no config role yet — run the config-role backfill)",
+                            call.app,
+                            s
+                        );
+                        return Ok(AuthResult {
+                            roles,
+                            user_id: sub,
+                        });
+                    }
+                }
+                // A VERIFIED platform token without authority is a hard
+                // deny — re-checking it as an app token cannot add
+                // platform authority.
+                return Err(deny(format!(
+                    "configure is owner/admin-only: caller is not an owner/admin of app '{}'",
+                    call.app,
+                )));
+            }
+            // Not a platform token — fall through to the pre-standard path.
+        }
+
+        // Pre-standard fallback: FIDO2 / app-OIDC verification + owners
+        // membership (the original Owner-policy behaviour), kept while
+        // clients migrate to platform bearers on configure.
+        if let Some(p) = permissions {
+            if !owners.is_empty() {
+                let auth = verify_auth_token(token, p, role_store).map_err(|e| {
+                    deny(format!(
+                        "configure is owner/admin-only: app_auth verification failed: {e}"
+                    ))
+                })?;
+                if let Some(s) = auth.user_id.as_deref() {
+                    if owners.iter().any(|o| o == s) {
+                        return Ok(auth);
+                    }
+                }
+            }
+        }
+        Err(deny(format!(
+            "configure is owner/admin-only: caller is not an owner/admin of app '{}' (team has {} member(s))",
+            call.app,
+            owners.len(),
+        )))
     }
 
     /// Enforce per-app permission policy on a `wasm_schema` request.
