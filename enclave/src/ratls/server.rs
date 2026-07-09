@@ -44,6 +44,8 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, UnixT
 use rustls::server::Acceptor;
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, Error as TlsError, ServerConfig, SignatureScheme};
+use rustls::server::RaTlsBindCertificate;
+use rustls::sign::CertifiedKey;
 
 // ========================================================================
 //  Session states
@@ -493,7 +495,10 @@ impl IngressServer {
             .and_then(|h| cert_store::cert_store().resolve(h));
 
         if let Some(n) = nonce {
-            let mode = CertMode::Challenge { nonce: n.clone() };
+            // binder=None here: pre-handshake mint has no key schedule yet.
+            // The channel binder is injected by the deferred mint hook (later
+            // slice), which re-mints with the handshake secret available.
+            let mode = CertMode::Challenge { nonce: n.clone(), binder: None };
             return build_tls_config(&self.ca, mode, app_data.as_ref());
         }
 
@@ -647,12 +652,59 @@ struct TlsConfigResult {
     client_challenge_nonce: Option<Vec<u8>>,
 }
 
+/// Per-connection RA-TLS channel-binding minter. Captures the challenge
+/// context so that at the TLS 1.3 Certificate-emit seam (once the handshake
+/// secret exists) it can re-mint the leaf with the 32-byte session channel
+/// binder folded into the quote's `report_data`.
+struct ChannelBindingMinter {
+    ca: CaContext,
+    nonce: Vec<u8>,
+    app: Option<cert_store::AppCertData>,
+}
+
+impl core::fmt::Debug for ChannelBindingMinter {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        // Never print the captured CA key / nonce.
+        f.debug_struct("ChannelBindingMinter").finish_non_exhaustive()
+    }
+}
+
+impl RaTlsBindCertificate for ChannelBindingMinter {
+    fn bind_certificate(&self, binder: &[u8; 32]) -> Option<Arc<CertifiedKey>> {
+        let mode = CertMode::Challenge {
+            nonce: self.nonce.clone(),
+            binder: Some(*binder),
+        };
+        let result = match &self.app {
+            Some(a) => attestation::generate_app_certificate(&self.ca, mode, a),
+            None => attestation::generate_ratls_certificate(&self.ca, mode),
+        }
+        .ok()?;
+        let certs: Vec<CertificateDer<'static>> = result
+            .cert_chain_der
+            .into_iter()
+            .map(|der| CertificateDer::from(der).into_owned())
+            .collect();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(result.pkcs8_key));
+        CertifiedKey::from_der(certs, key, &default_provider())
+            .ok()
+            .map(Arc::new)
+    }
+}
+
 /// Build a `ServerConfig` from an RA-TLS certificate.
 fn build_tls_config(
     ca: &CaContext,
     mode: CertMode,
     app: Option<&cert_store::AppCertData>,
 ) -> Result<TlsConfigResult, String> {
+    // Capture the challenge nonce for the channel-binding hook before `mode`
+    // is consumed by the initial (placeholder) mint below.
+    let challenge_nonce = match &mode {
+        CertMode::Challenge { nonce, .. } => Some(nonce.clone()),
+        CertMode::Deterministic { .. } => None,
+    };
+
     let result = match app {
         Some(a) => attestation::generate_app_certificate(ca, mode, a)?,
         None => attestation::generate_ratls_certificate(ca, mode)?,
@@ -677,6 +729,17 @@ fn build_tls_config(
     // (bidirectional challenge-response RA-TLS).
     if let Some(ref nonce) = result.client_challenge_nonce {
         config.ratls_challenge = Some(nonce.clone());
+    }
+
+    // Channel binding: install the per-connection re-mint hook for challenge
+    // connections so the served leaf's quote commits to this TLS session. It
+    // fires once the handshake secret is derived (the TLS 1.3 emit seam).
+    if let Some(nonce) = challenge_nonce {
+        config.ratls_bind_certificate = Some(Arc::new(ChannelBindingMinter {
+            ca: ca.clone(),
+            nonce,
+            app: app.cloned(),
+        }));
     }
 
     Ok(TlsConfigResult {

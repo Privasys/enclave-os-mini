@@ -51,7 +51,13 @@ pub const DETERMINISTIC_VALIDITY_SECS: u64 = 86400;
 pub enum CertMode {
     /// Challenge-response: nonce extracted from ClientHello extension 0xFFBB.
     /// Produces a short-lived cert (5 min) with a fresh key + quote.
-    Challenge { nonce: Vec<u8> },
+    ///
+    /// `binder`, when present, is the 32-byte TLS channel binder derived from
+    /// the handshake key schedule. It is folded into `report_data`
+    /// (`SHA-512(SHA-256(SPKI) || nonce || binder)`) and marks the leaf with
+    /// the RA-TLS Channel Binding OID (2.9), pinning the quote to this TLS
+    /// session. `None` reproduces the legacy nonce-only preimage.
+    Challenge { nonce: Vec<u8>, binder: Option<[u8; 32]> },
     /// Deterministic: binding = the minute-truncated `creation_time` formatted
     /// as `"YYYY-MM-DDTHH:MMZ"`. The leaf's `NotBefore` is set to the same
     /// minute so a verifier reproduces the binding from the cert. Valid 24 h,
@@ -68,6 +74,7 @@ pub enum CertMode {
 /// provisioned externally (typically as part of the `EnclaveConfig`) and
 /// is then sealed to disk via SGX sealing so that subsequent restarts
 /// can unseal it without re-provisioning.
+#[derive(Clone)]
 pub struct CaContext {
     /// DER-encoded X.509 certificate of the intermediary CA.
     pub ca_cert_der: Vec<u8>,
@@ -277,6 +284,8 @@ pub fn mint_vault_client_cert(
         ca,
         CertMode::Challenge {
             nonce: challenge.to_vec(),
+            // Client-cert (mutual) binder is threaded in a later slice.
+            binder: None,
         },
         &app,
     )?;
@@ -348,13 +357,26 @@ fn prepare_attestation(mode: &CertMode) -> Result<AttestationContext, String> {
     let spki_der = enclave_os_common::quote::build_p256_spki_der(raw_ec_point);
 
     let (report_data, not_before, not_after) = match mode {
-        CertMode::Challenge { nonce } => (
-            compute_report_data(&spki_der, nonce),
-            // Wide window; freshness is proved by the quote + the 5-min cache
-            // TTL, and the challenge verifier binds the nonce, not NotBefore.
-            rcgen::date_time_ymd(2024, 1, 1),
-            rcgen::date_time_ymd(2030, 12, 31),
-        ),
+        CertMode::Challenge { nonce, binder } => {
+            // report_data = SHA-512(SHA-256(SPKI) || nonce [|| binder]).
+            // When a channel binder is present, append it so the quote pins
+            // this TLS session to the shared key schedule (channel binding).
+            let binding = match binder {
+                Some(b) => {
+                    let mut v = nonce.clone();
+                    v.extend_from_slice(b);
+                    v
+                }
+                None => nonce.clone(),
+            };
+            (
+                compute_report_data(&spki_der, &binding),
+                // Wide window; freshness is proved by the quote + the 5-min cache
+                // TTL, and the challenge verifier binds the nonce, not NotBefore.
+                rcgen::date_time_ymd(2024, 1, 1),
+                rcgen::date_time_ymd(2030, 12, 31),
+            )
+        }
         CertMode::Deterministic { creation_time } => {
             // Minute-truncate so the binding is stable across the cert's life
             // and reproducible from NotBefore. Bind the ASCII "YYYY-MM-DDTHH:MMZ"

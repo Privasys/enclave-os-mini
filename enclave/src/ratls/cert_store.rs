@@ -63,6 +63,7 @@ pub fn init_cert_store(store: CertStore) {
 ///
 /// Cloned from the store when the RA-TLS server needs to generate
 /// a certificate for an incoming connection.
+#[derive(Clone)]
 pub struct AppCertData {
     /// SNI hostname (used as Subject CN in the leaf certificate).
     pub hostname: String,

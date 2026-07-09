@@ -65,7 +65,7 @@ sgx_crypto = { git = "https://github.com/Privasys/teaclave-sgx-sdk", tag = "priv
 
 # Lightweight TLS – rustls is a pure-Rust TLS 1.3 library (Privasys fork with RA-TLS 0xFFBB extension).
 # In SGX we use ring for crypto (it has SGX support via teaclave).
-rustls = { git = "https://github.com/Privasys/rustls", tag = "privasys-v0.3.0", default-features = false, features = ["ring", "tls12", "std"] }
+rustls = { git = "https://github.com/Privasys/rustls", tag = "privasys-v0.7.0", default-features = false, features = ["ring", "tls12", "std"] }
 # webpki for certificate verification
 webpki = { package = "rustls-webpki", version = "0.102", default-features = false, features = ["ring", "alloc", "std"] }
 # ring for low-level crypto (AEAD, key generation)

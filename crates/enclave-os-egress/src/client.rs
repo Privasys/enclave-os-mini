@@ -365,6 +365,14 @@ fn https_request_inner(
     tls_handshake(fd, &mut tls_conn)
         .map_err(|e| format!("TLS handshake failed: {e}"))?;
 
+    // RA-TLS channel binding: in challenge mode a server's quote MUST commit to
+    // this TLS session (report_data folds the session binder). Verify it with
+    // the binder before sending any request data. Fails closed on a relayed or
+    // co-located quote that cannot commit to this session.
+    if let Some(policy) = ratls {
+        verify_channel_binding(&tls_conn, policy)?;
+    }
+
     // Send the HTTP request.
     {
         let mut writer = tls_conn.writer();
@@ -1073,11 +1081,11 @@ fn verify_sgx_report_data(
     let spki_der = enclave_os_common::quote::build_p256_spki_der(ec_point);
 
     match &policy.report_data {
-        ReportDataBinding::ChallengeResponse { nonce } => {
-            let expected = compute_report_data_hash(&spki_der, nonce);
-            if quote.report_body.report_data.d != expected.as_ref() {
-                return Err("RA-TLS: SGX ReportData mismatch (challenge-response)".into());
-            }
+        ReportDataBinding::ChallengeResponse { .. } => {
+            // In challenge mode report_data folds this session's channel binder,
+            // which is not available in this cert-verifier callback. The full
+            // check runs post-handshake in verify_channel_binding, before any
+            // application data is sent. Nothing to do here.
         }
         ReportDataBinding::Deterministic => {
             // SGX sets NotBefore to the minute-truncated creation time and binds
@@ -1131,10 +1139,77 @@ fn verify_tdx_report_data(
                 return Err("RA-TLS: TDX ReportData mismatch (deterministic)".into());
             }
         }
-        ReportDataBinding::ChallengeResponse { nonce } => {
-            let expected = compute_report_data_hash(&spki_der, nonce);
-            if quote.report_body.report_data.d != expected.as_ref() {
-                return Err("RA-TLS: TDX ReportData mismatch (challenge-response)".into());
+        ReportDataBinding::ChallengeResponse { .. } => {
+            // In challenge mode report_data folds this session's channel binder,
+            // verified post-handshake in verify_channel_binding before any
+            // application data is sent. Nothing to do here.
+        }
+    }
+    Ok(())
+}
+
+/// Post-handshake RA-TLS channel-binding check (client verifying the server).
+///
+/// In challenge mode a server's quote's report_data is
+/// `SHA-512(SHA-256(SPKI) || nonce || binder)`. The binder is a 32-byte value
+/// derived from the shared handshake key schedule and is only available after
+/// ServerHello, so it cannot be checked in the cert-verifier callback. Here —
+/// after the handshake completes but before any application data is sent —
+/// recompute report_data WITH the binder (obtained from our own key schedule
+/// via `ratls_channel_binder`) and verify it. Binding is mandatory: a relayed,
+/// co-located, or unbound quote fails, because it cannot commit to this
+/// session's binder. Deterministic mode cannot channel-bind (cached quote); it
+/// is fully verified in the cert-verifier callback, so this is a no-op there.
+fn verify_channel_binding(
+    tls_conn: &ClientConnection,
+    policy: &RaTlsPolicy,
+) -> Result<(), String> {
+    let nonce = match &policy.report_data {
+        ReportDataBinding::ChallengeResponse { nonce } => nonce.clone(),
+        ReportDataBinding::Deterministic => return Ok(()),
+    };
+
+    let certs = tls_conn
+        .peer_certificates()
+        .ok_or_else(|| "RA-TLS: no peer certificate for channel-binding check".to_string())?;
+    let leaf = certs
+        .first()
+        .ok_or_else(|| "RA-TLS: empty peer certificate chain".to_string())?;
+    let (_, cert) = X509Certificate::from_der(leaf)
+        .map_err(|_| "RA-TLS: failed to parse leaf for channel binding".to_string())?;
+
+    let binder = tls_conn
+        .ratls_channel_binder()
+        .ok_or_else(|| "RA-TLS: channel binder unavailable".to_string())?;
+
+    let mut binding = nonce;
+    binding.extend_from_slice(&binder);
+
+    let ec_point = cert.public_key().subject_public_key.as_ref();
+    let spki_der = enclave_os_common::quote::build_p256_spki_der(ec_point);
+    let expected = compute_report_data_hash(&spki_der, &binding);
+
+    let expected_oid = match policy.tee {
+        TeeType::Sgx => oids::SGX_QUOTE_OID_STR,
+        TeeType::Tdx => oids::TDX_QUOTE_OID_STR,
+    };
+    let quote_ext = cert
+        .extensions()
+        .iter()
+        .find(|e| e.oid.to_id_string() == expected_oid)
+        .ok_or_else(|| "RA-TLS: no quote for channel-binding check".to_string())?;
+
+    match policy.tee {
+        TeeType::Sgx => {
+            let q = parse_quote3(quote_ext.value)?;
+            if q.report_body.report_data.d != expected.as_ref() {
+                return Err("RA-TLS: channel-binding mismatch (SGX) — quote does not commit to this TLS session".into());
+            }
+        }
+        TeeType::Tdx => {
+            let q = parse_quote4(quote_ext.value)?;
+            if q.report_body.report_data.d != expected.as_ref() {
+                return Err("RA-TLS: channel-binding mismatch (TDX) — quote does not commit to this TLS session".into());
             }
         }
     }

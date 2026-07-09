@@ -71,6 +71,7 @@ echo "==> Configuring CMake build (flavor=${FLAVOR})..."
 cmake -S "${SRC}" -B "${BUILD_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
     "${FLAVOR_FLAGS[@]}" \
+    ${EXTRA_CMAKE_FLAGS:-} \
     -DCMAKE_C_COMPILER=gcc \
     -DCMAKE_CXX_COMPILER=g++
 
