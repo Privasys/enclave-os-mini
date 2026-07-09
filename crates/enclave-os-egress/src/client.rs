@@ -1060,30 +1060,42 @@ fn verify_tdx_measurements(quote: &Quote4, policy: &RaTlsPolicy) -> Result<(), S
 /// | Mode | pubkey | binding |
 /// |------|--------|---------|
 /// | ChallengeResponse | SPKI DER (91 B) | client nonce |
-/// | Deterministic | — | *skipped* (creation_time not in cert) |
+/// | Deterministic | SPKI DER (91 B) | `NotBefore` as `"YYYY-MM-DDTHH:MMZ"` |
 fn verify_sgx_report_data(
     quote: &Quote3,
     cert: &X509Certificate<'_>,
     policy: &RaTlsPolicy,
 ) -> Result<(), String> {
+    // SGX (enclave-os) uses the full SPKI DER (91 bytes for P-256), matching
+    // Go's x509.MarshalPKIXPublicKey and standard X.509 certificate viewers'
+    // "Public Key SHA-256" fingerprint.
+    let ec_point = cert.public_key().subject_public_key.as_ref();
+    let spki_der = enclave_os_common::quote::build_p256_spki_der(ec_point);
+
     match &policy.report_data {
         ReportDataBinding::ChallengeResponse { nonce } => {
-            // SGX (enclave-os) uses the full SPKI DER (91 bytes for P-256),
-            // matching Go's x509.MarshalPKIXPublicKey and standard X.509
-            // certificate viewers' "Public Key SHA-256" fingerprint.
-            let ec_point = cert.public_key().subject_public_key.as_ref();
-            let spki_der = enclave_os_common::quote::build_p256_spki_der(ec_point);
             let expected = compute_report_data_hash(&spki_der, nonce);
             if quote.report_body.report_data.d != expected.as_ref() {
                 return Err("RA-TLS: SGX ReportData mismatch (challenge-response)".into());
             }
         }
         ReportDataBinding::Deterministic => {
-            // SGX deterministic certs use `creation_time` (8-byte LE epoch)
-            // as the binding, but this value is not recoverable from the
-            // certificate's NotBefore which is set to a fixed date.
-            // Verification is skipped; quote presence + measurements still
-            // provide trust.
+            // SGX sets NotBefore to the minute-truncated creation time and binds
+            // "YYYY-MM-DDTHH:MMZ", same as the container/TDX issuer, so the
+            // binding is reproducible from the certificate.
+            let not_before = cert.validity().not_before.to_datetime();
+            let binding = format!(
+                "{:04}-{:02}-{:02}T{:02}:{:02}Z",
+                not_before.year(),
+                not_before.month() as u8,
+                not_before.day(),
+                not_before.hour(),
+                not_before.minute(),
+            );
+            let expected = compute_report_data_hash(&spki_der, binding.as_bytes());
+            if quote.report_body.report_data.d != expected.as_ref() {
+                return Err("RA-TLS: SGX ReportData mismatch (deterministic)".into());
+            }
         }
     }
     Ok(())

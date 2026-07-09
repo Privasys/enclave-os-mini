@@ -76,6 +76,9 @@ ring = "0.17"
 getrandom = { version = "0.2", features = ["rdrand"] }
 # For RA-TLS certificate generation
 rcgen = { version = "0.13", default-features = false, features = ["ring", "x509-parser"] }
+# Civil-time conversion for the deterministic cert NotBefore / ReportData binding.
+# Already in the graph via rcgen; default-features off keeps time-macros out.
+time = { version = "0.3", default-features = false }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

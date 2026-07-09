@@ -11,16 +11,25 @@
 //!
 //! Two modes:
 //!
-//! | Mode          | Binding          | Validity | Caching |
-//! |---------------|------------------|----------|---------|
-//! | Challenge     | nonce from 0xFFBB| 5 min    | no      |
-//! | Deterministic | creation_time LE | 24 h     | yes     |
+//! | Mode          | Binding                       | Validity | Caching |
+//! |---------------|-------------------------------|----------|---------|
+//! | Challenge     | nonce from 0xFFBB             | 5 min    | no      |
+//! | Deterministic | creation_time "YYYY-MM-DDTHH:MMZ" | 24 h | yes  |
+//!
+//! In deterministic mode the binding is the minute-truncated creation time
+//! formatted as `"YYYY-MM-DDTHH:MMZ"`, and the leaf's `NotBefore` is set to
+//! that same minute so a verifier reproduces the binding from the certificate
+//! alone. This matches the container (TDX) issuer, so both TEE types share one
+//! verification path. (Earlier builds bound an 8-byte little-endian
+//! `creation_time` that was not recoverable from the cert, which forced
+//! verifiers to skip the SGX deterministic key-to-quote check entirely.)
 
 use std::string::String;
 use std::vec::Vec;
 use ring::digest;
 use ring::rand::SystemRandom;
 use ring::signature::{self, EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
+use time::OffsetDateTime;
 
 use enclave_os_common::oids::{
     SGX_QUOTE_OID, CONFIG_MERKLE_ROOT_OID, APP_CONFIG_MERKLE_ROOT_OID,
@@ -43,8 +52,10 @@ pub enum CertMode {
     /// Challenge-response: nonce extracted from ClientHello extension 0xFFBB.
     /// Produces a short-lived cert (5 min) with a fresh key + quote.
     Challenge { nonce: Vec<u8> },
-    /// Deterministic: binding = `creation_time` (seconds since epoch, 8‑byte LE).
-    /// Cert is valid 24 h and can be cached.
+    /// Deterministic: binding = the minute-truncated `creation_time` formatted
+    /// as `"YYYY-MM-DDTHH:MMZ"`. The leaf's `NotBefore` is set to the same
+    /// minute so a verifier reproduces the binding from the cert. Valid 24 h,
+    /// cacheable. `creation_time` is seconds since the Unix epoch.
     Deterministic { creation_time: u64 },
 }
 
@@ -102,7 +113,8 @@ impl CaContext {
 /// viewers, making browser-side verification straightforward.
 ///
 /// * **Challenge mode**: `binding` = nonce from ClientHello ext 0xFFBB
-/// * **Deterministic mode**: `binding` = creation_time as 8-byte LE
+/// * **Deterministic mode**: `binding` = creation time as the ASCII string
+///   `"YYYY-MM-DDTHH:MMZ"` (minute precision), recoverable from `NotBefore`
 pub fn compute_report_data(spki_der: &[u8], binding: &[u8]) -> [u8; 64] {
     let pubkey_hash = digest::digest(&digest::SHA256, spki_der);
     let mut preimage = Vec::with_capacity(32 + binding.len());
@@ -166,7 +178,7 @@ pub fn generate_ratls_certificate(
     };
 
     let leaf_der = build_leaf_cert(
-        &ctx.pkcs8_bytes, &ctx.quote, ctx.validity_secs, ca,
+        &ctx.pkcs8_bytes, &ctx.quote, ctx.not_before, ctx.not_after, ca,
         "Enclave OS RA-TLS", &extensions,
     )?;
 
@@ -215,7 +227,7 @@ pub fn generate_app_certificate(
     };
 
     let leaf_der = build_leaf_cert(
-        &ctx.pkcs8_bytes, &ctx.quote, ctx.validity_secs, ca,
+        &ctx.pkcs8_bytes, &ctx.quote, ctx.not_before, ctx.not_after, ca,
         &app.hostname, &extensions,
     )?;
 
@@ -305,7 +317,11 @@ fn generate_random_nonce() -> Result<Vec<u8>, String> {
 struct AttestationContext {
     pkcs8_bytes: Vec<u8>,
     quote: Vec<u8>,
-    validity_secs: u64,
+    /// Leaf validity window. In deterministic mode `not_before` is the
+    /// minute-truncated creation time that the ReportData binding is derived
+    /// from, so it must land verbatim in the certificate.
+    not_before: OffsetDateTime,
+    not_after: OffsetDateTime,
 }
 
 /// Generate a fresh ECDSA key pair, compute report_data from the mode,
@@ -331,19 +347,47 @@ fn prepare_attestation(mode: &CertMode) -> Result<AttestationContext, String> {
     let raw_ec_point = signature::KeyPair::public_key(&key_pair).as_ref();
     let spki_der = enclave_os_common::quote::build_p256_spki_der(raw_ec_point);
 
-    let (report_data, validity_secs) = match mode {
+    let (report_data, not_before, not_after) = match mode {
         CertMode::Challenge { nonce } => (
             compute_report_data(&spki_der, nonce),
-            CHALLENGE_VALIDITY_SECS,
+            // Wide window; freshness is proved by the quote + the 5-min cache
+            // TTL, and the challenge verifier binds the nonce, not NotBefore.
+            rcgen::date_time_ymd(2024, 1, 1),
+            rcgen::date_time_ymd(2030, 12, 31),
         ),
-        CertMode::Deterministic { creation_time } => (
-            compute_report_data(&spki_der, &creation_time.to_le_bytes()),
-            DETERMINISTIC_VALIDITY_SECS,
-        ),
+        CertMode::Deterministic { creation_time } => {
+            // Minute-truncate so the binding is stable across the cert's life
+            // and reproducible from NotBefore. Bind the ASCII "YYYY-MM-DDTHH:MMZ"
+            // form (matches the container/TDX issuer); NotBefore carries it.
+            let minute = creation_time - (creation_time % 60);
+            let nb = OffsetDateTime::from_unix_timestamp(minute as i64)
+                .map_err(|e| format!("creation_time out of range: {e}"))?;
+            let na = OffsetDateTime::from_unix_timestamp(
+                (minute + DETERMINISTIC_VALIDITY_SECS) as i64,
+            )
+            .map_err(|e| format!("not_after out of range: {e}"))?;
+            let binding = format_ratls_time(&nb);
+            (compute_report_data(&spki_der, binding.as_bytes()), nb, na)
+        }
     };
 
     let quote = generate_sgx_quote(&report_data)?;
-    Ok(AttestationContext { pkcs8_bytes, quote, validity_secs })
+    Ok(AttestationContext { pkcs8_bytes, quote, not_before, not_after })
+}
+
+/// Format an `OffsetDateTime` as the deterministic binding string
+/// `"YYYY-MM-DDTHH:MMZ"` (UTC, minute precision). Must match byte-for-byte the
+/// string a verifier reconstructs from the certificate's `NotBefore`, and the
+/// container/TDX issuer's `reportTimeFormat`.
+fn format_ratls_time(t: &OffsetDateTime) -> String {
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}Z",
+        t.year(),
+        t.month() as u8,
+        t.day(),
+        t.hour(),
+        t.minute()
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -486,7 +530,8 @@ pub fn self_mrenclave() -> Result<[u8; 32], String> {
 fn build_leaf_cert(
     leaf_pkcs8: &[u8],
     quote: &[u8],
-    _validity_secs: u64,
+    not_before: OffsetDateTime,
+    not_after: OffsetDateTime,
     ca: &CaContext,
     common_name: &str,
     extensions: &[(&'static [u64], Vec<u8>)],
@@ -533,9 +578,11 @@ fn build_leaf_cert(
         }
     }
 
-    // Validity: wide window; actual freshness is proved by the quote.
-    leaf_params.not_before = rcgen::date_time_ymd(2024, 1, 1);
-    leaf_params.not_after = rcgen::date_time_ymd(2030, 12, 31);
+    // Validity window. Challenge mode passes a wide window (freshness is proved
+    // by the quote); deterministic mode passes the minute-truncated creation
+    // time as NotBefore so a verifier reproduces the ReportData binding.
+    leaf_params.not_before = not_before;
+    leaf_params.not_after = not_after;
 
     // SGX quote
     let quote_ext = CustomExtension::from_oid_content(SGX_QUOTE_OID, quote.to_vec());
@@ -777,11 +824,20 @@ mod tests {
     }
 
     #[test]
-    fn report_data_deterministic_mode_uses_le_time() {
-        let creation_time: u64 = 1700000000;
-        let rd = compute_report_data(b"key", &creation_time.to_le_bytes());
-        // Different time should give different report_data
-        let rd2 = compute_report_data(b"key", &(creation_time + 1).to_le_bytes());
+    fn ratls_time_format_matches_verifier() {
+        // 1700000000 = 2023-11-14T22:13:20Z; minute-truncated -> 22:13.
+        // This string must match byte-for-byte what the SDK verifiers
+        // reconstruct from NotBefore, so pin it.
+        let minute = 1700000000u64 - (1700000000u64 % 60);
+        let t = OffsetDateTime::from_unix_timestamp(minute as i64).unwrap();
+        assert_eq!(format_ratls_time(&t), "2023-11-14T22:13Z");
+    }
+
+    #[test]
+    fn report_data_deterministic_binding_is_time_string() {
+        let rd = compute_report_data(b"key", b"2023-11-14T22:13Z");
+        // A different minute must give different report_data.
+        let rd2 = compute_report_data(b"key", b"2023-11-14T22:14Z");
         assert_ne!(rd, rd2);
     }
 
