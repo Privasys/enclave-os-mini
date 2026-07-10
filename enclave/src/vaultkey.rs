@@ -37,12 +37,14 @@ impl EnclaveClientCertSigner for OsClientCertSigner {
     fn sign(
         &self,
         challenge: &[u8],
+        channel_binder: Option<&[u8]>,
         identity: &ClientCertIdentity,
     ) -> Option<(Vec<Vec<u8>>, Vec<u8>)> {
         let ca = CaContext::from_parts(self.ca_cert_der.clone(), self.ca_key_pkcs8.clone()).ok()?;
         mint_vault_client_cert(
             &ca,
             challenge,
+            channel_binder,
             &identity.code_hash,
             identity.app_id.as_deref(),
         )

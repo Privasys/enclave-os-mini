@@ -323,6 +323,7 @@ impl IngressServer {
         let base_ctx = enclave_os_common::modules::RequestContext {
             peer_cert_der: session.peer_cert_der(),
             client_challenge_nonce: session.client_challenge_nonce().cloned(),
+            channel_binder: session.ratls_channel_binder(),
             oidc_claims: None,
         };
 
@@ -1290,6 +1291,7 @@ fn handle_fido2_request(
     let ctx = enclave_os_common::modules::RequestContext {
         peer_cert_der: base_ctx.peer_cert_der.clone(),
         client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
+        channel_binder: base_ctx.channel_binder.clone(),
         oidc_claims,
     };
 
@@ -1386,6 +1388,7 @@ fn handle_data_request_http(
     let ctx = enclave_os_common::modules::RequestContext {
         peer_cert_der: base_ctx.peer_cert_der.clone(),
         client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
+        channel_binder: base_ctx.channel_binder.clone(),
         oidc_claims,
     };
 
@@ -1463,6 +1466,7 @@ fn handle_rpc_request(
     let ctx = enclave_os_common::modules::RequestContext {
         peer_cert_der: base_ctx.peer_cert_der.clone(),
         client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
+        channel_binder: base_ctx.channel_binder.clone(),
         oidc_claims,
     };
 
@@ -1585,6 +1589,7 @@ fn handle_mcp_tools_request(
     let ctx = enclave_os_common::modules::RequestContext {
         peer_cert_der: base_ctx.peer_cert_der.clone(),
         client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
+        channel_binder: base_ctx.channel_binder.clone(),
         oidc_claims,
     };
 

@@ -137,7 +137,7 @@ pub fn resolve_caller(
     if let Some(peer_der) = ctx.peer_cert_der.as_deref() {
         for (i, p) in policy.principals.tees.iter().enumerate() {
             if let Principal::Tee(profile) = p {
-                if tee_matches(profile, peer_der, ctx.client_challenge_nonce.as_deref()) {
+                if tee_matches(profile, peer_der, ctx.client_challenge_nonce.as_deref(), ctx.channel_binder.as_deref()) {
                     return Some((PrincipalRef::Tee(i as u32), CallerRole::Tee));
                 }
             }
@@ -198,6 +198,7 @@ pub(crate) fn tee_matches(
     profile: &AttestationProfile,
     peer_der: &[u8],
     challenge_nonce: Option<&[u8]>,
+    channel_binder: Option<&[u8]>,
 ) -> bool {
     let evidence = match dissect_peer_cert(peer_der) {
         Ok(e) => e,
@@ -228,7 +229,13 @@ pub(crate) fn tee_matches(
     }
 
     // 4. Challenge binding.
-    if verify_challenge_binding(&evidence.evidence, &evidence.pubkey_raw, challenge_nonce).is_err()
+    if verify_challenge_binding(
+        &evidence.evidence,
+        &evidence.pubkey_raw,
+        challenge_nonce,
+        channel_binder,
+    )
+    .is_err()
     {
         return false;
     }
@@ -372,7 +379,7 @@ fn evaluate_conditions(
                 let peer = ctx.peer_cert_der.as_deref().ok_or_else(|| {
                     "AttestationMatches: no peer RA-TLS cert in request".to_string()
                 })?;
-                if !tee_matches(profile, peer, ctx.client_challenge_nonce.as_deref()) {
+                if !tee_matches(profile, peer, ctx.client_challenge_nonce.as_deref(), ctx.channel_binder.as_deref()) {
                     return Err(format!(
                         "AttestationMatches: peer does not match profile '{}'",
                         profile.name

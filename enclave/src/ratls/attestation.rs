@@ -260,6 +260,7 @@ pub fn generate_app_certificate(
 pub fn mint_vault_client_cert(
     ca: &CaContext,
     challenge: &[u8],
+    channel_binder: Option<&[u8]>,
     cwasm_code_hash: &[u8],
     app_id: Option<&[u8]>,
 ) -> Result<(Vec<Vec<u8>>, Vec<u8>), String> {
@@ -280,12 +281,15 @@ pub fn mint_vault_client_cert(
         merkle_root: [0u8; 32],
         oid_extensions,
     };
+    // Fold the session channel binder (TLS 1.3) into the quote's report_data so
+    // the vault can confirm this client cert commits to the live session and is
+    // not a relayed identity. Absent (e.g. TLS 1.2) leaves the nonce-only form.
+    let binder: Option<[u8; 32]> = channel_binder.and_then(|b| b.try_into().ok());
     let result = generate_app_certificate(
         ca,
         CertMode::Challenge {
             nonce: challenge.to_vec(),
-            // Client-cert (mutual) binder is threaded in a later slice.
-            binder: None,
+            binder,
         },
         &app,
     )?;

@@ -340,6 +340,13 @@ impl RaTlsSession {
         self.client_challenge_nonce.as_ref()
     }
 
+    /// Return this session's 32-byte RA-TLS channel binder (TLS 1.3), derived
+    /// from the handshake key schedule. Used to verify a mutual-auth client
+    /// cert's channel binding post-handshake.
+    pub fn ratls_channel_binder(&self) -> Option<Vec<u8>> {
+        self.tls_conn.ratls_channel_binder().map(|b| b.to_vec())
+    }
+
     /// Return the FIDO2 identity for this session, if authenticated.
     pub fn fido2_identity(&self) -> Option<&FidoIdentity> {
         self.fido2_identity.as_ref()

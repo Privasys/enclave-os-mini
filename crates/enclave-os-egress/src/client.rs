@@ -483,11 +483,14 @@ pub struct ClientCertIdentity {
 /// real measurement and signs.
 pub trait EnclaveClientCertSigner: Send + Sync {
     /// Mint a client cert carrying `identity`, with the SGX quote's ReportData
-    /// bound to the server's `challenge` (ext `0xFFBB`). Returns
-    /// `(cert_chain_der, pkcs8_key_der)`, or `None` to decline.
+    /// bound to the server's `challenge` (ext `0xFFBB`) and, when present, the
+    /// session `channel_binder` (`nonce || binder`), so the quote commits to
+    /// this exact TLS session. Returns `(cert_chain_der, pkcs8_key_der)`, or
+    /// `None` to decline.
     fn sign(
         &self,
         challenge: &[u8],
+        channel_binder: Option<&[u8]>,
         identity: &ClientCertIdentity,
     ) -> Option<(Vec<Vec<u8>>, Vec<u8>)>;
 }
@@ -554,13 +557,15 @@ impl ResolvesClientCert for ChallengeBoundClientAuth {
         _root_hint_subjects: &[&[u8]],
         _sigschemes: &[SignatureScheme],
         ratls_challenge: Option<&[u8]>,
+        ratls_channel_binder: Option<&[u8]>,
     ) -> Option<Arc<CertifiedKey>> {
         // Bidirectional challenge-response is mandatory: without the server's
         // nonce we cannot bind a fresh quote, so decline rather than present
-        // an unbound identity.
+        // an unbound identity. The channel binder (present on TLS 1.3) is folded
+        // in too, so the client cert's quote commits to this exact session.
         let challenge = ratls_challenge?;
         let signer = *CLIENT_CERT_SIGNER.get()?;
-        let (chain_der, pkcs8) = signer.sign(challenge, &self.identity)?;
+        let (chain_der, pkcs8) = signer.sign(challenge, ratls_channel_binder, &self.identity)?;
         let certs: Vec<CertificateDer<'static>> =
             chain_der.into_iter().map(CertificateDer::from).collect();
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8));

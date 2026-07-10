@@ -91,6 +91,12 @@ pub struct RequestContext {
     /// extension `0xFFBB` for bidirectional challenge-response attestation.
     pub client_challenge_nonce: Option<Vec<u8>>,
 
+    /// 32-byte RA-TLS channel binder for this TLS session (TLS 1.3), derived
+    /// from the handshake key schedule. A mutual-auth verifier folds it into the
+    /// expected client-cert `report_data` so a relayed client cert from another
+    /// session fails closed. `None` on non-TLS-1.3 handshakes.
+    pub channel_binder: Option<Vec<u8>>,
+
     /// Verified OIDC claims extracted from the `"auth"` field in the
     /// JSON envelope.  `None` when no bearer token was provided (e.g.
     /// healthz, or RA-TLS-only vault GetSecret).
