@@ -884,8 +884,8 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.37"
-source = "git+https://github.com/Privasys/rustls?tag=privasys-v0.2.0#47091d34727ea285ab8a58e8af9e5f20d8d20b48"
+version = "0.23.41"
+source = "git+https://github.com/Privasys/rustls?tag=privasys-v0.8.1#ab630583b58fee84260cbbfe2f4a8b45d8bde200"
 dependencies = [
  "once_cell",
  "ring",

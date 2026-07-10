@@ -11,6 +11,11 @@ description = "WASM module for enclave-os — WebAssembly Component runtime insi
 [lib]
 name = "enclave_os_wasm"
 
+# This crate is composed into the enclave build (see enclave/Cargo.toml)
+# and is not a member of the root workspace. The empty table opts out of
+# workspace inference so `cargo check` / `cargo test` work from this dir.
+[workspace]
+
 [dependencies]
 # Shared types, module trait, OCall vtable, hex utils, JWT/JWKS verification
 enclave-os-common = { path = "../../common", features = ["jwt"] }
