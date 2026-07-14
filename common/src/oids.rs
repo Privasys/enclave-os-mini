@@ -162,3 +162,18 @@ pub const APP_CONFIGURATION_HASH_OID_STR: &str = "1.3.6.1.4.1.65230.3.5";
 // the parent OID under a second name. Shared with enclave-os-virtual,
 // whose manager exposes the same arc through the
 // `/api/v1/containers/<name>/attestation-extensions` endpoint.
+
+/// Attested Dependency Set — `1.3.6.1.4.1.65230.6.1`
+///
+/// The set of DIRECT cross-enclave dependency identities this workload is pinned
+/// to and will only complete an RA-TLS handshake with. The value is the canonical
+/// encoding of the dependency set (see the dependency-set encoder). This
+/// extension is owned by the runtime, NOT the app: unlike the app-writable
+/// `3.5.{n}` sub-arc, an app cannot install, alter, or remove it. The advertised
+/// set and the runtime-enforced set are therefore one object, so a peer can trust
+/// the certificate's declared dependencies. The top-level `6` arc is distinct from
+/// the hardware-evidence arcs (`4.x` = SEV-SNP, `5.x` = NVIDIA GPU) used by the
+/// SDK verifiers.
+pub const ATTESTED_DEPENDENCY_SET_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 6, 1];
+/// Attested Dependency Set (dotted-string).
+pub const ATTESTED_DEPENDENCY_SET_OID_STR: &str = "1.3.6.1.4.1.65230.6.1";

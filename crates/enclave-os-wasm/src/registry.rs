@@ -401,6 +401,15 @@ pub struct AppMeta {
     /// behaviour. Defaults false for apps sealed before this field existed.
     #[serde(default)]
     pub config_complete: bool,
+    /// Attested cross-enclave dependency set — the canonical OID
+    /// `1.3.6.1.4.1.65230.6.1` encoding of the enclaves this app is pinned to.
+    /// Owned by the runtime: supplied by the platform via `wasm_load` /
+    /// `wasm_set_dependencies`, never writable by the app (unlike the `3.5.{n}`
+    /// extensions). Sealed so it survives restarts and stamped on the per-app leaf
+    /// so verifiers and the wallet can read what this app depends on. `None` =
+    /// no declared dependencies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dependencies: Option<Vec<u8>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -543,6 +552,7 @@ impl AppRegistry {
         owners: Vec<String>,
         app_id: Option<[u8; 16]>,
         vault: Option<VaultBacking>,
+        dependencies: Option<Vec<u8>>,
     ) -> Result<AppMeta, String> {
         if self.known.contains_key(name) {
             return Err(format!("app '{}' is already loaded", name));
@@ -686,6 +696,7 @@ impl AppRegistry {
             // replay restores the persisted value via register_known instead of
             // reaching this literal.
             config_complete: false,
+            dependencies,
         };
         self.known.insert(name.to_string(), meta.clone());
         // Wire the freeze gate: when a config_api function is declared, the app
@@ -944,6 +955,15 @@ impl AppRegistry {
     ) -> Option<AppMeta> {
         let meta = self.known.get_mut(name)?;
         meta.extensions.insert(arc_suffix, value);
+        Some(meta.clone())
+    }
+
+    /// Set (or clear, when `dependencies` is `None`) an app's attested
+    /// cross-enclave dependency set (the canonical OID 6.1 encoding). Returns the
+    /// updated meta so the caller can persist it and re-register the identity.
+    pub fn set_dependencies(&mut self, name: &str, dependencies: Option<Vec<u8>>) -> Option<AppMeta> {
+        let meta = self.known.get_mut(name)?;
+        meta.dependencies = dependencies;
         Some(meta.clone())
     }
 

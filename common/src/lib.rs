@@ -13,6 +13,7 @@
 // gated on the sgx feature (gating it broke the host build of this crate).
 extern crate alloc;
 pub mod channel;
+pub mod dependencies;
 pub mod hex;
 pub mod modules;
 pub mod ocall;

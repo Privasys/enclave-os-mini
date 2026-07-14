@@ -110,6 +110,31 @@ pub struct WasmEnvelope {
     /// Requires the **manager** role.
     #[serde(default)]
     pub wasm_rotate_key: Option<WasmRotateKey>,
+
+    /// Set (or clear) an app's attested cross-enclave dependency set, re-minting
+    /// its per-app certificate so OID 6.1 reflects the new set on the next
+    /// handshake. Runtime-owned; the app cannot issue this. Requires the
+    /// **manager** role.
+    #[serde(default)]
+    pub wasm_set_dependencies: Option<WasmSetDependencies>,
+}
+
+/// Set an app's attested cross-enclave dependency set.
+///
+/// ```json
+/// { "wasm_set_dependencies": { "name": "my-app", "dependencies": "<base64 canonical>" } }
+/// ```
+///
+/// `dependencies` is the canonical OID 6.1 encoding (standard base64). The
+/// runtime validates it (decode + re-encode canonical), seals it, and re-mints
+/// the per-app leaf. Absent/empty clears the set.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WasmSetDependencies {
+    /// App identifier whose dependency set is being set.
+    pub name: String,
+    /// Canonical dependency-set encoding, standard base64. Absent/empty clears it.
+    #[serde(default)]
+    pub dependencies: Option<String>,
 }
 
 /// Rotate a vault-backed app's storage KEK to a new key generation.
@@ -331,6 +356,12 @@ pub struct WasmLoad {
     /// `vault_backed` is true.
     #[serde(default)]
     pub key_handle: Option<String>,
+    /// Attested cross-enclave dependency set, as the canonical OID 6.1 encoding in
+    /// standard base64. Runtime-owned (the app cannot set it). Validated and
+    /// re-canonicalised by the enclave, sealed, and stamped on the per-app leaf.
+    /// Absent means the app declares no dependencies.
+    #[serde(default)]
+    pub dependencies: Option<String>,
 }
 
 /// Configure-endpoint declaration. See [`WasmLoad::config_api`].
@@ -519,6 +550,14 @@ pub enum WasmManagementResult {
         name: String,
         /// The new-generation handle now in effect.
         handle: String,
+    },
+    /// An app's attested cross-enclave dependency set was updated.
+    #[serde(rename = "dependencies_set")]
+    DependenciesSet {
+        /// App whose dependency set was updated.
+        name: String,
+        /// `true` when a set was applied, `false` when it was cleared.
+        present: bool,
     },
 }
 

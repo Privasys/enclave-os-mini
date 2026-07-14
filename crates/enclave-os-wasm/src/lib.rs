@@ -241,6 +241,7 @@ impl WasmModule {
         owners: Vec<String>,
         app_id: Option<[u8; 16]>,
         vault: Option<crate::registry::VaultBacking>,
+        dependencies: Option<Vec<u8>>,
     ) -> Result<(), String> {
         // Load into the registry (compile + introspect + per-app key)
         let meta = {
@@ -261,6 +262,7 @@ impl WasmModule {
                 owners,
                 app_id,
                 vault,
+                dependencies,
             )?
         };
 
@@ -331,6 +333,25 @@ impl WasmModule {
         // We do not need the wasm bytes here \u2014 only the meta entry
         // changes; persist_app_to_kv writes both, so use a smaller
         // path that updates only the meta.
+        self.persist_meta_to_kv(name, &updated_meta);
+        register_app_identity(&updated_meta);
+        Ok(())
+    }
+
+    /// Set (or clear) an app's attested cross-enclave dependency set. Persists the
+    /// canonical OID 6.1 encoding to KV and re-registers the per-app identity so
+    /// the next RA-TLS handshake serves a leaf carrying the updated dependency
+    /// set. Runtime-owned: reached only via the `wasm_set_dependencies` management
+    /// command, never by the app.
+    pub fn set_dependencies(&self, name: &str, dependencies: Option<Vec<u8>>) -> Result<(), String> {
+        let updated_meta = {
+            let mut reg = self
+                .registry
+                .lock()
+                .map_err(|_| String::from("registry lock poisoned"))?;
+            reg.set_dependencies(name, dependencies)
+                .ok_or_else(|| format!("unknown app: '{}'", name))?
+        };
         self.persist_meta_to_kv(name, &updated_meta);
         register_app_identity(&updated_meta);
         Ok(())
@@ -1418,7 +1439,8 @@ impl EnclaveModule for WasmModule {
         let needs_manager = envelope.wasm_load.is_some()
             || envelope.wasm_unload.is_some()
             || envelope.wasm_freeze.is_some()
-            || envelope.wasm_rotate_key.is_some();
+            || envelope.wasm_rotate_key.is_some()
+            || envelope.wasm_set_dependencies.is_some();
         let needs_monitoring = envelope.wasm_list.is_some();
 
         if needs_manager {
@@ -1562,6 +1584,15 @@ impl EnclaveModule for WasmModule {
                 None
             };
 
+            let dependencies = match parse_dependencies(load.dependencies.as_deref()) {
+                Ok(d) => d,
+                Err(e) => {
+                    return Some(Response::Data(serialize_or_error(
+                        &WasmManagementResult::Error { message: e },
+                    )));
+                }
+            };
+
             let mgmt_result = match self.load_app(
                 &load.name,
                 &hostname,
@@ -1575,6 +1606,7 @@ impl EnclaveModule for WasmModule {
                 load.owners,
                 app_id,
                 vault,
+                dependencies,
             ) {
                 Ok(()) => {
                     // Return the loaded app's info
@@ -1665,6 +1697,27 @@ impl EnclaveModule for WasmModule {
                         handle: rot.new_handle,
                     }
                 }
+                Err(e) => WasmManagementResult::Error { message: e },
+            };
+            return Some(Response::Data(serialize_or_error(&mgmt_result)));
+        }
+
+        // 3d. wasm_set_dependencies — set/clear the attested dependency set
+        if let Some(sd) = envelope.wasm_set_dependencies {
+            let deps = match parse_dependencies(sd.dependencies.as_deref()) {
+                Ok(d) => d,
+                Err(e) => {
+                    return Some(Response::Data(serialize_or_error(
+                        &WasmManagementResult::Error { message: e },
+                    )));
+                }
+            };
+            let present = deps.is_some();
+            let mgmt_result = match self.set_dependencies(&sd.name, deps) {
+                Ok(()) => WasmManagementResult::DependenciesSet {
+                    name: sd.name,
+                    present,
+                },
                 Err(e) => WasmManagementResult::Error { message: e },
             };
             return Some(Response::Data(serialize_or_error(&mgmt_result)));
@@ -1882,6 +1935,26 @@ fn parse_app_id(s: Option<&str>) -> Option<[u8; 16]> {
     Some(out)
 }
 
+/// Decode and canonicalise a base64 attested-dependency set supplied by the
+/// platform. `None`/empty clears the set. Runtime-owned: the bytes are validated
+/// (decoded and re-encoded canonically) here, so a malformed or non-canonical
+/// input is rejected before it can reach a certificate.
+fn parse_dependencies(b64: Option<&str>) -> Result<Option<Vec<u8>>, String> {
+    match b64 {
+        None => Ok(None),
+        Some(s) if s.is_empty() => Ok(None),
+        Some(s) => {
+            use base64::{engine::general_purpose::STANDARD, Engine};
+            let raw = STANDARD
+                .decode(s)
+                .map_err(|e| format!("dependencies: invalid base64: {e}"))?;
+            let canon = enclave_os_common::dependencies::canonicalize_encoded(&raw)
+                .map_err(|e| format!("dependencies: {e}"))?;
+            Ok(Some(canon))
+        }
+    }
+}
+
 fn build_app_identity(meta: &AppMeta) -> AppIdentity {
     let mut config = vec![
         ConfigEntry {
@@ -1909,6 +1982,16 @@ fn build_app_identity(meta: &AppMeta) -> AppIdentity {
             key: format!("wasm.{}.app_id", meta.name),
             value: id.to_vec(),
             oid: Some(enclave_os_common::oids::APP_ID_OID),
+        });
+    }
+    // Attested cross-enclave dependency set (OID 6.1). Runtime-owned: the value
+    // comes from the platform (wasm_load / wasm_set_dependencies), never from the
+    // app, so the advertised set and the enforced set are one object.
+    if let Some(ref deps) = meta.dependencies {
+        config.push(ConfigEntry {
+            key: format!("wasm.{}.dependencies", meta.name),
+            value: deps.clone(),
+            oid: Some(enclave_os_common::oids::ATTESTED_DEPENDENCY_SET_OID),
         });
     }
     // App-defined extensions live under sub-OIDs of
