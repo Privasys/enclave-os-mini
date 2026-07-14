@@ -439,6 +439,8 @@ fn build_ratls_policy(
             code_hash: code_hash.to_vec(),
             app_id: app_id.map(|a| a.to_vec()),
         }),
+        // The vault is platform infrastructure, not an app dependency.
+        dependencies: None,
     })
 }
 

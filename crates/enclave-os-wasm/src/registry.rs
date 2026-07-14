@@ -1123,6 +1123,10 @@ impl AppRegistry {
     ) -> Result<CallPrep, WasmResult> {
         self.touch(app_name);
 
+        // The app's runtime-owned attested-dependency set, injected into the
+        // per-call context so outbound RA-TLS enforces it fail-closed.
+        let pinned_dependencies = self.known.get(app_name).and_then(|m| m.dependencies.clone());
+
         // ── Look up app ────────────────────────────────────────────
         let app = match self.loaded.get(app_name) {
             Some(a) => a,
@@ -1168,6 +1172,7 @@ impl AppRegistry {
             let ctx = store.data_mut();
             ctx.caller_id = caller_id;
             ctx.caller_roles = caller_roles;
+            ctx.pinned_dependencies = pinned_dependencies;
         }
 
         // ── Resolve the exported function ──────────────────────────

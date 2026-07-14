@@ -187,6 +187,11 @@ pub struct AppContext {
     pub caller_id: Option<String>,
     /// Authenticated caller's roles (from enclave role store or OIDC claims).
     pub caller_roles: Vec<String>,
+    /// The app's runtime-owned attested-dependency set (canonical OID 6.1
+    /// encoding), populated per call from the app's sealed metadata. Injected
+    /// into every outbound RA-TLS policy so a connection to a declared dependency
+    /// is verified fail-closed. `None` when the app declares no dependencies.
+    pub pinned_dependencies: Option<Vec<u8>>,
 
     // ── Billable SDK resource usage (this call only) ──────────────
     /// Accumulates billable Enclave-OS SDK resource usage for the
@@ -240,6 +245,7 @@ impl AppContext {
             ),
             caller_id: None,
             caller_roles: Vec::new(),
+            pinned_dependencies: None,
             usage: SdkUsage::default(),
             output_streams: BTreeMap::new(),
             input_streams: BTreeMap::new(),

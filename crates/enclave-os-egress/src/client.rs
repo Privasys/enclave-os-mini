@@ -278,6 +278,16 @@ pub struct RaTlsPolicy {
     /// registered [`EnclaveClientCertSigner`] and bound to the server's
     /// challenge. `None` (the default) presents no client certificate.
     pub client_identity: Option<ClientCertIdentity>,
+
+    /// Attested cross-enclave dependency set (the canonical OID 6.1 encoding).
+    /// Runtime-owned: injected from the calling app's sealed metadata, NOT from
+    /// the app's own request, so the app cannot weaken it. When `Some` and the
+    /// peer presents an app-id (OID 3.6) that this set pins, the peer MUST match
+    /// the pinned identity (measurement + required OIDs) or the handshake fails
+    /// closed. A peer whose app-id is not a declared dependency is unaffected
+    /// (the ordinary policy above governs it). `None` (the default) disables the
+    /// check.
+    pub dependencies: Option<Vec<u8>>,
 }
 
 /// Perform a full HTTPS request with any method, custom headers, and
@@ -936,23 +946,39 @@ fn verify_ratls_cert(der: &[u8], policy: &RaTlsPolicy) -> Result<(), String> {
     #[cfg(not(feature = "mock"))]
     let is_mock = false;
 
+    // Peer measurement registers, captured for the attested-dependency check.
+    let mut peer_mrenclave: Option<[u8; 32]> = None;
+    let mut peer_mrtd: Option<[u8; 48]> = None;
+
     if !is_mock {
         match policy.tee {
             TeeType::Sgx => {
                 let q = parse_quote3(quote)?;
                 verify_sgx_measurements(&q, policy)?;
                 verify_sgx_report_data(&q, &cert, policy)?;
+                peer_mrenclave = Some(q.report_body.mr_enclave.m);
             }
             TeeType::Tdx => {
                 let q = parse_quote4(quote)?;
                 verify_tdx_measurements(&q, policy)?;
                 verify_tdx_report_data(&q, &cert, policy)?;
+                peer_mrtd = Some(q.report_body.mr_td.m);
             }
         }
     }
 
     // --- Verify configuration OIDs ---
     verify_expected_oids(&cert, &policy.expected_oids)?;
+
+    // --- Enforce attested cross-enclave dependencies (fail closed) ---
+    // Runtime-owned: if the peer's app-id (OID 3.6) is one this app pins as a
+    // dependency, the peer must match the pinned identity, regardless of the
+    // app-supplied policy above. Skipped in mock mode (no real measurement).
+    if !is_mock {
+        if let Some(ref deps) = policy.dependencies {
+            verify_dependencies(&cert, policy.tee, peer_mrenclave, peer_mrtd, deps)?;
+        }
+    }
 
     // --- Verify quote via attestation server(s) ---
     //
@@ -1040,6 +1066,112 @@ fn parse_quote4(data: &[u8]) -> Result<Quote4, String> {
 // =========================================================================
 
 /// Verify SGX measurements (MRENCLAVE, MRSIGNER) from the parsed `Quote3`.
+/// Enforce the attested cross-enclave dependency set (fail closed).
+///
+/// The dependency set is the runtime-owned OID 6.1 encoding sealed with the
+/// calling app. If the peer presents an app-id (OID 3.6) that this set pins as a
+/// dependency, the peer MUST satisfy that entry: its measurement register matches
+/// one of the entry's allowed measurements AND every required OID is present
+/// verbatim. A peer whose app-id is not a declared dependency passes through
+/// (governed only by the ordinary policy) — so an app's non-dependency egress is
+/// unaffected, while a connection to a declared dependency can never land on a
+/// rogue build even if the app's own policy is weak.
+fn verify_dependencies(
+    cert: &X509Certificate<'_>,
+    tee: TeeType,
+    peer_mrenclave: Option<[u8; 32]>,
+    peer_mrtd: Option<[u8; 48]>,
+    deps: &[u8],
+) -> Result<(), String> {
+    use enclave_os_common::dependencies::{decode_dependency_set, DepMeasurement};
+
+    let set = decode_dependency_set(deps)
+        .map_err(|e| format!("RA-TLS: invalid pinned dependency set: {e}"))?;
+    if set.entries.is_empty() {
+        return Ok(());
+    }
+
+    // The peer's app-id (raw bytes) identifies which enclave it claims to be.
+    let peer_app_id = ext_value(cert, oids::APP_ID_OID_STR);
+    let Some(peer_app_id) = peer_app_id else {
+        // No app-id: the peer cannot be matched to a declared dependency, so the
+        // ordinary policy already governed this connection.
+        return Ok(());
+    };
+
+    for entry in &set.entries {
+        if !entry_pins_app_id(entry, peer_app_id) {
+            continue;
+        }
+        // This entry is about the peer's app — enforce it, fail closed.
+        let measurement_ok = entry.measurements.iter().any(|m| match m {
+            DepMeasurement::Sgx(h) => {
+                tee == TeeType::Sgx
+                    && peer_mrenclave
+                        .map(|mre| enclave_os_common::hex::hex_decode(h) == Some(mre.to_vec()))
+                        .unwrap_or(false)
+            }
+            DepMeasurement::Tdx { mrtd, .. } => {
+                tee == TeeType::Tdx
+                    && peer_mrtd
+                        .map(|t| enclave_os_common::hex::hex_decode(mrtd) == Some(t.to_vec()))
+                        .unwrap_or(false)
+            }
+        });
+        if !measurement_ok {
+            return Err(format!(
+                "RA-TLS: dependency {} measurement not pinned (fail closed)",
+                entry.app_id
+            ));
+        }
+        for (oid, val) in &entry.required_oids {
+            match ext_value(cert, oid) {
+                Some(v) if v == val.as_slice() => {}
+                _ => {
+                    return Err(format!(
+                        "RA-TLS: dependency {} required OID {} mismatch (fail closed)",
+                        entry.app_id, oid
+                    ));
+                }
+            }
+        }
+        return Ok(());
+    }
+    // The peer's app-id is not a declared dependency.
+    Ok(())
+}
+
+/// Raw value bytes of the cert extension with the given dotted-string OID.
+fn ext_value<'a>(cert: &'a X509Certificate<'_>, oid: &str) -> Option<&'a [u8]> {
+    cert.extensions()
+        .iter()
+        .find(|e| e.oid.to_id_string() == oid)
+        .map(|e| e.value)
+}
+
+/// Whether a dependency entry pins the given peer app-id (raw bytes). Matches
+/// either the entry's OID-3.6 required value or the entry's app-id parsed as a
+/// dashed UUID.
+fn entry_pins_app_id(
+    entry: &enclave_os_common::dependencies::DependencyEntry,
+    peer_app_id: &[u8],
+) -> bool {
+    // 1. An explicit OID 3.6 pin in required_oids (the raw app-id bytes).
+    for (oid, val) in &entry.required_oids {
+        if oid == oids::APP_ID_OID_STR {
+            return val.as_slice() == peer_app_id;
+        }
+    }
+    // 2. entry.app_id compared as raw bytes (matches the SDK, which compares the
+    //    OID 3.6 value decoded as a string against app_id).
+    if entry.app_id.as_bytes() == peer_app_id {
+        return true;
+    }
+    // 3. entry.app_id as a dashed UUID (undashed hex → 16 bytes).
+    let undashed: String = entry.app_id.chars().filter(|c| *c != '-').collect();
+    matches!(enclave_os_common::hex::hex_decode(&undashed), Some(b) if b == peer_app_id)
+}
+
 fn verify_sgx_measurements(quote: &Quote3, policy: &RaTlsPolicy) -> Result<(), String> {
     if let Some(expected) = &policy.mr_enclave {
         if quote.report_body.mr_enclave.m != *expected {

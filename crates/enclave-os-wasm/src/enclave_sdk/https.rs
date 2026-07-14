@@ -151,6 +151,8 @@ fn build_ratls_policy(p: wit::RatlsPolicy) -> Result<RaTlsPolicy, String> {
         attestation_servers: p.attestation_servers,
         // App egress presents no client certificate (server attestation only).
         client_identity: None,
+        // Set by the caller from the app's sealed metadata, not the app request.
+        dependencies: None,
     })
 }
 
@@ -183,7 +185,13 @@ impl wit::Host for AppContext {
         let is_ratls = req.ratls.is_some();
         let req_body_len = req.body.as_deref().map(|b| b.len()).unwrap_or(0) as i64;
 
-        let ratls_policy = req.ratls.map(build_ratls_policy).transpose()?;
+        // Inject the app's runtime-owned attested-dependency set (from sealed
+        // metadata, never the app request) so a connection to a declared
+        // dependency is verified fail-closed against its pinned identity.
+        let ratls_policy = req.ratls.map(build_ratls_policy).transpose()?.map(|mut pol| {
+            pol.dependencies = self.pinned_dependencies.clone();
+            pol
+        });
         let custom_store = build_custom_root_store(req.ca_roots_der)?;
 
         let root_store: &RootCertStore = match &custom_store {
