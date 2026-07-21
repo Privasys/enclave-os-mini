@@ -291,18 +291,33 @@ unsafe extern "C" fn sgx_veh_handler(info: *mut SgxExceptionInfo) -> i32 {
     0
 }
 
-/// Register a VEH trap handler (called once by wasmtime during init).
+/// wasmtime v47 trap-handler callback signature (see `handle_trap` in
+/// wasmtime's `sys::custom::traphandlers`). Passed to `wasmtime_init_traps`
+/// so the platform can deliver hardware faults back to wasmtime.
+type WasmtimeTrapHandler =
+    extern "C" fn(pc: usize, fp: usize, has_faulting_addr: bool, faulting_addr: usize);
+
+/// Register the SGX VEH trap handler (called once by wasmtime during init).
 ///
-/// Returns a non-null handle on success.
+/// wasmtime v47 changed this capi: it now passes its own trap callback and
+/// expects `0` on success (non-zero = failure) rather than a handle. We
+/// register the VEH exactly as before. NOTE: the VEH is currently passive (it
+/// does not forward faults to `_handler`), matching the pre-v47 behaviour —
+/// wiring SGX faults through to wasmtime so wasm-level traps surface as clean
+/// errors is a follow-up.
 #[no_mangle]
-pub extern "C" fn wasmtime_init_traps() -> *const u8 {
+pub extern "C" fn wasmtime_init_traps(_handler: WasmtimeTrapHandler) -> i32 {
     unsafe {
         let handle = sgx_register_exception_handler(1, sgx_veh_handler);
         enclave_os_common::enclave_log_info!(
             "[sgx_platform] VEH trap handler registered (handle={:p})",
             handle
         );
-        handle as *const u8
+        if handle.is_null() {
+            -1
+        } else {
+            0
+        }
     }
 }
 
@@ -345,20 +360,28 @@ pub extern "C" fn wasmtime_memory_image_free(_image: *mut u8) {}
 //  Thread-local storage for wasmtime trap handling
 // =========================================================================
 
-/// Per-thread trap state pointer.
+/// Trap-handling TLS slots.
 ///
-/// In SGX, WASM execution is single-threaded per TCS, so a simple
-/// atomic pointer suffices.
-static TRAP_TLS: AtomicPtr<u8> = AtomicPtr::new(ptr::null_mut());
+/// wasmtime v47 addresses its runtime TLS by slot index: slot 0 is the
+/// default runtime pointer and slot 1 is the (optional) component-model-async
+/// state. WASM execution is single-threaded per TCS, so plain atomics suffice;
+/// both slots default to NULL. `.get(slot)` keeps an unexpected index from
+/// panicking inside this `extern "C"` boundary (which cannot unwind).
+static TRAP_TLS: [AtomicPtr<u8>; 2] =
+    [AtomicPtr::new(ptr::null_mut()), AtomicPtr::new(ptr::null_mut())];
 
-/// Get the current trap handling TLS value.
+/// Get the current trap-handling TLS value for `slot`.
 #[no_mangle]
-pub extern "C" fn wasmtime_tls_get() -> *mut u8 {
-    TRAP_TLS.load(Ordering::Relaxed)
+pub extern "C" fn wasmtime_tls_get(slot: usize) -> *mut u8 {
+    TRAP_TLS
+        .get(slot)
+        .map_or(ptr::null_mut(), |s| s.load(Ordering::Relaxed))
 }
 
-/// Set the trap handling TLS value.
+/// Set the trap-handling TLS value for `slot`.
 #[no_mangle]
-pub extern "C" fn wasmtime_tls_set(val: *mut u8) {
-    TRAP_TLS.store(val, Ordering::Relaxed);
+pub extern "C" fn wasmtime_tls_set(slot: usize, val: *mut u8) {
+    if let Some(s) = TRAP_TLS.get(slot) {
+        s.store(val, Ordering::Relaxed);
+    }
 }
