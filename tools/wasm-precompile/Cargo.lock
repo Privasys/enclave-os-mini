@@ -110,7 +110,7 @@ dependencies = [
 [[package]]
 name = "cranelift-assembler-x64"
 version = "0.134.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "cranelift-assembler-x64-meta",
 ]
@@ -118,7 +118,7 @@ dependencies = [
 [[package]]
 name = "cranelift-assembler-x64-meta"
 version = "0.134.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "cranelift-srcgen",
 ]
@@ -126,7 +126,7 @@ dependencies = [
 [[package]]
 name = "cranelift-bforest"
 version = "0.134.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "cranelift-entity",
  "wasmtime-internal-core",
@@ -135,7 +135,7 @@ dependencies = [
 [[package]]
 name = "cranelift-bitset"
 version = "0.134.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "serde",
  "serde_derive",
@@ -145,7 +145,7 @@ dependencies = [
 [[package]]
 name = "cranelift-codegen"
 version = "0.134.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "bumpalo",
  "cranelift-assembler-x64",
@@ -175,7 +175,7 @@ dependencies = [
 [[package]]
 name = "cranelift-codegen-meta"
 version = "0.134.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "cranelift-assembler-x64-meta",
  "cranelift-codegen-shared",
@@ -187,12 +187,12 @@ dependencies = [
 [[package]]
 name = "cranelift-codegen-shared"
 version = "0.134.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 
 [[package]]
 name = "cranelift-control"
 version = "0.134.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "arbitrary",
 ]
@@ -200,7 +200,7 @@ dependencies = [
 [[package]]
 name = "cranelift-entity"
 version = "0.134.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "cranelift-bitset",
  "serde",
@@ -211,7 +211,7 @@ dependencies = [
 [[package]]
 name = "cranelift-frontend"
 version = "0.134.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "cranelift-codegen",
  "hashbrown 0.17.1",
@@ -223,12 +223,12 @@ dependencies = [
 [[package]]
 name = "cranelift-isle"
 version = "0.134.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 
 [[package]]
 name = "cranelift-native"
 version = "0.134.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "cranelift-codegen",
  "libc",
@@ -238,7 +238,7 @@ dependencies = [
 [[package]]
 name = "cranelift-srcgen"
 version = "0.134.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 
 [[package]]
 name = "crc32fast"
@@ -571,7 +571,7 @@ dependencies = [
 [[package]]
 name = "pulley-interpreter"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "cranelift-bitset",
  "log",
@@ -582,7 +582,7 @@ dependencies = [
 [[package]]
 name = "pulley-macros"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -837,7 +837,7 @@ dependencies = [
 [[package]]
 name = "wasmtime"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "addr2line",
  "async-trait",
@@ -878,7 +878,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-environ"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "anyhow",
  "cpp_demangle",
@@ -908,7 +908,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-component-macro"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "anyhow",
  "proc-macro2",
@@ -922,12 +922,12 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-component-util"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 
 [[package]]
 name = "wasmtime-internal-core"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "hashbrown 0.17.1",
  "libm",
@@ -937,7 +937,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-cranelift"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "cfg-if",
  "cranelift-codegen",
@@ -963,7 +963,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-fiber"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "cc",
  "cfg-if",
@@ -977,7 +977,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-jit-debug"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "cc",
  "wasmtime-internal-versioned-export-macros",
@@ -986,7 +986,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-jit-icache-coherence"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "cfg-if",
  "libc",
@@ -997,7 +997,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-unwinder"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "cfg-if",
  "cranelift-codegen",
@@ -1009,7 +1009,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-versioned-export-macros"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1019,7 +1019,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-wit-bindgen"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "anyhow",
  "bitflags",

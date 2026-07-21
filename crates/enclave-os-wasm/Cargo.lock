@@ -173,7 +173,7 @@ dependencies = [
 [[package]]
 name = "cranelift-bforest"
 version = "0.134.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "cranelift-entity",
  "wasmtime-internal-core",
@@ -182,7 +182,7 @@ dependencies = [
 [[package]]
 name = "cranelift-bitset"
 version = "0.134.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "serde",
  "serde_derive",
@@ -192,7 +192,7 @@ dependencies = [
 [[package]]
 name = "cranelift-entity"
 version = "0.134.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "cranelift-bitset",
  "serde",
@@ -373,7 +373,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -701,7 +701,7 @@ dependencies = [
 [[package]]
 name = "pulley-interpreter"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "cranelift-bitset",
  "log",
@@ -712,7 +712,7 @@ dependencies = [
 [[package]]
 name = "pulley-macros"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -767,7 +767,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1054,7 +1054,7 @@ dependencies = [
 [[package]]
 name = "wasmtime"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "addr2line",
  "async-trait",
@@ -1094,7 +1094,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-environ"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "anyhow",
  "cpp_demangle",
@@ -1122,7 +1122,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-component-macro"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "anyhow",
  "proc-macro2",
@@ -1136,12 +1136,12 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-component-util"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 
 [[package]]
 name = "wasmtime-internal-core"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "hashbrown",
  "libm",
@@ -1151,7 +1151,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-fiber"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "cc",
  "cfg-if",
@@ -1165,7 +1165,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-jit-debug"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "cc",
  "wasmtime-internal-versioned-export-macros",
@@ -1174,7 +1174,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-jit-icache-coherence"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "cfg-if",
  "libc",
@@ -1185,7 +1185,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-unwinder"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "cfg-if",
  "log",
@@ -1196,7 +1196,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-versioned-export-macros"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -1206,7 +1206,7 @@ dependencies = [
 [[package]]
 name = "wasmtime-internal-wit-bindgen"
 version = "47.0.1"
-source = "git+https://github.com/Privasys/wasmtime?branch=sgx#478d9de5b086ab6511beec219afcac7871fa7953"
+source = "git+https://github.com/Privasys/wasmtime?tag=privasys-v0.2.0#6d01615eaf52d4e70010290f8444a8ec285d01ae"
 dependencies = [
  "anyhow",
  "bitflags",

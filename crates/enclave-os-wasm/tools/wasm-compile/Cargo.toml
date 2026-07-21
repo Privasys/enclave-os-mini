@@ -16,7 +16,7 @@ path = "src/main.rs"
 # Same wasmtime fork + branch as enclave-os-wasm.
 # The precompiled artefact format is strongly tied to the wasmtime version
 # and the Engine configuration, so both MUST stay in sync.
-wasmtime = { git = "https://github.com/Privasys/wasmtime", branch = "sgx", default-features = false, features = [
+wasmtime = { git = "https://github.com/Privasys/wasmtime", tag = "privasys-v0.2.0", default-features = false, features = [
     "cranelift",
     "component-model",
     "runtime",

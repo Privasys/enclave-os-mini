@@ -53,7 +53,7 @@ enclave-os-app-auth = { path = "../enclave-os-app-auth", optional = true }
 #   pooling-allocator— complex SGX memory constraints
 #   cache            — no filesystem in SGX
 #   wat              — text format parsing not needed at runtime
-wasmtime = { git = "https://github.com/Privasys/wasmtime", branch = "sgx", default-features = false, features = [
+wasmtime = { git = "https://github.com/Privasys/wasmtime", tag = "privasys-v0.2.0", default-features = false, features = [
     "component-model",
     "runtime",
     "std",

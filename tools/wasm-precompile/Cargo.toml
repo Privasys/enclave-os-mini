@@ -15,7 +15,7 @@ path = "src/main.rs"
 [dependencies]
 # Wasmtime with Cranelift — needed to compile, NOT needed at runtime.
 # The enclave only deserialises; this tool does the heavy lifting.
-wasmtime = { git = "https://github.com/Privasys/wasmtime", branch = "sgx", default-features = false, features = [
+wasmtime = { git = "https://github.com/Privasys/wasmtime", tag = "privasys-v0.2.0", default-features = false, features = [
     "cranelift",
     "component-model",
     "runtime",
