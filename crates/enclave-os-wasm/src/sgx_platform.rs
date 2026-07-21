@@ -131,9 +131,30 @@ unsafe fn heap_dealloc_pages(ptr: *mut u8, size: usize) {
 //  SGX FFI declarations
 // =========================================================================
 
+/// Intel SGX `sgx_cpu_context_t` (x86-64) — the general-purpose register file
+/// captured at the faulting instruction, as delivered to a registered
+/// exception handler. Field order/offsets are ABI and must not change; the VEH
+/// reads `rbp`/`rip` and rewrites `rip` to redirect execution.
 #[repr(C)]
 struct SgxCpuContext {
-    _pad: [u64; 20],
+    rax: u64,
+    rcx: u64,
+    rdx: u64,
+    rbx: u64,
+    rsp: u64,
+    rbp: u64,
+    rsi: u64,
+    rdi: u64,
+    r8: u64,
+    r9: u64,
+    r10: u64,
+    r11: u64,
+    r12: u64,
+    r13: u64,
+    r14: u64,
+    r15: u64,
+    rflags: u64,
+    rip: u64,
 }
 
 #[repr(C)]
@@ -280,33 +301,79 @@ pub extern "C" fn wasmtime_page_size() -> usize {
 //  Trap handling — SGX Vectored Exception Handler
 // =========================================================================
 
-/// VEH handler for SIGILL/SIGSEGV-like exceptions inside the enclave.
-///
-/// Wasmtime uses this to catch traps from WASM code (e.g. unreachable,
-/// out-of-bounds memory access, division by zero).
-unsafe extern "C" fn sgx_veh_handler(info: *mut SgxExceptionInfo) -> i32 {
-    let _info = &*info;
-    // 0 = continue searching handlers, 1 = continue execution
-    // Let wasmtime's internal handler manage trap details.
-    0
-}
-
-/// wasmtime v47 trap-handler callback signature (see `handle_trap` in
-/// wasmtime's `sys::custom::traphandlers`). Passed to `wasmtime_init_traps`
-/// so the platform can deliver hardware faults back to wasmtime.
+/// wasmtime's trap-handler callback (`handle_trap` in wasmtime's
+/// `sys::custom::traphandlers`). Given the faulting pc/fp it decides whether the
+/// fault is a wasm trap; if so it never returns (it resumes at the enclosing
+/// `try_call`/`catch_traps` landing pad via the tail-call exception ABI),
+/// otherwise it returns normally. Registered via `wasmtime_init_traps`.
 type WasmtimeTrapHandler =
     extern "C" fn(pc: usize, fp: usize, has_faulting_addr: bool, faulting_addr: usize);
 
+/// wasmtime's trap handler, stored at `wasmtime_init_traps` time.
+static WASMTIME_TRAP_HANDLER: AtomicPtr<()> = AtomicPtr::new(ptr::null_mut());
+
+/// Faulting pc/fp stashed by the VEH for [`wasm_trap_trampoline`]. SGX runs one
+/// thread per TCS, so plain statics are sufficient (no cross-thread race).
+static TRAP_PC: AtomicUsize = AtomicUsize::new(0);
+static TRAP_FP: AtomicUsize = AtomicUsize::new(0);
+
+// Intel SGX exception-handler return codes.
+const EXCEPTION_CONTINUE_SEARCH: i32 = 0;
+const EXCEPTION_CONTINUE_EXECUTION: i32 = -1;
+
+/// Trampoline the VEH redirects `rip` to. It runs on the faulting thread AFTER
+/// the SGX runtime has restored context (so the SSA frame is cleaned up — we
+/// must not call `resume_tailcc`, which never returns, from inside the VEH
+/// itself, or the SGX exception state would leak). It hands the fault to
+/// wasmtime, which unwinds to the wasm trap handler and never returns here.
+extern "C" fn wasm_trap_trampoline() -> ! {
+    let pc = TRAP_PC.load(Ordering::SeqCst);
+    let fp = TRAP_FP.load(Ordering::SeqCst);
+    let handler = WASMTIME_TRAP_HANDLER.load(Ordering::SeqCst);
+    if !handler.is_null() {
+        // SAFETY: `handler` is the `wasmtime_trap_handler_t` stored by
+        // wasmtime in `wasmtime_init_traps`. It resumes at the wasm trap
+        // landing pad and does not return for a genuine wasm trap.
+        let handler: WasmtimeTrapHandler = unsafe { core::mem::transmute(handler) };
+        // We force explicit (PC-based) bounds checks via
+        // `Config::signals_based_traps(false)`, so every wasm trap is an
+        // explicit trap opcode at a known PC — no faulting address is needed.
+        handler(pc, fp, false, 0);
+    }
+    // Only reached if wasmtime declined the fault (should not happen for a
+    // fault whose PC lies in the wasm code pool). Abort the thread cleanly.
+    core::panic!("wasm trap trampoline: unhandled fault at pc={:#x}", pc);
+}
+
+/// SGX Vectored Exception Handler.
+///
+/// Faults whose faulting instruction (`rip`) lies inside the RWX wasm code pool
+/// are wasm traps (unreachable, integer div-by-zero, out-of-bounds access with
+/// explicit bounds checks, indirect-call type mismatch, …). For those we stash
+/// pc/fp, rewrite `rip` to [`wasm_trap_trampoline`], and let the SGX runtime
+/// resume there with the SSA properly unwound. Any other fault is not ours and
+/// is passed on (which, with no other handler, ends the enclave — as before).
+unsafe extern "C" fn sgx_veh_handler(info: *mut SgxExceptionInfo) -> i32 {
+    let info = &mut *info;
+    let rip = info.cpu_context.rip as *const u8;
+    if !is_code_pool(rip) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    TRAP_PC.store(info.cpu_context.rip as usize, Ordering::SeqCst);
+    TRAP_FP.store(info.cpu_context.rbp as usize, Ordering::SeqCst);
+    info.cpu_context.rip = wasm_trap_trampoline as usize as u64;
+    EXCEPTION_CONTINUE_EXECUTION
+}
+
 /// Register the SGX VEH trap handler (called once by wasmtime during init).
 ///
-/// wasmtime v47 changed this capi: it now passes its own trap callback and
-/// expects `0` on success (non-zero = failure) rather than a handle. We
-/// register the VEH exactly as before. NOTE: the VEH is currently passive (it
-/// does not forward faults to `_handler`), matching the pre-v47 behaviour —
-/// wiring SGX faults through to wasmtime so wasm-level traps surface as clean
-/// errors is a follow-up.
+/// wasmtime 47 passes its own trap callback and expects `0` on success
+/// (non-zero = failure). We store the callback and register the VEH, which
+/// forwards wasm-code-pool faults to it — so wasm traps surface as clean
+/// `Trap` errors instead of crashing the enclave.
 #[no_mangle]
-pub extern "C" fn wasmtime_init_traps(_handler: WasmtimeTrapHandler) -> i32 {
+pub extern "C" fn wasmtime_init_traps(handler: WasmtimeTrapHandler) -> i32 {
+    WASMTIME_TRAP_HANDLER.store(handler as *mut (), Ordering::SeqCst);
     unsafe {
         let handle = sgx_register_exception_handler(1, sgx_veh_handler);
         enclave_os_common::enclave_log_info!(

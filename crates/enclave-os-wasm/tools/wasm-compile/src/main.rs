@@ -64,6 +64,13 @@ fn build_engine_config() -> Config {
     config.wasm_multi_memory(true);
     config.wasm_simd(true);
 
+    // Pinned proposal set + SGX codegen — MUST match engine.rs.
+    config.wasm_gc(true);
+    config.wasm_function_references(true);
+    config.wasm_exceptions(true);
+    config.native_unwind_info(false);
+    config.signals_based_traps(false);
+
     // ── SGX-appropriate limits ─────────────────────────────────
     config.memory_reservation(4 * 1024 * 1024);
     config.memory_guard_size(64 * 1024);

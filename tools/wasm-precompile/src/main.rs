@@ -34,12 +34,24 @@ fn enclave_compatible_config() -> Config {
     config.wasm_multi_memory(true);
     config.wasm_simd(true);
 
+    // ── Pinned WASM proposal set (MUST match engine.rs) ────────
+    config.wasm_gc(true);
+    config.wasm_function_references(true);
+    config.wasm_exceptions(true);
+
     // ── SGX-appropriate limits ─────────────────────────────────
     config.memory_reservation(4 * 1024 * 1024);
     config.memory_guard_size(64 * 1024);
 
     // ── No CoW / no disk-backed images ─────────────────────────
     config.memory_init_cow(false);
+
+    // ── SGX codegen (MUST match engine.rs) ─────────────────────
+    // No host `.eh_frame` unwind tables (the enclave's host unwinder is a
+    // no-op), and explicit (PC-based) bounds checks so every wasm trap is an
+    // explicit trap opcode the SGX VEH can forward to wasmtime.
+    config.native_unwind_info(false);
+    config.signals_based_traps(false);
 
     config
 }

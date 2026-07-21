@@ -58,6 +58,11 @@ wasmtime = { git = "https://github.com/Privasys/wasmtime", tag = "privasys-v0.2.
     "runtime",
     "std",
     "sgx",
+    # gc-drc pulls the `gc` feature + the deferred-reference-counting collector.
+    # Required for the WASM exception-handling proposal (exnref is GC-managed)
+    # and the function-references / GC proposals. See engine.rs for the pinned
+    # proposal set.
+    "gc-drc",
 ] }
 
 # Crypto (SHA-256 for WASM code hashing, RNG for WASI random)

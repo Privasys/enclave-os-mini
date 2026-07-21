@@ -91,6 +91,34 @@ impl WasmEngine {
         // ── No CoW / no disk-backed images ─────────────────────────
         config.memory_init_cow(false);
 
+        // ── Pinned WASM proposal set ───────────────────────────────
+        // Set the enabled proposals explicitly rather than inheriting
+        // wasmtime's shifting per-version defaults. This MUST stay in lock-step
+        // with the AOT compiler's `build_engine_config` (enclave-os-wasm-compile
+        // / wasm-precompile): a mismatch makes `Component::deserialize` reject
+        // the `.cwasm`.
+        //
+        // (The `threads` proposal is compiled out — the `threads` cargo feature
+        // is not enabled — so shared-memory threads are already unavailable,
+        // which suits SGX's single-thread-per-TCS model.)
+        // Exception-handling proposal (wasmtime 47+, requires the `gc` feature).
+        // Enabled so apps can use try/catch; unwinding uses wasmtime's tail-call
+        // exception ABI (the `unwinder` crate), not the host unwinder — so it
+        // works even though our host `UnwindRegistration` is a no-op in SGX.
+        config.wasm_gc(true);
+        config.wasm_function_references(true);
+        config.wasm_exceptions(true);
+        // The host unwinder is a no-op stub in SGX (see sgx_platform.rs), so the
+        // native `.eh_frame` unwind tables baked into each `.cwasm` are dead
+        // weight — drop them to shrink artefacts and EPC footprint.
+        config.native_unwind_info(false);
+        // Force explicit (PC-based) bounds checks instead of guard-page signal
+        // traps. In SGX every wasm trap then becomes an explicit trap opcode at a
+        // known PC inside the RWX code pool, which the VEH forwards to wasmtime
+        // uniformly (see sgx_platform.rs) — no faulting-address recovery needed,
+        // and no reliance on SGX guard-page semantics.
+        config.signals_based_traps(false);
+
         let engine =
             Engine::new(&config).map_err(|e| format!("wasmtime engine init failed: {}", e))?;
 

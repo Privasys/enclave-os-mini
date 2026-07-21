@@ -20,4 +20,7 @@ wasmtime = { git = "https://github.com/Privasys/wasmtime", tag = "privasys-v0.2.
     "component-model",
     "runtime",
     "std",
+    # Must match the enclave: gc-drc is required to compile the GC /
+    # function-references / exception-handling proposals.
+    "gc-drc",
 ] }

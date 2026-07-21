@@ -21,6 +21,7 @@ wasmtime = { git = "https://github.com/Privasys/wasmtime", tag = "privasys-v0.2.
     "component-model",
     "runtime",
     "std",
+    "gc-drc",
 ] }
 
 clap = { version = "4", features = ["derive"] }
