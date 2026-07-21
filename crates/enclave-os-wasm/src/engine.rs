@@ -188,7 +188,9 @@ impl WasmEngine {
         let mut exports = Vec::new();
 
         for (name, item) in ty.exports(&self.engine) {
-            match item {
+            // wasmtime 47: `exports()` yields `ComponentExtern`, whose `.ty`
+            // field carries the `ComponentItem` (was yielded directly in 46).
+            match item.ty {
                 ComponentItem::ComponentFunc(func_ty) => {
                     exports.push((
                         name.to_string(),
@@ -201,7 +203,7 @@ impl WasmEngine {
                     // WIT interfaces appear as exported instances, e.g.
                     //   export my-api: interface { process: func(...) }
                     for (func_name, nested) in inst_ty.exports(&self.engine) {
-                        if let ComponentItem::ComponentFunc(func_ty) = nested {
+                        if let ComponentItem::ComponentFunc(func_ty) = nested.ty {
                             let qualified = format!("{}/{}", name, func_name);
                             exports.push((
                                 qualified,
@@ -258,14 +260,16 @@ impl WasmEngine {
         let mut interfaces = Vec::new();
 
         for (name, item) in ty.exports(&self.engine) {
-            match item {
+            // wasmtime 47: `exports()` yields `ComponentExtern`, whose `.ty`
+            // field carries the `ComponentItem` (was yielded directly in 46).
+            match item.ty {
                 ComponentItem::ComponentFunc(func_ty) => {
                     functions.push(func_type_to_schema(&name, &func_ty, &docs));
                 }
                 ComponentItem::ComponentInstance(inst_ty) => {
                     let mut iface_fns = Vec::new();
                     for (func_name, nested) in inst_ty.exports(&self.engine) {
-                        if let ComponentItem::ComponentFunc(func_ty) = nested {
+                        if let ComponentItem::ComponentFunc(func_ty) = nested.ty {
                             iface_fns.push(func_type_to_schema(&func_name, &func_ty, &docs));
                         }
                     }
