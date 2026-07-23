@@ -304,6 +304,7 @@ fn merge_auth_from_docs(
         functions: BTreeMap::new(),
         schema_policy: FunctionPolicy::Public,
         schema_roles: Vec::new(),
+        default_price: None,
     });
 
     for (name, value) in auth_entries {
