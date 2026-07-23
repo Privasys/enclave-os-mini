@@ -108,6 +108,16 @@ impl WasmEngine {
         config.wasm_gc(true);
         config.wasm_function_references(true);
         config.wasm_exceptions(true);
+
+        // Fuel metering — compute billing's primary dimension. Without this,
+        // set_fuel/get_fuel error (silently .ok()'d) and every call meters 0
+        // fuel, leaving compute unbilled and the per-call max_fuel budget
+        // unenforced (a runaway call could spin forever). Enabled in
+        // lock-step with the reproducible-app-builder AOT config: a
+        // fuel-enabled runtime rejects .cwasm artifacts compiled without
+        // fuel support, so apps built before the builder flag must be
+        // rebuilt before deploying to this runtime.
+        config.consume_fuel(true);
         // The host unwinder is a no-op stub in SGX (see sgx_platform.rs), so the
         // native `.eh_frame` unwind tables baked into each `.cwasm` are dead
         // weight — drop them to shrink artefacts and EPC footprint.
