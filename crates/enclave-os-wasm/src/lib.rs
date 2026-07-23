@@ -490,7 +490,7 @@ impl WasmModule {
         // sealed-KV). The AppContext is per-call, so this is the delta.
         let sdk_usage = prep.store.data().usage.clone();
 
-        let result = if let Some(e) = call_err {
+        let mut result = if let Some(e) = call_err {
             WasmResult::Error {
                 message: format!("call failed: {}", e),
             }
@@ -499,7 +499,10 @@ impl WasmModule {
                 .iter()
                 .map(crate::registry::val_to_wasm_value)
                 .collect();
-            WasmResult::Ok { returns }
+            WasmResult::Ok {
+                returns,
+                billing_charged: None,
+            }
         };
 
         // Auto-lift the configure-then-freeze gate: a successful return from the
@@ -569,6 +572,15 @@ impl WasmModule {
                             sponsor_rp,
                             credits,
                         );
+                    }
+                    // Surface the charge on the response envelope so the
+                    // platform can emit X-Billing-Charged to the caller.
+                    if let WasmResult::Ok {
+                        ref mut billing_charged,
+                        ..
+                    } = result
+                    {
+                        *billing_charged = Some(credits);
                     }
                 }
             }
@@ -809,6 +821,43 @@ impl WasmModule {
                 return Err(Response::Data(serialize_or_error(&err)));
             }
         };
+
+        // x-privasys.price consent (caller mode): the caller must pre-approve
+        // EXACTLY the attested price (X-Billing-Approved, forwarded here as
+        // billing_approved) unless an exemption applies. Refusing before
+        // dispatch means no compute is spent without informed consent — and
+        // because this measured code compares the caller's literal approval
+        // against the measured price, a successful priced call is attestable
+        // proof the caller knew the price they were charged.
+        if let Some((rule, _)) = &price_ctx {
+            if rule.payer == Payer::Caller {
+                let exempt = auth.wallet_class && rule.free_for.iter().any(|c| c == "wallet");
+                if !exempt {
+                    let expected = format!("{} credits", rule.credits);
+                    match call.billing_approved.as_deref().map(str::trim) {
+                        Some(approved) if approved == expected => {}
+                        Some(approved) => {
+                            let err = WasmResult::Error {
+                                message: format!(
+                                    "payment approval mismatch: approved '{}' but this call charges {} — retry with X-Billing-Approved: {}",
+                                    approved, expected, expected,
+                                ),
+                            };
+                            return Err(Response::Data(serialize_or_error(&err)));
+                        }
+                        None => {
+                            let err = WasmResult::Error {
+                                message: format!(
+                                    "payment approval required: this call charges {} — retry with X-Billing-Approved: {}",
+                                    expected, expected,
+                                ),
+                            };
+                            return Err(Response::Data(serialize_or_error(&err)));
+                        }
+                    }
+                }
+            }
+        }
 
         // Authenticated → token is valid, no role check needed.
         if *policy == FunctionPolicy::Authenticated {
@@ -1241,6 +1290,7 @@ impl WasmModule {
             function: call.function.clone(),
             params,
             app_auth: call.app_auth.clone(),
+            billing_approved: call.billing_approved.clone(),
         })
     }
 

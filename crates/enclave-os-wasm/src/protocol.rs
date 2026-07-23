@@ -456,6 +456,11 @@ pub struct ConnectCall {
     /// App-level OIDC bearer token (same semantics as [`WasmCall::app_auth`]).
     #[serde(default)]
     pub app_auth: Option<String>,
+    /// Caller's billing pre-approval (the literal `X-Billing-Approved` header
+    /// value, e.g. `"5000 credits"`). Same semantics as
+    /// [`WasmCall::billing_approved`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_approved: Option<String>,
 }
 
 /// Request the MCP tool manifest for a WASM app.
@@ -614,6 +619,17 @@ pub struct WasmCall {
     /// auth layer.
     #[serde(default)]
     pub app_auth: Option<String>,
+    /// Caller's billing pre-approval — the LITERAL `X-Billing-Approved`
+    /// header value forwarded by the platform (e.g. `"5000 credits"`).
+    ///
+    /// For a caller-priced function (`x-privasys.price`, payer `caller`,
+    /// no applicable exemption) this MUST parse as exactly the attested
+    /// price (`"<credits> credits"`); a missing or mismatched approval is
+    /// refused before dispatch. Because the measured runtime performs the
+    /// comparison against the measured price, a successful call is
+    /// attestable proof the caller pre-approved exactly the price charged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing_approved: Option<String>,
 }
 
 /// A typed parameter passed to a WASM function.
@@ -688,6 +704,11 @@ pub enum WasmResult {
         /// Return values from the function (may be empty for void fns).
         #[serde(default)]
         returns: Vec<WasmValue>,
+        /// Credits actually charged for this call (`x-privasys.price`).
+        /// Absent = free / exempt. The platform surfaces it to the caller
+        /// as the `X-Billing-Charged` response header.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        billing_charged: Option<u64>,
     },
     /// Execution failed.
     #[serde(rename = "error")]
