@@ -2500,11 +2500,17 @@ fn verify_auth_token(
                 });
             }
             Err(e) => {
-                // If OIDC is also available, fall through silently.
-                if permissions.oidc.is_none() {
-                    return Err(format!("FIDO2 auth failed: {e}"));
-                }
-                // Otherwise fall through to OIDC attempt.
+                // A token that MATCHES the FIDO2 session shape (64 hex chars)
+                // can never be a JWT (JWTs contain dots), so falling through
+                // to the OIDC path only replaces a meaningful failure with
+                // JSON-parse noise ("JWT header JSON: expected value…") —
+                // seen when a client restores a session token that a
+                // restarted/rotated enclave no longer knows. Fail here with
+                // an actionable message instead; clients match on "expired"
+                // to clear the stale session and prompt re-authentication.
+                return Err(format!(
+                    "app session token invalid or expired — re-authenticate ({e})"
+                ));
             }
         }
     }
