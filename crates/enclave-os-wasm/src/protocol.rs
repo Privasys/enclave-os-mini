@@ -100,6 +100,16 @@ pub struct WasmEnvelope {
     #[serde(default)]
     pub wasm_freeze: Option<WasmFreeze>,
 
+    /// Host-pushed set of funded sponsor relying parties (`x-privasys.price`
+    /// payer:"sponsor"). The management-service pushes the rp_ids whose
+    /// linked accounts can cover sponsored calls; a sponsored call whose
+    /// rp_id is not in the set is refused before dispatch ("relying party
+    /// has not funded verification") instead of silently shifting cost to
+    /// the owner. Never pushed → no refusal (pre-rollout compatibility).
+    /// Requires the **manager** role.
+    #[serde(default)]
+    pub wasm_funded_rps: Option<WasmFundedRps>,
+
     /// Rotate a vault-backed app's storage KEK to a new generation.
     ///
     /// A cheap re-wrap, never a re-encrypt: the enclave reconstructs the old KEK
@@ -193,6 +203,18 @@ pub struct WasmFreeze {
     /// `admin_hold`). Ignored when `frozen` is `false`.
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+/// Host-pushed funded-sponsor set (see `WasmEnvelope::wasm_funded_rps`).
+///
+/// Replaces the previous set wholesale on every push (the host re-asserts
+/// it each sweep, like the billing freeze).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WasmFundedRps {
+    /// rp_ids whose sponsor accounts are funded. Enclave-global (funding is
+    /// account-level, not per-app).
+    #[serde(default)]
+    pub rp_ids: Vec<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -543,6 +565,12 @@ pub enum WasmManagementResult {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         reason: Option<String>,
     },
+    /// The host-pushed funded-sponsor set was replaced.
+    #[serde(rename = "funded_rps_set")]
+    FundedRpsSet {
+        /// Number of rp_ids now in the set.
+        count: usize,
+    },
     /// A vault-backed app's storage KEK was rotated to a new generation.
     #[serde(rename = "rotated")]
     Rotated {
@@ -802,6 +830,23 @@ pub struct AppPermissions {
     /// Roles required when `schema_policy` is `Role`.
     #[serde(default)]
     pub schema_roles: Vec<String>,
+    /// Default API fee for functions without a per-function `price`
+    /// (from `price:__default__`). `None` = free by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_price: Option<PriceRule>,
+}
+
+impl AppPermissions {
+    /// Resolve the effective price rule for a function: the per-function
+    /// rule, else the app default; `None` when the result would be free
+    /// (absent or zero credits).
+    pub fn price_for(&self, func: &str) -> Option<&PriceRule> {
+        self.functions
+            .get(func)
+            .and_then(|f| f.price.as_ref())
+            .or(self.default_price.as_ref())
+            .filter(|p| p.credits > 0)
+    }
 }
 
 /// OIDC provider configuration for an app's own identity provider.
@@ -827,6 +872,50 @@ pub struct FunctionPermission {
     /// least one of these roles.
     #[serde(default)]
     pub roles: Vec<String>,
+    /// Developer-set per-call API fee (`x-privasys.price`). `None` = free.
+    /// Optional and skipped when absent so existing apps' canonical
+    /// permissions JSON — and thus their configuration hash — is unchanged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<PriceRule>,
+}
+
+/// Payer mode for a priced function (`x-privasys.price`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum Payer {
+    /// The authenticated caller is debited (default).
+    #[default]
+    Caller,
+    /// A third party named in the request pays; the caller pays nothing.
+    Sponsor,
+}
+
+/// Developer-set per-call API fee for one exported function.
+///
+/// Parsed from `price:<func>` docs entries (the WIT `@price` annotation,
+/// mirroring `@auth`) and folded into [`AppPermissions`], so it is part of
+/// the measured configuration hash: the fee a payer is charged is exactly
+/// the attested, advertised price. On each successful (non-`Err`) call the
+/// runtime records an `api_fee` event which the management-service pulls
+/// and settles (payer debited, owner 85%, platform 15%).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PriceRule {
+    /// Fee in credits charged to the payer per successful call.
+    /// `0` = free (today's behaviour).
+    #[serde(default)]
+    pub credits: u64,
+    /// Who pays: the authenticated caller (default) or a request-named sponsor.
+    #[serde(default)]
+    pub payer: Payer,
+    /// Request parameter naming the sponsor id (required iff `payer` is
+    /// `sponsor`); resolved to a funded account platform-side.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sponsor_from: Option<String>,
+    /// Caller classes exempt from the fee (caller mode only). v1 class:
+    /// `"wallet"` — the caller's token carries the IdP's non-identifying
+    /// wallet marker.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub free_for: Vec<String>,
 }
 
 /// Access policy type.

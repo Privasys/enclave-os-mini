@@ -143,6 +143,42 @@ pub struct EnclaveMetrics {
     /// Per-app WASM fuel metering metrics (empty if WASM not enabled).
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub wasm_app_metrics: Vec<WasmAppMetrics>,
+    /// Developer API-fee events (`x-privasys.price`) recorded by the WASM
+    /// runtime on successful priced calls. Unlike the cumulative fuel
+    /// counters these are discrete billable events: the runtime keeps a
+    /// bounded ring of recent events and the management-service pulls them
+    /// at-least-once — the ledger deduplicates on `call_id`, so replays
+    /// across polls or restarts never double-charge.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub api_fees: Vec<ApiFeeEvent>,
+}
+
+/// One developer API fee owed for one successful priced WASM call.
+///
+/// Emitted by the attested runtime (the metering authority): the price and
+/// payer rule come from the measured app manifest, so the fee reported here
+/// is exactly the advertised price. The runtime reports OIDC subjects and
+/// rp_ids, never ledger account UUIDs — account resolution is the
+/// management-service's job.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiFeeEvent {
+    /// Monotonic per-enclave sequence number (restart-safe: persisted with
+    /// the metrics snapshot). Lets the poller skip already-applied events.
+    pub seq: u64,
+    /// App identifier (the load name; the platform maps it to the app row).
+    pub app: String,
+    /// The priced exported function that was called.
+    pub function: String,
+    /// Unique id for this call — the ledger's idempotency key.
+    pub call_id: String,
+    /// Verified caller subject (payer mode "caller"). The payer.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub caller_sub: Option<String>,
+    /// Relying-party id extracted from the request (payer mode "sponsor").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sponsor_rp_id: Option<String>,
+    /// Fee in credits, as declared by the measured manifest.
+    pub credits: u64,
 }
 
 /// Aggregated fuel metrics for a single WASM app.

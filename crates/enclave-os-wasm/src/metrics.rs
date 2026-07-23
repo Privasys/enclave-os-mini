@@ -7,12 +7,12 @@
 //! metering.  Metrics live in memory and can be persisted to the sealed
 //! KV store via [`WasmMetricsStore::save`] / [`WasmMetricsStore::load`].
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::vec::Vec;
 
 use serde::{Deserialize, Serialize};
 
-use enclave_os_common::protocol::{WasmAppMetrics, WasmFunctionMetrics};
+use enclave_os_common::protocol::{ApiFeeEvent, WasmAppMetrics, WasmFunctionMetrics};
 
 // ---------------------------------------------------------------------------
 //  KV key for persistence
@@ -160,7 +160,21 @@ pub struct WasmMetricsStore {
     #[serde(default)]
     schema_version: u32,
     apps: BTreeMap<String, AppCounters>,
+    /// Monotonic API-fee sequence (`x-privasys.price`); persisted so the
+    /// poller's last-seen cursor survives a restart.
+    #[serde(default)]
+    fee_seq: u64,
+    /// Bounded ring of recent API-fee events (discrete billable events,
+    /// unlike the cumulative counters above). Never drained on read: the
+    /// poller pulls at-least-once and the ledger dedupes on `call_id`;
+    /// old events simply age out of the ring.
+    #[serde(default)]
+    api_fees: VecDeque<ApiFeeEvent>,
 }
+
+/// Maximum API-fee events retained. At the 60s poll cadence this allows
+/// ~68 priced calls/second sustained before an unpulled event ages out.
+const MAX_API_FEE_EVENTS: usize = 4096;
 
 impl WasmMetricsStore {
     pub fn new() -> Self {
@@ -209,6 +223,39 @@ impl WasmMetricsStore {
         ac.https_plain_bytes += usage.https_plain_bytes;
         ac.https_ratls_calls += usage.https_ratls_calls;
         ac.https_ratls_bytes += usage.https_ratls_bytes;
+    }
+
+    /// Record one developer API fee owed for a successful priced call
+    /// (`x-privasys.price`). Assigns the next sequence number; the oldest
+    /// event ages out past [`MAX_API_FEE_EVENTS`].
+    pub fn record_api_fee(
+        &mut self,
+        app: &str,
+        function: &str,
+        call_id: String,
+        caller_sub: Option<String>,
+        sponsor_rp_id: Option<String>,
+        credits: u64,
+    ) {
+        self.fee_seq += 1;
+        self.api_fees.push_back(ApiFeeEvent {
+            seq: self.fee_seq,
+            app: app.to_string(),
+            function: function.to_string(),
+            call_id,
+            caller_sub,
+            sponsor_rp_id,
+            credits,
+        });
+        while self.api_fees.len() > MAX_API_FEE_EVENTS {
+            self.api_fees.pop_front();
+        }
+    }
+
+    /// Snapshot the retained API-fee events (oldest first) for the metrics
+    /// wire response. Pure read — nothing is drained.
+    pub fn api_fee_events(&self) -> Vec<ApiFeeEvent> {
+        self.api_fees.iter().cloned().collect()
     }
 
     /// Record a failed call (error).
@@ -336,6 +383,25 @@ impl WasmMetricsStore {
                                 fc.fuel_max = saved_fc.fuel_max;
                             }
                         }
+                    }
+                }
+                // API-fee ring: persisted events precede anything recorded
+                // since boot, so splice them in front and renumber the boot
+                // events past the saved high-water mark (seq stays monotonic;
+                // call_id — the ledger idempotency key — is untouched, so a
+                // renumber can at worst cause an idempotent re-apply).
+                if saved.fee_seq > 0 || !saved.api_fees.is_empty() {
+                    let boot_events: Vec<ApiFeeEvent> = self.api_fees.drain(..).collect();
+                    let mut seq = saved.fee_seq;
+                    self.api_fees = saved.api_fees;
+                    for mut ev in boot_events {
+                        seq += 1;
+                        ev.seq = seq;
+                        self.api_fees.push_back(ev);
+                    }
+                    self.fee_seq = seq.max(self.fee_seq);
+                    while self.api_fees.len() > MAX_API_FEE_EVENTS {
+                        self.api_fees.pop_front();
                     }
                 }
                 Ok(true)

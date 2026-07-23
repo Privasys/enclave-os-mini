@@ -40,7 +40,7 @@
 //! [`Component`]: wasmtime::component::Component
 //! [`WasmCall::function`]: crate::protocol::WasmCall::function
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::string::String;
 use std::vec::Vec;
 
@@ -52,8 +52,8 @@ use wasmtime::Store;
 
 use crate::engine::WasmEngine;
 use crate::protocol::{
-    AppPermissions, ExportedFunc, FunctionPermission, FunctionPolicy, WasmParam, WasmResult,
-    WasmValue,
+    AppPermissions, ExportedFunc, FunctionPermission, FunctionPolicy, PriceRule, WasmParam,
+    WasmResult, WasmValue,
 };
 use crate::wasi::AppContext;
 use enclave_os_common::types::AEAD_KEY_SIZE;
@@ -312,12 +312,58 @@ fn merge_auth_from_docs(
             perms.default_policy = policy;
             perms.default_roles = roles;
         } else {
-            perms
-                .functions
-                .insert(name.to_string(), FunctionPermission { policy, roles });
+            perms.functions.insert(
+                name.to_string(),
+                FunctionPermission {
+                    policy,
+                    roles,
+                    price: None,
+                },
+            );
         }
     }
 
+    Some(perms)
+}
+
+/// Merge `price:<func>` / `price:__default__` docs entries (the WIT `@price`
+/// annotation, JSON [`PriceRule`] values) into the permissions. Mirrors
+/// [`merge_auth_from_docs`] and runs after it, so per-function entries merge
+/// onto any auth-created `FunctionPermission`. A price on an app with no
+/// permissions block at all is ignored (a priced caller-mode call requires
+/// an authenticated caller, which requires an auth configuration).
+fn merge_price_from_docs(
+    docs: &BTreeMap<String, String>,
+    permissions: Option<AppPermissions>,
+) -> Option<AppPermissions> {
+    let entries: Vec<(&str, &str)> = docs
+        .iter()
+        .filter_map(|(k, v)| k.strip_prefix("price:").map(|name| (name, v.as_str())))
+        .collect();
+    if entries.is_empty() {
+        return permissions;
+    }
+    let mut perms = permissions?;
+    for (name, raw) in entries {
+        let rule: PriceRule = match serde_json::from_str(raw) {
+            Ok(r) => r,
+            Err(_) => continue, // malformed annotation → unpriced, never mis-priced
+        };
+        if name == "__default__" {
+            perms.default_price = Some(rule);
+        } else if let Some(fp) = perms.functions.get_mut(name) {
+            fp.price = Some(rule);
+        } else {
+            perms.functions.insert(
+                name.to_string(),
+                FunctionPermission {
+                    policy: perms.default_policy.clone(),
+                    roles: perms.default_roles.clone(),
+                    price: Some(rule),
+                },
+            );
+        }
+    }
     Some(perms)
 }
 
@@ -503,6 +549,12 @@ pub struct AppRegistry {
     /// top-up. In-memory only — the feed re-applies it after a restart.
     /// Independent of the `configured` config-gate.
     billing_frozen: BTreeMap<String, String>,
+    /// Host-pushed funded sponsor rp_ids (`x-privasys.price`
+    /// payer:"sponsor"). `None` = never pushed → no refusal (pre-rollout
+    /// compatibility); `Some(set)` → a sponsored call whose rp_id is not
+    /// in the set is refused before dispatch. In-memory only — the usage
+    /// feed re-asserts it each sweep, like the billing freeze.
+    funded_rps: Option<BTreeSet<String>>,
 }
 
 impl AppRegistry {
@@ -517,6 +569,7 @@ impl AppRegistry {
             config_api: BTreeMap::new(),
             configured: BTreeMap::new(),
             billing_frozen: BTreeMap::new(),
+            funded_rps: None,
         }
     }
 
@@ -615,9 +668,12 @@ impl AppRegistry {
             },
         };
         // ── Introspect exports (full WIT type schema) ──────────────
-        // Extract @auth annotations from docs before passing to schema builder.
+        // Extract @auth + @price annotations from docs before passing to the
+        // schema builder. Price merges after auth so per-function rules land
+        // on the auth-created permissions; both are folded into the measured
+        // configuration hash below (an attested price).
         let permissions = match docs {
-            Some(ref d) => merge_auth_from_docs(d, permissions),
+            Some(ref d) => merge_price_from_docs(d, merge_auth_from_docs(d, permissions)),
             None => permissions,
         };
         // Extract @config-api decoration from docs. The WIT-derived
@@ -941,6 +997,41 @@ impl AppRegistry {
     /// orthogonal to [`is_frozen`](Self::is_frozen) (the config gate).
     pub fn billing_freeze_reason(&self, name: &str) -> Option<&str> {
         self.billing_frozen.get(name).map(|s| s.as_str())
+    }
+
+    /// Replace the host-pushed funded-sponsor set (`x-privasys.price`).
+    /// Returns the new set size.
+    pub fn set_funded_rps(&mut self, rp_ids: Vec<String>) -> usize {
+        let set: BTreeSet<String> = rp_ids.into_iter().collect();
+        let n = set.len();
+        self.funded_rps = Some(set);
+        n
+    }
+
+    /// Whether a sponsored call for `rp_id` may proceed. `true` until the
+    /// host has pushed a funded set (pre-rollout compatibility); once
+    /// pushed, only listed rp_ids are allowed.
+    pub fn funded_rp_allowed(&self, rp_id: &str) -> bool {
+        match &self.funded_rps {
+            None => true,
+            Some(set) => set.contains(rp_id),
+        }
+    }
+
+    /// Resolve the effective API-fee context for a call: the price rule
+    /// (per-function or app default; `None` when free) and, for sponsor
+    /// mode, the positional index of the request parameter named by
+    /// `sponsor_from` (schema-derived; params are positional on the wire).
+    pub fn price_context(&self, app: &str, func: &str) -> Option<(PriceRule, Option<usize>)> {
+        let meta = self.get_known(app)?;
+        let rule = meta.permissions.as_ref()?.price_for(func)?.clone();
+        let sponsor_idx = rule.sponsor_from.as_deref().and_then(|field| {
+            meta.schema.as_ref().and_then(|s| {
+                s.find_function(func)
+                    .and_then(|f| f.params.iter().position(|p| p.name == field))
+            })
+        });
+        Some((rule, sponsor_idx))
     }
 
     /// Install (or replace) an app-defined attestation extension at

@@ -92,7 +92,8 @@ use ring::digest;
 
 use crate::metrics::WasmMetricsStore;
 use crate::protocol::{
-    AppPermissions, FunctionPolicy, WasmCall, WasmEnvelope, WasmManagementResult, WasmResult,
+    AppPermissions, FunctionPolicy, Payer, WasmCall, WasmEnvelope, WasmManagementResult, WasmParam,
+    WasmResult,
     WasmSchemaRequest,
 };
 use crate::protocol::{AppRolesAction, AppRolesResult, UserRoles};
@@ -430,6 +431,12 @@ impl WasmModule {
             }
         }
 
+        // x-privasys.price: capture the fee-relevant caller facts before
+        // `auth` is consumed by prepare_call below. Used only in the
+        // on-success fee recording at the bottom of this function.
+        let fee_caller = auth.as_ref().and_then(|a| a.user_id.clone());
+        let fee_wallet = auth.as_ref().map(|a| a.wallet_class).unwrap_or(false);
+
         // Prepare under lock, but release the lock before invoking
         // the wasm function. Wasm host bindings (e.g.
         // `attestation.set-config-complete`) re-enter `WasmModule`
@@ -518,6 +525,52 @@ impl WasmModule {
                 if is_config_fn {
                     let _ = self.mark_configured(&call.app);
                 }
+
+                // x-privasys.price: record the fee owed for this successful
+                // priced call. The rule comes from the measured permissions
+                // (an attested price); the event is pulled by the usage feed
+                // and settled ledger-side (payer debited, owner 85%, platform
+                // 15%), idempotent on call_id. Fee on success only; compute
+                // is metered to the owner regardless, below.
+                let fee = self.registry.lock().ok().and_then(|reg| {
+                    let (rule, sponsor_idx) =
+                        reg.price_context(&call.app, &call.function)?;
+                    match rule.payer {
+                        Payer::Caller => {
+                            if fee_wallet && rule.free_for.iter().any(|c| c == "wallet") {
+                                None // wallet-class exemption: caller pays 0
+                            } else {
+                                // check_app_permissions enforced an
+                                // authenticated caller for priced functions;
+                                // a missing sub here means an unbillable
+                                // legacy path — skip, never mischarge.
+                                fee_caller
+                                    .clone()
+                                    .map(|sub| (rule.credits, Some(sub), None))
+                            }
+                        }
+                        Payer::Sponsor => sponsor_idx
+                            .and_then(|i| match call.params.get(i) {
+                                Some(WasmParam::String(s)) if !s.is_empty() => {
+                                    Some(s.clone())
+                                }
+                                _ => None,
+                            })
+                            .map(|rp| (rule.credits, None, Some(rp))),
+                    }
+                });
+                if let Some((credits, caller_sub, sponsor_rp)) = fee {
+                    if let Ok(mut m) = self.metrics.lock() {
+                        m.record_api_fee(
+                            &call.app,
+                            &call.function,
+                            random_call_id(),
+                            caller_sub,
+                            sponsor_rp,
+                            credits,
+                        );
+                    }
+                }
             }
         }
 
@@ -589,6 +642,44 @@ impl WasmModule {
         };
         // Build the app's role store for FIDO2 role lookup.
         let role_store = build_app_role_store(&registry, &call.app);
+
+        // x-privasys.price pre-dispatch gate. The rule lives in the measured
+        // permissions (an attested price). Sponsor mode: the request must
+        // carry the sponsor's rp_id in the `sponsor_from` parameter, and —
+        // once the host has pushed the funded set — that rp_id must be
+        // funded ("refuse rather than silently move cost to the owner").
+        let price_ctx = registry.price_context(&call.app, &call.function);
+        if let Some((rule, sponsor_idx)) = &price_ctx {
+            if rule.payer == Payer::Sponsor {
+                let rp = sponsor_idx.and_then(|i| match call.params.get(i) {
+                    Some(WasmParam::String(s)) if !s.is_empty() => Some(s.as_str()),
+                    _ => None,
+                });
+                match rp {
+                    None => {
+                        let err = WasmResult::Error {
+                            message: format!(
+                                "payment required: function '{}' on app '{}' is sponsor-priced; the request must carry the sponsoring relying party in '{}'",
+                                call.function,
+                                call.app,
+                                rule.sponsor_from.as_deref().unwrap_or("<unset>"),
+                            ),
+                        };
+                        return Err(Response::Data(serialize_or_error(&err)));
+                    }
+                    Some(rp) if !registry.funded_rp_allowed(rp) => {
+                        let err = WasmResult::Error {
+                            message: format!(
+                                "payment required: relying party '{}' has not funded this verification",
+                                rp,
+                            ),
+                        };
+                        return Err(Response::Data(serialize_or_error(&err)));
+                    }
+                    Some(_) => {}
+                }
+            }
+        }
         drop(registry); // Release lock before potentially slow token verification.
 
         // Determine the effective policy for this function.
@@ -597,8 +688,16 @@ impl WasmModule {
             None => (&permissions.default_policy, &permissions.default_roles),
         };
 
-        // Public → no auth needed.
-        if *policy == FunctionPolicy::Public {
+        // A caller-priced function can never be billed anonymously: even
+        // when its auth policy is `public`, require a verified token
+        // (Authenticated semantics; a `free_for` class also needs the
+        // token to prove the class). Sponsor-priced functions stay open —
+        // the caller is never the payer.
+        let priced_caller =
+            matches!(&price_ctx, Some((rule, _)) if rule.payer == Payer::Caller);
+
+        // Public → no auth needed (unless caller-priced).
+        if *policy == FunctionPolicy::Public && !priced_caller {
             return Ok(None);
         }
 
@@ -764,6 +863,7 @@ impl WasmModule {
             return Ok(AuthResult {
                 roles: Vec::new(),
                 user_id: None,
+                wallet_class: false,
             });
         }
 
@@ -785,7 +885,7 @@ impl WasmModule {
                 audience: cfg.audience.clone(),
                 roles_claim: cfg.role_claim.clone(),
             };
-            if let Ok((roles, sub)) = verify_app_token(token, &platform) {
+            if let Ok((roles, sub, wallet)) = verify_app_token(token, &platform) {
                 if let Some(id) = app_id {
                     let hexid = enclave_os_common::hex::hex_encode(&id);
                     let owner_role = format!("{}:app:{}:owner", cfg.audience, hexid);
@@ -799,6 +899,7 @@ impl WasmModule {
                         return Ok(AuthResult {
                             roles,
                             user_id: sub,
+                            wallet_class: wallet,
                         });
                     }
                 }
@@ -814,6 +915,7 @@ impl WasmModule {
                         return Ok(AuthResult {
                             roles,
                             user_id: sub,
+                            wallet_class: wallet,
                         });
                     }
                 }
@@ -1661,6 +1763,21 @@ impl EnclaveModule for WasmModule {
             return Some(Response::Data(serialize_or_error(&mgmt_result)));
         }
 
+        // 3b2. wasm_funded_rps — host-pushed funded-sponsor set
+        // (x-privasys.price payer:"sponsor"). Replaced wholesale each push;
+        // the usage feed re-asserts it every sweep, like the freeze.
+        if let Some(fr) = envelope.wasm_funded_rps {
+            let mgmt_result = match self.registry.lock() {
+                Ok(mut registry) => WasmManagementResult::FundedRpsSet {
+                    count: registry.set_funded_rps(fr.rp_ids),
+                },
+                Err(_) => WasmManagementResult::Error {
+                    message: String::from("registry lock poisoned"),
+                },
+            };
+            return Some(Response::Data(serialize_or_error(&mgmt_result)));
+        }
+
         // 3c. wasm_rotate_key — rotate a vault-backed app's storage KEK
         if let Some(rot) = envelope.wasm_rotate_key {
             let mgmt_url = rot.mgmt_url.clone().unwrap_or_default();
@@ -1869,6 +1986,9 @@ impl EnclaveModule for WasmModule {
     fn enrich_metrics(&self, metrics: &mut enclave_os_common::protocol::EnclaveMetrics) {
         if let Ok(m) = self.metrics.lock() {
             metrics.wasm_app_metrics = m.to_app_metrics();
+            // Developer API-fee events (x-privasys.price): at-least-once
+            // pull — the ledger dedupes on call_id.
+            metrics.api_fees = m.api_fee_events();
             let _ = m.save();
         }
     }
@@ -2294,6 +2414,31 @@ struct AuthResult {
     roles: Vec<String>,
     /// Caller's identity (FIDO2 user_handle or OIDC `sub` claim).
     user_id: Option<String>,
+    /// Caller holds a wallet-class token (the IdP's constant,
+    /// non-identifying `wallet` claim on tokens minted from a genuine
+    /// wallet WebAuthn ceremony). Drives the `free_for:["wallet"]`
+    /// API-fee exemption (`x-privasys.price`); never identifies anyone.
+    wallet_class: bool,
+}
+
+/// Random 128-bit hex call id for an API-fee event — the ledger's
+/// idempotency key, so it must be globally unique (RDRAND-backed; a
+/// deterministic id would collide across restarts and silently drop fees).
+fn random_call_id() -> String {
+    use ring::rand::{SecureRandom, SystemRandom};
+    let mut b = [0u8; 16];
+    if SystemRandom::new().fill(&mut b).is_err() {
+        // RDRAND failure is practically impossible; salt with the clock
+        // rather than emit an all-zero (colliding) id.
+        let t = enclave_os_common::ocall::get_current_time().unwrap_or(0);
+        b[..8].copy_from_slice(&t.to_be_bytes());
+    }
+    let mut s = String::with_capacity(32);
+    for byte in b {
+        use core::fmt::Write;
+        let _ = write!(s, "{:02x}", byte);
+    }
+    s
 }
 
 /// Build a [`SealedKvStore`] scoped to an app's `app:<name>` table.
@@ -2350,6 +2495,8 @@ fn verify_auth_token(
                 return Ok(AuthResult {
                     roles,
                     user_id: Some(user_id),
+                    // FIDO2 sessions carry no claims — no wallet class.
+                    wallet_class: false,
                 });
             }
             Err(e) => {
@@ -2375,10 +2522,11 @@ fn verify_auth_token(
 
     // Try OIDC JWT verification.
     if let Some(oidc) = &permissions.oidc {
-        let (roles, sub) = verify_app_token(token, oidc)?;
+        let (roles, sub, wallet) = verify_app_token(token, oidc)?;
         return Ok(AuthResult {
             roles,
             user_id: sub,
+            wallet_class: wallet,
         });
     }
 
@@ -2396,7 +2544,7 @@ fn verify_auth_token(
 fn verify_app_token(
     token: &str,
     oidc: &crate::protocol::AppOidcConfig,
-) -> Result<(Vec<String>, Option<String>), String> {
+) -> Result<(Vec<String>, Option<String>, bool), String> {
     // Verify ES256 signature via JWKS (rejects alg:none, fetches/caches keys)
     let claims: serde_json::Value =
         crate::jwks_fetcher::verify_jwt_signature(token, &oidc.issuer, &oidc.jwks_uri)?;
@@ -2456,7 +2604,19 @@ fn verify_app_token(
 
     roles.sort();
     roles.dedup();
-    Ok((roles, sub))
+
+    // Wallet-class marker (`x-privasys.price` free_for:["wallet"]): the IdP
+    // stamps a constant `wallet` claim (string "true" or boolean) on tokens
+    // minted from a genuine wallet WebAuthn ceremony. Only meaningful when
+    // the app's OIDC issuer IS the platform IdP (the deploy default); any
+    // other issuer simply never yields the class.
+    let wallet = match claims.get("wallet") {
+        Some(serde_json::Value::Bool(b)) => *b,
+        Some(serde_json::Value::String(s)) => s == "true",
+        _ => false,
+    };
+
+    Ok((roles, sub, wallet))
 }
 
 /// Collect role strings from a JSON value (array of strings or map
