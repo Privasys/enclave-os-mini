@@ -1128,6 +1128,12 @@ pub struct FunctionSchema {
     /// Human-readable description from `///` doc comment in WIT.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Developer-set per-call API fee (`x-privasys.price`), copied from the
+    /// measured permissions at load time so clients discover the ATTESTED
+    /// price on the schema they fetch from the enclave itself — the price a
+    /// caller consents to is the price the runtime will charge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub price: Option<PriceRule>,
 }
 
 /// An exported interface containing one or more functions.

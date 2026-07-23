@@ -373,6 +373,9 @@ fn func_type_to_schema(
         params,
         results,
         description: docs.get(&format!("func:{}", name)).cloned(),
+        // Attached from the measured permissions after registration (the
+        // schema builder has no permissions context here).
+        price: None,
     }
 }
 

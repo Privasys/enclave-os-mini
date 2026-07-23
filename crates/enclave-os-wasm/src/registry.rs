@@ -696,6 +696,19 @@ impl AppRegistry {
             self.engine
                 .discover_exports_typed(name, hostname, &component, Some(wasm_bytes), docs);
         schema.mcp_enabled = mcp_enabled;
+        // Stamp each function's ATTESTED price (from the measured permissions)
+        // onto the schema, so clients that fetch the schema from the enclave
+        // discover exactly the fee the runtime will charge.
+        if let Some(ref perms) = permissions {
+            for f in schema.functions.iter_mut() {
+                f.price = perms.price_for(&f.name).cloned();
+            }
+            for iface in schema.interfaces.iter_mut() {
+                for f in iface.functions.iter_mut() {
+                    f.price = perms.price_for(&f.name).cloned();
+                }
+            }
+        }
         let exports = schema.to_exports_map();
 
         if exports.is_empty() {
