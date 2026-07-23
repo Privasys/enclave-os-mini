@@ -627,7 +627,11 @@ impl AppRegistry {
         // only surface on the first wasm_call, after the management
         // service already reported a successful deployment.
         {
-            let mut probe_store = self.engine.new_store(name, [0u8; AEAD_KEY_SIZE], 1);
+            // Fund the probe with the app's per-call budget: instantiation
+            // runs component init code, which burns real fuel now that
+            // consume_fuel is on (a 1-unit store traps instantly with
+            // "all fuel consumed").
+            let mut probe_store = self.engine.new_store(name, [0u8; AEAD_KEY_SIZE], max_fuel);
             self.engine
                 .linker()
                 .instantiate(&mut probe_store, &component)
