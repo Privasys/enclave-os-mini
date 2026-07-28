@@ -14,14 +14,35 @@ use std::vec::Vec;
 #[cfg(not(feature = "mock"))]
 use sgx_tseal::seal::SealedData;
 
-/// Seal data using MRENCLAVE policy.
+/// Seal data using **MRENCLAVE** policy.
 ///
 /// The sealed blob can only be unsealed by an enclave with the same MRENCLAVE.
+///
+/// NB: `SealedData::seal` uses SGX's *default* key policy, which the teaclave
+/// SDK implements as **MRSIGNER** — that would let any same-signer enclave
+/// unseal (weaker than this function's name implies) and, because our signing
+/// key is generated per build, would also break unseal on every rebuild. We
+/// therefore bind explicitly to MRENCLAVE with the crate's default masks
+/// (`AttributesFlags::DEFAULT_MASK`, `xfrm = 0`, `TSEAL_DEFAULT_MISCMASK`).
+/// Continuity across an MRENCLAVE change is provided by the vault (KEK-wrapped
+/// per-app DEK), never by this seal.
 #[cfg(not(feature = "mock"))]
 pub fn seal_with_mrenclave(plaintext: &[u8], aad: &[u8]) -> Result<Vec<u8>, &'static str> {
+    use sgx_types::types::{Attributes, AttributesFlags, KeyPolicy, TSEAL_DEFAULT_MISCMASK};
+
     let aad_opt = if aad.is_empty() { None } else { Some(aad) };
-    let sealed = SealedData::<[u8]>::seal(plaintext, aad_opt)
-        .map_err(|_| "sgx_seal_data failed")?;
+    let attribute_mask = Attributes {
+        flags: AttributesFlags::DEFAULT_MASK,
+        xfrm: 0,
+    };
+    let sealed = SealedData::<[u8]>::seal_with_key_policy(
+        KeyPolicy::MRENCLAVE,
+        attribute_mask,
+        TSEAL_DEFAULT_MISCMASK,
+        plaintext,
+        aad_opt,
+    )
+    .map_err(|_| "sgx_seal_data failed")?;
 
     sealed.into_bytes().map_err(|_| "Failed to serialize sealed data")
 }
