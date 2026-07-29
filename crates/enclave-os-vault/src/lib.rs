@@ -1049,6 +1049,53 @@ fn check_pending_mutability(
     Ok(role)
 }
 
+/// Who is staging a pending profile.
+enum StagerIdentity {
+    /// A key principal (owner, or a manager the Mutability rules permit).
+    Principal(CallerRole),
+    /// The PLATFORM: a verified manager-role bearer that matches no key
+    /// principal. This is the staging-only capability from the
+    /// enclave-upgrade design (item 2): after a runtime roll the platform
+    /// may PROPOSE the new measurement on any key — staging authorises
+    /// nothing by itself — while promote, revoke, export, update and every
+    /// other operation still resolve through the key's own principals,
+    /// where the platform deliberately has no slot.
+    Platform,
+}
+
+/// Stage-only authority check. Principals go through the same Mutability
+/// rules as [`check_pending_mutability`]; a non-principal manager-role
+/// bearer is admitted as [`StagerIdentity::Platform`]. Revoke keeps using
+/// `check_pending_mutability` — the platform must never drop an owner's
+/// staged profile.
+fn check_stage_authority(
+    record: &KeyRecord,
+    ctx: &RequestContext,
+) -> Result<StagerIdentity, String> {
+    if resolve_caller(&record.policy, ctx).is_some() {
+        return check_pending_mutability(record, ctx).map(StagerIdentity::Principal);
+    }
+    let is_platform = ctx
+        .oidc_claims
+        .as_ref()
+        .map(|c| c.is_manager)
+        .unwrap_or(false);
+    if !is_platform {
+        return Err("caller is not in policy.principals".into());
+    }
+    // An owner who marked PendingProfiles immutable has explicitly frozen
+    // the staging surface; that veto binds the platform too.
+    if record
+        .policy
+        .mutability
+        .immutable
+        .contains(&PolicyField::PendingProfiles)
+    {
+        return Err("PolicyField::PendingProfiles is immutable on this key".into());
+    }
+    Ok(StagerIdentity::Platform)
+}
+
 fn handle_stage_pending(
     handle: &str,
     mut profile: AttestationProfile,
@@ -1060,17 +1107,108 @@ fn handle_stage_pending(
         Err(e) => return e,
     };
     let caller = caller_str(ctx);
-    if let Err(e) = check_pending_mutability(&record, ctx) {
+    let stager = match check_stage_authority(&record, ctx) {
+        Ok(s) => s,
+        Err(e) => {
+            let _ = audit_and_save(
+                &mut record,
+                "StagePendingProfile",
+                &caller,
+                AuditDecision::Denied,
+                &e,
+            );
+            return VaultResponse::Error(e);
+        }
+    };
+    normalise_profile(&mut profile);
+
+    // Idempotent re-stage of an already-accepted profile: nothing pending,
+    // nothing to promote. Platform sweeps re-stage on every roll; this must
+    // not grow state or demand another owner approval.
+    if record
+        .policy
+        .principals
+        .tees
+        .iter()
+        .any(|p| matches!(p, Principal::Tee(t) if t == &profile))
+    {
+        return VaultResponse::PendingProfileStaged {
+            pending_id: 0,
+            auto_promoted: true,
+            policy_version: record.policy_version,
+        };
+    }
+    // Dedupe an identical already-pending profile: hand back its id.
+    if let Some(existing) = record
+        .pending_profiles
+        .iter()
+        .find(|p| p.profile == profile)
+    {
+        return VaultResponse::PendingProfileStaged {
+            pending_id: existing.id,
+            auto_promoted: false,
+            policy_version: record.policy_version,
+        };
+    }
+
+    let staged_by_platform = matches!(stager, StagerIdentity::Platform);
+    // Auto-migrate acceptance (see `Lifecycle`): only for the PLATFORM
+    // stager — `source` is caller-supplied and never trusted — and only a
+    // runtime-only delta of a profile the owner already accepted. The
+    // promote-time OID append/strengthen invariant is re-checked out of
+    // defence in depth (equality of required_oids implies it).
+    if staged_by_platform
+        && record
+            .policy
+            .lifecycle
+            .auto_migrate_to_next_attestation_profile
+        && record.policy.principals.tees.iter().any(
+            |p| matches!(p, Principal::Tee(t) if crate::policy::runtime_only_delta(&profile, t)),
+        )
+        && {
+            let established = crate::policy::key_required_oids(&record.policy);
+            established
+                .iter()
+                .all(|oid| profile.required_oids.iter().any(|r| &r.oid == oid))
+        }
+    {
+        record
+            .policy
+            .principals
+            .tees
+            .push(Principal::Tee(profile));
+        record.policy_version = record.policy_version.saturating_add(1);
+        let new_tee_idx = record.policy.principals.tees.len() - 1;
+        if let Err(e) = audit_and_save(
+            &mut record,
+            "AutoMigrateProfile",
+            &caller,
+            AuditDecision::Allowed,
+            &format!("runtime-only delta -> tees[{}]", new_tee_idx),
+        ) {
+            return e;
+        }
+        return VaultResponse::PendingProfileStaged {
+            pending_id: 0,
+            auto_promoted: true,
+            policy_version: record.policy_version,
+        };
+    }
+
+    if record.pending_profiles.len() >= crate::types::MAX_PENDING_PROFILES {
+        let msg = format!(
+            "too many pending profiles (max {}): promote or revoke some first",
+            crate::types::MAX_PENDING_PROFILES
+        );
         let _ = audit_and_save(
             &mut record,
             "StagePendingProfile",
             &caller,
             AuditDecision::Denied,
-            &e,
+            &msg,
         );
-        return VaultResponse::Error(e);
+        return VaultResponse::Error(msg);
     }
-    normalise_profile(&mut profile);
 
     let staged_by_sub = ctx
         .oidc_claims
@@ -1082,9 +1220,16 @@ fn handle_stage_pending(
     record.pending_profiles.push(PendingProfile {
         id: pending_id,
         profile,
-        source,
+        // The platform's stage is always a platform build proposal,
+        // whatever the caller claimed.
+        source: if staged_by_platform {
+            PendingProfileSource::PlatformBuild
+        } else {
+            source
+        },
         staged_at: now_secs(),
         staged_by_sub,
+        staged_by_platform,
     });
 
     if let Err(e) = audit_and_save(
@@ -1096,7 +1241,12 @@ fn handle_stage_pending(
     ) {
         return e;
     }
-    VaultResponse::PendingProfileStaged { pending_id }
+    let policy_version = record.policy_version;
+    VaultResponse::PendingProfileStaged {
+        pending_id,
+        auto_promoted: false,
+        policy_version,
+    }
 }
 
 fn handle_list_pending(handle: &str, ctx: &RequestContext) -> VaultResponse {

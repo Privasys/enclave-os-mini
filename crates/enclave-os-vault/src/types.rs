@@ -176,7 +176,13 @@ pub enum VaultRequest {
     // --- Pending attestation profiles (enclave upgrade flow) -------------
     /// Stage a new `AttestationProfile` as `pending`. Owner-only by
     /// default; managers may stage if `mutability.manager_can` includes
-    /// [`PolicyField::PendingProfiles`].
+    /// [`PolicyField::PendingProfiles`]. The PLATFORM (a manager-role
+    /// bearer that matches no key principal) may also stage — staging is
+    /// a proposal and authorises nothing — unless `PendingProfiles` is
+    /// immutable on the key. If the key opted into
+    /// `lifecycle.auto_migrate_to_next_attestation_profile` and the
+    /// platform-staged profile is a runtime-only delta of an accepted
+    /// profile, it is promoted immediately (see [`Lifecycle`]).
     StagePendingProfile {
         handle: String,
         profile: AttestationProfile,
@@ -248,7 +254,20 @@ pub enum VaultResponse {
     },
 
     PendingProfileStaged {
+        /// Id of the staged pending profile. Meaningless (0) when
+        /// `auto_promoted` — there is nothing pending to promote or revoke.
         pending_id: u32,
+        /// True when no owner promote is needed: the profile was accepted
+        /// immediately (the key's `auto_migrate` opt-in matched a
+        /// runtime-only delta), or it was already an accepted principal
+        /// (idempotent re-stage). False = staged as pending, owner promote
+        /// required.
+        #[serde(default)]
+        auto_promoted: bool,
+        /// The key's policy version after this call (bumped only when the
+        /// profile was newly auto-promoted).
+        #[serde(default)]
+        policy_version: u32,
     },
     PendingProfileList {
         pending: Vec<PendingProfile>,
@@ -575,12 +594,29 @@ pub struct Lifecycle {
     /// Capped at [`MAX_KEY_TTL_SECONDS`]. Zero means default.
     #[serde(default)]
     pub ttl_seconds: u64,
+    /// Auto-migrate opt-in (the enclave-upgrade design, item 2 —
+    /// "auto-rolling"): when true, a profile staged by the PLATFORM
+    /// (manager-role bearer, not a key principal) that differs from an
+    /// already-accepted profile **only in the platform-runtime measurement**
+    /// (SGX MRENCLAVE, or the TDX MRTD/RTMR set) is promoted immediately,
+    /// without an owner promote. The app-code digest (OID …65230.3.2), the
+    /// app id (…3.6) and every other required OID must be byte-identical —
+    /// app-code changes ALWAYS need the owner. This is the owner's standing
+    /// "trust the platform's own enclave-upgrade approval" grant; it is
+    /// justified by build transparency (a bad platform measurement is
+    /// publicly visible), not by any per-upgrade credential. Only the OWNER
+    /// may change this flag (enforced unconditionally in
+    /// `evaluate_policy_update`). Default false: every new measurement
+    /// waits for an owner promote.
+    #[serde(default)]
+    pub auto_migrate_to_next_attestation_profile: bool,
 }
 
 impl Default for Lifecycle {
     fn default() -> Self {
         Lifecycle {
             ttl_seconds: DEFAULT_KEY_TTL_SECONDS,
+            auto_migrate_to_next_attestation_profile: false,
         }
     }
 }
@@ -680,7 +716,18 @@ pub struct PendingProfile {
     pub source: PendingProfileSource,
     pub staged_at: u64,
     pub staged_by_sub: String,
+    /// True when the stager was the PLATFORM (manager-role bearer via the
+    /// staging-only capability), not a key principal. Set by the vault from
+    /// the resolved identity — never from caller input (`source` is
+    /// caller-supplied and advisory only).
+    #[serde(default)]
+    pub staged_by_platform: bool,
 }
+
+/// Hard cap on `pending_profiles` per key. Staging authorises nothing, but
+/// with platform sweeps staging on every runtime roll an unbounded list is a
+/// storage/DoS surface; identical profiles dedupe before this cap applies.
+pub const MAX_PENDING_PROFILES: usize = 16;
 
 // ---------------------------------------------------------------------------
 //  Audit log

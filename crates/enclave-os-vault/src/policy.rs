@@ -574,7 +574,62 @@ pub fn evaluate_policy_update(
             ));
         }
     }
+    // The auto-migrate opt-in is a standing trust grant to the platform's own
+    // enclave-upgrade approval; only the key OWNER may flip it, in either
+    // direction. Unconditional like the OID rule above — the flag rides inside
+    // `Lifecycle`, whose Mutability entry a policy may hand to managers for
+    // TTL tuning, and that delegation must never extend to this grant.
+    if old.lifecycle.auto_migrate_to_next_attestation_profile
+        != new.lifecycle.auto_migrate_to_next_attestation_profile
+        && role != CallerRole::Owner
+    {
+        return Err(
+            "lifecycle.auto_migrate_to_next_attestation_profile may only be changed by the key owner"
+                .into(),
+        );
+    }
     Ok(())
+}
+
+/// True iff `staged` differs from the accepted profile `active` ONLY in the
+/// platform-runtime measurement — the acceptance test for the auto-migrate
+/// opt-in ([`crate::types::Lifecycle`]). Requires:
+///   - identical `required_oids` (as an unordered set; both sides are
+///     normalised, so the app-code digest at …65230.3.2 and the app id at
+///     …3.6 must be byte-identical),
+///   - identical `attestation_servers` (URL + pinned SPKI, unordered),
+///   - non-empty measurement lists of the SAME TEE family on both sides
+///     (all-SGX or all-TDX — a runtime roll never changes the TEE type),
+///   - actually different measurements (an identical profile is a re-stage,
+///     not a migration — the caller dedupes that separately).
+/// `name` is advisory display text and deliberately ignored.
+pub(crate) fn runtime_only_delta(staged: &AttestationProfile, active: &AttestationProfile) -> bool {
+    if !same_elements(&staged.required_oids, &active.required_oids) {
+        return false;
+    }
+    if !same_elements(&staged.attestation_servers, &active.attestation_servers) {
+        return false;
+    }
+    let family = |ms: &[Measurement]| -> Option<bool> {
+        // Some(true) = all SGX, Some(false) = all TDX, None = empty or mixed.
+        let mut it = ms.iter().map(|m| matches!(m, Measurement::Mrenclave(_)));
+        let first = it.next()?;
+        if it.all(|f| f == first) {
+            Some(first)
+        } else {
+            None
+        }
+    };
+    match (family(&staged.measurements), family(&active.measurements)) {
+        (Some(a), Some(b)) if a == b => {}
+        _ => return false,
+    }
+    staged.measurements != active.measurements
+}
+
+/// Unordered, duplicate-insensitive equality for small profile field vecs.
+fn same_elements<T: PartialEq>(a: &[T], b: &[T]) -> bool {
+    a.iter().all(|x| b.contains(x)) && b.iter().all(|x| a.contains(x))
 }
 
 /// The OIDs that EVERY accepted Tee profile already requires (the intersection of
@@ -780,5 +835,145 @@ mod measurement_match_tests {
             },
             &pol
         ));
+    }
+}
+
+#[cfg(test)]
+mod auto_migrate_tests {
+    use super::*;
+    use crate::types::{
+        AttestationProfile, AttestationServer, KeyPolicy, Lifecycle, Measurement, Mutability,
+        OidRequirement, Principal, PrincipalSet,
+    };
+
+    fn profile(mrenclave: &str, code: &str, app_id: &str) -> AttestationProfile {
+        AttestationProfile {
+            name: format!("app:x / SGX ({})", mrenclave),
+            measurements: vec![Measurement::Mrenclave(mrenclave.into())],
+            attestation_servers: vec![AttestationServer {
+                url: "https://as.privasys.org/verify".into(),
+                pinned_spki_sha256_hex: None,
+            }],
+            required_oids: vec![
+                OidRequirement {
+                    oid: "1.3.6.1.4.1.65230.3.2".into(),
+                    value: code.into(),
+                },
+                OidRequirement {
+                    oid: "1.3.6.1.4.1.65230.3.6".into(),
+                    value: app_id.into(),
+                },
+            ],
+        }
+    }
+
+    fn tdx_profile(mrtd: &str, r1: &str, r2: &str, code: &str) -> AttestationProfile {
+        let mut p = profile("unused", code, "aid");
+        p.measurements = vec![Measurement::Tdx {
+            mrtd: mrtd.into(),
+            rtmr1: r1.into(),
+            rtmr2: r2.into(),
+        }];
+        p
+    }
+
+    #[test]
+    fn accepts_runtime_only_change() {
+        let active = profile("aaaa", "code1", "aid1");
+        let staged = profile("bbbb", "code1", "aid1");
+        assert!(runtime_only_delta(&staged, &active));
+        // Name is advisory and ignored — already differs in the fixtures.
+    }
+
+    #[test]
+    fn rejects_code_or_app_id_change() {
+        let active = profile("aaaa", "code1", "aid1");
+        assert!(!runtime_only_delta(&profile("bbbb", "code2", "aid1"), &active));
+        assert!(!runtime_only_delta(&profile("bbbb", "code1", "aid2"), &active));
+        // Dropping an OID entirely is also not a runtime-only delta.
+        let mut dropped = profile("bbbb", "code1", "aid1");
+        dropped.required_oids.pop();
+        assert!(!runtime_only_delta(&dropped, &active));
+        // Adding an extra OID is a strengthening — still not auto-acceptable
+        // (the platform must not author policy semantics on its own).
+        let mut added = profile("bbbb", "code1", "aid1");
+        added.required_oids.push(OidRequirement {
+            oid: "1.3.6.1.4.1.65230.3.1".into(),
+            value: "cfg".into(),
+        });
+        assert!(!runtime_only_delta(&added, &active));
+    }
+
+    #[test]
+    fn rejects_identical_and_cross_family_and_server_changes() {
+        let active = profile("aaaa", "code1", "aid1");
+        // Identical profile is a re-stage, not a migration.
+        assert!(!runtime_only_delta(&profile("aaaa", "code1", "aid1"), &active));
+        // SGX -> TDX is never a runtime roll.
+        assert!(!runtime_only_delta(&tdx_profile("m", "r1", "r2", "code1"), &active));
+        // Changing the attestation server is a trust change, not a runtime roll.
+        let mut moved = profile("bbbb", "code1", "aid1");
+        moved.attestation_servers[0].url = "https://evil.example/verify".into();
+        assert!(!runtime_only_delta(&moved, &active));
+        // Empty measurement lists never qualify.
+        let mut empty = profile("bbbb", "code1", "aid1");
+        empty.measurements.clear();
+        assert!(!runtime_only_delta(&empty, &active));
+    }
+
+    #[test]
+    fn accepts_tdx_runtime_roll() {
+        let active = tdx_profile("m1", "r1", "r2", "img1");
+        assert!(runtime_only_delta(&tdx_profile("m2", "x1", "x2", "img1"), &active));
+        assert!(!runtime_only_delta(&tdx_profile("m2", "x1", "x2", "img2"), &active));
+    }
+
+    fn policy_with_auto(auto: bool) -> KeyPolicy {
+        KeyPolicy {
+            version: 1,
+            principals: PrincipalSet {
+                owner: Principal::Oidc {
+                    issuer: "https://privasys.id".into(),
+                    sub: "owner".into(),
+                    required_roles: vec![],
+                },
+                managers: vec![],
+                auditors: vec![],
+                tees: vec![],
+            },
+            operations: vec![],
+            mutability: Mutability::default(),
+            lifecycle: Lifecycle {
+                ttl_seconds: 0,
+                auto_migrate_to_next_attestation_profile: auto,
+            },
+        }
+    }
+
+    #[test]
+    fn auto_migrate_flag_is_owner_only_to_change() {
+        let off = policy_with_auto(false);
+        let on = policy_with_auto(true);
+        // Owner may flip it either way (Lifecycle is in owner_can by default).
+        assert!(evaluate_policy_update(&off, &on, CallerRole::Owner).is_ok());
+        assert!(evaluate_policy_update(&on, &off, CallerRole::Owner).is_ok());
+        // A manager may not, even when Mutability delegates Lifecycle.
+        let mut off_delegated = policy_with_auto(false);
+        off_delegated
+            .mutability
+            .manager_can
+            .push(crate::types::PolicyField::Lifecycle);
+        let mut on_delegated = policy_with_auto(true);
+        on_delegated
+            .mutability
+            .manager_can
+            .push(crate::types::PolicyField::Lifecycle);
+        let err = evaluate_policy_update(&off_delegated, &on_delegated, CallerRole::Manager)
+            .unwrap_err();
+        assert!(err.contains("only be changed by the key owner"), "{err}");
+        // The same delegated manager may still change the TTL.
+        let mut ttl_changed = off_delegated.clone();
+        ttl_changed.lifecycle.ttl_seconds = 1234;
+        assert!(evaluate_policy_update(&off_delegated, &ttl_changed, CallerRole::Manager).is_ok());
     }
 }
