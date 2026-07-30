@@ -181,11 +181,25 @@ pub struct ApiFeeEvent {
     pub credits: u64,
 }
 
+fn default_true() -> bool {
+    true
+}
+
 /// Aggregated fuel metrics for a single WASM app.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WasmAppMetrics {
     /// App identifier.
     pub name: String,
+    /// Whether the app has completed its configure-then-freeze step, as the
+    /// RUNTIME sees it — the authority, since the runtime is what refuses every
+    /// other export until the declared config function has run.
+    ///
+    /// Reported so the control plane can PULL this state the way it polls a
+    /// container's manager, instead of depending on having witnessed the
+    /// configure call. An app with no declared config function is never frozen
+    /// and reports `true`.
+    #[serde(default = "default_true")]
+    pub configured: bool,
     /// Total number of calls across all functions.
     pub calls_total: i64,
     /// Total fuel consumed across all functions.

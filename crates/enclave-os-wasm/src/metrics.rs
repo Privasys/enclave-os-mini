@@ -280,6 +280,9 @@ impl WasmMetricsStore {
             .iter()
             .map(|(name, ac)| WasmAppMetrics {
                 name: name.clone(),
+                // Freeze state lives in the registry, not here; the caller
+                // (enrich_metrics) fills it in from there.
+                configured: true,
                 calls_total: ac.calls_total,
                 fuel_consumed_total: ac.fuel_consumed_total,
                 errors_total: ac.errors_total,

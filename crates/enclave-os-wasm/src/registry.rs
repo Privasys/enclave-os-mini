@@ -951,6 +951,29 @@ impl AppRegistry {
         self.known.remove(name).map(|m| m.hostname)
     }
 
+    /// Whether the app has completed configure-then-freeze, as the runtime sees
+    /// it. An app that declared no config function is never frozen, so it
+    /// reports true. Exported in the metrics so the control plane can PULL this
+    /// state instead of depending on having witnessed the configure call — the
+    /// same shape as polling a container's manager.
+    pub fn is_configured(&self, name: &str) -> bool {
+        if !self.config_api.contains_key(name) {
+            return true;
+        }
+        self.configured.get(name).copied().unwrap_or(false)
+    }
+
+    /// Configure-then-freeze state for every known app.
+    ///
+    /// Snapshotted in one call so a reporter never has to hold this lock and
+    /// the metrics lock at the same time.
+    pub fn configured_snapshot(&self) -> Vec<(String, bool)> {
+        self.known
+            .keys()
+            .map(|name| (name.clone(), self.is_configured(name)))
+            .collect()
+    }
+
     /// Returns `true` when the app is frozen (declared a `config_api`
     /// at load time and has not yet called `set-config-complete`) and
     /// the requested function is NOT the configure function.

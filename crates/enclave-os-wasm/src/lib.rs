@@ -2034,8 +2034,24 @@ impl EnclaveModule for WasmModule {
     /// Enrich the core `Metrics` response with per-app fuel-metering data
     /// and persist a snapshot to the sealed KV store.
     fn enrich_metrics(&self, metrics: &mut enclave_os_common::protocol::EnclaveMetrics) {
+        // Configure-then-freeze state comes from the registry, which is the
+        // authority — it is what refuses every other export until the declared
+        // config function has run. Reporting it lets the control plane poll for
+        // it, the way it polls a container's manager, instead of relying on
+        // having seen the configure call go by (which coupled a portal badge to
+        // the data path). Snapshotted BEFORE the metrics lock so the two are
+        // never held together and no lock order has to be remembered.
+        let configured = match self.registry.lock() {
+            Ok(reg) => reg.configured_snapshot(),
+            Err(_) => Vec::new(),
+        };
         if let Ok(m) = self.metrics.lock() {
             metrics.wasm_app_metrics = m.to_app_metrics();
+            for app in metrics.wasm_app_metrics.iter_mut() {
+                if let Some((_, state)) = configured.iter().find(|(n, _)| n == &app.name) {
+                    app.configured = *state;
+                }
+            }
             // Developer API-fee events (x-privasys.price): at-least-once
             // pull — the ledger dedupes on call_id.
             metrics.api_fees = m.api_fee_events();
