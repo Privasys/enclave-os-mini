@@ -279,6 +279,15 @@ pub struct HttpRequest {
     /// Separate from `authorization` (platform OIDC) so that app-level
     /// permissions can use a different OIDC provider.
     pub app_auth: Option<String>,
+    /// Literal price consent from the `X-Billing-Approved` header, e.g.
+    /// `"5000 credits"`.
+    ///
+    /// A priced function refuses to run unless this matches the measured price
+    /// exactly, which is what makes the charge provably informed. It must reach
+    /// the runtime from wherever the caller entered: a browser on a sealed
+    /// session sends the header, so the HTTP shim has to carry it into the
+    /// `connect_call` envelope or the call is unapprovable and 402s for ever.
+    pub billing_approved: Option<String>,
     /// Privasys browser-session id (without the `"PrivasysSession "` prefix), if present.
     /// Set when `Authorization: PrivasysSession <id>` is sent (mutually exclusive with `Bearer`).
     pub privasys_session: Option<String>,
@@ -347,6 +356,7 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
     let mut content_length: Option<usize> = None;
     let mut authorization: Option<String> = None;
     let mut app_auth: Option<String> = None;
+    let mut billing_approved: Option<String> = None;
     let mut privasys_session: Option<String> = None;
     let mut content_type: Option<String> = None;
     let mut host: Option<String> = None;
@@ -389,6 +399,13 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
                     app_auth = Some(val.to_string());
                 }
             }
+        } else if h.name.eq_ignore_ascii_case("x-billing-approved") {
+            if let Ok(val) = core::str::from_utf8(h.value) {
+                let val = val.trim();
+                if !val.is_empty() {
+                    billing_approved = Some(val.to_string());
+                }
+            }
         } else if h.name.eq_ignore_ascii_case("connection") {
             if let Ok(val) = core::str::from_utf8(h.value) {
                 connection_close = val.eq_ignore_ascii_case("close");
@@ -422,6 +439,7 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
             path,
             authorization,
             app_auth,
+            billing_approved,
             privasys_session,
             content_type,
             host,
@@ -677,5 +695,21 @@ mod tests {
         let (req, _) = parse_http_request(raw).unwrap();
         assert_eq!(req.body, b"hi");
         assert_eq!(req.authorization.as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn test_parse_billing_approved_header() {
+        // Price consent must reach the runtime verbatim: it is compared
+        // against the measured price exactly, so trimming is the only liberty.
+        let raw = b"POST /rpc/app/fn HTTP/1.1\r\nContent-Length: 2\r\nX-Billing-Approved:  5000 credits \r\n\r\nhi";
+        let (req, _) = parse_http_request(raw).unwrap();
+        assert_eq!(req.billing_approved.as_deref(), Some("5000 credits"));
+    }
+
+    #[test]
+    fn test_parse_no_billing_approved_header() {
+        let raw = b"POST /rpc/app/fn HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi";
+        let (req, _) = parse_http_request(raw).unwrap();
+        assert!(req.billing_approved.is_none());
     }
 }

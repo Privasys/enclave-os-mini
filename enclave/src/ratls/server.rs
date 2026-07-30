@@ -1508,9 +1508,23 @@ fn handle_rpc_request(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    // Remove "app_auth" from the body so it doesn't pollute the params.
+    // Price consent (`x-privasys.price`). The runtime refuses a priced call
+    // unless this matches the measured price exactly, so it has to survive the
+    // hop from however the caller arrived: the `X-Billing-Approved` header
+    // (what a browser on a sealed session sends) wins, with a body field as the
+    // fallback for callers that cannot set headers. Without this the only way
+    // to approve a priced call was the control-plane proxy, which meant a
+    // direct or sealed caller 402'd with no way to consent.
+    let billing_approved = http_req.billing_approved.clone().or_else(|| {
+        body_value.get("billing_approved")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_string())
+    });
+
+    // Remove the transport-only fields so they don't pollute the params.
     let params_body = if let serde_json::Value::Object(mut map) = body_value {
         map.remove("app_auth");
+        map.remove("billing_approved");
         serde_json::Value::Object(map)
     } else {
         body_value
@@ -1522,6 +1536,7 @@ fn handle_rpc_request(
             "function": tail,
             "body": params_body,
             "app_auth": app_auth,
+            "billing_approved": billing_approved,
         }
     });
     let body = serde_json::to_vec(&envelope).unwrap_or_default();
