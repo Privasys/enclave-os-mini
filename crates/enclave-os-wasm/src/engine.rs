@@ -186,15 +186,17 @@ impl WasmEngine {
         app_name: &str,
         master_key: [u8; AEAD_KEY_SIZE],
         fuel: u64,
-    ) -> Store<AppContext> {
+    ) -> Result<Store<AppContext>, String> {
         let host = AppContext::with_app(app_name, master_key);
         let mut store = Store::new(&self.engine, host);
 
         // ── Fuel / resource limits ─────────────────────────────
         // Fuel limits prevent infinite loops from hanging the enclave.
-        store.set_fuel(fuel).ok();
-
         store
+            .set_fuel(fuel)
+            .map_err(|e| format!("WASM fuel installation failed: {}", e))?;
+
+        Ok(store)
     }
 
     /// Instantiate a compiled [`Component`] in a fresh store.
@@ -207,7 +209,7 @@ impl WasmEngine {
         fuel: u64,
         component: &Component,
     ) -> Result<(Store<AppContext>, wasmtime::component::Instance), String> {
-        let mut store = self.new_store(app_name, master_key, fuel);
+        let mut store = self.new_store(app_name, master_key, fuel)?;
         let instance = self
             .linker
             .instantiate(&mut store, component)
