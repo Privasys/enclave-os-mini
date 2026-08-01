@@ -435,7 +435,6 @@ impl WasmModule {
         // `auth` is consumed by prepare_call below. Used only in the
         // on-success fee recording at the bottom of this function.
         let fee_caller = auth.as_ref().and_then(|a| a.user_id.clone());
-        let fee_wallet = auth.as_ref().map(|a| a.wallet_class).unwrap_or(false);
 
         // Prepare under lock, but release the lock before invoking
         // the wasm function. Wasm host bindings (e.g.
@@ -540,17 +539,22 @@ impl WasmModule {
                         reg.price_context(&call.app, &call.function)?;
                     match rule.payer {
                         Payer::Caller => {
-                            if fee_wallet && rule.free_for.iter().any(|c| c == "wallet") {
-                                None // wallet-class exemption: caller pays 0
-                            } else {
-                                // check_app_permissions enforced an
-                                // authenticated caller for priced functions;
-                                // a missing sub here means an unbillable
-                                // legacy path — skip, never mischarge.
-                                fee_caller
-                                    .clone()
-                                    .map(|sub| (rule.credits, Some(sub), None))
-                            }
+                            // No `free_for` class is reachable here. The
+                            // exemption means "the WALLET APP made this call",
+                            // which only a per-request proof can establish
+                            // (device attestation + a holder-key signature
+                            // bound to the call). This runtime has no channel
+                            // to carry one yet, so the class is unreachable by
+                            // construction and a priced call is charged. See
+                            // wallet_class_unavailable below.
+                            //
+                            // check_app_permissions enforced an authenticated
+                            // caller for priced functions; a missing sub here
+                            // means an unbillable legacy path — skip, never
+                            // mischarge.
+                            fee_caller
+                                .clone()
+                                .map(|sub| (rule.credits, Some(sub), None))
                         }
                         Payer::Sponsor => sponsor_idx
                             .and_then(|i| match call.params.get(i) {
@@ -831,7 +835,7 @@ impl WasmModule {
         // proof the caller knew the price they were charged.
         if let Some((rule, _)) = &price_ctx {
             if rule.payer == Payer::Caller {
-                let exempt = auth.wallet_class && rule.free_for.iter().any(|c| c == "wallet");
+                let exempt = wallet_class_unavailable(&rule.free_for);
                 if !exempt {
                     let expected = format!("{} credits", rule.credits);
                     match call.billing_approved.as_deref().map(str::trim) {
@@ -912,7 +916,6 @@ impl WasmModule {
             return Ok(AuthResult {
                 roles: Vec::new(),
                 user_id: None,
-                wallet_class: false,
             });
         }
 
@@ -934,7 +937,7 @@ impl WasmModule {
                 audience: cfg.audience.clone(),
                 roles_claim: cfg.role_claim.clone(),
             };
-            if let Ok((roles, sub, wallet)) = verify_app_token(token, &platform) {
+            if let Ok((roles, sub)) = verify_app_token(token, &platform) {
                 if let Some(id) = app_id {
                     let hexid = enclave_os_common::hex::hex_encode(&id);
                     let owner_role = format!("{}:app:{}:owner", cfg.audience, hexid);
@@ -948,7 +951,6 @@ impl WasmModule {
                         return Ok(AuthResult {
                             roles,
                             user_id: sub,
-                            wallet_class: wallet,
                         });
                     }
                 }
@@ -964,7 +966,6 @@ impl WasmModule {
                         return Ok(AuthResult {
                             roles,
                             user_id: sub,
-                            wallet_class: wallet,
                         });
                     }
                 }
@@ -2480,11 +2481,33 @@ struct AuthResult {
     roles: Vec<String>,
     /// Caller's identity (FIDO2 user_handle or OIDC `sub` claim).
     user_id: Option<String>,
-    /// Caller holds a wallet-class token (the IdP's constant,
-    /// non-identifying `wallet` claim on tokens minted from a genuine
-    /// wallet WebAuthn ceremony). Drives the `free_for:["wallet"]`
-    /// API-fee exemption (`x-privasys.price`); never identifies anyone.
-    wallet_class: bool,
+}
+
+/// Whether a `free_for` class exempts this caller. Always `false`, and named
+/// for the reason rather than the answer.
+///
+/// `free_for:["wallet"]` means "the WALLET APP made this call" — not "a wallet
+/// authenticated this user". The two differ exactly where it matters: a browser
+/// session that signed in with the wallet must still pay. Establishing the
+/// former needs a per-request proof (a wallet-instance attestation plus a
+/// holder-key signature bound to the call itself), which the container runtime
+/// verifies from two request headers before the app is reached.
+///
+/// This runtime has no such channel: a wasm call is a typed RPC with no header
+/// surface, so there is nothing for a wallet to present and nothing to verify.
+/// It previously read a `wallet` claim off the caller's OIDC token, which is
+/// precisely the session-level signal that gets the rule wrong — and that path
+/// is deleted rather than left dormant, because a claim the IdP could resume
+/// minting would silently start giving browsers free calls.
+///
+/// So the class is unreachable here by construction and every priced call is
+/// charged. That is the safe direction: over-charging is visible and
+/// refundable, under-charging is neither. Reaching real parity means extending
+/// the call protocol to carry the attestation and proof (as `billing_approved`
+/// already carries the consent header) and verifying them in-enclave with the
+/// existing JWKS and raw-ES256 primitives.
+fn wallet_class_unavailable(_free_for: &[String]) -> bool {
+    false
 }
 
 /// Random 128-bit hex call id for an API-fee event — the ledger's
@@ -2562,7 +2585,6 @@ fn verify_auth_token(
                     roles,
                     user_id: Some(user_id),
                     // FIDO2 sessions carry no claims — no wallet class.
-                    wallet_class: false,
                 });
             }
             Err(e) => {
@@ -2594,11 +2616,10 @@ fn verify_auth_token(
 
     // Try OIDC JWT verification.
     if let Some(oidc) = &permissions.oidc {
-        let (roles, sub, wallet) = verify_app_token(token, oidc)?;
+        let (roles, sub) = verify_app_token(token, oidc)?;
         return Ok(AuthResult {
             roles,
             user_id: sub,
-            wallet_class: wallet,
         });
     }
 
@@ -2616,7 +2637,7 @@ fn verify_auth_token(
 fn verify_app_token(
     token: &str,
     oidc: &crate::protocol::AppOidcConfig,
-) -> Result<(Vec<String>, Option<String>, bool), String> {
+) -> Result<(Vec<String>, Option<String>), String> {
     // Verify ES256 signature via JWKS (rejects alg:none, fetches/caches keys)
     let claims: serde_json::Value =
         crate::jwks_fetcher::verify_jwt_signature(token, &oidc.issuer, &oidc.jwks_uri)?;
@@ -2677,18 +2698,10 @@ fn verify_app_token(
     roles.sort();
     roles.dedup();
 
-    // Wallet-class marker (`x-privasys.price` free_for:["wallet"]): the IdP
-    // stamps a constant `wallet` claim (string "true" or boolean) on tokens
-    // minted from a genuine wallet WebAuthn ceremony. Only meaningful when
-    // the app's OIDC issuer IS the platform IdP (the deploy default); any
-    // other issuer simply never yields the class.
-    let wallet = match claims.get("wallet") {
-        Some(serde_json::Value::Bool(b)) => *b,
-        Some(serde_json::Value::String(s)) => s == "true",
-        _ => false,
-    };
-
-    Ok((roles, sub, wallet))
+    // A `wallet` claim on this token is deliberately NOT read. It asserts that
+    // a wallet authenticated the SESSION, which is not what
+    // `free_for:["wallet"]` means — see wallet_class_unavailable.
+    Ok((roles, sub))
 }
 
 /// Collect role strings from a JSON value (array of strings or map
