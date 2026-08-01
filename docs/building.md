@@ -72,6 +72,10 @@ points CMake at the composition crate that registers the WASM module.
 | `ENABLE_WASM` | `OFF` | Enable the WASM runtime module |
 | `WASM_ENCLAVE_DIR` | *(none)* | Path to the WASM composition crate (required when `ENABLE_WASM=ON`) |
 
+Each CMake build directory owns its enclave Cargo target directory. Combined
+with source-prefix remapping, this prevents cache sharing between independent
+measurement-reproduction builds without making the signed bytes path-specific.
+
 ### Host-only build (development on Windows/macOS)
 
 For local development without SGX hardware, build only the host crate in

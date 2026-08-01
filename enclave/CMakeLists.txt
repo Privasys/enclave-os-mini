@@ -83,7 +83,14 @@ else()
     endif()
 endif()
 
-rust_build_enclave("${_ENCLAVE_CRATE_DIR}" ${_ENCLAVE_CRATE_NAME} "${_ENCLAVE_FEATURES}")
+set(_ENCLAVE_TARGET_DIR
+    "${CMAKE_BINARY_DIR}/cargo/${_ENCLAVE_CRATE_NAME}")
+rust_build_enclave(
+    "${_ENCLAVE_CRATE_DIR}"
+    ${_ENCLAVE_CRATE_NAME}
+    "${_ENCLAVE_FEATURES}"
+    "${_ENCLAVE_TARGET_DIR}"
+)
 add_dependencies(${_ENCLAVE_CRATE_NAME} sgx_sysroot)
 set(ENCLAVE_STATIC_LIB "${${_ENCLAVE_CRATE_NAME}_STATIC_LIB}")
 
