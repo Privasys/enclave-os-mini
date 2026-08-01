@@ -4,6 +4,10 @@
 cmake_minimum_required(VERSION 3.20)
 project(enclave-os-mini LANGUAGES C CXX)
 
+# Feed Cargo a stable build epoch so identical pinned inputs produce the same
+# enclave measurement. Deliberate identity rolls may override this cache value.
+set(SOURCE_DATE_EPOCH "0" CACHE STRING "Epoch for reproducible Rust artifacts")
+
 # =============================================================================
 # Options
 # =============================================================================

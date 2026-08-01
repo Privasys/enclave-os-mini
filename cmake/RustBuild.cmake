@@ -15,6 +15,9 @@ set(RUST_ENCLAVE_TARGET "x86_64-unknown-linux-sgx" CACHE STRING
 set(RUST_ENCLAVE_TOOLCHAIN "nightly-2026-06-21" CACHE STRING
     "Rustup toolchain name for enclave builds")
 
+set(RUST_ENCLAVE_SOURCE_ROOT "${CMAKE_SOURCE_DIR}" CACHE PATH
+    "Source root remapped to /workspace in enclave compiler output")
+
 # Build type mapping
 if(CMAKE_BUILD_TYPE STREQUAL "Release")
     set(CARGO_BUILD_TYPE "--release")
@@ -75,6 +78,18 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME)
     if(_FEATURES)
         set(_FEATURES_ARGS --no-default-features --features "sgx,default-ecall,${_FEATURES}")
     endif()
+    if(ARGC GREATER 3)
+        get_filename_component(_ENCLAVE_TARGET_DIR "${ARGV3}" ABSOLUTE)
+    else()
+        set(_ENCLAVE_TARGET_DIR
+            "${CMAKE_SOURCE_DIR}/target/cmake-enclave-${_FEATURES}-${SOURCE_DATE_EPOCH}")
+    endif()
+    get_filename_component(_ENCLAVE_SOURCE_ROOT
+        "${RUST_ENCLAVE_SOURCE_ROOT}" ABSOLUTE)
+    string(CONCAT _ENCLAVE_RUSTFLAGS
+        "--sysroot ${SGX_SYSROOT_DIR} -C target-feature=+rdrand"
+        " --remap-path-prefix ${_ENCLAVE_SOURCE_ROOT}=/workspace"
+        " --remap-path-prefix ${_ENCLAVE_TARGET_DIR}=/cargo-target")
 
     set(_BUILD_COMMENT "Building enclave Rust crate: ${OUTPUT_NAME}")
     if(_FEATURES)
@@ -85,7 +100,11 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME)
         COMMAND ${CMAKE_COMMAND} -E env
             "SGX_SDK_PATH=${SGX_SDK_PATH}"
             "RUSTUP_TOOLCHAIN=${RUST_ENCLAVE_TOOLCHAIN}"
-            "RUSTFLAGS=--sysroot ${SGX_SYSROOT_DIR} -C target-feature=+rdrand"
+            "SOURCE_DATE_EPOCH=${SOURCE_DATE_EPOCH}"
+            "CARGO_TARGET_DIR=${_ENCLAVE_TARGET_DIR}"
+            "CC=${CMAKE_C_COMPILER}"
+            "CXX=${CMAKE_CXX_COMPILER}"
+            "RUSTFLAGS=${_ENCLAVE_RUSTFLAGS}"
             ${CARGO_EXECUTABLE} build
                 ${CARGO_BUILD_TYPE}
                 -Zjson-target-spec
@@ -98,7 +117,7 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME)
     )
 
     set(${OUTPUT_NAME}_STATIC_LIB
-        "${CRATE_DIR}/target/${RUST_ENCLAVE_TARGET}/${CARGO_OUT_DIR}/lib${OUTPUT_NAME}.a"
+        "${_ENCLAVE_TARGET_DIR}/${RUST_ENCLAVE_TARGET}/${CARGO_OUT_DIR}/lib${OUTPUT_NAME}.a"
         PARENT_SCOPE)
 endfunction()
 
