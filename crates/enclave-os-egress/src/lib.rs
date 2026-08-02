@@ -75,6 +75,7 @@ use std::sync::OnceLock;
 use std::vec::Vec;
 
 use ring::digest;
+use rustls::pki_types::{pem::PemObject, CertificateDer};
 pub use rustls::RootCertStore;
 
 use enclave_os_common::modules::ConfigLeaf;
@@ -128,8 +129,7 @@ impl EgressModule {
 
         let cert_count = if let Some(ref pem_bytes) = pem {
             let mut store = RootCertStore::empty();
-            let mut reader = std::io::BufReader::new(pem_bytes.as_slice());
-            let certs: Vec<_> = rustls_pemfile::certs(&mut reader)
+            let certs: Vec<_> = CertificateDer::pem_slice_iter(pem_bytes)
                 .filter_map(|r| r.ok())
                 .collect();
             let count = certs.len();
