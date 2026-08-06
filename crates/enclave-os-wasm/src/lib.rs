@@ -1836,6 +1836,28 @@ impl EnclaveModule for WasmModule {
                 .environment
                 .clone()
                 .unwrap_or_else(|| String::from("prod"));
+            // TARGET constellation addressing = a cross-constellation migration:
+            // the new KEK is created there instead of the sealed selection.
+            let new_cfg = match rot.new_vault_endpoints.as_ref() {
+                Some(eps) => {
+                    match crate::vaultkey::VaultConfig::from_parts(
+                        eps.clone(),
+                        rot.new_vault_mrenclave.as_deref().unwrap_or(""),
+                        rot.new_vault_attestation_server.as_deref().unwrap_or(""),
+                        rot.new_vault_ca_roots.as_deref().unwrap_or(&[]),
+                        rot.new_vault_threshold.unwrap_or(0),
+                        rot.new_vault_oidc_issuer.as_deref().unwrap_or(""),
+                    ) {
+                        Ok(c) => Some(c),
+                        Err(e) => {
+                            return Some(Response::Data(serialize_or_error(
+                                &WasmManagementResult::Error { message: e },
+                            )));
+                        }
+                    }
+                }
+                None => None,
+            };
             // Re-wrap under the registry lock, then re-seal the advanced metadata
             // with the lock released (persist_meta_to_kv re-enters `self`).
             let result = {
@@ -1855,6 +1877,7 @@ impl EnclaveModule for WasmModule {
                     &rot.new_key_creation_grant,
                     &mgmt_url,
                     &environment,
+                    new_cfg,
                 )
             };
             let mgmt_result = match result {

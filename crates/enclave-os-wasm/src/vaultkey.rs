@@ -87,6 +87,43 @@ impl VaultConfig {
             self.threshold
         }
     }
+
+    /// Build a config from caller-supplied constellation addressing (the
+    /// cross-constellation migration path: management-service passes the
+    /// TARGET constellation's coordinates inline, exactly like the container
+    /// rotate request). Addressing is not trust: the vaults still have to
+    /// pass RA-TLS against `mrenclave_hex` + the attestation server, and the
+    /// key policy inside them stays the authorisation boundary.
+    pub fn from_parts(
+        endpoints: Vec<String>,
+        mrenclave_hex: &str,
+        attestation_server: &str,
+        ca_roots_hex: &[String],
+        threshold: usize,
+        oidc_issuer: &str,
+    ) -> Result<VaultConfig, String> {
+        if endpoints.is_empty() {
+            return Err("vaultkey: target constellation has no endpoints".into());
+        }
+        let mrenclave = parse_mrenclave(mrenclave_hex)?;
+        if attestation_server.is_empty() {
+            return Err("vaultkey: target constellation has no attestation server".into());
+        }
+        let ca_roots_der: Vec<Vec<u8>> = ca_roots_hex.iter().filter_map(|h| hex_decode(h)).collect();
+        if ca_roots_der.is_empty() {
+            return Err(
+                "vaultkey: target constellation has no CA roots (cannot trust vault leaves)".into(),
+            );
+        }
+        Ok(VaultConfig {
+            endpoints,
+            threshold: threshold.max(2),
+            mrenclave,
+            attestation_servers: std::vec![attestation_server.to_string()],
+            ca_roots_der,
+            oidc_issuer: oidc_issuer.to_string(),
+        })
+    }
 }
 
 // ===========================================================================

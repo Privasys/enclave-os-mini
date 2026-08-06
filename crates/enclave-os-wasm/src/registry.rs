@@ -216,18 +216,22 @@ fn resolve_vault_backed_key(
 }
 
 /// Rotate a vault-backed app's storage KEK: re-wrap the `encryption_key` (the KV
-/// DEK) from the OLD key generation to a NEW one on the same constellation.
+/// DEK) from the OLD key generation to a NEW one.
 ///
 /// This is the WASM analog of the container's LUKS keyslot re-key: the DEK never
 /// changes, so the sealed KV (encrypted under the DEK) is untouched — only the
 /// KEK that protects the host-side wrapped DEK blob advances. The old KEK is
-/// reconstructed by EXPORT (it exists, so no grant is needed); the new KEK is
-/// reconstructed by CREATE with the owner-minted `new_grant`. The freshly wrapped
-/// blob is stored under the new handle (AAD-bound to it) and the old blob is
-/// retired. The vault retires the old KEK generation separately (owner-proxied),
-/// after which the old blob is permanently un-unwrappable.
+/// reconstructed by EXPORT from `old_cfg` (it exists, so no grant is needed);
+/// the new KEK is reconstructed by CREATE on `new_cfg` with the owner-minted
+/// `new_grant`. Same-constellation generation rotation passes the same config
+/// twice; the graceful cross-constellation migration passes the TARGET
+/// constellation as `new_cfg`. The freshly wrapped blob is stored under the new
+/// handle (AAD-bound to it) and the old blob is retired. The vault retires the
+/// old KEK generation separately (owner-proxied), after which the old blob is
+/// permanently un-unwrappable.
 fn rotate_vault_backed_key(
-    cfg: &crate::vaultkey::VaultConfig,
+    old_cfg: &crate::vaultkey::VaultConfig,
+    new_cfg: &crate::vaultkey::VaultConfig,
     old_handle: &str,
     new_handle: &str,
     new_grant: &str,
@@ -242,10 +246,10 @@ fn rotate_vault_backed_key(
 
     // Old KEK: the key already exists, so export it (a grant is only needed to
     // CREATE). A policy denial here is the upgrade gate, not a first boot.
-    let old_kek = vaultkey::resolve_or_provision(cfg, old_handle, "", code_hash, app_id_slice)?;
+    let old_kek = vaultkey::resolve_or_provision(old_cfg, old_handle, "", code_hash, app_id_slice)?;
     // New KEK: create the new generation with the owner-minted grant.
     let new_kek =
-        vaultkey::resolve_or_provision(cfg, new_handle, new_grant, code_hash, app_id_slice)?;
+        vaultkey::resolve_or_provision(new_cfg, new_handle, new_grant, code_hash, app_id_slice)?;
 
     let old_cipher = AeadCipher::from_key(old_kek);
     let new_cipher = AeadCipher::from_key(new_kek);
@@ -915,6 +919,12 @@ impl AppRegistry {
     /// host-side wrapped DEK advances (a cheap re-wrap, like the container's LUKS
     /// keyslot re-key). `mgmt_url`/`environment` are only consulted if the app has
     /// no sealed selection to reuse.
+    ///
+    /// `new_cfg` = None rotates generations on the SAME constellation (today's
+    /// KEK rotation). Some(target) is the graceful cross-constellation
+    /// migration: the old KEK exports from the sealed selection, the new one
+    /// is created on `target`, and the sealed selection advances to `target`
+    /// so every later reconstruct goes there.
     pub fn rotate_vault_key(
         &mut self,
         name: &str,
@@ -922,6 +932,7 @@ impl AppRegistry {
         new_grant: &str,
         mgmt_url: &str,
         environment: &str,
+        new_cfg: Option<crate::vaultkey::VaultConfig>,
     ) -> Result<AppMeta, String> {
         let meta = self
             .known
@@ -936,21 +947,34 @@ impl AppRegistry {
                 "rotate: new handle equals the current handle {new_handle}"
             ));
         }
-        let cfg = match &meta.vault_config {
+        let old_cfg = match &meta.vault_config {
             Some(c) => c.clone(),
             None => crate::vaultkey::discover(mgmt_url, environment)?,
         };
+        let target_cfg = new_cfg.clone().unwrap_or_else(|| old_cfg.clone());
         let code_hash = meta.code_hash;
         let app_id = meta.app_id;
 
-        rotate_vault_backed_key(&cfg, &old_handle, new_handle, new_grant, &code_hash, app_id)?;
+        rotate_vault_backed_key(
+            &old_cfg,
+            &target_cfg,
+            &old_handle,
+            new_handle,
+            new_grant,
+            &code_hash,
+            app_id,
+        )?;
 
-        // Advance the sealed handle (the DEK and vault_config are unchanged).
+        // Advance the sealed handle (the DEK is unchanged); on a migration the
+        // sealed constellation selection advances with it.
         let source = format!("vault:{new_handle}");
         let updated = {
             let m = self.known.get_mut(name).expect("known checked above");
             m.vault_handle = Some(new_handle.to_string());
             m.key_source = source.clone();
+            if new_cfg.is_some() {
+                m.vault_config = Some(target_cfg);
+            }
             m.clone()
         };
         if let Some(la) = self.loaded.get_mut(name) {
