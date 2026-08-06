@@ -63,6 +63,62 @@ use enclave_os_common::types::AEAD_KEY_SIZE;
 /// untrusted host; only an enclave that can reconstruct the KEK can unwrap it.
 const VAULTWRAP_TABLE: &[u8] = b"vaultwrap";
 
+/// Reserved key inside an app's own `app:<name>` DEK-encrypted KV table that
+/// mirrors the configure-then-freeze marker. The sealed `AppMeta` copy of
+/// `config_complete` is MRENCLAVE-bound and dies with the old runtime on an
+/// enclave upgrade, while a vault-backed app's KV (and everything the owner
+/// configured into it) survives — this mirror lets `load_app` restore the
+/// configured state alongside the data. The value is the configuration hash
+/// in force when the owner configured (empty when the app declares none), so
+/// a changed policy still re-freezes. Reads are self-guarding: only the
+/// surviving DEK decrypts the marker; a fresh generated key finds nothing.
+/// Apps address their KV with arbitrary keys, so the name is namespaced to
+/// make a collision practically impossible.
+const CONFIGURED_MARKER_KEY: &[u8] = b"__privasys.config_complete.v1";
+
+/// Write the configured marker into the app's DEK-encrypted KV (best-effort:
+/// the sealed AppMeta remains the primary record for same-MRENCLAVE restarts).
+fn write_configured_marker(
+    dek: [u8; AEAD_KEY_SIZE],
+    app_name: &str,
+    configuration_hash: Option<[u8; 32]>,
+) {
+    let table = format!("app:{}", app_name);
+    let store =
+        enclave_os_kvstore::SealedKvStore::from_master_key_with_table(dek, table.as_bytes());
+    let value: &[u8] = match configuration_hash.as_ref() {
+        Some(h) => h.as_slice(),
+        None => &[],
+    };
+    // Best-effort by design (and this crate has no logging channel): a failed
+    // mirror write only degrades upgrade survival — same-MRENCLAVE restarts
+    // still restore from the sealed AppMeta, and the owner can re-configure.
+    let _ = store.put(CONFIGURED_MARKER_KEY, value);
+}
+
+/// True when the app's DEK-encrypted KV carries a configured marker matching
+/// the current configuration hash — i.e. the data this app was configured
+/// with is present and readable under `dek`, and the policy is unchanged.
+fn read_configured_marker(
+    dek: [u8; AEAD_KEY_SIZE],
+    app_name: &str,
+    configuration_hash: Option<[u8; 32]>,
+) -> bool {
+    let table = format!("app:{}", app_name);
+    let store =
+        enclave_os_kvstore::SealedKvStore::from_master_key_with_table(dek, table.as_bytes());
+    match store.get(CONFIGURED_MARKER_KEY) {
+        Ok(Some(recorded)) => {
+            let expected: &[u8] = match configuration_hash.as_ref() {
+                Some(h) => h.as_slice(),
+                None => &[],
+            };
+            recorded == expected
+        }
+        _ => false,
+    }
+}
+
 /// Instructs `load_app` to vault-back an app's `encryption_key`. The platform
 /// authors the owner-bound policy and delivers it as a key-creation grant; the
 /// enclave discovers the constellation from the directory (`mgmt_url`), then on
@@ -749,6 +805,38 @@ impl AppRegistry {
             }
         }
 
+        // ── Configured-state carry-over ─────────────────────────────
+        // A redeploy of an already-known app goes through THIS path (wasm_load
+        // → load_app), not register_known — so the literal `false` here used to
+        // discard the persisted config_complete on every redeploy/reconciler
+        // reload, re-freezing an app around secrets it still holds (prod
+        // web-search-brave, repeatedly). Carry the flag over, but only when the
+        // KV really is the same one the app configured:
+        //   - the DEK bytes match (a vault-backed reload reconstructs the SAME
+        //     key; a non-vault reload gets a fresh key, so its old data is
+        //     unreadable and the freeze is correct), belt-and-braced by
+        //     key_source/vault_handle equality;
+        //   - the configuration hash is unchanged (a new permissions policy
+        //     re-freezes: the owner must confirm configuration under the new
+        //     contract).
+        let carried_config_complete = self.known.get(name).is_some_and(|prev| {
+            prev.config_complete
+                && prev.encryption_key == app_key
+                && prev.key_source == key_source
+                && prev.vault_handle == vault.as_ref().map(|vb| vb.handle.clone())
+                && prev.configuration_hash == configuration_hash
+        });
+        // Enclave-UPGRADE survival: after an MRENCLAVE roll the sealed AppMeta
+        // (and with it the flag above) is gone, but a vault-backed app's KV
+        // survives — the reconstructed DEK opens the same data. mark_configured
+        // mirrors a marker into that per-app encrypted KV; reading it back is
+        // self-guarding, since only the surviving DEK can decrypt it (a fresh
+        // generated key simply finds nothing). The marker records the
+        // configuration hash so a changed policy still re-freezes.
+        let config_complete = carried_config_complete
+            || (config_api_function.is_some()
+                && read_configured_marker(app_key, name, configuration_hash));
+
         let meta = AppMeta {
             name: name.to_string(),
             hostname: hostname.to_string(),
@@ -765,11 +853,7 @@ impl AppRegistry {
             app_id,
             vault_config,
             vault_handle: vault.as_ref().map(|vb| vb.handle.clone()),
-            // A brand-new load starts unconfigured; the marker is set + persisted
-            // by mark_configured on a successful configure. A same-MRENCLAVE
-            // replay restores the persisted value via register_known instead of
-            // reaching this literal.
-            config_complete: false,
+            config_complete,
             dependencies,
         };
         self.known.insert(name.to_string(), meta.clone());
@@ -990,8 +1074,11 @@ impl AppRegistry {
 
     /// Flip the freeze flag for `name` to configured. Also persists the marker
     /// on the app's sealed `AppMeta` (returned so the caller writes it to KV) so
-    /// a restart whose KV survives does not re-freeze the app. No-op / returns
-    /// None when the app has no declared `config_api`.
+    /// a restart whose KV survives does not re-freeze the app, and mirrors it
+    /// into the app's own DEK-encrypted KV so a vault-backed app stays
+    /// configured across an ENCLAVE UPGRADE too (the sealed AppMeta is
+    /// MRENCLAVE-bound and dies with the old runtime; the app's KV does not).
+    /// No-op / returns None when the app has no declared `config_api`.
     pub fn mark_configured(&mut self, name: &str) -> Option<AppMeta> {
         if !self.config_api.contains_key(name) {
             return None;
@@ -1002,6 +1089,7 @@ impl AppRegistry {
             return None; // already persisted; nothing to write
         }
         meta.config_complete = true;
+        write_configured_marker(meta.encryption_key, name, meta.configuration_hash);
         Some(meta.clone())
     }
 
