@@ -42,7 +42,7 @@ use crate::rpc_client::RpcClient;
 use crate::ratls::attestation::CaContext;
 use crate::ratls::server::IngressServer;
 use crate::sealed_config::SealedConfig;
-use crate::{enclave_log_info, enclave_log_error};
+use crate::{enclave_log_info, enclave_log_error, ShutdownOriginV1};
 use enclave_os_common::hex::{hex_decode, hex_encode};
 use enclave_os_common::types::AEAD_KEY_SIZE;
 use enclave_os_common::queue::{SpscProducer, SpscConsumer, SpscQueueHeader};
@@ -381,6 +381,9 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
                                 enclave_log_error!(
                                     "MINI-CONTROL-SHUTDOWN: reason=StateLockUnavailable"
                                 );
+                                crate::signal_shutdown_with_origin(
+                                    ShutdownOriginV1::StateLockUnavailable,
+                                );
                                 break;
                             }
                         };
@@ -391,7 +394,12 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
                                     "MINI-CONTROL-SHUTDOWN: reason=Ingress({:?})",
                                     reason
                                 );
-                                crate::signal_shutdown();
+                                let origin = match reason {
+                                    crate::ratls::server::IngressShutdownReasonV1::ExplicitHttpRequest => {
+                                        ShutdownOriginV1::IngressExplicitHttpRequest
+                                    }
+                                };
+                                crate::signal_shutdown_with_origin(origin);
                             }
                         }
                     }
@@ -411,7 +419,7 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
     }
 
     enclave_log_info!("Event loop exited");
-    0
+    crate::shutdown_return_code()
 }
 
 // ==========================================================================
@@ -848,7 +856,7 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
 #[no_mangle]
 pub extern "C" fn ecall_shutdown() -> i32 {
     enclave_log_info!("Enclave shutting down");
-    crate::signal_shutdown();
+    crate::signal_shutdown_with_origin(ShutdownOriginV1::ExternalEcall);
 
     // Clean up subsystems
     if let Ok(mut st) = crate::state().lock() {

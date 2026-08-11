@@ -69,7 +69,7 @@ pub mod sessionrelay;
 #[cfg(feature = "egress")]
 pub mod vaultkey;
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU16, Ordering};
 use std::sync::OnceLock;
 
 use std::sync::Mutex;
@@ -88,6 +88,19 @@ static RPC_CLIENT: OnceLock<RpcClient> = OnceLock::new();
 
 /// Shutdown flag – set when `ecall_shutdown` is called.
 static SHUTDOWN: AtomicBool = AtomicBool::new(false);
+/// First-writer-wins bounded shutdown origin returned independently of logs.
+static SHUTDOWN_ORIGIN: AtomicU16 = AtomicU16::new(0);
+
+const ADOPTER_SHUTDOWN_ORIGIN_BASE: u16 = 256;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[repr(u16)]
+pub(crate) enum ShutdownOriginV1 {
+    Unclassified = 1,
+    IngressExplicitHttpRequest = 3,
+    StateLockUnavailable = 5,
+    ExternalEcall = 7,
+}
 
 /// Data channel: enclave → host TCP proxy (set by `ecall_init_data_channel`).
 static DATA_TX: OnceLock<SpscProducer> = OnceLock::new();
@@ -172,5 +185,43 @@ pub fn set_data_channel(tx: SpscProducer, rx: SpscConsumer) -> Result<(), i32> {
 
 /// Signal shutdown.
 pub fn signal_shutdown() {
-    SHUTDOWN.store(true, Ordering::Relaxed);
+    signal_shutdown_with_origin(ShutdownOriginV1::Unclassified);
+}
+
+pub(crate) fn signal_shutdown_with_origin(origin: ShutdownOriginV1) {
+    record_shutdown_origin(origin as u16);
+    SHUTDOWN.store(true, Ordering::Release);
+}
+
+/// Signal a fail-closed adopter-owned shutdown with one bounded nonzero code.
+///
+/// Mini deliberately assigns no meaning to adopter codes. The embedding
+/// composition owns their closed mapping. Code zero is invalid and is
+/// retained as an unclassified origin rather than silently becoming success.
+pub fn signal_shutdown_with_adopter_code(code: u8) {
+    let origin = if code == 0 {
+        ShutdownOriginV1::Unclassified as u16
+    } else {
+        ADOPTER_SHUTDOWN_ORIGIN_BASE + u16::from(code)
+    };
+    record_shutdown_origin(origin);
+    SHUTDOWN.store(true, Ordering::Release);
+}
+
+fn record_shutdown_origin(origin: u16) {
+    let _ = SHUTDOWN_ORIGIN.compare_exchange(0, origin, Ordering::AcqRel, Ordering::Acquire);
+}
+
+/// Return zero only for the two explicitly graceful stop origins.
+pub(crate) fn shutdown_return_code() -> i32 {
+    match SHUTDOWN_ORIGIN.load(Ordering::Acquire) {
+        value
+            if value == ShutdownOriginV1::IngressExplicitHttpRequest as u16
+                || value == ShutdownOriginV1::ExternalEcall as u16 =>
+        {
+            0
+        }
+        0 => -(ShutdownOriginV1::Unclassified as i32),
+        value => -i32::from(value),
+    }
 }
