@@ -74,6 +74,16 @@ enum SessionState {
 /// ClientHello (even with the RA-TLS challenge extension) is ~1-2 KiB.
 const MAX_PENDING_CLIENTHELLO: usize = 16 * 1024;
 
+/// Closed reason why the ingress server requested a global enclave stop.
+///
+/// The reason is deliberately free of connection identifiers, request bytes,
+/// TLS material and host/runtime error strings so it is safe to retain in
+/// measured lifecycle evidence.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum IngressShutdownReasonV1 {
+    ExplicitHttpRequest,
+}
+
 // ========================================================================
 //  IngressServer
 // ========================================================================
@@ -180,7 +190,16 @@ impl IngressServer {
 
     /// Are we shutting down?
     pub fn is_shutdown(&self) -> bool {
-        self.shutdown
+        self.shutdown_reason().is_some()
+    }
+
+    /// Return the exact bounded reason for a requested global stop.
+    pub fn shutdown_reason(&self) -> Option<IngressShutdownReasonV1> {
+        if self.shutdown {
+            Some(IngressShutdownReasonV1::ExplicitHttpRequest)
+        } else {
+            None
+        }
     }
 
     /// Invalidate cached cert for a hostname (called when an app is

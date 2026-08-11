@@ -377,11 +377,20 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
                         }
                         let mut st = match crate::state().lock() {
                             Ok(st) => st,
-                            Err(_) => break,
+                            Err(_) => {
+                                enclave_log_error!(
+                                    "MINI-CONTROL-SHUTDOWN: reason=StateLockUnavailable"
+                                );
+                                break;
+                            }
                         };
                         if let Some(ref mut srv) = st.ingress_server {
                             srv.handle_message(msg_type, conn_id, payload);
-                            if srv.is_shutdown() {
+                            if let Some(reason) = srv.shutdown_reason() {
+                                enclave_log_error!(
+                                    "MINI-CONTROL-SHUTDOWN: reason=Ingress({:?})",
+                                    reason
+                                );
                                 crate::signal_shutdown();
                             }
                         }

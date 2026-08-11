@@ -309,8 +309,10 @@ fn main() -> Result<()> {
     // Enter the enclave (blocks until enclave returns)
     info!("Calling ecall_run (Ctrl+C to stop)...");
     let ret = enclave::call_ecall_run(enclave_id, &config_bytes);
-    if ret != 0 {
-        error!("ecall_run returned: {}", ret);
+    if ret == 0 {
+        info!("ecall_run returned: code=0");
+    } else {
+        error!("ecall_run returned: code={ret}");
     }
 
     // Signal dispatcher and proxy to stop
