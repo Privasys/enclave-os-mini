@@ -1,0 +1,23 @@
+# Copyright (c) Privasys. All rights reserved.
+# Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
+
+[package]
+name = "enclave-os-merkle"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+description = "Authenticated key-value store for enclave-os — versioned sparse Merkle tree over the host KV store, encryption-independent root."
+
+[lib]
+name = "enclave_os_merkle"
+
+[dependencies]
+# Shared types, OCall vtable, AEAD cipher
+enclave-os-common = { path = "../../common", features = ["crypto"] }
+
+# Crypto (SHA-256 node hashing, HMAC path/value commitments)
+ring = "0.17"
+
+# Standalone (not a member of the root workspace — built as a path dep of
+# the enclave crate, and testable directly with `cargo test`).
+[workspace]
