@@ -205,12 +205,16 @@ mod tests {
     use super::*;
 
     /// Helper: open a fresh RocksDB in a temp dir for one test.
+    ///
+    /// Opens with the default column family listed explicitly so that
+    /// `cf_handle("default")` resolves (plain `DB::open` does not
+    /// register any CF handles).
     fn open_tmp() -> (tempfile::TempDir, DB) {
         let tmp = tempfile::tempdir().unwrap();
         let mut opts = Options::default();
         opts.create_if_missing(true);
         opts.create_missing_column_families(true);
-        let db = DB::open(&opts, tmp.path()).unwrap();
+        let db = DB::open_cf(&opts, tmp.path(), ["default"]).unwrap();
         (tmp, db)
     }
 
