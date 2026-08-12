@@ -1,0 +1,17 @@
+[package]
+name = "enclave-os-raft"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+description = "Attested Raft consensus core for Enclave OS (Mini) clusters"
+
+# The consensus core is deliberately dependency-free: a sans-I/O state
+# machine (messages in, messages out, ticks in) with a hand-rolled wire
+# codec. Storage, networking and the ledger state machine are wired in
+# by the enclave runtime (see docs/raft.md when it lands with WS3+).
+[dependencies]
+
+# Standalone workspace so `cargo test` runs here without the repo root
+# workspace (which excludes module crates; same pattern as
+# enclave-os-merkle).
+[workspace]
