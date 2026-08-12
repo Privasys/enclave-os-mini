@@ -23,9 +23,10 @@
 //!
 //! | Type | Value | Payload | Description |
 //! |------|-------|---------|-------------|
-//! | `TcpNew`   | 0x01 | UTF-8 peer address | New TCP connection accepted |
-//! | `TcpData`  | 0x02 | raw bytes          | TCP segment(s) from client |
-//! | `TcpClose` | 0x03 | (empty)            | Connection closed by peer  |
+//! | `TcpNew`       | 0x01 | UTF-8 peer address | New TCP connection accepted |
+//! | `TcpData`      | 0x02 | raw bytes          | TCP segment(s) from client |
+//! | `TcpClose`     | 0x03 | (empty)            | Connection closed by peer (also: outbound connect failed) |
+//! | `TcpConnected` | 0x06 | (empty)            | Enclave-requested outbound connect succeeded |
 //!
 //! ## enclave → host (`data_enc_to_host` queue)
 //!
@@ -34,14 +35,32 @@
 //! | `TcpData`    | 0x02 | raw bytes | TLS bytes to send to client            |
 //! | `TcpClose`   | 0x03 | (empty)   | Enclave closing connection             |
 //! | `DataReady`  | 0x04 | (empty)   | Data channel consumer ready — start accepting |
+//! | `TcpConnect` | 0x05 | UTF-8 `host:port` | Open an outbound TCP connection owned by the proxy |
+//!
+//! # Connection-id ranges
+//!
+//! `conn_id` provenance is encoded in its range so the enclave event loop
+//! can route without extra state and ids never collide:
+//!
+//! - `[1, 0x3FFF_FFFF]` — proxy-assigned, inbound on the ingress port
+//! - `[0x4000_0000, 0x7FFF_FFFF]` — proxy-assigned, inbound on the peer port
+//! - `[0x8000_0000, 0xFFFF_FFFF]` — enclave-assigned, outbound (`TcpConnect`)
+//!
+//! Outbound flow: the enclave picks a conn_id from its range and sends
+//! `TcpConnect`. The proxy performs a non-blocking connect; `TcpData`
+//! sent by the enclave before the connect completes is buffered by the
+//! proxy (so a TLS ClientHello can be emitted immediately). On success
+//! the host sends `TcpConnected`; on failure or timeout it sends
+//! `TcpClose`. After that the connection behaves exactly like an inbound
+//! one.
 //!
 //! # Queue layout
 //!
 //! Two SPSC queue pairs are used:
 //! - **RPC channel** (existing): enclave ↔ host RPC for KV, time, log,
 //!   shutdown, and egress socket calls.
-//! - **Data channel** (new): host TCP proxy ↔ enclave TLS engine for
-//!   inbound connections only.
+//! - **Data channel**: host TCP proxy ↔ enclave TLS engine, inbound and
+//!   proxy-owned outbound connections.
 
 #[cfg(feature = "sgx")]
 use alloc::string::String;
@@ -83,6 +102,15 @@ pub enum ChannelMsgType {
     /// event loop.  The TCP proxy must not accept connections until
     /// it has received this message.
     DataReady = 0x04,
+
+    /// Open an outbound TCP connection (enclave → host).
+    /// Payload: UTF-8 `host:port`. The conn_id MUST come from the
+    /// enclave-assigned outbound range (`CONN_ID_OUTBOUND_BASE..`).
+    TcpConnect = 0x05,
+
+    /// An enclave-requested outbound connect succeeded (host → enclave).
+    /// Payload: empty. Failure is reported as `TcpClose`.
+    TcpConnected = 0x06,
 }
 
 impl ChannelMsgType {
@@ -93,9 +121,39 @@ impl ChannelMsgType {
             0x02 => Some(Self::TcpData),
             0x03 => Some(Self::TcpClose),
             0x04 => Some(Self::DataReady),
+            0x05 => Some(Self::TcpConnect),
+            0x06 => Some(Self::TcpConnected),
             _ => None,
         }
     }
+}
+
+// ========================================================================
+//  Connection-id ranges
+// ========================================================================
+
+/// First conn_id of the proxy-assigned inbound *peer-port* range.
+pub const CONN_ID_PEER_IN_BASE: u32 = 0x4000_0000;
+
+/// First conn_id of the enclave-assigned *outbound* range.
+pub const CONN_ID_OUTBOUND_BASE: u32 = 0x8000_0000;
+
+/// Is this conn_id an inbound connection on the ingress port?
+#[inline]
+pub fn conn_id_is_ingress(conn_id: u32) -> bool {
+    conn_id < CONN_ID_PEER_IN_BASE
+}
+
+/// Is this conn_id an inbound connection on the peer port?
+#[inline]
+pub fn conn_id_is_peer_inbound(conn_id: u32) -> bool {
+    (CONN_ID_PEER_IN_BASE..CONN_ID_OUTBOUND_BASE).contains(&conn_id)
+}
+
+/// Is this conn_id an enclave-initiated outbound connection?
+#[inline]
+pub fn conn_id_is_outbound(conn_id: u32) -> bool {
+    conn_id >= CONN_ID_OUTBOUND_BASE
 }
 
 // ========================================================================
@@ -152,6 +210,18 @@ pub fn encode_tcp_close(conn_id: u32) -> Vec<u8> {
     encode_channel_msg(ChannelMsgType::TcpClose, conn_id, &[])
 }
 
+/// Convenience: encode a TcpConnect message (enclave → host).
+#[inline]
+pub fn encode_tcp_connect(conn_id: u32, addr: &str) -> Vec<u8> {
+    encode_channel_msg(ChannelMsgType::TcpConnect, conn_id, addr.as_bytes())
+}
+
+/// Convenience: encode a TcpConnected message (host → enclave).
+#[inline]
+pub fn encode_tcp_connected(conn_id: u32) -> Vec<u8> {
+    encode_channel_msg(ChannelMsgType::TcpConnected, conn_id, &[])
+}
+
 // ========================================================================
 //  Tests
 // ========================================================================
@@ -186,6 +256,37 @@ mod tests {
         assert_eq!(typ, ChannelMsgType::TcpClose);
         assert_eq!(id, 7);
         assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn test_roundtrip_tcp_connect() {
+        let msg = encode_tcp_connect(0x8000_0001, "10.0.0.7:7400");
+        let (typ, id, payload) = decode_channel_msg(&msg).unwrap();
+        assert_eq!(typ, ChannelMsgType::TcpConnect);
+        assert_eq!(id, 0x8000_0001);
+        assert_eq!(core::str::from_utf8(payload).unwrap(), "10.0.0.7:7400");
+    }
+
+    #[test]
+    fn test_roundtrip_tcp_connected() {
+        let msg = encode_tcp_connected(0x8000_0001);
+        let (typ, id, payload) = decode_channel_msg(&msg).unwrap();
+        assert_eq!(typ, ChannelMsgType::TcpConnected);
+        assert_eq!(id, 0x8000_0001);
+        assert!(payload.is_empty());
+    }
+
+    #[test]
+    fn test_conn_id_ranges() {
+        assert!(conn_id_is_ingress(1));
+        assert!(conn_id_is_ingress(CONN_ID_PEER_IN_BASE - 1));
+        assert!(!conn_id_is_ingress(CONN_ID_PEER_IN_BASE));
+        assert!(conn_id_is_peer_inbound(CONN_ID_PEER_IN_BASE));
+        assert!(conn_id_is_peer_inbound(CONN_ID_OUTBOUND_BASE - 1));
+        assert!(!conn_id_is_peer_inbound(CONN_ID_OUTBOUND_BASE));
+        assert!(conn_id_is_outbound(CONN_ID_OUTBOUND_BASE));
+        assert!(conn_id_is_outbound(u32::MAX));
+        assert!(!conn_id_is_outbound(CONN_ID_OUTBOUND_BASE - 1));
     }
 
     #[test]

@@ -44,6 +44,12 @@ struct Cli {
     #[arg(short, long, default_value_t = 128)]
     backlog: i32,
 
+    /// Optional second listen port for cluster peer links (raft).
+    /// Inbound connections on this port are routed to the enclave's
+    /// peer-link layer instead of the HTTPS ingress.
+    #[arg(long)]
+    peer_port: Option<u16>,
+
     /// Path for the KV store data directory
     #[arg(short, long, default_value = "./kvdata")]
     kv_path: String,
@@ -186,6 +192,7 @@ fn main() -> Result<()> {
     // Spawn the TCP proxy thread
     let proxy_port = cli.port;
     let proxy_backlog = cli.backlog;
+    let proxy_peer_port = cli.peer_port;
     let shutdown_clone = shutdown.clone();
     let proxy_handle = thread::Builder::new()
         .name("tcp-proxy".into())
@@ -193,6 +200,7 @@ fn main() -> Result<()> {
             match tcp_proxy::TcpProxy::new(
                 proxy_port,
                 proxy_backlog,
+                proxy_peer_port,
                 data_to_enc_tx,
                 data_from_enc_rx,
                 shutdown_clone,
