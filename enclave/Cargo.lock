@@ -390,6 +390,7 @@ dependencies = [
  "enclave-os-egress",
  "enclave-os-fido2",
  "enclave-os-kvstore",
+ "enclave-os-merkle",
  "enclave-os-vault",
  "enclave-os-wasm",
  "getrandom",
@@ -425,6 +426,16 @@ version = "0.1.0"
 dependencies = [
  "enclave-os-common",
  "ring",
+]
+
+[[package]]
+name = "enclave-os-merkle"
+version = "0.1.0"
+dependencies = [
+ "enclave-os-common",
+ "ring",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
