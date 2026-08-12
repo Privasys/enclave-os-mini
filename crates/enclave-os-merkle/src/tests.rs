@@ -508,6 +508,210 @@ fn proof_mutation_fuzz() {
 }
 
 // ---------------------------------------------------------------------------
+//  Pruning
+// ---------------------------------------------------------------------------
+
+/// Count backend records by type prefix: (nodes, values, stale, roots).
+fn record_census(store: &MerkleStore<MemBackend>) -> (usize, usize, usize, usize) {
+    let (mut n, mut v, mut s, mut r) = (0, 0, 0, 0);
+    for k in store.backend().keys() {
+        match k[0] {
+            b'n' => n += 1,
+            b'v' => v += 1,
+            b's' => s += 1,
+            b'r' => r += 1,
+            other => panic!("unknown record prefix {other}"),
+        }
+    }
+    (n, v, s, r)
+}
+
+/// After pruning all history, the store holds exactly what a freshly
+/// built store with the same content holds: same node count, same value
+/// count, zero stale entries, one live root record.
+#[test]
+fn prune_removes_exactly_the_garbage() {
+    let mut store = new_store();
+    let mut model: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
+    let mut rng = Rng(3);
+    for _ in 0..50 {
+        let mut batch = Vec::new();
+        for _ in 0..(rng.next() % 8 + 1) {
+            let k = key(rng.next() % 40);
+            if rng.next() % 4 == 0 {
+                batch.push((k, None));
+            } else {
+                batch.push((k, Some(val(rng.next() % 500))));
+            }
+        }
+        for (k, v) in &batch {
+            match v {
+                Some(v) => {
+                    model.insert(k.clone(), v.clone());
+                }
+                None => {
+                    model.remove(k);
+                }
+            }
+        }
+        store.put_batch(&batch).unwrap();
+    }
+    let (root, version) = store.root();
+    let before_census = record_census(&store);
+    assert!(before_census.2 > 0, "churn should have produced stale entries");
+
+    let stats = store.prune(version).unwrap();
+    assert!(stats.records_deleted > 0);
+
+    // Root and content untouched.
+    assert_eq!(store.root(), (root, version));
+    for (k, v) in &model {
+        assert_eq!(store.get(k).unwrap().as_ref(), Some(v));
+    }
+
+    // Census matches a fresh store with identical content.
+    let mut fresh = new_store();
+    let final_state: Vec<_> = model.iter().map(|(k, v)| (k.clone(), Some(v.clone()))).collect();
+    fresh.put_batch(&final_state).unwrap();
+    let (n, v, s, r) = record_census(&store);
+    let (fn_, fv, _fs, _fr) = record_census(&fresh);
+    assert_eq!(s, 0, "stale entries must all be consumed");
+    assert_eq!(r, 1, "only the live root record remains");
+    assert_eq!(n, fn_, "node count must match a fresh build");
+    assert_eq!(v, fv, "value count must match a fresh build");
+
+    // Roots still equal, of course.
+    assert_eq!(store.root().0, fresh.root().0);
+}
+
+#[test]
+fn prune_keeps_the_retained_window() {
+    let mut store = new_store();
+    let mut snapshots: Vec<(u64, Vec<(Vec<u8>, Option<Vec<u8>>)>)> = Vec::new();
+    for round in 0..10u64 {
+        store
+            .put_batch(&[(key(round % 4), Some(val(round))), (key(100 + round), Some(val(round)))])
+            .unwrap();
+        let (_, v) = store.root();
+        // Snapshot the small keyspace via live reads.
+        let mut snap = Vec::new();
+        for i in 0..4u64 {
+            snap.push((key(i), store.get(&key(i)).unwrap()));
+        }
+        snapshots.push((v, snap));
+    }
+
+    let horizon = 6u64;
+    store.prune(horizon).unwrap();
+
+    for (v, snap) in &snapshots {
+        if *v >= horizon {
+            for (k, expected) in snap {
+                assert_eq!(&store.get_at(*v, k).unwrap(), expected, "v{v}");
+            }
+        } else {
+            // Below the horizon: root record gone, clean Missing error.
+            let r = store.get_at(*v, &key(0));
+            assert!(
+                matches!(r, Err(MerkleError::Missing(_))),
+                "v{v} expected Missing, got {r:?}"
+            );
+        }
+    }
+}
+
+/// Delete + re-insert of the same (key, value) across commits: the
+/// resurrected value must survive pruning of the deletion's stale entry.
+#[test]
+fn resurrection_survives_prune() {
+    let mut store = new_store();
+    store.put_batch(&[(b"k".to_vec(), Some(b"same".to_vec()))]).unwrap(); // v1
+    store.put_batch(&[(b"k".to_vec(), None)]).unwrap(); // v2 (stales v1 records)
+    store.put_batch(&[(b"k".to_vec(), Some(b"same".to_vec()))]).unwrap(); // v3, same vh
+    let (_, v) = store.root();
+    assert_eq!(v, 3);
+
+    store.prune(3).unwrap();
+    assert_eq!(store.get(b"k").unwrap(), Some(b"same".to_vec()));
+
+    // Exactly one value record remains (the v3 one); v1's was pruned.
+    let values = store
+        .backend()
+        .keys()
+        .into_iter()
+        .filter(|k| k[0] == b'v')
+        .collect::<Vec<_>>();
+    assert_eq!(values.len(), 1);
+    assert_eq!(&values[0][values[0].len() - 8..], &3u64.to_be_bytes());
+}
+
+#[test]
+fn prune_is_idempotent_and_validates() {
+    let mut store = new_store();
+    for i in 0..5u64 {
+        store.put_batch(&[(key(i), Some(val(i)))]).unwrap();
+    }
+    let (_, version) = store.root();
+
+    let first = store.prune(version).unwrap();
+    assert!(first.records_deleted > 0 || first.root_records_deleted > 0);
+    let second = store.prune(version).unwrap();
+    assert_eq!(second, crate::tree::PruneStats::default());
+
+    // Future horizon is rejected.
+    assert!(matches!(store.prune(version + 1), Err(MerkleError::Invalid(_))));
+}
+
+#[test]
+fn retain_recent_window() {
+    let mut store = new_store();
+    for i in 0..20u64 {
+        store.put_batch(&[(key(i % 3), Some(val(i)))]).unwrap();
+    }
+    let (_, version) = store.root();
+    store.retain_recent(5).unwrap();
+
+    // version-5 .. version stay readable.
+    for v in version - 5..=version {
+        store.get_at(v, &key(0)).unwrap();
+    }
+    assert!(matches!(
+        store.get_at(version - 6, &key(0)),
+        Err(MerkleError::Missing(_))
+    ));
+}
+
+/// Pruning must not disturb fail-closed behaviour of what remains.
+#[test]
+fn pruned_store_still_fails_closed() {
+    let mut store = new_store();
+    let batch: Vec<_> = (0..30u64).map(|i| (key(i), Some(val(i)))).collect();
+    store.put_batch(&batch).unwrap();
+    store.put_batch(&[(key(0), Some(val(999)))]).unwrap();
+    let (_, version) = store.root();
+    store.prune(version).unwrap();
+
+    for rk in store.backend().keys() {
+        if rk[0] == b'r' {
+            continue;
+        }
+        assert!(store.backend().tamper(&rk));
+        for i in 0..30u64 {
+            match store.get(&key(i)) {
+                Ok(Some(v)) => {
+                    let expected = if i == 0 { val(999) } else { val(i) };
+                    assert_eq!(v, expected, "wrong data after tampering {rk:?}");
+                }
+                Ok(None) => panic!("silent absence after tampering {rk:?}"),
+                Err(MerkleError::Corrupted(_) | MerkleError::Missing(_)) => {}
+                Err(e) => panic!("unexpected error kind: {e}"),
+            }
+        }
+        store.backend().tamper(&rk); // undo
+    }
+}
+
+// ---------------------------------------------------------------------------
 //  I/O complexity
 // ---------------------------------------------------------------------------
 

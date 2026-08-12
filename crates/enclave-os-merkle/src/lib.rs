@@ -50,4 +50,4 @@ pub use backend::{KvBackend, MemBackend, OcallBackend};
 pub use error::MerkleError;
 pub use hash::{Hash, HASH_SIZE};
 pub use proof::{verify, Proof, Verified};
-pub use tree::MerkleStore;
+pub use tree::{MerkleStore, PruneStats};

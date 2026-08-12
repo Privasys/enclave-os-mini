@@ -20,9 +20,14 @@
 //! | prefix | key | value |
 //! |--------|-----|-------|
 //! | `n` | NodeKey | node encoding |
-//! | `v` | vh | GCM ciphertext |
-//! | `s` | stale_since u64 BE ‖ target record key | node: empty, value: path |
+//! | `v` | vh ‖ value_version u64 BE | GCM ciphertext |
+//! | `s` | stale_since u64 BE ‖ target record key | empty |
 //! | `r` | version u64 BE | root hash |
+//!
+//! Node and value records are both versioned and immutable: a record is
+//! written by exactly one commit and never again (re-inserting a value
+//! after deleting it writes a *new* value record under the new
+//! version). The pruner therefore deletes stale targets blindly.
 //!
 //! A commit lands all of the above in **one atomic** `write_batch`; only
 //! after the host confirms does the in-memory `(root, version)` swing.
@@ -67,10 +72,11 @@ fn node_record_key(nk: &NodeKey) -> Vec<u8> {
     k
 }
 
-fn value_record_key(vh: &Hash) -> Vec<u8> {
-    let mut k = Vec::with_capacity(1 + HASH_SIZE);
+fn value_record_key(vh: &Hash, value_version: u64) -> Vec<u8> {
+    let mut k = Vec::with_capacity(1 + HASH_SIZE + 8);
     k.push(REC_VALUE);
     k.extend_from_slice(vh);
+    k.extend_from_slice(&value_version.to_be_bytes());
     k
 }
 
@@ -107,18 +113,34 @@ pub struct MerkleStore<B: KvBackend> {
 /// One deduplicated update: `Some(vh)` = insert/overwrite, `None` = delete.
 type Update = (Hash, Option<Hash>);
 
+/// Records processed per prune scan/delete round trip.
+const PRUNE_CHUNK: u32 = 512;
+
+/// What a [`MerkleStore::prune`] call removed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PruneStats {
+    /// Stale-index entries processed (and removed).
+    pub stale_entries: usize,
+    /// Node + value records deleted.
+    pub records_deleted: usize,
+    /// Root records deleted.
+    pub root_records_deleted: usize,
+}
+
 /// Work accumulated while applying a batch, flushed atomically.
 struct CommitAcc {
     new_version: u64,
     /// Nodes written this commit (may be revised by leaf collapse).
     pending: BTreeMap<NodeKey, Node>,
-    /// Record keys superseded this commit (nodes; deleted blindly at prune).
-    stale_nodes: Vec<Vec<u8>>,
-    /// Superseded value commitments with their path (prune re-checks
-    /// liveness via the path before deleting — a later commit may have
-    /// re-inserted the same (path, value) and thus the same record).
-    stale_values: Vec<(Hash, Hash)>, // (vh, path)
-    /// Value records to write: vh → ciphertext.
+    /// Record keys superseded this commit. Both node and value records
+    /// are versioned and never rewritten, so the pruner deletes them
+    /// blindly.
+    stale: Vec<Vec<u8>>,
+    /// Ciphertexts for this batch's inserts, by path; consumed when the
+    /// insert actually lands as a new leaf.
+    insert_cts: BTreeMap<Hash, Vec<u8>>,
+    /// Value records to write this commit: vh → ciphertext (all at
+    /// `new_version`).
     values: BTreeMap<Hash, Vec<u8>>,
 }
 
@@ -233,12 +255,15 @@ impl<B: KvBackend> MerkleStore<B> {
         let mut acc = CommitAcc {
             new_version,
             pending: BTreeMap::new(),
-            stale_nodes: Vec::new(),
-            stale_values: Vec::new(),
+            stale: Vec::new(),
+            insert_cts: BTreeMap::new(),
             values: BTreeMap::new(),
         };
 
-        // Precompute commitments and ciphertexts for inserts.
+        // Precompute commitments and ciphertexts for inserts. Value
+        // records are only written when an insert actually lands as a
+        // new leaf (see `put_leaf`), so no-op overwrites leave no
+        // orphaned records behind.
         let mut updates: Vec<Update> = Vec::with_capacity(deduped.len());
         for (path, value) in &deduped {
             match value {
@@ -248,7 +273,7 @@ impl<B: KvBackend> MerkleStore<B> {
                         .cipher
                         .encrypt(pt, &value_aad(path))
                         .map_err(|e| MerkleError::Corrupted(format!("encrypt: {e}")))?;
-                    acc.values.insert(vh, ct);
+                    acc.insert_cts.insert(*path, ct);
                     updates.push((*path, Some(vh)));
                 }
                 None => updates.push((*path, None)),
@@ -269,25 +294,21 @@ impl<B: KvBackend> MerkleStore<B> {
 
         // Assemble the atomic commit.
         let mut batch: Vec<KvBatchOp> = Vec::with_capacity(
-            acc.pending.len() + acc.values.len() + acc.stale_nodes.len()
-                + acc.stale_values.len() + 1,
+            acc.pending.len() + acc.values.len() + acc.stale.len() + 1,
         );
         for (nk, node) in &acc.pending {
             batch.push(KvBatchOp::Put { key: node_record_key(nk), value: node.encode() });
         }
         for (vh, ct) in &acc.values {
-            batch.push(KvBatchOp::Put { key: value_record_key(vh), value: ct.clone() });
+            batch.push(KvBatchOp::Put {
+                key: value_record_key(vh, new_version),
+                value: ct.clone(),
+            });
         }
-        for target in &acc.stale_nodes {
+        for target in &acc.stale {
             batch.push(KvBatchOp::Put {
                 key: stale_record_key(new_version, target),
                 value: Vec::new(),
-            });
-        }
-        for (vh, path) in &acc.stale_values {
-            batch.push(KvBatchOp::Put {
-                key: stale_record_key(new_version, &value_record_key(vh)),
-                value: path.to_vec(),
             });
         }
         batch.push(KvBatchOp::Put { key: root_record_key(new_version), value: new_root.to_vec() });
@@ -299,6 +320,92 @@ impl<B: KvBackend> MerkleStore<B> {
         self.version = new_version;
         self.root_child = new_root_child;
         Ok((self.root, self.version))
+    }
+
+    // -- pruning ----------------------------------------------------------
+
+    /// Delete storage needed only by versions strictly before
+    /// `before_version`: stale records that died at or before it, and
+    /// root records below it. Afterwards `get_at`/`prove_at` keep
+    /// working for every version `>= before_version` and fail with
+    /// [`MerkleError::Missing`] below it. The live tree is never
+    /// touched — both node and value records are versioned and never
+    /// rewritten, so stale targets are deleted blindly.
+    ///
+    /// Costs are proportional to accumulated garbage, not store size.
+    /// Idempotent; safe to re-run after a partial failure.
+    pub fn prune(&mut self, before_version: u64) -> Result<PruneStats, MerkleError> {
+        if before_version > self.version {
+            return Err(MerkleError::Invalid(format!(
+                "cannot prune to future version {before_version} (current {})",
+                self.version
+            )));
+        }
+        let mut stats = PruneStats::default();
+
+        // Stale entries with stale_since <= before_version. Each entry's
+        // key embeds the target record key; both die in one batch.
+        let start = [REC_STALE];
+        let end = match before_version.checked_add(1) {
+            Some(v) => {
+                let mut e = vec![REC_STALE];
+                e.extend_from_slice(&v.to_be_bytes());
+                e
+            }
+            None => vec![REC_STALE + 1],
+        };
+        loop {
+            let entries = self.backend.scan(&start, &end, PRUNE_CHUNK)?;
+            if entries.is_empty() {
+                break;
+            }
+            let full_chunk = entries.len() == PRUNE_CHUNK as usize;
+            let mut batch = Vec::with_capacity(entries.len() * 2);
+            for (key, _) in entries {
+                if key.len() < 10 {
+                    return Err(MerkleError::Corrupted("stale entry key too short".into()));
+                }
+                batch.push(KvBatchOp::Delete { key: key[9..].to_vec() });
+                batch.push(KvBatchOp::Delete { key });
+                stats.stale_entries += 1;
+                stats.records_deleted += 1;
+            }
+            self.backend.write_batch(batch)?;
+            if !full_chunk {
+                break;
+            }
+        }
+
+        // Root records below the horizon.
+        let start = [REC_ROOT];
+        let mut end = vec![REC_ROOT];
+        end.extend_from_slice(&before_version.to_be_bytes());
+        loop {
+            let entries = self.backend.scan(&start, &end, PRUNE_CHUNK)?;
+            if entries.is_empty() {
+                break;
+            }
+            let full_chunk = entries.len() == PRUNE_CHUNK as usize;
+            let batch: Vec<KvBatchOp> = entries
+                .into_iter()
+                .map(|(key, _)| {
+                    stats.root_records_deleted += 1;
+                    KvBatchOp::Delete { key }
+                })
+                .collect();
+            self.backend.write_batch(batch)?;
+            if !full_chunk {
+                break;
+            }
+        }
+
+        Ok(stats)
+    }
+
+    /// Prune so that (at least) the last `window` versions stay
+    /// readable: `prune(version - window)`, clamped at zero.
+    pub fn retain_recent(&mut self, window: u64) -> Result<PruneStats, MerkleError> {
+        self.prune(self.version.saturating_sub(window))
     }
 
     // -- proofs -----------------------------------------------------------
@@ -490,10 +597,15 @@ impl<B: KvBackend> MerkleStore<B> {
         Ok(Some(Child { version, hash: root, is_leaf: node.is_leaf() }))
     }
 
-    fn read_value(&self, path: &Hash, vh: &Hash) -> Result<Vec<u8>, MerkleError> {
+    fn read_value(
+        &self,
+        path: &Hash,
+        vh: &Hash,
+        value_version: u64,
+    ) -> Result<Vec<u8>, MerkleError> {
         let ct = self
             .backend
-            .get(&value_record_key(vh))?
+            .get(&value_record_key(vh, value_version))?
             .ok_or_else(|| MerkleError::Missing("value record".into()))?;
         let pt = self
             .cipher
@@ -524,7 +636,11 @@ impl<B: KvBackend> MerkleStore<B> {
             match node {
                 Node::Leaf(leaf) => {
                     if &leaf.path == path {
-                        return Ok(Some(self.read_value(path, &leaf.vh)?));
+                        return Ok(Some(self.read_value(
+                            path,
+                            &leaf.vh,
+                            leaf.value_version,
+                        )?));
                     }
                     return Ok(None);
                 }
@@ -561,11 +677,11 @@ impl<B: KvBackend> MerkleStore<B> {
         let old_child = match old {
             None => {
                 // Empty subtree: only inserts materialise anything.
-                let pairs: Vec<(Hash, Hash)> = updates
+                let pairs: Vec<(Hash, Hash, u64)> = updates
                     .iter()
-                    .filter_map(|(p, vh)| vh.map(|h| (*p, h)))
+                    .filter_map(|(p, vh)| vh.map(|h| (*p, h, acc.new_version)))
                     .collect();
-                return Ok(self.build_from_pairs(acc, prefix, &pairs));
+                return self.build_from_pairs(acc, prefix, &pairs);
             }
             Some(c) => c,
         };
@@ -578,13 +694,21 @@ impl<B: KvBackend> MerkleStore<B> {
 
         match node {
             Node::Leaf(leaf) => {
-                // Merge the resident leaf with the updates.
-                let mut merged: BTreeMap<Hash, Hash> = BTreeMap::new();
-                merged.insert(leaf.path, leaf.vh);
+                // Merge the resident leaf with the updates. Entries are
+                // (vh, value_version): an overwrite with the identical
+                // value keeps the old record, anything else routes to a
+                // record written this commit.
+                let mut merged: BTreeMap<Hash, (Hash, u64)> = BTreeMap::new();
+                merged.insert(leaf.path, (leaf.vh, leaf.value_version));
                 for (p, vh) in updates {
                     match vh {
                         Some(h) => {
-                            merged.insert(*p, *h);
+                            let vv = if *p == leaf.path && *h == leaf.vh {
+                                leaf.value_version
+                            } else {
+                                acc.new_version
+                            };
+                            merged.insert(*p, (*h, vv));
                         }
                         None => {
                             merged.remove(p);
@@ -592,18 +716,21 @@ impl<B: KvBackend> MerkleStore<B> {
                     }
                 }
                 if merged.len() == 1
-                    && merged.get(&leaf.path) == Some(&leaf.vh)
+                    && merged.get(&leaf.path) == Some(&(leaf.vh, leaf.value_version))
                 {
                     return Ok(Some(old_child)); // nothing changed
                 }
                 // The resident leaf node is superseded in every changed case.
-                acc.stale_nodes.push(node_record_key(&nk));
+                acc.stale.push(node_record_key(&nk));
                 match merged.get(&leaf.path) {
-                    Some(vh) if *vh == leaf.vh => {}
-                    _ => acc.stale_values.push((leaf.vh, leaf.path)),
+                    Some((vh, _)) if *vh == leaf.vh => {}
+                    _ => acc.stale.push(value_record_key(&leaf.vh, leaf.value_version)),
                 }
-                let pairs: Vec<(Hash, Hash)> = merged.into_iter().collect();
-                Ok(self.build_from_pairs(acc, prefix, &pairs))
+                let pairs: Vec<(Hash, Hash, u64)> = merged
+                    .into_iter()
+                    .map(|(p, (vh, vv))| (p, vh, vv))
+                    .collect();
+                self.build_from_pairs(acc, prefix, &pairs)
             }
             Node::Internal(internal) => {
                 let depth = prefix.len();
@@ -637,7 +764,7 @@ impl<B: KvBackend> MerkleStore<B> {
                 if !changed {
                     return Ok(Some(old_child));
                 }
-                acc.stale_nodes.push(node_record_key(&nk));
+                acc.stale.push(node_record_key(&nk));
 
                 let mut present = children.iter().flatten();
                 match (present.next().cloned(), present.next()) {
@@ -651,7 +778,7 @@ impl<B: KvBackend> MerkleStore<B> {
                         prefix.push(nib);
                         let leaf = self.take_leaf(acc, &only, prefix)?;
                         prefix.pop();
-                        Ok(Some(self.put_leaf(acc, prefix, leaf)))
+                        Ok(Some(self.put_leaf(acc, prefix, leaf)?))
                     }
                     _ => {
                         let new_node = Node::Internal(InternalNode { children });
@@ -665,16 +792,21 @@ impl<B: KvBackend> MerkleStore<B> {
         }
     }
 
-    /// Build a fresh subtree at `prefix` from sorted `(path, vh)` pairs.
+    /// Build a fresh subtree at `prefix` from sorted
+    /// `(path, vh, value_version)` pairs.
     fn build_from_pairs(
         &self,
         acc: &mut CommitAcc,
         prefix: &mut Vec<u8>,
-        pairs: &[(Hash, Hash)],
-    ) -> Option<Child> {
+        pairs: &[(Hash, Hash, u64)],
+    ) -> Result<Option<Child>, MerkleError> {
         match pairs {
-            [] => None,
-            [(path, vh)] => Some(self.put_leaf(acc, prefix, LeafNode { path: *path, vh: *vh })),
+            [] => Ok(None),
+            [(path, vh, vv)] => Ok(Some(self.put_leaf(
+                acc,
+                prefix,
+                LeafNode { path: *path, vh: *vh, value_version: *vv },
+            )?)),
             _ => {
                 let depth = prefix.len();
                 let mut children: [Option<Child>; 16] = Default::default();
@@ -686,7 +818,7 @@ impl<B: KvBackend> MerkleStore<B> {
                         j += 1;
                     }
                     prefix.push(nib);
-                    children[nib as usize] = self.build_from_pairs(acc, prefix, &pairs[i..j]);
+                    children[nib as usize] = self.build_from_pairs(acc, prefix, &pairs[i..j])?;
                     prefix.pop();
                     i = j;
                 }
@@ -694,18 +826,31 @@ impl<B: KvBackend> MerkleStore<B> {
                 let hash = node.hash();
                 acc.pending
                     .insert(NodeKey { version: acc.new_version, prefix: prefix.clone() }, node);
-                Some(Child { version: acc.new_version, hash, is_leaf: false })
+                Ok(Some(Child { version: acc.new_version, hash, is_leaf: false }))
             }
         }
     }
 
-    /// Store a leaf node at `prefix` (new version) and return its child ref.
-    fn put_leaf(&self, acc: &mut CommitAcc, prefix: &[u8], leaf: LeafNode) -> Child {
+    /// Store a leaf node at `prefix` (new version) and return its child
+    /// ref. A leaf whose value was (re)written this commit also emits
+    /// its value record.
+    fn put_leaf(
+        &self,
+        acc: &mut CommitAcc,
+        prefix: &[u8],
+        leaf: LeafNode,
+    ) -> Result<Child, MerkleError> {
+        if leaf.value_version == acc.new_version && !acc.values.contains_key(&leaf.vh) {
+            let ct = acc.insert_cts.get(&leaf.path).ok_or_else(|| {
+                MerkleError::Corrupted("internal: landed insert without ciphertext".into())
+            })?;
+            acc.values.insert(leaf.vh, ct.clone());
+        }
         let node = Node::Leaf(leaf);
         let hash = node.hash();
         acc.pending
             .insert(NodeKey { version: acc.new_version, prefix: prefix.to_vec() }, node);
-        Child { version: acc.new_version, hash, is_leaf: true }
+        Ok(Child { version: acc.new_version, hash, is_leaf: true })
     }
 
     /// Fetch the content of a leaf child at `prefix` so it can be
@@ -729,7 +874,7 @@ impl<B: KvBackend> MerkleStore<B> {
         } else {
             match self.load_node(&nk, &child.hash)? {
                 Node::Leaf(leaf) => {
-                    acc.stale_nodes.push(node_record_key(&nk));
+                    acc.stale.push(node_record_key(&nk));
                     Ok(leaf)
                 }
                 Node::Internal(_) => {

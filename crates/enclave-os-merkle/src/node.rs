@@ -95,10 +95,19 @@ pub struct InternalNode {
 /// Leaf node: terminates the path however deep it sits. `path` is the
 /// full 256-bit key path; `vh` is the keyed plaintext commitment of the
 /// value.
+///
+/// `value_version` is the commit version at which the value record was
+/// written: it routes reads to the versioned value record
+/// (`v ‖ vh ‖ value_version`). It is storage metadata, **not part of
+/// the leaf hash** — the hash commits to `(path, vh)` only, so the root
+/// stays a pure function of logical state. A tampered `value_version`
+/// can only point at a missing record (fail closed) or at a record
+/// whose content still has to satisfy `vh` (same plaintext).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LeafNode {
     pub path: Hash,
     pub vh: Hash,
+    pub value_version: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -117,16 +126,17 @@ impl Node {
 
     /// Encode to the stored byte form.
     ///
-    /// Leaf: `[2] path(32) vh(32)`.
+    /// Leaf: `[2] path(32) vh(32) value_version u64 BE`.
     /// Internal: `[1] bitmap u16 LE { version u64 BE, hash(32), is_leaf u8 }*`
     /// with children serialized in ascending nibble order of set bits.
     pub fn encode(&self) -> Vec<u8> {
         match self {
             Node::Leaf(leaf) => {
-                let mut buf = Vec::with_capacity(1 + 2 * HASH_SIZE);
+                let mut buf = Vec::with_capacity(1 + 2 * HASH_SIZE + 8);
                 buf.push(NODE_TAG_LEAF);
                 buf.extend_from_slice(&leaf.path);
                 buf.extend_from_slice(&leaf.vh);
+                buf.extend_from_slice(&leaf.value_version.to_be_bytes());
                 buf
             }
             Node::Internal(node) => {
@@ -157,14 +167,17 @@ impl Node {
         let corrupt = |m: &str| MerkleError::Corrupted(format!("node decode: {m}"));
         match data.first() {
             Some(&NODE_TAG_LEAF) => {
-                if data.len() != 1 + 2 * HASH_SIZE {
+                if data.len() != 1 + 2 * HASH_SIZE + 8 {
                     return Err(corrupt("bad leaf length"));
                 }
                 let mut path = [0u8; HASH_SIZE];
                 let mut vh = [0u8; HASH_SIZE];
                 path.copy_from_slice(&data[1..1 + HASH_SIZE]);
-                vh.copy_from_slice(&data[1 + HASH_SIZE..]);
-                Ok(Node::Leaf(LeafNode { path, vh }))
+                vh.copy_from_slice(&data[1 + HASH_SIZE..1 + 2 * HASH_SIZE]);
+                let value_version = u64::from_be_bytes(
+                    data[1 + 2 * HASH_SIZE..].try_into().map_err(|_| corrupt("value_version"))?,
+                );
+                Ok(Node::Leaf(LeafNode { path, vh, value_version }))
             }
             Some(&NODE_TAG_INTERNAL) => {
                 if data.len() < 3 {
@@ -277,9 +290,17 @@ mod tests {
 
     #[test]
     fn leaf_codec_roundtrip() {
-        let node = Node::Leaf(LeafNode { path: [3u8; 32], vh: [4u8; 32] });
+        let node =
+            Node::Leaf(LeafNode { path: [3u8; 32], vh: [4u8; 32], value_version: 900 });
         let decoded = Node::decode(&node.encode()).unwrap();
         assert_eq!(decoded, node);
+    }
+
+    #[test]
+    fn leaf_hash_excludes_value_version() {
+        let a = Node::Leaf(LeafNode { path: [3u8; 32], vh: [4u8; 32], value_version: 1 });
+        let b = Node::Leaf(LeafNode { path: [3u8; 32], vh: [4u8; 32], value_version: 99 });
+        assert_eq!(a.hash(), b.hash());
     }
 
     #[test]
@@ -297,7 +318,8 @@ mod tests {
     fn decode_rejects_garbage() {
         assert!(Node::decode(&[]).is_err());
         assert!(Node::decode(&[9, 1, 2]).is_err());
-        let node = Node::Leaf(LeafNode { path: [3u8; 32], vh: [4u8; 32] });
+        let node =
+            Node::Leaf(LeafNode { path: [3u8; 32], vh: [4u8; 32], value_version: 1 });
         let mut enc = node.encode();
         enc.push(0); // trailing byte
         assert!(Node::decode(&enc).is_err());
