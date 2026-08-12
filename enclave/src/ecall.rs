@@ -416,6 +416,9 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
         kv_store_get:      |table, key| crate::ocall::kv_store_get(table, key, 0),
         kv_store_delete:   crate::ocall::kv_store_delete,
         kv_store_list_keys: crate::ocall::kv_store_list_keys,
+        kv_store_write_batch: crate::ocall::kv_store_write_batch,
+        kv_store_multi_get: crate::ocall::kv_store_multi_get,
+        kv_store_scan:     crate::ocall::kv_store_scan,
         get_current_time:  crate::ocall::get_current_time,
         log:               |level, msg| {
             let ll = match level {

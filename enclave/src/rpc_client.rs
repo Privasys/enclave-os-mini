@@ -215,6 +215,41 @@ impl RpcClient {
         }
     }
 
+    /// Apply a batch of puts/deletes atomically in the given table.
+    pub fn kv_write_batch(&self, table: &[u8], ops: &[rpc::KvBatchOp]) -> Result<(), i32> {
+        let payload = rpc::encode_kv_write_batch_req(table, ops);
+        let (status, _) = self.call(RpcMethod::KvWriteBatch, &payload);
+        if status == 0 { Ok(()) } else { Err(status) }
+    }
+
+    /// Fetch several keys in one round trip. Results are in request order.
+    pub fn kv_multi_get(&self, table: &[u8], keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, i32> {
+        let payload = rpc::encode_kv_multi_get_req(table, keys);
+        let (status, resp) = self.call(RpcMethod::KvMultiGet, &payload);
+        if status == 0 {
+            rpc::decode_kv_multi_get_resp(&resp).ok_or(-1)
+        } else {
+            Err(status)
+        }
+    }
+
+    /// Range scan `[start, end)`, ascending, up to `limit` entries.
+    pub fn kv_scan(
+        &self,
+        table: &[u8],
+        start: &[u8],
+        end: &[u8],
+        limit: u32,
+    ) -> Result<Vec<(Vec<u8>, Vec<u8>)>, i32> {
+        let payload = rpc::encode_kv_scan_req(table, start, end, limit);
+        let (status, resp) = self.call(RpcMethod::KvScan, &payload);
+        if status == 0 {
+            rpc::decode_kv_scan_resp(&resp).ok_or(-1)
+        } else {
+            Err(status)
+        }
+    }
+
     // ====================================================================
     //  Utility calls
     // ====================================================================

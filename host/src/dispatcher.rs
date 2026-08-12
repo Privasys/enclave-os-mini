@@ -106,6 +106,9 @@ impl RpcDispatcher {
             RpcMethod::KvGet => self.handle_kv_get(payload),
             RpcMethod::KvDelete => self.handle_kv_delete(payload),
             RpcMethod::KvListKeys => self.handle_kv_list_keys(payload),
+            RpcMethod::KvWriteBatch => self.handle_kv_write_batch(payload),
+            RpcMethod::KvMultiGet => self.handle_kv_multi_get(payload),
+            RpcMethod::KvScan => self.handle_kv_scan(payload),
 
             // ---- Utility ----
             RpcMethod::GetCurrentTime => self.handle_get_current_time(),
@@ -283,6 +286,58 @@ impl RpcDispatcher {
             }
             Err(e) => {
                 error!("KvListKeys failed: {}", e);
+                (-1, Vec::new())
+            }
+        }
+    }
+
+    fn handle_kv_write_batch(&self, payload: &[u8]) -> (i32, Vec<u8>) {
+        let (table, ops) = match rpc::decode_kv_write_batch_req(payload) {
+            Some(r) => r,
+            None => return (-1, Vec::new()),
+        };
+        let table_str = core::str::from_utf8(table).unwrap_or("default");
+        let tuples: Vec<(&[u8], Option<&[u8]>)> = ops
+            .iter()
+            .map(|op| match op {
+                rpc::KvBatchOp::Put { key, value } => (key.as_slice(), Some(value.as_slice())),
+                rpc::KvBatchOp::Delete { key } => (key.as_slice(), None),
+            })
+            .collect();
+        match kvstore::write_batch(table_str, &tuples) {
+            Ok(()) => (0, Vec::new()),
+            Err(e) => {
+                error!("KvWriteBatch failed: {}", e);
+                (-1, Vec::new())
+            }
+        }
+    }
+
+    fn handle_kv_multi_get(&self, payload: &[u8]) -> (i32, Vec<u8>) {
+        let (table, keys) = match rpc::decode_kv_multi_get_req(payload) {
+            Some(r) => r,
+            None => return (-1, Vec::new()),
+        };
+        let table_str = core::str::from_utf8(table).unwrap_or("default");
+        match kvstore::multi_get(table_str, &keys) {
+            Ok(values) => (0, rpc::encode_kv_multi_get_resp(&values)),
+            Err(e) => {
+                error!("KvMultiGet failed: {}", e);
+                (-1, Vec::new())
+            }
+        }
+    }
+
+    fn handle_kv_scan(&self, payload: &[u8]) -> (i32, Vec<u8>) {
+        let (table, start, end, limit) = match rpc::decode_kv_scan_req(payload) {
+            Some(r) => r,
+            None => return (-1, Vec::new()),
+        };
+        let table_str = core::str::from_utf8(table).unwrap_or("default");
+        match kvstore::scan(table_str, start, end, limit as usize) {
+            Ok(entries) => (0, rpc::encode_kv_scan_resp(&entries)),
+            Err(e) => {
+                error!("KvScan failed: {}", e);
                 (-1, Vec::new())
             }
         }

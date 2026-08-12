@@ -25,6 +25,9 @@ socket2 = { version = "0.6", features = ["all"] }
 sgx_types = { git = "https://github.com/Privasys/teaclave-sgx-sdk", tag = "privasys-v0.4.0" }
 sgx_urts  = { git = "https://github.com/Privasys/teaclave-sgx-sdk", tag = "privasys-v0.4.0" }
 
+[dev-dependencies]
+tempfile = "3"
+
 [features]
 mock = []
 

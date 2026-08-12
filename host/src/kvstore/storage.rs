@@ -8,8 +8,11 @@
 //! ciphertext – all encryption/decryption happens inside the enclave.
 
 use anyhow::{Context, Result};
-use rocksdb::{ColumnFamilyDescriptor, Options, DB};
+use rocksdb::{ColumnFamilyDescriptor, Direction, IteratorMode, Options, WriteBatch, DB};
 use std::sync::{Mutex, OnceLock};
+
+/// Cap applied to scans when the caller passes `limit == 0`.
+const DEFAULT_SCAN_LIMIT: usize = 10_000;
 
 static DB_INSTANCE: OnceLock<Mutex<DB>> = OnceLock::new();
 
@@ -100,6 +103,76 @@ pub fn delete(table: &str, enc_key: &[u8]) -> Result<bool> {
     Ok(existed)
 }
 
+/// Apply a batch of operations atomically in the given table.
+///
+/// Each op is `(key, Some(value))` for a put or `(key, None)` for a
+/// delete. RocksDB `WriteBatch` guarantees all-or-nothing.
+pub fn write_batch(table: &str, ops: &[(&[u8], Option<&[u8]>)]) -> Result<()> {
+    let mut db = db();
+    ensure_cf(&mut db, table);
+    let cf = db.cf_handle(table).unwrap();
+    let mut batch = WriteBatch::default();
+    for (key, value) in ops {
+        match value {
+            Some(v) => batch.put_cf(&cf, key, v),
+            None => batch.delete_cf(&cf, key),
+        }
+    }
+    db.write(batch).context("RocksDB write batch failed")
+}
+
+/// Retrieve several encrypted values in one call. Results are in request
+/// order; missing keys yield `None`.
+pub fn multi_get(table: &str, keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>> {
+    let mut db = db();
+    ensure_cf(&mut db, table);
+    let cf = db.cf_handle(table).unwrap();
+    db.multi_get_cf(keys.iter().map(|k| (cf, *k)))
+        .into_iter()
+        .map(|r| r.context("RocksDB multi_get_cf failed"))
+        .collect()
+}
+
+/// Range scan `[start, end)` returning key-value pairs in ascending key
+/// order. An empty `start` scans from the beginning; an empty `end` is
+/// unbounded. `limit == 0` applies [`DEFAULT_SCAN_LIMIT`].
+pub fn scan(table: &str, start: &[u8], end: &[u8], limit: usize) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let mut db = db();
+    ensure_cf(&mut db, table);
+    let cf = db.cf_handle(table).unwrap();
+
+    scan_cf(&db, cf, start, end, limit)
+}
+
+/// Scan implementation over an already-resolved column family.
+fn scan_cf(
+    db: &DB,
+    cf: &rocksdb::ColumnFamily,
+    start: &[u8],
+    end: &[u8],
+    limit: usize,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
+    let limit = if limit == 0 { DEFAULT_SCAN_LIMIT } else { limit };
+    let mode = if start.is_empty() {
+        IteratorMode::Start
+    } else {
+        IteratorMode::From(start, Direction::Forward)
+    };
+
+    let mut entries = Vec::new();
+    for item in db.iterator_cf(&cf, mode) {
+        let (k, v) = item.context("RocksDB iterator failed")?;
+        if !end.is_empty() && &*k >= end {
+            break;
+        }
+        entries.push((k.to_vec(), v.to_vec()));
+        if entries.len() >= limit {
+            break;
+        }
+    }
+    Ok(entries)
+}
+
 /// List all keys in a table, optionally filtered by a prefix.
 ///
 /// Returns up to `limit` keys whose raw bytes start with `prefix`.
@@ -180,6 +253,75 @@ mod tests {
         let val = vec![0xFFu8; 64_000];
         db.put(&key, &val).unwrap();
         assert_eq!(db.get(&key).unwrap().unwrap(), val);
+    }
+
+    #[test]
+    fn write_batch_atomic_put_and_delete() {
+        let (_tmp, db) = open_tmp();
+        db.put(b"old", b"v").unwrap();
+
+        let mut batch = WriteBatch::default();
+        let cf = db.cf_handle("default").unwrap();
+        batch.put_cf(&cf, b"a", b"1");
+        batch.put_cf(&cf, b"b", b"2");
+        batch.delete_cf(&cf, b"old");
+        db.write(batch).unwrap();
+
+        assert_eq!(db.get(b"a").unwrap(), Some(b"1".to_vec()));
+        assert_eq!(db.get(b"b").unwrap(), Some(b"2".to_vec()));
+        assert_eq!(db.get(b"old").unwrap(), None);
+    }
+
+    #[test]
+    fn multi_get_preserves_order_and_misses() {
+        let (_tmp, db) = open_tmp();
+        db.put(b"k1", b"v1").unwrap();
+        db.put(b"k3", b"v3").unwrap();
+
+        let cf = db.cf_handle("default").unwrap();
+        let keys: Vec<&[u8]> = vec![b"k3", b"k2", b"k1"];
+        let results: Vec<Option<Vec<u8>>> = db
+            .multi_get_cf(keys.iter().map(|k| (cf, *k)))
+            .into_iter()
+            .map(|r| r.unwrap())
+            .collect();
+        assert_eq!(
+            results,
+            vec![Some(b"v3".to_vec()), None, Some(b"v1".to_vec())]
+        );
+    }
+
+    #[test]
+    fn scan_range_semantics() {
+        let (_tmp, db) = open_tmp();
+        for (k, v) in [(b"a", b"1"), (b"b", b"2"), (b"c", b"3"), (b"d", b"4")] {
+            db.put(k, v).unwrap();
+        }
+        let cf = db.cf_handle("default").unwrap();
+
+        // [b, d) is half-open: includes b and c, excludes d.
+        let entries = scan_cf(&db, cf, b"b", b"d", 100).unwrap();
+        assert_eq!(
+            entries,
+            vec![(b"b".to_vec(), b"2".to_vec()), (b"c".to_vec(), b"3".to_vec())]
+        );
+
+        // Empty start scans from the beginning; empty end is unbounded.
+        let entries = scan_cf(&db, cf, b"", b"", 100).unwrap();
+        assert_eq!(entries.len(), 4);
+
+        // Limit truncates.
+        let entries = scan_cf(&db, cf, b"", b"", 3).unwrap();
+        assert_eq!(entries.len(), 3);
+        assert_eq!(entries[2].0, b"c".to_vec());
+
+        // Start between keys lands on the next key.
+        let entries = scan_cf(&db, cf, b"bb", b"", 100).unwrap();
+        assert_eq!(entries[0].0, b"c".to_vec());
+
+        // Empty range.
+        let entries = scan_cf(&db, cf, b"x", b"", 100).unwrap();
+        assert!(entries.is_empty());
     }
 
     #[test]

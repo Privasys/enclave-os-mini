@@ -47,6 +47,9 @@ pub enum RpcMethod {
     KvGet            = 0x0201,
     KvDelete         = 0x0202,
     KvListKeys       = 0x0203,
+    KvWriteBatch     = 0x0204,
+    KvMultiGet       = 0x0205,
+    KvScan           = 0x0206,
 
     // -- Utility --
     GetCurrentTime   = 0x0300,
@@ -73,6 +76,9 @@ impl RpcMethod {
             0x0201 => Some(Self::KvGet),
             0x0202 => Some(Self::KvDelete),
             0x0203 => Some(Self::KvListKeys),
+            0x0204 => Some(Self::KvWriteBatch),
+            0x0205 => Some(Self::KvMultiGet),
+            0x0206 => Some(Self::KvScan),
             0x0300 => Some(Self::GetCurrentTime),
             0x0301 => Some(Self::Log),
             0x0400 => Some(Self::QeGetTargetInfo),
@@ -345,6 +351,228 @@ pub fn decode_kv_list_keys_resp(p: &[u8]) -> Option<Vec<Vec<u8>>> {
     Some(keys)
 }
 
+// -- KvWriteBatch --
+/// One operation in a KV write batch: a put or a delete.
+///
+/// The whole batch is applied atomically by the host (RocksDB `WriteBatch`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum KvBatchOp {
+    Put { key: Vec<u8>, value: Vec<u8> },
+    Delete { key: Vec<u8> },
+}
+
+/// Request payload:
+/// `[u16 table_len] [table] [u32 count] { [u8 op] [u32 key_len] [key] ([u32 val_len] [value] if op == 0) }*`
+/// op: 0 = put, 1 = delete.
+/// Response: no payload; status 0 = whole batch committed, else nothing was.
+pub fn encode_kv_write_batch_req(table: &[u8], ops: &[KvBatchOp]) -> Vec<u8> {
+    let total: usize = ops
+        .iter()
+        .map(|op| match op {
+            KvBatchOp::Put { key, value } => 1 + 4 + key.len() + 4 + value.len(),
+            KvBatchOp::Delete { key } => 1 + 4 + key.len(),
+        })
+        .sum();
+    let mut buf = Vec::with_capacity(2 + table.len() + 4 + total);
+    buf.extend_from_slice(&(table.len() as u16).to_le_bytes());
+    buf.extend_from_slice(table);
+    buf.extend_from_slice(&(ops.len() as u32).to_le_bytes());
+    for op in ops {
+        match op {
+            KvBatchOp::Put { key, value } => {
+                buf.push(0);
+                buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                buf.extend_from_slice(key);
+                buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                buf.extend_from_slice(value);
+            }
+            KvBatchOp::Delete { key } => {
+                buf.push(1);
+                buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                buf.extend_from_slice(key);
+            }
+        }
+    }
+    buf
+}
+pub fn decode_kv_write_batch_req(p: &[u8]) -> Option<(&[u8], Vec<KvBatchOp>)> {
+    if p.len() < 2 { return None; }
+    let table_len = u16::from_le_bytes(p[0..2].try_into().ok()?) as usize;
+    if p.len() < 2 + table_len + 4 { return None; }
+    let table = &p[2..2 + table_len];
+    let mut off = 2 + table_len;
+    let count = u32::from_le_bytes(p[off..off + 4].try_into().ok()?) as usize;
+    off += 4;
+    let mut ops = Vec::with_capacity(count);
+    for _ in 0..count {
+        if off + 5 > p.len() { return None; }
+        let tag = p[off];
+        let key_len = u32::from_le_bytes(p[off + 1..off + 5].try_into().ok()?) as usize;
+        off += 5;
+        if off + key_len > p.len() { return None; }
+        let key = p[off..off + key_len].to_vec();
+        off += key_len;
+        match tag {
+            0 => {
+                if off + 4 > p.len() { return None; }
+                let val_len = u32::from_le_bytes(p[off..off + 4].try_into().ok()?) as usize;
+                off += 4;
+                if off + val_len > p.len() { return None; }
+                let value = p[off..off + val_len].to_vec();
+                off += val_len;
+                ops.push(KvBatchOp::Put { key, value });
+            }
+            1 => ops.push(KvBatchOp::Delete { key }),
+            _ => return None,
+        }
+    }
+    Some((table, ops))
+}
+
+// -- KvMultiGet --
+/// Request payload: `[u16 table_len] [table] [u32 count] { [u32 key_len] [key] }*`
+/// Response payload: `[u32 count] { [u8 present] ([u32 val_len] [value] if present == 1) }*`
+/// Results are in request order.
+pub fn encode_kv_multi_get_req(table: &[u8], keys: &[&[u8]]) -> Vec<u8> {
+    let total: usize = keys.iter().map(|k| 4 + k.len()).sum();
+    let mut buf = Vec::with_capacity(2 + table.len() + 4 + total);
+    buf.extend_from_slice(&(table.len() as u16).to_le_bytes());
+    buf.extend_from_slice(table);
+    buf.extend_from_slice(&(keys.len() as u32).to_le_bytes());
+    for key in keys {
+        buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        buf.extend_from_slice(key);
+    }
+    buf
+}
+pub fn decode_kv_multi_get_req(p: &[u8]) -> Option<(&[u8], Vec<&[u8]>)> {
+    if p.len() < 2 { return None; }
+    let table_len = u16::from_le_bytes(p[0..2].try_into().ok()?) as usize;
+    if p.len() < 2 + table_len + 4 { return None; }
+    let table = &p[2..2 + table_len];
+    let mut off = 2 + table_len;
+    let count = u32::from_le_bytes(p[off..off + 4].try_into().ok()?) as usize;
+    off += 4;
+    let mut keys = Vec::with_capacity(count);
+    for _ in 0..count {
+        if off + 4 > p.len() { return None; }
+        let kl = u32::from_le_bytes(p[off..off + 4].try_into().ok()?) as usize;
+        off += 4;
+        if off + kl > p.len() { return None; }
+        keys.push(&p[off..off + kl]);
+        off += kl;
+    }
+    Some((table, keys))
+}
+pub fn encode_kv_multi_get_resp(values: &[Option<Vec<u8>>]) -> Vec<u8> {
+    let total: usize = values
+        .iter()
+        .map(|v| 1 + v.as_ref().map_or(0, |v| 4 + v.len()))
+        .sum();
+    let mut buf = Vec::with_capacity(4 + total);
+    buf.extend_from_slice(&(values.len() as u32).to_le_bytes());
+    for value in values {
+        match value {
+            Some(v) => {
+                buf.push(1);
+                buf.extend_from_slice(&(v.len() as u32).to_le_bytes());
+                buf.extend_from_slice(v);
+            }
+            None => buf.push(0),
+        }
+    }
+    buf
+}
+pub fn decode_kv_multi_get_resp(p: &[u8]) -> Option<Vec<Option<Vec<u8>>>> {
+    if p.len() < 4 { return None; }
+    let count = u32::from_le_bytes(p[0..4].try_into().ok()?) as usize;
+    let mut off = 4;
+    let mut values = Vec::with_capacity(count);
+    for _ in 0..count {
+        if off + 1 > p.len() { return None; }
+        let present = p[off];
+        off += 1;
+        match present {
+            0 => values.push(None),
+            1 => {
+                if off + 4 > p.len() { return None; }
+                let vl = u32::from_le_bytes(p[off..off + 4].try_into().ok()?) as usize;
+                off += 4;
+                if off + vl > p.len() { return None; }
+                values.push(Some(p[off..off + vl].to_vec()));
+                off += vl;
+            }
+            _ => return None,
+        }
+    }
+    Some(values)
+}
+
+// -- KvScan --
+/// Request payload:
+/// `[u16 table_len] [table] [u32 limit] [u32 start_len] [start] [end]`
+/// Range is `[start, end)`; an empty `end` means unbounded. `limit == 0`
+/// means "host default cap". Keys are raw stored bytes, sorted ascending.
+/// Response payload: `[u32 count] { [u32 key_len] [key] [u32 val_len] [value] }*`
+pub fn encode_kv_scan_req(table: &[u8], start: &[u8], end: &[u8], limit: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(2 + table.len() + 4 + 4 + start.len() + end.len());
+    buf.extend_from_slice(&(table.len() as u16).to_le_bytes());
+    buf.extend_from_slice(table);
+    buf.extend_from_slice(&limit.to_le_bytes());
+    buf.extend_from_slice(&(start.len() as u32).to_le_bytes());
+    buf.extend_from_slice(start);
+    buf.extend_from_slice(end);
+    buf
+}
+pub fn decode_kv_scan_req(p: &[u8]) -> Option<(&[u8], &[u8], &[u8], u32)> {
+    if p.len() < 2 { return None; }
+    let table_len = u16::from_le_bytes(p[0..2].try_into().ok()?) as usize;
+    if p.len() < 2 + table_len + 8 { return None; }
+    let table = &p[2..2 + table_len];
+    let mut off = 2 + table_len;
+    let limit = u32::from_le_bytes(p[off..off + 4].try_into().ok()?);
+    off += 4;
+    let start_len = u32::from_le_bytes(p[off..off + 4].try_into().ok()?) as usize;
+    off += 4;
+    if off + start_len > p.len() { return None; }
+    let start = &p[off..off + start_len];
+    let end = &p[off + start_len..];
+    Some((table, start, end, limit))
+}
+pub fn encode_kv_scan_resp(entries: &[(Vec<u8>, Vec<u8>)]) -> Vec<u8> {
+    let total: usize = entries.iter().map(|(k, v)| 8 + k.len() + v.len()).sum();
+    let mut buf = Vec::with_capacity(4 + total);
+    buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for (key, value) in entries {
+        buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+        buf.extend_from_slice(key);
+        buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+        buf.extend_from_slice(value);
+    }
+    buf
+}
+pub fn decode_kv_scan_resp(p: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
+    if p.len() < 4 { return None; }
+    let count = u32::from_le_bytes(p[0..4].try_into().ok()?) as usize;
+    let mut off = 4;
+    let mut entries = Vec::with_capacity(count);
+    for _ in 0..count {
+        if off + 4 > p.len() { return None; }
+        let kl = u32::from_le_bytes(p[off..off + 4].try_into().ok()?) as usize;
+        off += 4;
+        if off + kl + 4 > p.len() { return None; }
+        let key = p[off..off + kl].to_vec();
+        off += kl;
+        let vl = u32::from_le_bytes(p[off..off + 4].try_into().ok()?) as usize;
+        off += 4;
+        if off + vl > p.len() { return None; }
+        let value = p[off..off + vl].to_vec();
+        off += vl;
+        entries.push((key, value));
+    }
+    Some(entries)
+}
+
 // -- GetCurrentTime --
 /// Request: no payload
 /// Response: [u64 timestamp LE]
@@ -479,6 +707,9 @@ mod tests {
             RpcMethod::KvGet,
             RpcMethod::KvDelete,
             RpcMethod::KvListKeys,
+            RpcMethod::KvWriteBatch,
+            RpcMethod::KvMultiGet,
+            RpcMethod::KvScan,
             RpcMethod::GetCurrentTime,
             RpcMethod::Log,
             RpcMethod::Shutdown,
@@ -633,6 +864,72 @@ mod tests {
         assert_eq!(decoded[0], b"key1");
         assert_eq!(decoded[1], b"key2");
         assert_eq!(decoded[2], b"key3");
+    }
+
+    #[test]
+    fn test_kv_write_batch_roundtrip() {
+        let ops = vec![
+            KvBatchOp::Put { key: b"k1".to_vec(), value: b"v1".to_vec() },
+            KvBatchOp::Delete { key: b"k2".to_vec() },
+            KvBatchOp::Put { key: b"k3".to_vec(), value: Vec::new() },
+        ];
+        let encoded = encode_kv_write_batch_req(b"merkle:t:nodes", &ops);
+        let (table, decoded) = decode_kv_write_batch_req(&encoded).unwrap();
+        assert_eq!(table, b"merkle:t:nodes");
+        assert_eq!(decoded, ops);
+    }
+
+    #[test]
+    fn test_kv_write_batch_empty() {
+        let encoded = encode_kv_write_batch_req(b"t", &[]);
+        let (table, decoded) = decode_kv_write_batch_req(&encoded).unwrap();
+        assert_eq!(table, b"t");
+        assert!(decoded.is_empty());
+    }
+
+    #[test]
+    fn test_kv_write_batch_truncated_fails() {
+        let ops = vec![KvBatchOp::Put { key: b"key".to_vec(), value: b"value".to_vec() }];
+        let encoded = encode_kv_write_batch_req(b"t", &ops);
+        assert!(decode_kv_write_batch_req(&encoded[..encoded.len() - 1]).is_none());
+    }
+
+    #[test]
+    fn test_kv_multi_get_roundtrip() {
+        let keys: &[&[u8]] = &[b"a", b"", b"longer_key"];
+        let encoded = encode_kv_multi_get_req(b"tbl", keys);
+        let (table, decoded) = decode_kv_multi_get_req(&encoded).unwrap();
+        assert_eq!(table, b"tbl");
+        assert_eq!(decoded, keys);
+
+        let values = vec![Some(b"v1".to_vec()), None, Some(Vec::new())];
+        let encoded = encode_kv_multi_get_resp(&values);
+        let decoded = decode_kv_multi_get_resp(&encoded).unwrap();
+        assert_eq!(decoded, values);
+    }
+
+    #[test]
+    fn test_kv_scan_roundtrip() {
+        let encoded = encode_kv_scan_req(b"tbl", b"start", b"end", 42);
+        let (table, start, end, limit) = decode_kv_scan_req(&encoded).unwrap();
+        assert_eq!(table, b"tbl");
+        assert_eq!(start, b"start");
+        assert_eq!(end, b"end");
+        assert_eq!(limit, 42);
+
+        // Unbounded end encodes as empty.
+        let encoded = encode_kv_scan_req(b"tbl", b"", b"", 0);
+        let (_, start, end, limit) = decode_kv_scan_req(&encoded).unwrap();
+        assert!(start.is_empty() && end.is_empty());
+        assert_eq!(limit, 0);
+
+        let entries = vec![
+            (b"k1".to_vec(), b"v1".to_vec()),
+            (b"k2".to_vec(), Vec::new()),
+        ];
+        let encoded = encode_kv_scan_resp(&entries);
+        let decoded = decode_kv_scan_resp(&encoded).unwrap();
+        assert_eq!(decoded, entries);
     }
 
     #[test]
@@ -792,6 +1089,9 @@ mod tests {
         assert_eq!(RpcMethod::from_u16(0x0201), Some(RpcMethod::KvGet));
         assert_eq!(RpcMethod::from_u16(0x0202), Some(RpcMethod::KvDelete));
         assert_eq!(RpcMethod::from_u16(0x0203), Some(RpcMethod::KvListKeys));
+        assert_eq!(RpcMethod::from_u16(0x0204), Some(RpcMethod::KvWriteBatch));
+        assert_eq!(RpcMethod::from_u16(0x0205), Some(RpcMethod::KvMultiGet));
+        assert_eq!(RpcMethod::from_u16(0x0206), Some(RpcMethod::KvScan));
         assert_eq!(RpcMethod::from_u16(0x0300), Some(RpcMethod::GetCurrentTime));
         assert_eq!(RpcMethod::from_u16(0x0301), Some(RpcMethod::Log));
         assert_eq!(RpcMethod::from_u16(0x0400), Some(RpcMethod::QeGetTargetInfo));
@@ -801,7 +1101,7 @@ mod tests {
         // Invalid IDs
         assert_eq!(RpcMethod::from_u16(0x0000), None);
         assert_eq!(RpcMethod::from_u16(0x0106), None);
-        assert_eq!(RpcMethod::from_u16(0x0204), None);
+        assert_eq!(RpcMethod::from_u16(0x0207), None);
         assert_eq!(RpcMethod::from_u16(0xFFFF), None);
     }
 }

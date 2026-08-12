@@ -32,6 +32,9 @@ pub struct OcallVtable {
     pub kv_store_get: fn(&[u8], &[u8]) -> Result<Option<Vec<u8>>, i32>,
     pub kv_store_delete: fn(&[u8], &[u8]) -> Result<bool, i32>,
     pub kv_store_list_keys: fn(&[u8], &[u8]) -> Result<Vec<Vec<u8>>, i32>,
+    pub kv_store_write_batch: fn(&[u8], &[crate::rpc::KvBatchOp]) -> Result<(), i32>,
+    pub kv_store_multi_get: fn(&[u8], &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, i32>,
+    pub kv_store_scan: fn(&[u8], &[u8], &[u8], u32) -> Result<Vec<(Vec<u8>, Vec<u8>)>, i32>,
 
     // ── Utility ──────────────────────────────────────────────────────
     pub get_current_time: fn() -> Result<u64, i32>,
@@ -102,6 +105,27 @@ pub fn kv_store_delete(table: &[u8], enc_key: &[u8]) -> Result<bool, i32> {
 
 pub fn kv_store_list_keys(table: &[u8], prefix: &[u8]) -> Result<Vec<Vec<u8>>, i32> {
     (vt().kv_store_list_keys)(table, prefix)
+}
+
+/// Apply a batch of puts/deletes atomically (all or nothing on the host).
+pub fn kv_store_write_batch(table: &[u8], ops: &[crate::rpc::KvBatchOp]) -> Result<(), i32> {
+    (vt().kv_store_write_batch)(table, ops)
+}
+
+/// Fetch several keys in one host round trip. Results are in request order.
+pub fn kv_store_multi_get(table: &[u8], keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, i32> {
+    (vt().kv_store_multi_get)(table, keys)
+}
+
+/// Range scan `[start, end)` returning key-value pairs in ascending key
+/// order. An empty `end` means unbounded; `limit == 0` uses the host cap.
+pub fn kv_store_scan(
+    table: &[u8],
+    start: &[u8],
+    end: &[u8],
+    limit: u32,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, i32> {
+    (vt().kv_store_scan)(table, start, end, limit)
 }
 
 pub fn get_current_time() -> Result<u64, i32> {

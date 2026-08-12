@@ -86,6 +86,29 @@ pub fn kv_store_list_keys(table: &[u8], prefix: &[u8]) -> Result<Vec<Vec<u8>>, i
     rpc().kv_list_keys(table, prefix)
 }
 
+/// Apply a batch of puts/deletes atomically on the host (RocksDB WriteBatch).
+pub fn kv_store_write_batch(
+    table: &[u8],
+    ops: &[enclave_os_common::rpc::KvBatchOp],
+) -> Result<(), i32> {
+    rpc().kv_write_batch(table, ops)
+}
+
+/// Fetch several keys in one host round trip. Results are in request order.
+pub fn kv_store_multi_get(table: &[u8], keys: &[&[u8]]) -> Result<Vec<Option<Vec<u8>>>, i32> {
+    rpc().kv_multi_get(table, keys)
+}
+
+/// Range scan `[start, end)` returning key-value pairs, ascending.
+pub fn kv_store_scan(
+    table: &[u8],
+    start: &[u8],
+    end: &[u8],
+    limit: u32,
+) -> Result<Vec<(Vec<u8>, Vec<u8>)>, i32> {
+    rpc().kv_scan(table, start, end, limit)
+}
+
 // ==========================================================================
 //  Utility wrappers
 // ==========================================================================
