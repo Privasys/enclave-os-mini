@@ -69,6 +69,19 @@ pub const COMBINED_WORKLOADS_HASH_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 2, 5]
 /// Combined Workloads Hash (dotted-string).
 pub const COMBINED_WORKLOADS_HASH_OID_STR: &str = "1.3.6.1.4.1.65230.2.5";
 
+/// Merkle State Root — `1.3.6.1.4.1.65230.2.6`
+///
+/// 40 bytes: the 32-byte root of the authenticated KV store
+/// (`enclave-os-merkle`) followed by the u64 BE commit version. The
+/// root commits to the store's entire logical data state
+/// (encryption-independent keyed plaintext commitments). Recomputed at
+/// certificate generation, so challenge-mode connections always carry
+/// the live value; deterministic-mode certs may lag up to their cache
+/// lifetime.
+pub const MERKLE_STATE_ROOT_OID: &[u64] = &[1, 3, 6, 1, 4, 1, 65230, 2, 6];
+/// Merkle State Root (dotted-string).
+pub const MERKLE_STATE_ROOT_OID_STR: &str = "1.3.6.1.4.1.65230.2.6";
+
 /// Attestation Servers Hash — `1.3.6.1.4.1.65230.2.7`
 ///
 /// 32-byte SHA-256 hash of the canonical attestation server URL list

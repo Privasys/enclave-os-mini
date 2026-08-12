@@ -37,8 +37,10 @@
 //! error, never data.
 
 mod backend;
+mod cache;
 mod error;
 mod hash;
+mod module;
 mod node;
 mod proof;
 mod tree;
@@ -49,5 +51,6 @@ mod tests;
 pub use backend::{KvBackend, MemBackend, OcallBackend};
 pub use error::MerkleError;
 pub use hash::{Hash, HASH_SIZE};
+pub use module::MerkleModule;
 pub use proof::{verify, Proof, Verified};
 pub use tree::{MerkleStore, PruneStats};

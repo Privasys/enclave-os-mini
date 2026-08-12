@@ -34,6 +34,8 @@ version = "0.1.0"
 dependencies = [
  "enclave-os-common",
  "ring",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

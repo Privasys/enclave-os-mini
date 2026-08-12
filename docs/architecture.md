@@ -110,6 +110,7 @@ OS returns an error to the client.
 |--------|-------|-------------|
 | **egress** | `crates/enclave-os-egress` | HTTPS egress; owns the root CA bundle |
 | **kvstore** | `crates/enclave-os-kvstore` | Sealed AES-256-GCM key-value store |
+| **merkle** | `crates/enclave-os-merkle` | Authenticated KV store — versioned sparse Merkle tree with an encryption-independent root (see [merkle-store.md](merkle-store.md)) |
 | **wasm** | `crates/enclave-os-wasm` | Wasmtime WASM runtime with WASI + SDK |
 | **vault** | `crates/enclave-os-vault` | JWT-authenticated (ES256) secret store |
 

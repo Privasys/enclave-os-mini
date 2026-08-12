@@ -516,6 +516,28 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
         _module_count += 1;
     }
 
+    // ── Merkle module (authenticated KV store, versioned sparse tree) ─
+    #[cfg(feature = "merkle")]
+    {
+        let store_name = config
+            .extra
+            .get("merkle_store_name")
+            .and_then(|v| v.as_str())
+            .unwrap_or("default");
+        let merkle = match enclave_os_merkle::MerkleModule::new(
+            sealed_cfg.master_key(),
+            store_name,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                enclave_log_error!("MerkleModule init failed: {}", e);
+                return -35;
+            }
+        };
+        crate::modules::register_module(Box::new(merkle));
+        _module_count += 1;
+    }
+
     // ── Vault module (policy-gated secrets, JWT + mRA-TLS) ───────────
     #[cfg(feature = "vault")]
     {
@@ -576,6 +598,7 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
     #[cfg(not(any(
         feature = "egress",
         feature = "kvstore",
+        feature = "merkle",
         feature = "vault",
         feature = "wasm",
         feature = "fido2"

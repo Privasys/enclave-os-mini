@@ -23,6 +23,8 @@
 //! | `v` | vh ‖ value_version u64 BE | GCM ciphertext |
 //! | `s` | stale_since u64 BE ‖ target record key | empty |
 //! | `r` | version u64 BE | root hash |
+//! | `c` | (fixed) | GCM-encrypted `(root, version)` checkpoint, written
+//!   atomically inside every commit batch |
 //!
 //! Node and value records are both versioned and immutable: a record is
 //! written by exactly one commit and never again (re-inserting a value
@@ -47,6 +49,7 @@ use enclave_os_common::types::AEAD_KEY_SIZE;
 use ring::hmac;
 
 use crate::backend::KvBackend;
+use crate::cache::NodeCache;
 use crate::error::MerkleError;
 use crate::hash::{placeholder, Hash, HASH_SIZE};
 use crate::node::{nibble, subtree_hash, Child, InternalNode, LeafNode, Node, NodeKey};
@@ -56,10 +59,12 @@ const REC_NODE: u8 = b'n';
 const REC_VALUE: u8 = b'v';
 const REC_STALE: u8 = b's';
 const REC_ROOT: u8 = b'r';
+const REC_CHECKPOINT: u8 = b'c';
 
 const HMAC_TAG_PATH: &[u8] = b"p";
 const HMAC_TAG_VALUE: &[u8] = b"v";
 const VALUE_AAD_TAG: &[u8] = b"enclave_os_merkle_val";
+const CHECKPOINT_AAD: &[u8] = b"enclave_os_merkle_ckpt";
 
 // ---------------------------------------------------------------------------
 //  Record keys
@@ -95,6 +100,10 @@ fn root_record_key(version: u64) -> Vec<u8> {
     k
 }
 
+fn checkpoint_record_key() -> Vec<u8> {
+    vec![REC_CHECKPOINT]
+}
+
 // ---------------------------------------------------------------------------
 //  Store
 // ---------------------------------------------------------------------------
@@ -108,7 +117,12 @@ pub struct MerkleStore<B: KvBackend> {
     root: Hash,
     version: u64,
     root_child: Option<Child>,
+    cache: NodeCache,
 }
+
+/// Default node-cache capacity: ~10³ immutable node records (≈ a few
+/// hundred KiB) keeps the top tree levels permanently warm.
+const DEFAULT_CACHE_CAPACITY: usize = 1024;
 
 /// One deduplicated update: `Some(vh)` = insert/overwrite, `None` = delete.
 type Update = (Hash, Option<Hash>);
@@ -158,11 +172,15 @@ impl<B: KvBackend> MerkleStore<B> {
             root: *placeholder(),
             version: 0,
             root_child: None,
+            cache: NodeCache::new(DEFAULT_CACHE_CAPACITY),
         };
-        store.backend.write_batch(vec![KvBatchOp::Put {
-            key: root_record_key(0),
-            value: placeholder().to_vec(),
-        }])?;
+        store.backend.write_batch(vec![
+            KvBatchOp::Put { key: root_record_key(0), value: placeholder().to_vec() },
+            KvBatchOp::Put {
+                key: checkpoint_record_key(),
+                value: store.encrypt_checkpoint(placeholder(), 0)?,
+            },
+        ])?;
         Ok(store)
     }
 
@@ -183,9 +201,53 @@ impl<B: KvBackend> MerkleStore<B> {
             root,
             version,
             root_child: None,
+            cache: NodeCache::new(DEFAULT_CACHE_CAPACITY),
         };
         store.root_child = store.load_root_child(root, version)?;
         Ok(store)
+    }
+
+    /// Open at the checkpoint record the store itself maintains (written
+    /// atomically inside every commit batch, AES-256-GCM under the
+    /// storage key). The host cannot forge it — at worst it can replay
+    /// an old checkpoint *together with* a matching old store, the
+    /// documented restart-replay residual risk. Prefer sealing
+    /// `root()` externally when an extra anchor is available.
+    pub fn open_latest(
+        backend: B,
+        commitment_key: [u8; AEAD_KEY_SIZE],
+        storage_key: [u8; AEAD_KEY_SIZE],
+    ) -> Result<Self, MerkleError> {
+        let cipher = AeadCipher::from_key(storage_key);
+        let record = backend
+            .get(&checkpoint_record_key())?
+            .ok_or_else(|| MerkleError::Missing("checkpoint record".into()))?;
+        let (root, version) = decrypt_checkpoint(&cipher, &record)?;
+        Self::open(backend, commitment_key, storage_key, root, version)
+    }
+
+    /// Open an existing store, or create a fresh one if no checkpoint
+    /// exists yet. The constructor modules use.
+    pub fn open_or_create(
+        backend: B,
+        commitment_key: [u8; AEAD_KEY_SIZE],
+        storage_key: [u8; AEAD_KEY_SIZE],
+    ) -> Result<Self, MerkleError> {
+        let exists = backend.get(&checkpoint_record_key())?.is_some();
+        if exists {
+            Self::open_latest(backend, commitment_key, storage_key)
+        } else {
+            Self::create(backend, commitment_key, storage_key)
+        }
+    }
+
+    fn encrypt_checkpoint(&self, root: &Hash, version: u64) -> Result<Vec<u8>, MerkleError> {
+        let mut payload = Vec::with_capacity(HASH_SIZE + 8);
+        payload.extend_from_slice(root);
+        payload.extend_from_slice(&version.to_be_bytes());
+        self.cipher
+            .encrypt(&payload, CHECKPOINT_AAD)
+            .map_err(|e| MerkleError::Corrupted(format!("checkpoint encrypt: {e}")))
     }
 
     /// Current `(root, version)`. Seal this pair after every commit.
@@ -196,6 +258,11 @@ impl<B: KvBackend> MerkleStore<B> {
     /// Borrow the backend (tests, diagnostics).
     pub fn backend(&self) -> &B {
         &self.backend
+    }
+
+    /// Resize the node cache (0 disables). Clears current contents.
+    pub fn set_cache_capacity(&self, capacity: usize) {
+        self.cache.set_capacity(capacity);
     }
 
     /// Consume the store, returning the backend (restart tests).
@@ -209,6 +276,18 @@ impl<B: KvBackend> MerkleStore<B> {
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, MerkleError> {
         let path = self.path_of(key);
         self.walk(self.root_child.clone(), &path)
+    }
+
+    /// The root hash recorded for a historical `version` (same
+    /// freshness caveat as [`Self::get_at`]).
+    pub fn root_at(&self, version: u64) -> Result<Hash, MerkleError> {
+        if version > self.version {
+            return Err(MerkleError::Invalid(format!(
+                "version {version} is in the future (current {})",
+                self.version
+            )));
+        }
+        self.load_root_record(version)
     }
 
     /// Get the value for `key` at a historical `version`.
@@ -312,10 +391,19 @@ impl<B: KvBackend> MerkleStore<B> {
             });
         }
         batch.push(KvBatchOp::Put { key: root_record_key(new_version), value: new_root.to_vec() });
+        batch.push(KvBatchOp::Put {
+            key: checkpoint_record_key(),
+            value: self.encrypt_checkpoint(&new_root, new_version)?,
+        });
 
         self.backend.write_batch(batch)?;
 
-        // Only after the host confirmed: swing the in-memory state.
+        // Only after the host confirmed: swing the in-memory state and
+        // warm the cache with this commit's nodes (root and top levels
+        // are the hottest records in the store).
+        for (nk, node) in acc.pending {
+            self.cache.put(nk, node);
+        }
         self.root = new_root;
         self.version = new_version;
         self.root_child = new_root_child;
@@ -342,6 +430,9 @@ impl<B: KvBackend> MerkleStore<B> {
             )));
         }
         let mut stats = PruneStats::default();
+
+        // Deleted history must not linger in the cache.
+        self.cache.clear();
 
         // Stale entries with stale_since <= before_version. Each entry's
         // key embeds the target record key; both die in one batch.
@@ -566,6 +657,14 @@ impl<B: KvBackend> MerkleStore<B> {
     // -- internals: loading -----------------------------------------------
 
     fn load_node(&self, nk: &NodeKey, expected_hash: &Hash) -> Result<Node, MerkleError> {
+        // The cache removes host I/O only — cached nodes are re-verified
+        // against the caller's expected hash exactly like loaded ones.
+        if let Some(node) = self.cache.get(nk) {
+            if &node.hash() != expected_hash {
+                return Err(MerkleError::Corrupted(format!("node {nk:?} hash mismatch")));
+            }
+            return Ok(node);
+        }
         let record = self
             .backend
             .get(&node_record_key(nk))?
@@ -574,6 +673,7 @@ impl<B: KvBackend> MerkleStore<B> {
         if &node.hash() != expected_hash {
             return Err(MerkleError::Corrupted(format!("node {nk:?} hash mismatch")));
         }
+        self.cache.put(nk.clone(), node.clone());
         Ok(node)
     }
 
@@ -890,4 +990,19 @@ fn value_aad(path: &Hash) -> Vec<u8> {
     aad.extend_from_slice(VALUE_AAD_TAG);
     aad.extend_from_slice(path);
     aad
+}
+
+fn decrypt_checkpoint(cipher: &AeadCipher, record: &[u8]) -> Result<(Hash, u64), MerkleError> {
+    let payload = cipher
+        .decrypt(record, CHECKPOINT_AAD)
+        .map_err(|e| MerkleError::Corrupted(format!("checkpoint decrypt: {e}")))?;
+    if payload.len() != HASH_SIZE + 8 {
+        return Err(MerkleError::Corrupted("checkpoint bad length".into()));
+    }
+    let mut root = [0u8; HASH_SIZE];
+    root.copy_from_slice(&payload[..HASH_SIZE]);
+    let version = u64::from_be_bytes(
+        payload[HASH_SIZE..].try_into().map_err(|_| MerkleError::Corrupted("checkpoint version".into()))?,
+    );
+    Ok((root, version))
 }

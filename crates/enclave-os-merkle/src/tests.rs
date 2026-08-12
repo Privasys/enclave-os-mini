@@ -291,6 +291,7 @@ fn reopen_empty_store() {
 #[test]
 fn tamper_sweep_fails_closed() {
     let mut store = new_store();
+    store.set_cache_capacity(0); // every read must hit the backend
     let n = 40u64;
     let batch: Vec<_> = (0..n).map(|i| (key(i), Some(val(i)))).collect();
     store.put_batch(&batch).unwrap();
@@ -321,10 +322,11 @@ fn tamper_sweep_fails_closed() {
 #[test]
 fn missing_records_fail_closed() {
     let mut store = new_store();
+    store.set_cache_capacity(0); // force every read to hit the backend
     store.put_batch(&[(b"k".to_vec(), Some(b"v".to_vec()))]).unwrap();
     for rk in store.backend().keys() {
-        if rk[0] == b'r' {
-            continue; // root records are not on the live read path
+        if rk[0] == b'r' || rk[0] == b'c' {
+            continue; // root/checkpoint records are not on the live read path
         }
         store.backend().remove(&rk);
         match store.get(b"k") {
@@ -333,6 +335,7 @@ fn missing_records_fail_closed() {
         }
         // Rebuild the store for the next iteration.
         store = new_store();
+        store.set_cache_capacity(0);
         store.put_batch(&[(b"k".to_vec(), Some(b"v".to_vec()))]).unwrap();
     }
 }
@@ -520,6 +523,7 @@ fn record_census(store: &MerkleStore<MemBackend>) -> (usize, usize, usize, usize
             b'v' => v += 1,
             b's' => s += 1,
             b'r' => r += 1,
+            b'c' => {} // the single checkpoint record
             other => panic!("unknown record prefix {other}"),
         }
     }
@@ -685,6 +689,7 @@ fn retain_recent_window() {
 #[test]
 fn pruned_store_still_fails_closed() {
     let mut store = new_store();
+    store.set_cache_capacity(0); // every read must hit the backend
     let batch: Vec<_> = (0..30u64).map(|i| (key(i), Some(val(i)))).collect();
     store.put_batch(&batch).unwrap();
     store.put_batch(&[(key(0), Some(val(999)))]).unwrap();
@@ -712,12 +717,228 @@ fn pruned_store_still_fails_closed() {
 }
 
 // ---------------------------------------------------------------------------
+//  Checkpoint record (open_latest / open_or_create)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn checkpoint_reopen_without_external_state() {
+    let store = MerkleStore::open_or_create(MemBackend::new(), CK, SK).unwrap();
+    let mut store = store;
+    store
+        .put_batch(&[
+            (b"a".to_vec(), Some(b"1".to_vec())),
+            (b"b".to_vec(), Some(b"2".to_vec())),
+        ])
+        .unwrap();
+    let expected = store.root();
+
+    // Reopen purely from the backend: the checkpoint record carries
+    // (root, version), atomically written with the commit.
+    let backend = store.into_backend();
+    let reopened = MerkleStore::open_or_create(backend, CK, SK).unwrap();
+    assert_eq!(reopened.root(), expected);
+    assert_eq!(reopened.get(b"a").unwrap(), Some(b"1".to_vec()));
+
+    // A tampered checkpoint fails closed (GCM tag).
+    let backend = reopened.into_backend();
+    assert!(backend.tamper(&[b'c']));
+    assert!(matches!(
+        MerkleStore::open_latest(backend, CK, SK),
+        Err(MerkleError::Corrupted(_))
+    ));
+}
+
+// ---------------------------------------------------------------------------
+//  Module envelope
+// ---------------------------------------------------------------------------
+
+mod module_tests {
+    use super::*;
+    use crate::module::MerkleModule;
+    use enclave_os_common::hex::{hex_decode, hex_encode};
+    use enclave_os_common::modules::{EnclaveModule, RequestContext};
+    use enclave_os_common::oidc::{OidcClaims, OidcConfig};
+    use enclave_os_common::protocol::{Request, Response};
+
+    fn claims(roles: &[&str]) -> OidcClaims {
+        let config: OidcConfig =
+            serde_json::from_str(r#"{"issuer":"i","audience":"a"}"#).unwrap();
+        OidcClaims::from_raw(
+            "tester".into(),
+            roles.iter().map(|s| s.to_string()).collect(),
+            &config,
+        )
+    }
+
+    fn ctx(oidc_claims: Option<OidcClaims>) -> RequestContext {
+        RequestContext {
+            peer_cert_der: None,
+            client_challenge_nonce: None,
+            channel_binder: None,
+            oidc_claims,
+        }
+    }
+
+    fn new_module() -> MerkleModule<MemBackend> {
+        let store = MerkleStore::create(MemBackend::new(), CK, SK).unwrap();
+        MerkleModule::with_store(store, "test")
+    }
+
+    fn call(
+        module: &MerkleModule<MemBackend>,
+        body: serde_json::Value,
+        context: &RequestContext,
+    ) -> Option<Response> {
+        module.handle(&Request::Data(body.to_string().into_bytes()), context)
+    }
+
+    fn data_json(resp: Response) -> serde_json::Value {
+        match resp {
+            Response::Data(d) => serde_json::from_slice(&d).unwrap(),
+            other => panic!("expected Data, got {other:?}"),
+        }
+    }
+
+    fn error_text(resp: Response) -> String {
+        match resp {
+            Response::Error(d) => {
+                serde_json::from_slice::<serde_json::Value>(&d).unwrap()["error"]
+                    .as_str()
+                    .unwrap()
+                    .to_string()
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn envelope_roundtrip() {
+        let module = new_module();
+        let manager = ctx(Some(claims(&["privasys-platform:manager"])));
+
+        // Put two keys, one delete of an absent key.
+        let resp = call(
+            &module,
+            serde_json::json!({"merkle_put": {"ops": [
+                {"key": hex_encode(b"alice"), "value": hex_encode(b"1000")},
+                {"key": hex_encode(b"bob"),   "value": hex_encode(b"250")},
+            ]}}),
+            &manager,
+        )
+        .unwrap();
+        let put = data_json(resp);
+        assert_eq!(put["version"], 1);
+
+        // Root query matches.
+        let root = data_json(call(&module, serde_json::json!({"merkle_root": {}}), &manager).unwrap());
+        assert_eq!(root["root"], put["root"]);
+
+        // Get present + absent.
+        let got = data_json(
+            call(&module, serde_json::json!({"merkle_get": {"key": hex_encode(b"alice")}}), &manager)
+                .unwrap(),
+        );
+        assert_eq!(got["value"], hex_encode(b"1000"));
+        let got = data_json(
+            call(&module, serde_json::json!({"merkle_get": {"key": hex_encode(b"nobody")}}), &manager)
+                .unwrap(),
+        );
+        assert!(got["value"].is_null());
+
+        // Prove: decodes and reports the live root.
+        let proved = data_json(
+            call(&module, serde_json::json!({"merkle_prove": {"key": hex_encode(b"alice")}}), &manager)
+                .unwrap(),
+        );
+        assert_eq!(proved["root"], root["root"]);
+        let proof_bytes = hex_decode(proved["proof"].as_str().unwrap()).unwrap();
+        crate::proof::Proof::decode(&proof_bytes).unwrap();
+
+        // Delete + prune via retain_recent.
+        let resp = call(
+            &module,
+            serde_json::json!({"merkle_put": {"ops": [{"key": hex_encode(b"bob")}]}}),
+            &manager,
+        )
+        .unwrap();
+        assert_eq!(data_json(resp)["version"], 2);
+        let pruned = data_json(
+            call(&module, serde_json::json!({"merkle_prune": {"retain_recent": 0}}), &manager)
+                .unwrap(),
+        );
+        assert!(pruned["records_deleted"].as_u64().unwrap() > 0);
+    }
+
+    #[test]
+    fn declines_foreign_payloads() {
+        let module = new_module();
+        let manager = ctx(Some(claims(&["privasys-platform:manager"])));
+        // Another module's envelope: decline (None), never an error.
+        assert!(call(&module, serde_json::json!({"wasm_schema": {"app": "x"}}), &manager).is_none());
+        // Non-JSON body: decline.
+        assert!(module.handle(&Request::Data(b"not json".to_vec()), &manager).is_none());
+        // Non-Data requests: decline.
+        assert!(module.handle(&Request::Healthz, &manager).is_none());
+    }
+
+    #[test]
+    fn role_gates() {
+        let module = new_module();
+
+        // No claims at all.
+        let resp = call(&module, serde_json::json!({"merkle_root": {}}), &ctx(None)).unwrap();
+        assert_eq!(error_text(resp), "authentication required");
+
+        // Monitoring can read but not write.
+        let monitoring = ctx(Some(claims(&["privasys-platform:monitoring"])));
+        assert!(matches!(
+            call(&module, serde_json::json!({"merkle_root": {}}), &monitoring).unwrap(),
+            Response::Data(_)
+        ));
+        let resp = call(
+            &module,
+            serde_json::json!({"merkle_put": {"ops": [{"key": "00", "value": "00"}]}}),
+            &monitoring,
+        )
+        .unwrap();
+        assert_eq!(error_text(resp), "manager role required");
+
+        // No roles: cannot even read.
+        let nobody = ctx(Some(claims(&[])));
+        let resp = call(&module, serde_json::json!({"merkle_root": {}}), &nobody).unwrap();
+        assert_eq!(error_text(resp), "monitoring role required");
+    }
+
+    #[test]
+    fn custom_oid_tracks_commits() {
+        let module = new_module();
+        let manager = ctx(Some(claims(&["privasys-platform:manager"])));
+
+        let oids = module.custom_oids();
+        assert_eq!(oids.len(), 1);
+        assert_eq!(oids[0].value.len(), 40);
+        let before = oids[0].value.clone();
+
+        call(
+            &module,
+            serde_json::json!({"merkle_put": {"ops": [{"key": "aa", "value": "bb"}]}}),
+            &manager,
+        )
+        .unwrap();
+        let after = module.custom_oids()[0].value.clone();
+        assert_ne!(before, after);
+        assert_eq!(&after[32..], &1u64.to_be_bytes());
+    }
+}
+
+// ---------------------------------------------------------------------------
 //  I/O complexity
 // ---------------------------------------------------------------------------
 
 #[test]
 fn point_lookups_stay_logarithmic() {
     let mut store = new_store();
+    store.set_cache_capacity(0); // measure raw tree I/O
     let n = 4096u64; // expected depth ≈ log16(4096) = 3
     let batch: Vec<_> = (0..n).map(|i| (key(i), Some(val(i)))).collect();
     store.put_batch(&batch).unwrap();
@@ -737,4 +958,72 @@ fn point_lookups_stay_logarithmic() {
         let reads = store.backend().reads();
         assert!(reads <= 7, "absent-key get cost {reads} reads");
     }
+}
+
+#[test]
+fn node_cache_cuts_reads() {
+    let mut store = new_store(); // default cache on
+    let n = 4096u64;
+    let batch: Vec<_> = (0..n).map(|i| (key(i), Some(val(i)))).collect();
+    store.put_batch(&batch).unwrap();
+
+    // Repeat read: all nodes cached, only the value record hits the host.
+    store.get(&key(7)).unwrap();
+    store.backend().reset_reads();
+    store.get(&key(7)).unwrap();
+    assert_eq!(store.backend().reads(), 1, "warm get must cost exactly the value read");
+
+    // Commit warm-fill: straight after a commit the touched path is hot.
+    store.put_batch(&[(key(1), Some(val(9999)))]).unwrap();
+    store.backend().reset_reads();
+    store.get(&key(1)).unwrap();
+    assert_eq!(store.backend().reads(), 1);
+
+    // Cold keys still benefit from shared upper levels: with the top of
+    // the tree cached, a first-touch get costs fewer node reads than
+    // the uncached depth.
+    store.backend().reset_reads();
+    store.get(&key(4000)).unwrap();
+    assert!(store.backend().reads() <= 4, "shared levels should be warm");
+
+    // Correctness is untouched by cache state.
+    for i in (0..n).step_by(211) {
+        let expected = if i == 1 { val(9999) } else { val(i) };
+        assert_eq!(store.get(&key(i)).unwrap(), Some(expected));
+    }
+}
+
+/// Not a benchmark, a sanity meter: prints reads-per-get and rough
+/// timings at 100k keys. Run manually: `cargo test --release bench_smoke
+/// -- --ignored --nocapture`.
+#[test]
+#[ignore]
+fn bench_smoke() {
+    use std::time::Instant;
+    let mut store = new_store();
+    let n = 100_000u64;
+    let t0 = Instant::now();
+    for chunk in (0..n).collect::<Vec<_>>().chunks(1000) {
+        let batch: Vec<_> = chunk.iter().map(|i| (key(*i), Some(val(*i)))).collect();
+        store.put_batch(&batch).unwrap();
+    }
+    let build = t0.elapsed();
+
+    let t1 = Instant::now();
+    let mut reads = 0usize;
+    let samples = 10_000u64;
+    for i in 0..samples {
+        let k = key((i * 7919) % n);
+        store.backend().reset_reads();
+        assert!(store.get(&k).unwrap().is_some());
+        reads += store.backend().reads();
+    }
+    let get_time = t1.elapsed();
+    println!(
+        "bench_smoke: n={n} build={build:?} ({:.1}µs/op) get={get_time:?} \
+         ({:.1}µs/op, {:.2} backend reads/op incl. value)",
+        build.as_micros() as f64 / n as f64,
+        get_time.as_micros() as f64 / samples as f64,
+        reads as f64 / samples as f64,
+    );
 }
