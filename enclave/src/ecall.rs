@@ -356,6 +356,18 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
                 // Decode the channel message
                 match channel::decode_channel_msg(&msg) {
                     Some((msg_type, conn_id, payload)) => {
+                        // Peer-port and outbound conn-id ranges belong to
+                        // the peer-link layer (raft transport, lands with
+                        // WS3/WS4). Until it registers, refuse inbound
+                        // peer connections politely instead of letting
+                        // them wedge the ingress server.
+                        if !channel::conn_id_is_ingress(conn_id) {
+                            if msg_type == channel::ChannelMsgType::TcpNew {
+                                crate::data_tx()
+                                    .send(&channel::encode_tcp_close(conn_id));
+                            }
+                            continue;
+                        }
                         let mut st = match crate::state().lock() {
                             Ok(st) => st,
                             Err(_) => break,

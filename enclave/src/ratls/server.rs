@@ -162,6 +162,17 @@ impl IngressServer {
             ChannelMsgType::DataReady => {
                 // DataReady is an enclave→host signal; ignore if received inbound.
             }
+
+            ChannelMsgType::TcpConnect | ChannelMsgType::TcpConnected => {
+                // Outbound-connection lifecycle messages belong to the
+                // peer-link layer (routed by conn-id range before this
+                // dispatch); the ingress server never initiates
+                // connections, so seeing one here is a routing bug.
+                enclave_log_error!(
+                    "Outbound-connection message for conn_id={} reached the ingress server",
+                    conn_id
+                );
+            }
         }
     }
 
