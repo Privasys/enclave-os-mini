@@ -108,7 +108,7 @@ where
 // =========================================================================
 
 /// A parsed HTTP response with status code, headers, and body.
-#[derive(Debug, Clone)]
+#[derive(Clone)]
 pub struct HttpResponse {
     /// HTTP status code (e.g. 200, 404, 500).
     pub status: u16,
@@ -116,6 +116,18 @@ pub struct HttpResponse {
     pub headers: Vec<(String, String)>,
     /// Response body (truncated to [`MAX_RESPONSE_BODY`] bytes).
     pub body: Vec<u8>,
+}
+
+impl core::fmt::Debug for HttpResponse {
+    fn fmt(&self, formatter: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        formatter
+            .debug_struct("HttpResponse")
+            .field("status", &self.status)
+            .field("header_count", &self.headers.len())
+            .field("headers", &"<protected>")
+            .field("body", &"<protected>")
+            .finish()
+    }
 }
 
 // =========================================================================
@@ -1381,4 +1393,22 @@ fn verify_channel_binding(
 /// Re-exported from [`enclave_os_common::quote::compute_report_data_hash`].
 fn compute_report_data_hash(pubkey_bytes: &[u8], binding: &[u8]) -> digest::Digest {
     enclave_os_common::quote::compute_report_data_hash(pubkey_bytes, binding)
+}
+
+#[cfg(test)]
+mod redaction_tests {
+    use super::HttpResponse;
+
+    #[test]
+    fn response_debug_never_discloses_protected_material() {
+        let response = HttpResponse {
+            status: 200,
+            headers: vec![("Set-Cookie".into(), "private-session-cookie".into())],
+            body: b"private-body".to_vec(),
+        };
+        let debug = format!("{response:?}");
+        assert!(!debug.contains("private-session-cookie"));
+        assert!(!debug.contains("private-body"));
+        assert!(!debug.contains("Set-Cookie"));
+    }
 }
