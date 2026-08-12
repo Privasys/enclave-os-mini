@@ -20,6 +20,7 @@ use core::mem;
 
 use ring::digest;
 use enclave_os_common::ocall;
+use zeroize::Zeroizing;
 
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::client::{ResolvesClientCert, WebPkiServerVerifier};
@@ -366,7 +367,9 @@ pub fn https_fetch(
     }
     request.push_str("\r\n");
 
-    let mut request_bytes = request.into_bytes();
+    // The assembled request can carry bearer tokens and other protected
+    // material — wipe the plaintext copy when it goes out of scope.
+    let mut request_bytes = Zeroizing::new(request.into_bytes());
     if let Some(b) = body {
         request_bytes.extend_from_slice(b);
     }

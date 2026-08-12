@@ -28,6 +28,7 @@ webpki-roots = "0.26"
 
 # Crypto (for CA bundle hashing + ReportData verification)
 ring = "0.17"
+zeroize = { version = "1.8", default-features = false, features = ["alloc"] }
 
 # Certificate parsing (for RA-TLS quote extraction + ReportData verification)
 x509-parser = "0.16"
