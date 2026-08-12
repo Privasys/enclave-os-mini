@@ -367,6 +367,147 @@ fn delete_collapses_to_equivalent_tree() {
 }
 
 // ---------------------------------------------------------------------------
+//  Proofs
+// ---------------------------------------------------------------------------
+
+#[test]
+fn inclusion_proofs_for_every_key() {
+    let mut store = new_store();
+    let n = 200u64;
+    let batch: Vec<_> = (0..n).map(|i| (key(i), Some(val(i)))).collect();
+    store.put_batch(&batch).unwrap();
+    let (root, _) = store.root();
+
+    for i in 0..n {
+        let proof = store.prove(&key(i)).unwrap();
+        // Wire round-trip, then verify the decoded proof.
+        let proof = crate::proof::Proof::decode(&proof.encode()).unwrap();
+        assert!(store.verify_value(&root, &key(i), &val(i), &proof).unwrap());
+        // The right key with the wrong value does not verify.
+        assert!(!store.verify_value(&root, &key(i), b"forged", &proof).unwrap());
+        // And it is not an absence proof.
+        assert!(!store.verify_absent(&root, &key(i), &proof).unwrap());
+    }
+}
+
+#[test]
+fn absence_proofs_both_kinds() {
+    let mut store = new_store();
+    // Enough keys that absent paths hit both divergent leaves and
+    // empty slots.
+    let batch: Vec<_> = (0..300u64).map(|i| (key(i), Some(val(i)))).collect();
+    store.put_batch(&batch).unwrap();
+    let (root, _) = store.root();
+
+    let mut with_leaf = 0;
+    let mut with_empty = 0;
+    for i in 0..300u64 {
+        let absent = format!("absent-{i}").into_bytes();
+        let proof = store.prove(&absent).unwrap();
+        match proof.leaf {
+            Some(_) => with_leaf += 1,
+            None => with_empty += 1,
+        }
+        assert!(store.verify_absent(&root, &absent, &proof).unwrap());
+        // An absence proof never verifies a value.
+        assert!(!store.verify_value(&root, &absent, b"x", &proof).unwrap());
+    }
+    // Both terminal kinds must actually be exercised.
+    assert!(with_leaf > 0, "no divergent-leaf absence proofs seen");
+    assert!(with_empty > 0, "no empty-slot absence proofs seen");
+}
+
+#[test]
+fn proofs_on_empty_and_single_key_trees() {
+    let store = new_store();
+    let (root, _) = store.root();
+    let proof = store.prove(b"anything").unwrap();
+    assert!(store.verify_absent(&root, b"anything", &proof).unwrap());
+
+    let mut store = new_store();
+    store.put_batch(&[(b"only".to_vec(), Some(b"v".to_vec()))]).unwrap();
+    let (root, _) = store.root();
+    let proof = store.prove(b"only").unwrap();
+    assert!(store.verify_value(&root, b"only", b"v", &proof).unwrap());
+    let proof = store.prove(b"other").unwrap();
+    assert!(store.verify_absent(&root, b"other", &proof).unwrap());
+}
+
+#[test]
+fn historical_proofs() {
+    let mut store = new_store();
+    store.put_batch(&[(b"k".to_vec(), Some(b"v1".to_vec()))]).unwrap();
+    let (root_v1, v1) = store.root();
+    store.put_batch(&[(b"k".to_vec(), Some(b"v2".to_vec()))]).unwrap();
+    store.put_batch(&[(b"k".to_vec(), None)]).unwrap();
+    let (root_v3, _) = store.root();
+
+    // v1: k = v1.
+    let proof = store.prove_at(v1, b"k").unwrap();
+    assert!(store.verify_value(&root_v1, b"k", b"v1", &proof).unwrap());
+    // Current: k absent.
+    let proof = store.prove(b"k").unwrap();
+    assert!(store.verify_absent(&root_v3, b"k", &proof).unwrap());
+    // Cross-version confusion fails: v1 proof against v3 root.
+    let proof_v1 = store.prove_at(v1, b"k").unwrap();
+    assert!(store.verify_value(&root_v3, b"k", b"v1", &proof_v1).is_err());
+}
+
+#[test]
+fn proofs_do_not_transfer_between_keys() {
+    let mut store = new_store();
+    let batch: Vec<_> = (0..100u64).map(|i| (key(i), Some(val(i)))).collect();
+    store.put_batch(&batch).unwrap();
+    let (root, _) = store.root();
+
+    let proof_0 = store.prove(&key(0)).unwrap();
+    for i in 1..100u64 {
+        // key(0)'s proof must not verify key(i)'s value, nor absence.
+        assert!(!store.verify_value(&root, &key(i), &val(i), &proof_0).unwrap_or(false));
+        assert!(!store.verify_absent(&root, &key(i), &proof_0).unwrap_or(false));
+    }
+}
+
+/// Any single mutation of an encoded proof must either fail to verify
+/// or establish the identical statement — never a different one.
+#[test]
+fn proof_mutation_fuzz() {
+    let mut store = new_store();
+    let batch: Vec<_> = (0..64u64).map(|i| (key(i), Some(val(i)))).collect();
+    store.put_batch(&batch).unwrap();
+    let (root, _) = store.root();
+
+    let target = key(7);
+    let path_free_check = |proof: &crate::proof::Proof| {
+        store.verify_value(&root, &target, &val(7), proof)
+    };
+    let original = store.prove(&target).unwrap();
+    assert!(path_free_check(&original).unwrap());
+    let encoded = original.encode();
+
+    let mut rng = Rng(99);
+    for _ in 0..500 {
+        let mut mutated = encoded.clone();
+        let pos = (rng.next() as usize) % mutated.len();
+        let bit = 1u8 << (rng.next() % 8);
+        mutated[pos] ^= bit;
+        if mutated == encoded {
+            continue;
+        }
+        match crate::proof::Proof::decode(&mutated) {
+            Err(_) => {}
+            Ok(p) => match path_free_check(&p) {
+                // A mutated proof may still decode, but it must not
+                // verify the target statement...
+                Ok(true) => panic!("mutated proof still verifies at byte {pos}"),
+                // ...rejecting or proving nothing is fine.
+                Ok(false) | Err(_) => {}
+            },
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
 //  I/O complexity
 // ---------------------------------------------------------------------------
 

@@ -220,7 +220,9 @@ impl Node {
 /// - range holding exactly one child which is a leaf → the leaf's hash
 ///   (the leaf represents the whole subtree, wherever it sits)
 /// - otherwise → `internal_hash(left half, right half)`
-fn subtree_hash(children: &[Option<Child>; 16], start: usize, width: usize) -> Hash {
+///
+/// `pub(crate)`: the prover folds sibling half-ranges with this.
+pub(crate) fn subtree_hash(children: &[Option<Child>; 16], start: usize, width: usize) -> Hash {
     let present: Vec<&Child> = children[start..start + width].iter().flatten().collect();
     match present.len() {
         0 => *placeholder(),

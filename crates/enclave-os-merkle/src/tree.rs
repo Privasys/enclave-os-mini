@@ -44,7 +44,8 @@ use ring::hmac;
 use crate::backend::KvBackend;
 use crate::error::MerkleError;
 use crate::hash::{placeholder, Hash, HASH_SIZE};
-use crate::node::{nibble, Child, InternalNode, LeafNode, Node, NodeKey};
+use crate::node::{nibble, subtree_hash, Child, InternalNode, LeafNode, Node, NodeKey};
+use crate::proof::{verify, Proof, Verified};
 
 const REC_NODE: u8 = b'n';
 const REC_VALUE: u8 = b'v';
@@ -298,6 +299,138 @@ impl<B: KvBackend> MerkleStore<B> {
         self.version = new_version;
         self.root_child = new_root_child;
         Ok((self.root, self.version))
+    }
+
+    // -- proofs -----------------------------------------------------------
+
+    /// Prove presence or absence of `key` at the current root.
+    pub fn prove(&self, key: &[u8]) -> Result<Proof, MerkleError> {
+        self.prove_path(self.root_child.clone(), &self.path_of(key))
+    }
+
+    /// Prove presence or absence of `key` at a historical `version`
+    /// (same freshness caveat as [`Self::get_at`]).
+    pub fn prove_at(&self, version: u64, key: &[u8]) -> Result<Proof, MerkleError> {
+        if version > self.version {
+            return Err(MerkleError::Invalid(format!(
+                "version {version} is in the future (current {})",
+                self.version
+            )));
+        }
+        let root = self.load_root_record(version)?;
+        let root_child = self.load_root_child(root, version)?;
+        self.prove_path(root_child, &self.path_of(key))
+    }
+
+    /// Check a proof claiming `key` = `value` against `root`.
+    /// Ok(false) = the proof is valid but proves something else
+    /// (absence, or a different value).
+    pub fn verify_value(
+        &self,
+        root: &Hash,
+        key: &[u8],
+        value: &[u8],
+        proof: &Proof,
+    ) -> Result<bool, MerkleError> {
+        let path = self.path_of(key);
+        Ok(match verify(root, &path, proof)? {
+            Verified::Present(vh) => vh == self.vh_of(&path, value),
+            Verified::Absent => false,
+        })
+    }
+
+    /// Check a proof claiming `key` is absent at `root`.
+    pub fn verify_absent(
+        &self,
+        root: &Hash,
+        key: &[u8],
+        proof: &Proof,
+    ) -> Result<bool, MerkleError> {
+        let path = self.path_of(key);
+        Ok(matches!(verify(root, &path, proof)?, Verified::Absent))
+    }
+
+    /// Walk the tree for `path`, collecting binary sibling hashes.
+    fn prove_path(
+        &self,
+        root_child: Option<Child>,
+        path: &Hash,
+    ) -> Result<Proof, MerkleError> {
+        let mut siblings: Vec<Hash> = Vec::new(); // collected top-down
+        let mut child = match root_child {
+            Some(c) => c,
+            None => return Ok(Proof { leaf: None, siblings }),
+        };
+        let mut prefix: Vec<u8> = Vec::new();
+
+        let leaf: Option<LeafNode> = 'walk: loop {
+            let nk = NodeKey { version: child.version, prefix: prefix.clone() };
+            let node = self.load_node(&nk, &child.hash)?;
+            if node.is_leaf() != child.is_leaf {
+                return Err(MerkleError::Corrupted(format!("node {nk:?} kind mismatch")));
+            }
+            let internal = match node {
+                // Terminal: the resident leaf (inclusion if paths match,
+                // otherwise absence evidence).
+                Node::Leaf(leaf) => break 'walk Some(leaf),
+                Node::Internal(n) => n,
+            };
+
+            // Binary descent inside this 16-slot node, mirroring
+            // `subtree_hash`: collect the off-path half at every level.
+            let slot = nibble(path, prefix.len()) as usize;
+            let mut start = 0usize;
+            let mut width = 16usize;
+            loop {
+                let present: Vec<usize> = (start..start + width)
+                    .filter(|i| internal.children[*i].is_some())
+                    .collect();
+                match present.as_slice() {
+                    [] => break 'walk None, // empty range: absence
+                    [idx] => {
+                        let c = internal.children[*idx].clone().expect("present");
+                        if c.is_leaf {
+                            // The range collapses to this leaf; it covers
+                            // the proven path's position here (inclusion
+                            // if it sits at `slot` with equal path).
+                            let mut leaf_prefix = prefix.clone();
+                            leaf_prefix.push(*idx as u8);
+                            let lk = NodeKey { version: c.version, prefix: leaf_prefix };
+                            match self.load_node(&lk, &c.hash)? {
+                                Node::Leaf(leaf) => break 'walk Some(leaf),
+                                Node::Internal(_) => {
+                                    return Err(MerkleError::Corrupted(format!(
+                                        "node {lk:?} kind mismatch"
+                                    )))
+                                }
+                            }
+                        }
+                        if width == 1 {
+                            // Singleton range holding an internal child:
+                            // descend one nibble deeper.
+                            debug_assert_eq!(*idx, slot);
+                            prefix.push(slot as u8);
+                            child = c;
+                            continue 'walk;
+                        }
+                    }
+                    _ => debug_assert!(width > 1),
+                }
+                // Halve towards the slot, collecting the other half.
+                let half = width / 2;
+                let (ours, sib) = if slot < start + half {
+                    (start, start + half)
+                } else {
+                    (start + half, start)
+                };
+                siblings.push(subtree_hash(&internal.children, sib, half));
+                start = ours;
+                width = half;
+            }
+        };
+
+        siblings.reverse(); // bottom-up, as the verifier folds
+        Ok(Proof { leaf: leaf.map(|l| (l.path, l.vh)), siblings })
     }
 
     // -- internals: commitments -------------------------------------------
