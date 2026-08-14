@@ -406,6 +406,7 @@ dependencies = [
  "sgx_tseal",
  "time",
  "time-core",
+ "x509-parser",
 ]
 
 [[package]]
