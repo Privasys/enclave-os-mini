@@ -356,12 +356,19 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
                 // Decode the channel message
                 match channel::decode_channel_msg(&msg) {
                     Some((msg_type, conn_id, payload)) => {
-                        // Peer-port and outbound conn-id ranges belong to
-                        // the peer-link layer (raft transport, lands with
-                        // WS3/WS4). Until it registers, refuse inbound
-                        // peer connections politely instead of letting
-                        // them wedge the ingress server.
-                        if !channel::conn_id_is_ingress(conn_id) {
+                        // Peer-port and outbound conn-id ranges, and the
+                        // proxy's timer ticks, belong to the raft layer.
+                        // Without it registered, refuse inbound peer
+                        // connections politely instead of letting them
+                        // wedge the ingress server.
+                        if !channel::conn_id_is_ingress(conn_id)
+                            || msg_type == channel::ChannelMsgType::Tick
+                        {
+                            #[cfg(feature = "raft")]
+                            if crate::raftglue::handle_channel_msg(msg_type, conn_id, payload)
+                            {
+                                continue;
+                            }
                             if msg_type == channel::ChannelMsgType::TcpNew {
                                 crate::data_tx()
                                     .send(&channel::encode_tcp_close(conn_id));
@@ -550,6 +557,68 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
         _module_count += 1;
     }
 
+    // ── Raft module (attested consensus + clustered ledger) ──────────
+    #[cfg(feature = "raft")]
+    {
+        // Config: raft_node_id (u64, required to activate),
+        // raft_peers ({"<id>": "host:port"}), raft_cluster_key
+        // (hex-64, shared by all replicas — the ledger commitment key
+        // derives from it).
+        if let Some(node_id) = config.extra.get("raft_node_id").and_then(|v| v.as_u64()) {
+            let peers: std::collections::BTreeMap<u64, String> = config
+                .extra
+                .get("raft_peers")
+                .and_then(|v| v.as_object())
+                .map(|m| {
+                    m.iter()
+                        .filter_map(|(k, v)| {
+                            Some((k.parse().ok()?, v.as_str()?.to_string()))
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            let cluster_key: Option<[u8; 32]> = config
+                .extra
+                .get("raft_cluster_key")
+                .and_then(|v| v.as_str())
+                .and_then(enclave_os_common::hex::hex_decode)
+                .and_then(|b| b.try_into().ok());
+            let Some(cluster_key) = cluster_key else {
+                enclave_log_error!("raft: raft_cluster_key missing or not 32 bytes hex");
+                return -36;
+            };
+            let ca = match crate::ratls::attestation::CaContext::from_parts(
+                sealed_cfg.ca_cert_der.clone(),
+                sealed_cfg.ca_key_pkcs8.clone(),
+            ) {
+                Ok(ca) => ca,
+                Err(e) => {
+                    enclave_log_error!("raft: CA context: {}", e);
+                    return -36;
+                }
+            };
+            match crate::raftglue::RaftGlue::new(
+                sealed_cfg.master_key(),
+                cluster_key,
+                node_id,
+                peers,
+                ca,
+            ) {
+                Ok(glue) => {
+                    crate::raftglue::install(glue);
+                    crate::modules::register_module(Box::new(crate::raftglue::RaftModule));
+                    _module_count += 1;
+                }
+                Err(e) => {
+                    enclave_log_error!("raft init failed: {}", e);
+                    return -36;
+                }
+            }
+        } else {
+            enclave_log_info!("raft feature built but raft_node_id not configured — inactive");
+        }
+    }
+
     // ── Vault module (policy-gated secrets, JWT + mRA-TLS) ───────────
     #[cfg(feature = "vault")]
     {
@@ -611,6 +680,7 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
         feature = "egress",
         feature = "kvstore",
         feature = "merkle",
+        feature = "raft",
         feature = "vault",
         feature = "wasm",
         feature = "fido2"

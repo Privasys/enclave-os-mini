@@ -40,6 +40,9 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// (the enclave emits its TLS ClientHello before the connect completes).
 const MAX_PENDING_WRITE: usize = 256 * 1024;
 
+/// Raft tick cadence (sent to the enclave when a peer port is set).
+const TICK_INTERVAL: Duration = Duration::from_millis(100);
+
 /// Errno for a non-blocking connect in progress. The host only runs on
 /// Linux (SGX); `WouldBlock` covers other platforms as a fallback.
 #[cfg(target_os = "linux")]
@@ -111,6 +114,8 @@ pub struct TcpProxy {
     ready: bool,
     /// Last time we ran the idle-connection sweep.
     last_idle_scan: Instant,
+    /// Last raft tick sent (peer-port mode only).
+    last_tick: Instant,
 }
 
 impl TcpProxy {
@@ -152,6 +157,7 @@ impl TcpProxy {
             shutdown,
             ready: false,
             last_idle_scan: Instant::now(),
+            last_tick: Instant::now(),
         })
     }
 
@@ -188,6 +194,16 @@ impl TcpProxy {
             if self.last_idle_scan.elapsed() >= IDLE_SCAN_INTERVAL {
                 self.reap_idle_connections();
                 self.last_idle_scan = Instant::now();
+            }
+
+            // 5. Raft timer ticks (only when a peer port is configured).
+            if self.peer_listener.is_some() && self.last_tick.elapsed() >= TICK_INTERVAL {
+                self.data_tx.send(&channel::encode_channel_msg(
+                    ChannelMsgType::Tick,
+                    0,
+                    &[],
+                ));
+                self.last_tick = Instant::now();
             }
 
             // If no work was done, yield briefly to avoid busy-spinning

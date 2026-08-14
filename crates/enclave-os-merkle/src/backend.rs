@@ -43,6 +43,12 @@ impl OcallBackend {
         table.extend_from_slice(store_name.as_bytes());
         Self { table }
     }
+
+    /// A backend over an explicit table name (no `merkle:` prefix) —
+    /// for non-merkle consumers of the KV OCALLs (e.g. the raft log).
+    pub fn with_table(table: &str) -> Self {
+        Self { table: table.as_bytes().to_vec() }
+    }
 }
 
 impl KvBackend for OcallBackend {

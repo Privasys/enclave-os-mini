@@ -111,6 +111,12 @@ pub enum ChannelMsgType {
     /// An enclave-requested outbound connect succeeded (host → enclave).
     /// Payload: empty. Failure is reported as `TcpClose`.
     TcpConnected = 0x06,
+
+    /// Periodic timer tick (host → enclave, conn_id 0, empty payload).
+    /// Sent by the proxy every ~100 ms when a peer port is configured;
+    /// drives raft election/heartbeat timers. Untrusted like all host
+    /// input: only liveness depends on it, never safety.
+    Tick = 0x07,
 }
 
 impl ChannelMsgType {
@@ -123,6 +129,7 @@ impl ChannelMsgType {
             0x04 => Some(Self::DataReady),
             0x05 => Some(Self::TcpConnect),
             0x06 => Some(Self::TcpConnected),
+            0x07 => Some(Self::Tick),
             _ => None,
         }
     }
