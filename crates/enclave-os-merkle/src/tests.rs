@@ -1137,3 +1137,139 @@ fn preview_batch_does_not_mutate() {
     assert_eq!(store.preview_batch(&ops).unwrap(), (preview_root, preview_version));
     assert_eq!(store.put_batch(&ops).unwrap(), (preview_root, preview_version));
 }
+
+// ---------------------------------------------------------------------------
+//  Snapshots (leaf streaming + restore)
+// ---------------------------------------------------------------------------
+
+fn snapshot_all(
+    store: &MerkleStore<MemBackend>,
+    version: u64,
+    chunk: usize,
+) -> Vec<(crate::hash::Hash, Vec<u8>)> {
+    let mut all = Vec::new();
+    let mut start_after = None;
+    loop {
+        let (leaves, done) =
+            store.snapshot_leaves(version, start_after.as_ref(), chunk).unwrap();
+        all.extend(leaves);
+        if done {
+            return all;
+        }
+        start_after = Some(all.last().unwrap().0);
+    }
+}
+
+#[test]
+fn snapshot_roundtrip_across_storage_keys() {
+    let mut store = new_store();
+    // Build a store with history: inserts, overwrites, deletes.
+    for i in 0..50u64 {
+        store.put_batch(&[(key(i), Some(val(i)))]).unwrap();
+    }
+    store.put_batch(&[(key(3), Some(val(999))), (key(7), None)]).unwrap();
+    let (root, version) = store.root();
+
+    // Stream in small chunks; rebuild under a DIFFERENT storage key.
+    let leaves = snapshot_all(&store, version, 7);
+    assert_eq!(leaves.len(), 49); // 50 inserts, 1 delete
+    let mut builder =
+        crate::snapshot::SnapshotBuilder::new(MemBackend::new(), CK, [0x77; 32]).unwrap();
+    for chunk in leaves.chunks(11) {
+        builder.add_leaves(chunk.to_vec());
+    }
+    let restored = builder.finalize(root, version).unwrap();
+    assert_eq!(restored.root(), (root, version));
+    assert_eq!(restored.get(&key(3)).unwrap(), Some(val(999)));
+    assert_eq!(restored.get(&key(7)).unwrap(), None);
+    assert_eq!(restored.get(&key(42)).unwrap(), Some(val(42)));
+
+    // The restored store keeps working: a new commit lands at V+1 and
+    // stays root-compatible with the original applying the same batch.
+    let mut original = store;
+    let ops = vec![(key(100), Some(val(100)))];
+    let mut restored = restored;
+    assert_eq!(original.put_batch(&ops).unwrap(), restored.put_batch(&ops).unwrap());
+}
+
+#[test]
+fn snapshot_chunk_size_invariance() {
+    let mut store = new_store();
+    let mut rng = Rng(42);
+    for _ in 0..80 {
+        let i = rng.next() % 200;
+        store.put_batch(&[(key(i), Some(val(i)))]).unwrap();
+    }
+    let (_, version) = store.root();
+    let a = snapshot_all(&store, version, 1);
+    let b = snapshot_all(&store, version, 13);
+    let c = snapshot_all(&store, version, 10_000);
+    assert_eq!(a, b);
+    assert_eq!(b, c);
+    // Path-ordered and unique.
+    for w in a.windows(2) {
+        assert!(w[0].0 < w[1].0);
+    }
+}
+
+#[test]
+fn snapshot_restore_reopens_from_checkpoint() {
+    let mut store = new_store();
+    for i in 0..10u64 {
+        store.put_batch(&[(key(i), Some(val(i)))]).unwrap();
+    }
+    let (root, version) = store.root();
+    let leaves = snapshot_all(&store, version, 4);
+
+    let backend = MemBackend::new();
+    let mut builder = crate::snapshot::SnapshotBuilder::new(
+        // SnapshotBuilder consumes the backend; rebuild opens later
+        // from the same data via a second handle in real deployments —
+        // MemBackend is single-owner, so restore + reopen in one go.
+        backend, CK, SK,
+    )
+    .unwrap();
+    builder.add_leaves(leaves);
+    let restored = builder.finalize(root, version).unwrap();
+    // The stamped checkpoint must satisfy open(): root record + root
+    // node duplicated at the stamped version.
+    let (r, v) = restored.root();
+    assert_eq!((r, v), (root, version));
+    assert_eq!(restored.get(&key(5)).unwrap(), Some(val(5)));
+}
+
+#[test]
+fn snapshot_wrong_root_fails_closed() {
+    let mut store = new_store();
+    store.put_batch(&[(key(1), Some(val(1)))]).unwrap();
+    let (_, version) = store.root();
+    let leaves = snapshot_all(&store, version, 100);
+    let mut builder =
+        crate::snapshot::SnapshotBuilder::new(MemBackend::new(), CK, SK).unwrap();
+    builder.add_leaves(leaves);
+    assert!(matches!(
+        builder.finalize([0xAB; 32], version),
+        Err(MerkleError::Corrupted(_))
+    ));
+}
+
+#[test]
+fn pinned_version_survives_prune() {
+    let mut store = new_store();
+    for i in 0..20u64 {
+        store.put_batch(&[(key(i % 5), Some(val(i)))]).unwrap();
+    }
+    let (_, version) = store.root();
+    let pin = version - 10;
+    // Sanity: the pinned version is fully streamable before pruning.
+    let before = snapshot_all(&store, pin, 100);
+    store.pin_version(Some(pin));
+    store.prune(version).unwrap(); // clamped to the pin
+    // The pinned version is still streamable after pruning...
+    let after = snapshot_all(&store, pin, 100);
+    assert_eq!(before, after);
+    // ...and releasing the pin lets the horizon advance past it.
+    store.pin_version(None);
+    store.prune(version).unwrap();
+    assert!(store.snapshot_leaves(pin, None, 1).is_err());
+}

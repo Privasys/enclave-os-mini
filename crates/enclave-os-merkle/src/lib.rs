@@ -44,6 +44,7 @@ mod hash;
 mod module;
 mod node;
 mod proof;
+mod snapshot;
 mod tree;
 
 #[cfg(test)]
@@ -55,4 +56,5 @@ pub use fork::{MerkleFork, SealedFork};
 pub use hash::{Hash, HASH_SIZE};
 pub use module::MerkleModule;
 pub use proof::{verify, Proof, Verified};
+pub use snapshot::SnapshotBuilder;
 pub use tree::{MerkleStore, PruneStats};

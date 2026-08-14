@@ -118,6 +118,8 @@ pub struct MerkleStore<B: KvBackend> {
     version: u64,
     root_child: Option<Child>,
     cache: NodeCache,
+    /// Version pinned against pruning while a snapshot streams from it.
+    snapshot_pin: Option<u64>,
 }
 
 /// Default node-cache capacity: ~10³ immutable node records (≈ a few
@@ -173,6 +175,7 @@ impl<B: KvBackend> MerkleStore<B> {
             version: 0,
             root_child: None,
             cache: NodeCache::new(DEFAULT_CACHE_CAPACITY),
+            snapshot_pin: None,
         };
         store.backend.write_batch(vec![
             KvBatchOp::Put { key: root_record_key(0), value: placeholder().to_vec() },
@@ -202,6 +205,7 @@ impl<B: KvBackend> MerkleStore<B> {
             version,
             root_child: None,
             cache: NodeCache::new(DEFAULT_CACHE_CAPACITY),
+            snapshot_pin: None,
         };
         store.root_child = store.load_root_child(root, version)?;
         Ok(store)
@@ -307,6 +311,94 @@ impl<B: KvBackend> MerkleStore<B> {
         self.walk(root_child, &path)
     }
 
+    // -- snapshots --------------------------------------------------------
+
+    /// Collect up to `max` leaves of the tree at `version`, in path
+    /// order, starting strictly after `start_after`. Each value is
+    /// read, decrypted and commitment-verified (fail-closed). Returns
+    /// `(leaves, done)` — `done` is false when more leaves remain.
+    ///
+    /// Chunked iteration re-descends only the resume path (subtrees
+    /// entirely at or below `start_after` are skipped by nibble
+    /// comparison), so a full scan costs O(n) total.
+    pub fn snapshot_leaves(
+        &self,
+        version: u64,
+        start_after: Option<&Hash>,
+        max: usize,
+    ) -> Result<(Vec<(Hash, Vec<u8>)>, bool), MerkleError> {
+        let root = self.load_root_record(version)?;
+        let root_child = self.load_root_child(root, version)?;
+        let mut out = Vec::new();
+        let done = match root_child {
+            None => true,
+            Some(child) => {
+                self.collect_leaves(&child, &mut Vec::new(), start_after, max, &mut out)?
+            }
+        };
+        Ok((out, done))
+    }
+
+    /// DFS in nibble order; returns true if the subtree was exhausted.
+    fn collect_leaves(
+        &self,
+        child: &Child,
+        prefix: &mut Vec<u8>,
+        start_after: Option<&Hash>,
+        max: usize,
+        out: &mut Vec<(Hash, Vec<u8>)>,
+    ) -> Result<bool, MerkleError> {
+        if out.len() >= max {
+            return Ok(false);
+        }
+        let nk = NodeKey { version: child.version, prefix: prefix.clone() };
+        let node = self.load_node(&nk, &child.hash)?;
+        match node {
+            Node::Leaf(leaf) => {
+                if let Some(sa) = start_after {
+                    if &leaf.path <= sa {
+                        return Ok(true); // already streamed
+                    }
+                }
+                let value = self.read_value(&leaf.path, &leaf.vh, leaf.value_version)?;
+                out.push((leaf.path, value));
+                Ok(true)
+            }
+            Node::Internal(internal) => {
+                let depth = prefix.len();
+                let resume_nib = start_after.map(|sa| nibble(sa, depth));
+                for nib in 0u8..16 {
+                    // Children below the resume nibble hold only paths
+                    // ≤ start_after: skip whole subtrees.
+                    if let Some(rn) = resume_nib {
+                        if nib < rn {
+                            continue;
+                        }
+                    }
+                    let Some(c) = &internal.children[nib as usize] else { continue };
+                    // Only the resume child keeps the start_after bound.
+                    let sa = match resume_nib {
+                        Some(rn) if nib == rn => start_after,
+                        _ => None,
+                    };
+                    prefix.push(nib);
+                    let exhausted = self.collect_leaves(c, prefix, sa, max, out)?;
+                    prefix.pop();
+                    if !exhausted {
+                        return Ok(false);
+                    }
+                }
+                Ok(true)
+            }
+        }
+    }
+
+    /// Pin a version against pruning (a snapshot is being served from
+    /// it). `None` releases the pin.
+    pub fn pin_version(&mut self, version: Option<u64>) {
+        self.snapshot_pin = version;
+    }
+
     // -- writes -----------------------------------------------------------
 
     /// The pure computation shared by [`Self::put_batch`] and
@@ -399,7 +491,61 @@ impl<B: KvBackend> MerkleStore<B> {
         let Some((acc, new_root_child, new_root)) = self.compute_batch(ops)? else {
             return Ok((self.root, self.version)); // no-op batch
         };
+        self.commit_acc(acc, new_root_child, new_root)
+    }
 
+    /// Insert plaintext values addressed by PATH (not logical key) —
+    /// the snapshot-restore path, where logical keys are unrecoverable
+    /// (paths are keyed hashes) and unnecessary (the tree is keyed by
+    /// path). One atomic commit; returns the new `(root, version)`.
+    pub(crate) fn put_batch_by_path(
+        &mut self,
+        ops: &[(Hash, Vec<u8>)],
+    ) -> Result<(Hash, u64), MerkleError> {
+        let mut deduped: BTreeMap<Hash, &[u8]> = BTreeMap::new();
+        for (path, value) in ops {
+            deduped.insert(*path, value.as_slice());
+        }
+        if deduped.is_empty() {
+            return Ok((self.root, self.version));
+        }
+        let mut acc = CommitAcc {
+            new_version: self.version + 1,
+            pending: BTreeMap::new(),
+            stale: Vec::new(),
+            insert_cts: BTreeMap::new(),
+            values: BTreeMap::new(),
+        };
+        let mut updates: Vec<Update> = Vec::with_capacity(deduped.len());
+        for (path, pt) in &deduped {
+            let vh = self.vh_of(path, pt);
+            let ct = self
+                .cipher
+                .encrypt(pt, &value_aad(path))
+                .map_err(|e| MerkleError::Corrupted(format!("encrypt: {e}")))?;
+            acc.insert_cts.insert(*path, ct);
+            updates.push((*path, Some(vh)));
+        }
+        let new_root_child =
+            self.apply_subtree(&mut acc, self.root_child.clone(), &mut Vec::new(), &updates)?;
+        if new_root_child == self.root_child {
+            return Ok((self.root, self.version));
+        }
+        let new_root = match &new_root_child {
+            Some(c) => c.hash,
+            None => *placeholder(),
+        };
+        self.commit_acc(acc, new_root_child, new_root)
+    }
+
+    /// The atomic tail shared by every commit path: write the batch,
+    /// then swing the in-memory state and warm the cache.
+    fn commit_acc(
+        &mut self,
+        acc: CommitAcc,
+        new_root_child: Option<Child>,
+        new_root: Hash,
+    ) -> Result<(Hash, u64), MerkleError> {
         let new_version = acc.new_version;
 
         // Assemble the atomic commit.
@@ -441,6 +587,40 @@ impl<B: KvBackend> MerkleStore<B> {
         Ok((self.root, self.version))
     }
 
+    /// Snapshot-restore epilogue: stamp the store at `version` (≥ the
+    /// current build version), writing the root record and checkpoint
+    /// for it, and duplicating the root NODE record at the stamped
+    /// version so a later `open(root, version)` resolves. Interior
+    /// node records keep their (smaller) build versions, which
+    /// child references tolerate (each carries its own version).
+    pub(crate) fn stamp_version(&mut self, version: u64) -> Result<(), MerkleError> {
+        if version < self.version {
+            return Err(MerkleError::Invalid(format!(
+                "cannot stamp version {version} below current {}",
+                self.version
+            )));
+        }
+        let mut batch = vec![
+            KvBatchOp::Put { key: root_record_key(version), value: self.root.to_vec() },
+            KvBatchOp::Put {
+                key: checkpoint_record_key(),
+                value: self.encrypt_checkpoint(&self.root, version)?,
+            },
+        ];
+        if let Some(c) = self.root_child.clone() {
+            let node =
+                self.load_node(&NodeKey { version: c.version, prefix: Vec::new() }, &c.hash)?;
+            batch.push(KvBatchOp::Put {
+                key: node_record_key(&NodeKey { version, prefix: Vec::new() }),
+                value: node.encode(),
+            });
+            self.root_child = Some(Child { version, hash: c.hash, is_leaf: c.is_leaf });
+        }
+        self.backend.write_batch(batch)?;
+        self.version = version;
+        Ok(())
+    }
+
     // -- pruning ----------------------------------------------------------
 
     /// Delete storage needed only by versions strictly before
@@ -454,6 +634,11 @@ impl<B: KvBackend> MerkleStore<B> {
     /// Costs are proportional to accumulated garbage, not store size.
     /// Idempotent; safe to re-run after a partial failure.
     pub fn prune(&mut self, before_version: u64) -> Result<PruneStats, MerkleError> {
+        // A pinned version (snapshot being served) caps the horizon.
+        let before_version = match self.snapshot_pin {
+            Some(pin) => before_version.min(pin),
+            None => before_version,
+        };
         if before_version > self.version {
             return Err(MerkleError::Invalid(format!(
                 "cannot prune to future version {before_version} (current {})",
