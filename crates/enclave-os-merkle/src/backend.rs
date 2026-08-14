@@ -33,6 +33,7 @@ pub trait KvBackend {
 
 /// Production backend: one host RocksDB table (column family) named
 /// `merkle:<store name>`, reached through the OCALL vtable.
+#[derive(Clone)]
 pub struct OcallBackend {
     table: Vec<u8>,
 }
