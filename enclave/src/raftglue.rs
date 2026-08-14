@@ -115,17 +115,25 @@ impl RaftGlue {
         let store = MerkleStore::open_or_create(ledger_backend, ck, sk)
             .map_err(|e| format!("raft ledger: {e}"))?;
 
-        // Fresh incarnation + jitter seed from in-enclave randomness:
+        // Jitter seed + restart incarnation from in-enclave randomness:
         // the incarnation gate depends on the host being unable to pin
         // these across a rollback.
         let rng = SystemRandom::new();
         let mut buf = [0u8; 16];
         rng.fill(&mut buf).map_err(|_| "rng".to_string())?;
-        let incarnation = u64::from_le_bytes(buf[0..8].try_into().unwrap());
+        let random_incarnation = u64::from_le_bytes(buf[0..8].try_into().unwrap());
         let seed = u64::from_le_bytes(buf[8..16].try_into().unwrap());
 
-        let cfg = Config::new(node_id, incarnation, seed);
         let exists = LogStore::exists(&log_backend).map_err(|e| format!("raft log: {e}"))?;
+        // Genesis convention: a bootstrapping node starts at
+        // incarnation 0, which is what the genesis membership admits.
+        // Every restart draws a fresh random incarnation (the
+        // anti-double-vote gate). Residual: a host that wipes the log
+        // back to genesis re-enters at incarnation 0 until the first
+        // committed refresh retires it — documented in the plan,
+        // constrained by quorum root confirmation.
+        let incarnation = if exists { random_incarnation } else { 0 };
+        let cfg = Config::new(node_id, incarnation, seed);
         let driver = if exists {
             RaftDriver::restore(cfg, log_backend, log_key, store)
         } else {
