@@ -39,6 +39,7 @@
 mod backend;
 mod cache;
 mod error;
+mod fork;
 mod hash;
 mod module;
 mod node;
@@ -50,6 +51,7 @@ mod tests;
 
 pub use backend::{KvBackend, MemBackend, OcallBackend};
 pub use error::MerkleError;
+pub use fork::{MerkleFork, SealedFork};
 pub use hash::{Hash, HASH_SIZE};
 pub use module::MerkleModule;
 pub use proof::{verify, Proof, Verified};

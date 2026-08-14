@@ -1027,3 +1027,113 @@ fn bench_smoke() {
         reads as f64 / samples as f64,
     );
 }
+
+// ---------------------------------------------------------------------------
+//  Forks (transaction overlays)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn fork_reads_through_overlay_and_store() {
+    let mut store = new_store();
+    store.put_batch(&[(key(1), Some(val(1))), (key(2), Some(val(2)))]).unwrap();
+
+    let mut fork = crate::fork::MerkleFork::new(&mut store);
+    // Read-through to the store.
+    assert_eq!(fork.get(&key(1)).unwrap(), Some(val(1)));
+    // Overlay wins over the store.
+    fork.put(&key(1), &val(100));
+    assert_eq!(fork.get(&key(1)).unwrap(), Some(val(100)));
+    // Overlay delete hides the stored value.
+    fork.delete(&key(2));
+    assert_eq!(fork.get(&key(2)).unwrap(), None);
+    // New key visible only in the fork.
+    fork.put(&key(3), &val(3));
+    assert_eq!(fork.get(&key(3)).unwrap(), Some(val(3)));
+
+    // Nothing committed: the store is untouched after the fork drops.
+    drop(fork);
+    assert_eq!(store.get(&key(1)).unwrap(), Some(val(1)));
+    assert_eq!(store.get(&key(2)).unwrap(), Some(val(2)));
+    assert_eq!(store.get(&key(3)).unwrap(), None);
+}
+
+#[test]
+fn sealed_fork_root_matches_actual_commit() {
+    let mut store = new_store();
+    store.put_batch(&[(key(1), Some(val(1))), (key(2), Some(val(2)))]).unwrap();
+    let (root_before, v_before) = store.root();
+
+    let mut fork = crate::fork::MerkleFork::new(&mut store);
+    fork.put(&key(1), &val(100));
+    fork.delete(&key(2));
+    fork.put(&key(9), &val(9));
+    let sealed = fork.seal().unwrap();
+
+    assert_eq!(sealed.root_before, root_before);
+    assert_eq!(sealed.version_before, v_before);
+    assert_ne!(sealed.root_after, root_before);
+    assert_eq!(sealed.version_after, v_before + 1);
+    // Sealing did not commit.
+    assert_eq!(store.root(), (root_before, v_before));
+
+    // Applying the sealed write-set produces exactly the previewed root.
+    let (root, version) = store.put_batch(&sealed.ops).unwrap();
+    assert_eq!((root, version), (sealed.root_after, sealed.version_after));
+    assert_eq!(store.get(&key(1)).unwrap(), Some(val(100)));
+    assert_eq!(store.get(&key(2)).unwrap(), None);
+}
+
+#[test]
+fn sealed_fork_applies_identically_on_replica_with_different_storage_key() {
+    // The BFT requirement, fork edition: a write-set sealed on one node
+    // produces the same root_after on a replica sharing ck but holding
+    // a different storage key.
+    let mut leader = new_store();
+    let mut replica = MerkleStore::create(MemBackend::new(), CK, [0x77; 32]).unwrap();
+    let genesis = &[(key(1), Some(val(1))), (key(2), Some(val(2)))];
+    leader.put_batch(genesis).unwrap();
+    replica.put_batch(genesis).unwrap();
+    assert_eq!(leader.root(), replica.root());
+
+    let mut fork = crate::fork::MerkleFork::new(&mut leader);
+    fork.put(&key(5), &val(5));
+    fork.delete(&key(1));
+    let sealed = fork.seal().unwrap();
+
+    // Replica checks root_before, applies the write-set, checks root_after.
+    assert_eq!(replica.root().0, sealed.root_before);
+    let (r_root, r_version) = replica.put_batch(&sealed.ops).unwrap();
+    assert_eq!((r_root, r_version), (sealed.root_after, sealed.version_after));
+
+    let (l_root, _) = leader.put_batch(&sealed.ops).unwrap();
+    assert_eq!(l_root, r_root);
+}
+
+#[test]
+fn noop_fork_seals_to_unchanged_root() {
+    let mut store = new_store();
+    store.put_batch(&[(key(1), Some(val(1)))]).unwrap();
+    let before = store.root();
+
+    let mut fork = crate::fork::MerkleFork::new(&mut store);
+    fork.put(&key(1), &val(1)); // same value: ineffective
+    fork.delete(&key(42)); // absent key: ineffective
+    let sealed = fork.seal().unwrap();
+    assert!(sealed.is_noop());
+    assert_eq!(sealed.root_after, before.0);
+    assert_eq!(sealed.version_after, before.1);
+}
+
+#[test]
+fn preview_batch_does_not_mutate() {
+    let mut store = new_store();
+    store.put_batch(&[(key(1), Some(val(1)))]).unwrap();
+    let before = store.root();
+    let ops = vec![(key(2), Some(val(2)))];
+    let (preview_root, preview_version) = store.preview_batch(&ops).unwrap();
+    assert_ne!(preview_root, before.0);
+    assert_eq!(store.root(), before, "preview must not commit");
+    // Previewing twice is stable, and committing matches the preview.
+    assert_eq!(store.preview_batch(&ops).unwrap(), (preview_root, preview_version));
+    assert_eq!(store.put_batch(&ops).unwrap(), (preview_root, preview_version));
+}

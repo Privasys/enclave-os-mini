@@ -309,17 +309,14 @@ impl<B: KvBackend> MerkleStore<B> {
 
     // -- writes -----------------------------------------------------------
 
-    /// Apply a batch of operations as one commit: `(key, Some(value))`
-    /// puts, `(key, None)` deletes. Later ops win over earlier ops on the
-    /// same key. Returns the new `(root, version)`.
-    ///
-    /// If the batch changes nothing (deletes of absent keys, overwrites
-    /// with identical values), no commit happens and the current
-    /// `(root, version)` is returned unchanged.
-    pub fn put_batch(
+    /// The pure computation shared by [`Self::put_batch`] and
+    /// [`Self::preview_batch`]: dedupe, commit/encrypt values, fold the
+    /// updates into the tree. Returns `None` for a no-op batch. Never
+    /// mutates the store — all effects live in the returned accumulator.
+    fn compute_batch(
         &mut self,
         ops: &[(Vec<u8>, Option<Vec<u8>>)],
-    ) -> Result<(Hash, u64), MerkleError> {
+    ) -> Result<Option<(CommitAcc, Option<Child>, Hash)>, MerkleError> {
         let new_version = self.version + 1;
 
         // Deduplicate (last wins) and sort by path via the BTreeMap.
@@ -328,7 +325,7 @@ impl<B: KvBackend> MerkleStore<B> {
             deduped.insert(self.path_of(key), value.as_deref());
         }
         if deduped.is_empty() {
-            return Ok((self.root, self.version));
+            return Ok(None);
         }
 
         let mut acc = CommitAcc {
@@ -363,13 +360,47 @@ impl<B: KvBackend> MerkleStore<B> {
             self.apply_subtree(&mut acc, self.root_child.clone(), &mut Vec::new(), &updates)?;
 
         if new_root_child == self.root_child {
-            return Ok((self.root, self.version)); // no-op batch
+            return Ok(None); // no-op batch
         }
 
         let new_root = match &new_root_child {
             Some(c) => c.hash,
             None => *placeholder(),
         };
+        Ok(Some((acc, new_root_child, new_root)))
+    }
+
+    /// Compute the `(root, version)` this batch WOULD produce, without
+    /// committing anything. The tree math is pure, so a later
+    /// [`Self::put_batch`] with the same ops from the same state
+    /// produces exactly this result. This is what a transaction fork
+    /// uses to seal `root_after` before consensus decides the commit.
+    pub fn preview_batch(
+        &mut self,
+        ops: &[(Vec<u8>, Option<Vec<u8>>)],
+    ) -> Result<(Hash, u64), MerkleError> {
+        match self.compute_batch(ops)? {
+            Some((_, _, new_root)) => Ok((new_root, self.version + 1)),
+            None => Ok((self.root, self.version)),
+        }
+    }
+
+    /// Apply a batch of operations as one commit: `(key, Some(value))`
+    /// puts, `(key, None)` deletes. Later ops win over earlier ops on the
+    /// same key. Returns the new `(root, version)`.
+    ///
+    /// If the batch changes nothing (deletes of absent keys, overwrites
+    /// with identical values), no commit happens and the current
+    /// `(root, version)` is returned unchanged.
+    pub fn put_batch(
+        &mut self,
+        ops: &[(Vec<u8>, Option<Vec<u8>>)],
+    ) -> Result<(Hash, u64), MerkleError> {
+        let Some((acc, new_root_child, new_root)) = self.compute_batch(ops)? else {
+            return Ok((self.root, self.version)); // no-op batch
+        };
+
+        let new_version = acc.new_version;
 
         // Assemble the atomic commit.
         let mut batch: Vec<KvBatchOp> = Vec::with_capacity(
