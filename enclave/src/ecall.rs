@@ -604,6 +604,13 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
                 .get("raft_genesis_voters")
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|v| v.as_u64()).collect());
+            // Peer measurement pinning defaults ON; disable transiently
+            // for a measurement rotation with raft_pin_measurement=false.
+            let pin_measurement = config
+                .extra
+                .get("raft_pin_measurement")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(true);
             match crate::raftglue::RaftGlue::new(
                 sealed_cfg.master_key(),
                 cluster_key,
@@ -611,6 +618,7 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
                 peers,
                 genesis_voters,
                 ca,
+                pin_measurement,
             ) {
                 Ok(glue) => {
                     crate::raftglue::install(glue);

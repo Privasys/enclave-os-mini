@@ -113,6 +113,7 @@ impl RaftGlue {
         peers: BTreeMap<NodeId, String>,
         genesis_voters: Option<Vec<NodeId>>,
         ca: CaContext,
+        pin_measurement: bool,
     ) -> Result<Self, String> {
         let ck = derive(&cluster_key, b"enclave-os-raft:ck:v1");
         let sk = derive(&master_key, b"enclave-os-raft:sk:v1");
@@ -165,7 +166,18 @@ impl RaftGlue {
         }
         .map_err(|e| format!("raft driver: {e:?}"))?;
 
-        let link = PeerLink::new(ca)?;
+        // Peer links only accept enclaves running the SAME binary
+        // unless the operator explicitly disables the pin (needed
+        // transiently during a measurement rotation).
+        let pinned = if pin_measurement {
+            Some(
+                crate::ratls::attestation::self_mrenclave()
+                    .map_err(|e| format!("self measurement for peer pinning: {e}"))?,
+            )
+        } else {
+            None
+        };
+        let link = PeerLink::new(ca, pinned)?;
         enclave_log_info!(
             "raft node {} up ({} peers, {})",
             node_id,

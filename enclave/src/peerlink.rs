@@ -67,12 +67,17 @@ struct PeerSession {
 pub struct PeerLink {
     ca: CaContext,
     fleet_roots: Arc<RootCertStore>,
+    /// When set, the peer's certificate must carry an SGX quote whose
+    /// MRENCLAVE equals this value (our own measurement): only enclaves
+    /// running the SAME binary may peer. `None` disables the check
+    /// (config `raft_pin_measurement: false`).
+    pinned_measurement: Option<[u8; 32]>,
     sessions: BTreeMap<u32, PeerSession>,
     next_out: u32,
 }
 
 impl PeerLink {
-    pub fn new(ca: CaContext) -> Result<Self, String> {
+    pub fn new(ca: CaContext, pinned_measurement: Option<[u8; 32]>) -> Result<Self, String> {
         let mut roots = RootCertStore::empty();
         roots
             .add(CertificateDer::from(ca.ca_cert_der.clone()))
@@ -80,6 +85,7 @@ impl PeerLink {
         Ok(Self {
             ca,
             fleet_roots: Arc::new(roots),
+            pinned_measurement,
             sessions: BTreeMap::new(),
             next_out: CONN_ID_OUTBOUND_BASE,
         })
@@ -110,7 +116,7 @@ impl PeerLink {
     /// the conn_id.
     pub fn dial(&mut self, addr: &str, now_secs: u64) -> Result<u32, String> {
         let (chain, key) = self.own_identity(now_secs)?;
-        let verifier = FleetCaVerifier::new(self.fleet_roots.clone())?;
+        let verifier = FleetCaVerifier::new(self.fleet_roots.clone(), self.pinned_measurement)?;
         let mut cfg = ClientConfig::builder_with_provider(Arc::new(default_provider()))
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|e| format!("peer client config: {e:?}"))?
@@ -188,12 +194,16 @@ impl PeerLink {
 
     fn accept_inbound(&self, now_secs: u64) -> Result<ServerConnection, String> {
         let (chain, key) = self.own_identity(now_secs)?;
-        let client_verifier = WebPkiClientVerifier::builder_with_provider(
+        let inner = WebPkiClientVerifier::builder_with_provider(
             self.fleet_roots.clone(),
             Arc::new(default_provider()),
         )
         .build()
         .map_err(|e| format!("peer client verifier: {e:?}"))?;
+        let client_verifier = Arc::new(FleetClientVerifier {
+            inner,
+            pinned_measurement: self.pinned_measurement,
+        });
         let cfg = ServerConfig::builder_with_provider(Arc::new(default_provider()))
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|e| format!("peer server config: {e:?}"))?
@@ -345,25 +355,67 @@ impl PeerLink {
     }
 }
 
+// ── Measurement pinning ─────────────────────────────────────────────
+
+/// Verify the peer certificate carries an SGX quote whose MRENCLAVE
+/// equals `expected`. The quote rides inside the fleet-CA-signed leaf:
+/// forging one requires the CA key (held only by provisioned enclaves,
+/// which embed only their own genuine quote), so under the fleet trust
+/// model this stops enclaves running a DIFFERENT binary — e.g. a
+/// not-yet-upgraded node after a measurement rotation — from peering.
+fn check_peer_measurement(
+    cert_der: &[u8],
+    expected: &[u8; 32],
+) -> Result<(), String> {
+    use x509_parser::prelude::*;
+    let (_, cert) = X509Certificate::from_der(cert_der)
+        .map_err(|_| "peer cert: DER parse failed".to_string())?;
+    let quote = cert
+        .extensions()
+        .iter()
+        .find(|ext| ext.oid.to_id_string() == enclave_os_common::oids::SGX_QUOTE_OID_STR)
+        .map(|ext| ext.value)
+        .ok_or_else(|| "peer cert: no SGX quote extension".to_string())?;
+    let identity = enclave_os_common::quote::parse_quote(quote)
+        .map_err(|e| format!("peer quote: {e}"))?;
+    let expected_hex = enclave_os_common::hex::hex_encode(expected);
+    if identity.measurement != expected_hex {
+        return Err(format!(
+            "peer MRENCLAVE {} != pinned {}",
+            identity.measurement, expected_hex
+        ));
+    }
+    Ok(())
+}
+
+fn pin_error(e: String) -> TlsError {
+    TlsError::General(format!("measurement pinning: {e}"))
+}
+
 // ── Fleet-CA server verifier (client side) ──────────────────────────
 
 /// Chain-verifies the peer's certificate against the fleet CA and
 /// ignores ONLY the DNS-name check (RA-TLS leaves carry no SAN) — the
-/// same convention as the egress RaTlsVerifier.
+/// same convention as the egress RaTlsVerifier. When a measurement is
+/// pinned, the peer's quote must carry it.
 #[derive(Debug)]
 struct FleetCaVerifier {
     inner: Arc<WebPkiServerVerifier>,
+    pinned_measurement: Option<[u8; 32]>,
 }
 
 impl FleetCaVerifier {
-    fn new(roots: Arc<RootCertStore>) -> Result<Self, String> {
+    fn new(
+        roots: Arc<RootCertStore>,
+        pinned_measurement: Option<[u8; 32]>,
+    ) -> Result<Self, String> {
         let inner = WebPkiServerVerifier::builder_with_provider(
             roots,
             Arc::new(default_provider()),
         )
         .build()
         .map_err(|e| format!("fleet verifier: {e:?}"))?;
-        Ok(Self { inner })
+        Ok(Self { inner, pinned_measurement })
     }
 }
 
@@ -383,13 +435,76 @@ impl ServerCertVerifier for FleetCaVerifier {
             ocsp_response,
             now,
         ) {
-            Ok(_) => Ok(ServerCertVerified::assertion()),
+            Ok(_) => {}
             Err(TlsError::InvalidCertificate(
                 CertificateError::NotValidForName
                 | CertificateError::NotValidForNameContext { .. },
-            )) => Ok(ServerCertVerified::assertion()),
-            Err(e) => Err(e),
+            )) => {}
+            Err(e) => return Err(e),
         }
+        if let Some(ref expected) = self.pinned_measurement {
+            check_peer_measurement(end_entity.as_ref(), expected).map_err(pin_error)?;
+        }
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, TlsError> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+// ── Fleet-CA client verifier (server side) ──────────────────────────
+
+/// Wraps the WebPKI client-cert verifier (mandatory client certs,
+/// chained to the fleet CA) with the same measurement pin.
+#[derive(Debug)]
+struct FleetClientVerifier {
+    inner: Arc<dyn rustls::server::danger::ClientCertVerifier>,
+    pinned_measurement: Option<[u8; 32]>,
+}
+
+impl rustls::server::danger::ClientCertVerifier for FleetClientVerifier {
+    fn offer_client_auth(&self) -> bool {
+        self.inner.offer_client_auth()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.inner.client_auth_mandatory()
+    }
+
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        self.inner.root_hint_subjects()
+    }
+
+    fn verify_client_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        now: UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, TlsError> {
+        let verified = self.inner.verify_client_cert(end_entity, intermediates, now)?;
+        if let Some(ref expected) = self.pinned_measurement {
+            check_peer_measurement(end_entity.as_ref(), expected).map_err(pin_error)?;
+        }
+        Ok(verified)
     }
 
     fn verify_tls12_signature(
