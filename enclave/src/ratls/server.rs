@@ -163,7 +163,9 @@ impl IngressServer {
                 // DataReady is an enclave→host signal; ignore if received inbound.
             }
 
-            ChannelMsgType::TcpConnect | ChannelMsgType::TcpConnected => {
+            ChannelMsgType::TcpConnect
+            | ChannelMsgType::TcpConnected
+            | ChannelMsgType::Tick => {
                 // Outbound-connection lifecycle messages belong to the
                 // peer-link layer (routed by conn-id range before this
                 // dispatch); the ingress server never initiates

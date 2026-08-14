@@ -574,7 +574,8 @@ impl TcpProxy {
                             }
                         }
                         Some((ChannelMsgType::TcpNew, conn_id, _))
-                        | Some((ChannelMsgType::TcpConnected, conn_id, _)) => {
+                        | Some((ChannelMsgType::TcpConnected, conn_id, _))
+                        | Some((ChannelMsgType::Tick, conn_id, _)) => {
                             // Host-bound only in the other direction — ignore
                             warn!(
                                 "Unexpected host-bound message from enclave for conn_id={}",
