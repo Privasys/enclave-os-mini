@@ -92,6 +92,9 @@ pub struct RaftGlue {
     /// Ticks until the next dial attempt per down peer.
     backoff: BTreeMap<NodeId, u32>,
     diverged_logged: bool,
+    /// Last logged (role, term, leader, commit, verified) for
+    /// transition logging.
+    last_logged: Option<(Role, u64, Option<NodeId>, u64, u64)>,
 }
 
 impl RaftGlue {
@@ -150,6 +153,7 @@ impl RaftGlue {
             dial_pending: BTreeMap::new(),
             backoff: BTreeMap::new(),
             diverged_logged: false,
+            last_logged: None,
         })
     }
 
@@ -190,6 +194,30 @@ impl RaftGlue {
 
     fn tick(&mut self) {
         self.drive(|d| d.tick());
+
+        // Log consensus-state transitions (role, term, leader, commit,
+        // verified) so cluster health is visible from container logs.
+        {
+            let core = self.driver.core();
+            let now = (
+                core.role(),
+                core.term(),
+                core.leader_id(),
+                core.commit_index(),
+                core.verified_index(),
+            );
+            if self.last_logged != Some(now) {
+                self.last_logged = Some(now);
+                enclave_log_info!(
+                    "raft: role={:?} term={} leader={:?} commit={} verified={}",
+                    now.0,
+                    now.1,
+                    now.2,
+                    now.3,
+                    now.4
+                );
+            }
+        }
 
         // Redial down peers with backoff.
         let down: Vec<(NodeId, String)> = self

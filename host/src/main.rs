@@ -96,6 +96,12 @@ struct Cli {
     #[arg(long)]
     oidc_audience: Option<String>,
 
+    /// Extra enclave config as a JSON object, merged into the config
+    /// passed to ecall_run (e.g. '{"raft_node_id":1,"raft_peers":
+    /// {"2":"10.0.0.2:7400"},"raft_cluster_key":"<hex64>"}').
+    #[arg(long)]
+    extra: Option<String>,
+
     /// Enable debug logging
     #[arg(short, long)]
     debug: bool,
@@ -284,6 +290,18 @@ fn main() -> Result<()> {
         });
     } else if cli.oidc_audience.is_some() {
         anyhow::bail!("--oidc-issuer is required when --oidc-audience is set");
+    }
+
+    // Merge --extra JSON object into the enclave config (raft_*, ...).
+    if let Some(ref extra) = cli.extra {
+        match serde_json::from_str::<serde_json::Value>(extra) {
+            Ok(serde_json::Value::Object(map)) => {
+                for (k, v) in map {
+                    config[k] = v;
+                }
+            }
+            _ => anyhow::bail!("--extra must be a JSON object"),
+        }
     }
 
     let config_bytes = serde_json::to_vec(&config)?;
