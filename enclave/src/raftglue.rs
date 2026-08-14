@@ -225,6 +225,11 @@ impl RaftGlue {
                     if let Some(node) = self.dial_pending.remove(&cid) {
                         self.map_conn(node, cid);
                     }
+                    // Introduce ourselves so the peer can map this
+                    // connection before any consensus traffic (a
+                    // joining non-member never speaks otherwise).
+                    let hello = self.driver.core().hello().encode();
+                    self.link.send_frame(cid, &hello);
                 }
                 PeerEvent::Frame(cid, bytes) => {
                     let Some(msg) = Message::decode(&bytes) else {

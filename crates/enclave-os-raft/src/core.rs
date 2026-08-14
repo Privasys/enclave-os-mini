@@ -283,6 +283,18 @@ impl RaftCore {
         self.seen_incarnations.get(&id).copied()
     }
 
+    /// A link-layer introduction frame carrying this node's identity;
+    /// the transport sends it when a peer session establishes.
+    pub fn hello(&self) -> Message {
+        Message::Hello {
+            meta: MsgMeta {
+                from: self.cfg.id,
+                term: self.term,
+                incarnation: self.cfg.incarnation,
+            },
+        }
+    }
+
     /// Is this node admitted to vote (its incarnation matches the one
     /// recorded in the replicated membership)?
     pub fn self_admitted(&self) -> bool {
@@ -564,6 +576,10 @@ impl RaftCore {
                         self.record_report(meta.from, index, root);
                     }
                 }
+            }
+            Message::Hello { .. } => {
+                // Link-layer introduction; the prologue above already
+                // recorded the sender's incarnation.
             }
         }
     }

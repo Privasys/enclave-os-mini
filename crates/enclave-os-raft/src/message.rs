@@ -56,6 +56,13 @@ pub enum Message {
         /// Verified-commit report (WS3): `(applied_index, ledger_root)`.
         applied_root: Option<(Index, [u8; 32])>,
     },
+    /// Sent by the dialing side when a peer link establishes, so the
+    /// receiver can map the connection to a node id before any
+    /// consensus traffic flows (a joining non-member never speaks
+    /// otherwise). Consensus ignores it.
+    Hello {
+        meta: MsgMeta,
+    },
 }
 
 /// Decode caps — a frame that exceeds these is rejected as corrupt.
@@ -68,7 +75,8 @@ impl Message {
             Message::RequestVote { meta, .. }
             | Message::VoteResponse { meta, .. }
             | Message::AppendEntries { meta, .. }
-            | Message::AppendResponse { meta, .. } => *meta,
+            | Message::AppendResponse { meta, .. }
+            | Message::Hello { meta } => *meta,
         }
     }
 
@@ -79,6 +87,7 @@ impl Message {
             Message::VoteResponse { meta, .. } => (2, meta),
             Message::AppendEntries { meta, .. } => (3, meta),
             Message::AppendResponse { meta, .. } => (4, meta),
+            Message::Hello { meta } => (5, meta),
         };
         buf.push(kind);
         buf.extend_from_slice(&meta.from.to_le_bytes());
@@ -124,6 +133,7 @@ impl Message {
                     None => buf.push(0),
                 }
             }
+            Message::Hello { .. } => {}
         }
         buf
     }
@@ -188,6 +198,7 @@ impl Message {
                 };
                 Message::AppendResponse { meta, success, match_index, conflict_index, applied_root }
             }
+            5 => Message::Hello { meta },
             _ => return None,
         };
         // Reject trailing garbage — frames are exact.
