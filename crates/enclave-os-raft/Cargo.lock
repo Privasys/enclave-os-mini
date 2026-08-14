@@ -42,6 +42,7 @@ dependencies = [
 name = "enclave-os-raft"
 version = "0.1.0"
 dependencies = [
+ "enclave-os-common",
  "enclave-os-merkle",
 ]
 

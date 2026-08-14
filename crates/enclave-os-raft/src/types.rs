@@ -46,6 +46,33 @@ pub struct Entry {
     pub data: Vec<u8>,
 }
 
+impl Entry {
+    /// Persistence codec: `[term u64][index u64][kind u8][len u32][data]`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(21 + self.data.len());
+        buf.extend_from_slice(&self.term.to_le_bytes());
+        buf.extend_from_slice(&self.index.to_le_bytes());
+        buf.push(self.kind as u8);
+        buf.extend_from_slice(&(self.data.len() as u32).to_le_bytes());
+        buf.extend_from_slice(&self.data);
+        buf
+    }
+
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        if data.len() < 21 {
+            return None;
+        }
+        let term = u64::from_le_bytes(data[0..8].try_into().ok()?);
+        let index = u64::from_le_bytes(data[8..16].try_into().ok()?);
+        let kind = EntryKind::from_u8(data[16])?;
+        let len = u32::from_le_bytes(data[17..21].try_into().ok()?) as usize;
+        if data.len() != 21 + len {
+            return None;
+        }
+        Some(Self { term, index, kind, data: data[21..].to_vec() })
+    }
+}
+
 /// A single-server membership change, applied when the entry is
 /// *appended* (not committed), per the Raft dissertation §4.1.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -140,6 +167,58 @@ impl Membership {
         self.voters.len() / 2 + 1
     }
 
+    /// Persistence codec:
+    /// `[voter_count u32][(id u64, incarnation u64)*][learner_count u32][id u64*]`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(8 + self.voters.len() * 16 + self.learners.len() * 8);
+        buf.extend_from_slice(&(self.voters.len() as u32).to_le_bytes());
+        for (id, inc) in &self.voters {
+            buf.extend_from_slice(&id.to_le_bytes());
+            buf.extend_from_slice(&inc.to_le_bytes());
+        }
+        buf.extend_from_slice(&(self.learners.len() as u32).to_le_bytes());
+        for id in &self.learners {
+            buf.extend_from_slice(&id.to_le_bytes());
+        }
+        buf
+    }
+
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        let mut off = 0usize;
+        let take_u32 = |d: &[u8], o: &mut usize| -> Option<u32> {
+            let v = u32::from_le_bytes(d.get(*o..*o + 4)?.try_into().ok()?);
+            *o += 4;
+            Some(v)
+        };
+        let take_u64 = |d: &[u8], o: &mut usize| -> Option<u64> {
+            let v = u64::from_le_bytes(d.get(*o..*o + 8)?.try_into().ok()?);
+            *o += 8;
+            Some(v)
+        };
+        let vc = take_u32(data, &mut off)? as usize;
+        if vc > 4096 {
+            return None;
+        }
+        let mut voters = BTreeMap::new();
+        for _ in 0..vc {
+            let id = take_u64(data, &mut off)?;
+            let inc = take_u64(data, &mut off)?;
+            voters.insert(id, inc);
+        }
+        let lc = take_u32(data, &mut off)? as usize;
+        if lc > 4096 {
+            return None;
+        }
+        let mut learners = BTreeSet::new();
+        for _ in 0..lc {
+            learners.insert(take_u64(data, &mut off)?);
+        }
+        if off != data.len() {
+            return None;
+        }
+        Some(Self { voters, learners })
+    }
+
     /// Apply a single-server change.
     pub fn apply(&mut self, cc: &ConfigChange) {
         match cc {
@@ -171,6 +250,30 @@ impl Membership {
 pub struct HardState {
     pub term: Term,
     pub voted_for: Option<NodeId>,
+}
+
+impl HardState {
+    /// Persistence codec: `[term u64][voted_flag u8][voted_for u64]`.
+    pub fn encode(&self) -> Vec<u8> {
+        let mut buf = Vec::with_capacity(17);
+        buf.extend_from_slice(&self.term.to_le_bytes());
+        buf.push(self.voted_for.is_some() as u8);
+        buf.extend_from_slice(&self.voted_for.unwrap_or(0).to_le_bytes());
+        buf
+    }
+
+    pub fn decode(data: &[u8]) -> Option<Self> {
+        if data.len() != 17 {
+            return None;
+        }
+        let term = u64::from_le_bytes(data[0..8].try_into().ok()?);
+        let voted_for = match data[8] {
+            0 => None,
+            1 => Some(u64::from_le_bytes(data[9..17].try_into().ok()?)),
+            _ => return None,
+        };
+        Some(Self { term, voted_for })
+    }
 }
 
 /// Volatile role.

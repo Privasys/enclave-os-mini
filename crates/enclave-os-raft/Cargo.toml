@@ -13,6 +13,8 @@ description = "Attested Raft consensus core for Enclave OS (Mini) clusters"
 # persistence are wired in by the enclave runtime (WS4).
 [dependencies]
 enclave-os-merkle = { path = "../enclave-os-merkle" }
+# AEAD cipher for the encrypted log store
+enclave-os-common = { path = "../../common", features = ["crypto"] }
 
 # Standalone workspace so `cargo test` runs here without the repo root
 # workspace (which excludes module crates; same pattern as

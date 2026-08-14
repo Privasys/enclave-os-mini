@@ -297,6 +297,16 @@ impl RaftCore {
         self.verified
     }
 
+    /// Restore-time only: entries at or below `floor` are already
+    /// reflected in the state machine (its checkpoint outran the
+    /// persisted applied marker by at most one batch) and must not be
+    /// re-delivered through [`Ready::committed_entries`]. Call once,
+    /// right after construction, before any tick/step.
+    pub fn set_applied_floor(&mut self, floor: Index) {
+        assert_eq!(self.applied, 0, "applied floor must be set before any Ready");
+        self.applied = floor.min(self.last_index());
+    }
+
     // ── Verified commits ────────────────────────────────────────────
 
     /// The driver MUST call this after applying a committed entry to
@@ -307,7 +317,13 @@ impl RaftCore {
     /// divergence (see [`RaftEvent`]).
     pub fn report_applied(&mut self, index: Index, root: LedgerRoot) {
         if let Some((prev, _)) = self.last_applied_report {
-            debug_assert!(index >= prev, "applied reports must be monotonic");
+            debug_assert!(
+                index >= prev,
+                "applied reports must be monotonic (node {} got {} after {})",
+                self.cfg.id,
+                index,
+                prev
+            );
         }
         self.last_applied_report = Some((index, root));
         if self.role == Role::Leader {
@@ -1014,7 +1030,9 @@ impl RaftCore {
         let committed_entries: Vec<Entry> = ((self.applied + 1)..=self.commit)
             .filter_map(|i| self.log.get(i as usize - 1).cloned())
             .collect();
-        self.applied = self.commit;
+        // max(): after a restart the applied floor can be ahead of the
+        // not-yet-recovered commit index; it must never move backwards.
+        self.applied = self.applied.max(self.commit);
 
         Ready {
             truncate_from: self.pending_truncate.take(),

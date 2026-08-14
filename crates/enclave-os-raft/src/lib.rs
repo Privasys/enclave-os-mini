@@ -48,9 +48,13 @@ pub mod message;
 pub mod core;
 pub mod transaction;
 pub mod ledger;
+pub mod logstore;
+pub mod driver;
 
 pub use crate::core::{Config, LedgerRoot, ProposeError, RaftCore, RaftEvent, Ready};
+pub use crate::driver::{DriverError, DriverOutput, RaftDriver};
 pub use crate::ledger::{LedgerError, MerkleLedger};
+pub use crate::logstore::{LogError, LogStore, RecoveredLog};
 pub use crate::message::Message;
 pub use crate::transaction::Transaction;
 pub use crate::types::{
@@ -59,3 +63,6 @@ pub use crate::types::{
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod driver_tests;
