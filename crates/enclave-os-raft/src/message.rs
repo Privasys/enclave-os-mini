@@ -42,6 +42,9 @@ pub enum Message {
         prev_log_index: Index,
         prev_log_term: Term,
         commit: Index,
+        /// The leader's verified index: highest entry whose post-apply
+        /// ledger root a quorum has confirmed (see `core` docs).
+        verified: Index,
         entries: Vec<Entry>,
     },
     AppendResponse {
@@ -90,10 +93,13 @@ impl Message {
             Message::VoteResponse { granted, .. } => {
                 buf.push(*granted as u8);
             }
-            Message::AppendEntries { prev_log_index, prev_log_term, commit, entries, .. } => {
+            Message::AppendEntries {
+                prev_log_index, prev_log_term, commit, verified, entries, ..
+            } => {
                 buf.extend_from_slice(&prev_log_index.to_le_bytes());
                 buf.extend_from_slice(&prev_log_term.to_le_bytes());
                 buf.extend_from_slice(&commit.to_le_bytes());
+                buf.extend_from_slice(&verified.to_le_bytes());
                 buf.extend_from_slice(&(entries.len() as u32).to_le_bytes());
                 for e in entries {
                     buf.extend_from_slice(&e.term.to_le_bytes());
@@ -141,6 +147,7 @@ impl Message {
                 let prev_log_index = get_u64(data, &mut off)?;
                 let prev_log_term = get_u64(data, &mut off)?;
                 let commit = get_u64(data, &mut off)?;
+                let verified = get_u64(data, &mut off)?;
                 let count = get_u32(data, &mut off)? as usize;
                 if count > MAX_ENTRIES_PER_MSG {
                     return None;
@@ -157,7 +164,14 @@ impl Message {
                     let data = get_bytes(data, &mut off, len)?.to_vec();
                     entries.push(Entry { term, index, kind, data });
                 }
-                Message::AppendEntries { meta, prev_log_index, prev_log_term, commit, entries }
+                Message::AppendEntries {
+                    meta,
+                    prev_log_index,
+                    prev_log_term,
+                    commit,
+                    verified,
+                    entries,
+                }
             }
             4 => {
                 let success = get_u8(data, &mut off)? != 0;
@@ -248,6 +262,7 @@ mod tests {
             prev_log_index: 4,
             prev_log_term: 2,
             commit: 5,
+            verified: 3,
             entries,
         };
         assert_eq!(Message::decode(&m.encode()).unwrap(), m);

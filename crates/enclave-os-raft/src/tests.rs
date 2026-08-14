@@ -15,11 +15,24 @@
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
-use crate::core::{Config, ProposeError, RaftCore};
+use enclave_os_merkle::{MemBackend, MerkleStore};
+
+use crate::core::{Config, ProposeError, RaftCore, RaftEvent};
+use crate::ledger::{LedgerError, MerkleLedger};
 use crate::message::{Message, MsgMeta};
+use crate::transaction::Transaction;
 use crate::types::{
     ConfigChange, Entry, EntryKind, HardState, Incarnation, Index, Membership, NodeId, Role,
 };
+
+/// Cluster commitment key (shared) — per-node storage keys differ, the
+/// whole point of the encryption-independent root.
+const CK: [u8; 32] = [0x11; 32];
+
+fn node_ledger(id: NodeId) -> MerkleLedger<MemBackend> {
+    let sk = [id as u8 + 1; 32];
+    MerkleLedger::new(MerkleStore::create(MemBackend::new(), CK, sk).unwrap())
+}
 
 // ── Deterministic RNG (same construction as the merkle test suite) ──
 
@@ -51,6 +64,14 @@ struct SimNode {
     disk_hs: HardState,
     /// The state machine: every committed entry applied, in order.
     applied: Vec<Entry>,
+    /// The Merkle ledger this node maintains (its own storage key).
+    ledger: MerkleLedger<MemBackend>,
+    /// Set when a transaction failed root verification: the node has
+    /// diverged and stopped serving (awaiting WS4 snapshot repair).
+    halted: bool,
+    /// Fault injection: apply committed write-sets WITH an extra sneaky
+    /// op, computing a divergent root (a corrupted replica).
+    sabotage: bool,
     alive: bool,
     seed: u64,
 }
@@ -69,6 +90,8 @@ struct Sim {
     leaders_by_term: BTreeMap<u64, NodeId>,
     /// Committed durability history: the longest applied sequence seen.
     history: Vec<Entry>,
+    /// Verification events surfaced by any node: `(node, event)`.
+    events: Vec<(NodeId, RaftEvent)>,
     next_incarnation: Incarnation,
 }
 
@@ -91,6 +114,9 @@ impl Sim {
                     disk_log: Vec::new(),
                     disk_hs: HardState::default(),
                     applied: Vec::new(),
+                    ledger: node_ledger(id),
+                    halted: false,
+                    sabotage: false,
                     alive: true,
                     seed: node_seed,
                 },
@@ -107,6 +133,7 @@ impl Sim {
             blocked: BTreeSet::new(),
             leaders_by_term: BTreeMap::new(),
             history: Vec::new(),
+            events: Vec::new(),
             next_incarnation: 0,
         }
     }
@@ -127,6 +154,9 @@ impl Sim {
                 disk_log: Vec::new(),
                 disk_hs: HardState::default(),
                 applied: Vec::new(),
+                ledger: node_ledger(id),
+                halted: false,
+                sabotage: false,
                 alive: true,
                 seed: node_seed,
             },
@@ -169,9 +199,50 @@ impl Sim {
                 for (to, msg) in ready.messages {
                     self.inflight.push_back((to, msg));
                 }
+                for ev in ready.events {
+                    self.events.push((*id, ev));
+                }
                 let node = self.nodes.get_mut(id).unwrap();
                 for e in ready.committed_entries {
-                    node.applied.push(e);
+                    node.applied.push(e.clone());
+                    if node.halted {
+                        continue; // diverged: stopped serving, no reports
+                    }
+                    // Apply to the ledger and report the resulting root
+                    // (the driver contract for verified commits).
+                    let root = match e.kind {
+                        EntryKind::App => match Transaction::decode(&e.data) {
+                            Some(txn) => {
+                                if node.sabotage {
+                                    // Corrupted replica: applies the
+                                    // write-set plus a sneaky extra op.
+                                    let mut ops = txn.ops.clone();
+                                    ops.push((b"__sneak__".to_vec(), Some(vec![0x66])));
+                                    node.ledger
+                                        .store_mut()
+                                        .put_batch(&ops)
+                                        .ok()
+                                        .map(|(r, _)| r)
+                                } else {
+                                    match node.ledger.apply(&txn) {
+                                        Ok((r, _)) => Some(r),
+                                        Err(LedgerError::RootMismatch { .. }) => {
+                                            node.halted = true;
+                                            None
+                                        }
+                                        Err(LedgerError::Store(_)) => None,
+                                    }
+                                }
+                            }
+                            // Opaque payloads (non-transaction tests):
+                            // the ledger is untouched.
+                            None => Some(node.ledger.root().0),
+                        },
+                        _ => Some(node.ledger.root().0),
+                    };
+                    if let Some(r) = root {
+                        node.core.report_applied(e.index, r);
+                    }
                 }
                 self.check_node_history(*id);
             }
@@ -245,6 +316,31 @@ impl Sim {
         r
     }
 
+    /// Leader-side transaction: fork the ledger, buffer the ops, seal,
+    /// propose the encoded transaction.
+    fn propose_txn(
+        &mut self,
+        ops: &[(&[u8], Option<&[u8]>)],
+    ) -> Result<Index, ProposeError> {
+        let l = self.leader().ok_or(ProposeError::NotLeader)?;
+        let node = self.nodes.get_mut(&l).unwrap();
+        let mut fork = node.ledger.fork();
+        for (k, v) in ops {
+            match v {
+                Some(v) => fork.put(k, v),
+                None => fork.delete(k),
+            }
+        }
+        let txn: Transaction = fork.seal().expect("seal fork").into();
+        let r = node.core.propose(txn.encode());
+        self.pump();
+        r
+    }
+
+    fn ledger_root(&self, id: NodeId) -> [u8; 32] {
+        self.nodes[&id].ledger.root().0
+    }
+
     fn crash(&mut self, id: NodeId) {
         self.nodes.get_mut(&id).unwrap().alive = false;
     }
@@ -264,6 +360,12 @@ impl Sim {
             node.disk_hs,
         );
         node.applied.clear();
+        // A restarted node rebuilds its ledger by replaying the
+        // re-delivered committed entries (a real node opens its
+        // checkpoint instead; same resulting state).
+        node.ledger = node_ledger(id);
+        node.halted = false;
+        node.sabotage = false;
         node.alive = true;
     }
 
@@ -870,4 +972,131 @@ fn fuzz_random_faults_converge() {
         }
         sim.check_invariants();
     }
+}
+
+// ── Verified commits over the Merkle ledger (WS3) ───────────────────
+
+#[test]
+fn transactions_replicate_and_verify() {
+    let mut sim = Sim::new(3, 20);
+    let l = sim.wait_for_leader(200);
+
+    sim.propose_txn(&[
+        (b"alice", Some(b"1000")),
+        (b"bob", Some(b"250")),
+    ])
+    .unwrap();
+    sim.propose_txn(&[(b"alice", Some(b"900")), (b"carol", Some(b"42"))]).unwrap();
+    sim.propose_txn(&[(b"bob", None)]).unwrap();
+    sim.tick(6);
+
+    // Every replica computed the same root from a different storage key.
+    let root = sim.ledger_root(l);
+    for id in 1..=3 {
+        assert_eq!(sim.ledger_root(id), root, "node {} ledger diverged", id);
+        let store = sim.nodes[&id].ledger.store();
+        assert_eq!(store.get(b"alice").unwrap(), Some(b"900".to_vec()));
+        assert_eq!(store.get(b"bob").unwrap(), None);
+        assert_eq!(store.get(b"carol").unwrap(), Some(b"42".to_vec()));
+    }
+
+    // The leader verified everything it committed, and propagated the
+    // watermark to the followers.
+    let leader = &sim.nodes[&l].core;
+    assert_eq!(leader.verified_index(), leader.commit_index());
+    for id in (1..=3).filter(|&id| id != l) {
+        assert!(
+            sim.nodes[&id].core.verified_index() > 0,
+            "node {} never learned the verified watermark",
+            id
+        );
+    }
+    assert!(sim.events.is_empty(), "no disputes expected: {:?}", sim.events);
+}
+
+#[test]
+fn diverging_follower_flagged_as_outlier() {
+    let mut sim = Sim::new(3, 21);
+    let l = sim.wait_for_leader(200);
+    let bad = (1..=3).find(|&id| id != l).unwrap();
+    sim.nodes.get_mut(&bad).unwrap().sabotage = true;
+
+    sim.propose_txn(&[(b"k1", Some(b"v1"))]).unwrap();
+    sim.tick(10);
+
+    // The leader confirmed the root with the healthy follower (quorum)
+    // and flagged the corrupted one.
+    let flagged = sim.events.iter().any(|(n, ev)| {
+        *n == l && matches!(ev, RaftEvent::OutlierFollower { node, .. } if *node == bad)
+    });
+    assert!(flagged, "outlier follower not flagged: {:?}", sim.events);
+    assert!(
+        sim.nodes[&l].core.verified_index() >= 1,
+        "verification must advance with the healthy quorum"
+    );
+
+    // The corruption stops but the ledger has already diverged: the
+    // honest apply path fails its root_before check and the node halts
+    // fail-closed.
+    sim.nodes.get_mut(&bad).unwrap().sabotage = false;
+    sim.propose_txn(&[(b"k2", Some(b"v2"))]).unwrap();
+    sim.tick(6);
+    assert!(sim.nodes[&bad].halted, "diverged node must stop serving");
+
+    // Healthy nodes agree.
+    let good = (1..=3).find(|&id| id != l && id != bad).unwrap();
+    assert_eq!(sim.ledger_root(l), sim.ledger_root(good));
+}
+
+#[test]
+fn diverging_leader_is_deposed() {
+    let mut sim = Sim::new(3, 22);
+    let l1 = sim.wait_for_leader(200);
+    sim.propose_txn(&[(b"base", Some(b"1"))]).unwrap();
+    sim.tick(6);
+
+    // The leader's ledger goes bad: it applies its own committed
+    // transactions with a sneaky extra op from now on.
+    sim.nodes.get_mut(&l1).unwrap().sabotage = true;
+    sim.propose_txn(&[(b"k", Some(b"v"))]).unwrap();
+    sim.tick(20);
+
+    // A quorum of followers agreed against the leader: LeaderOutlier
+    // fired on the (now deposed) leader.
+    let deposed = sim.events.iter().any(|(n, ev)| {
+        *n == l1 && matches!(ev, RaftEvent::LeaderOutlier { .. })
+    });
+    assert!(deposed, "diverged leader not deposed: {:?}", sim.events);
+    assert_ne!(sim.nodes[&l1].core.role(), Role::Leader);
+
+    // Driver reaction per the plan: the outlier stops serving and
+    // awaits snapshot repair. Take it down and continue on the healthy
+    // majority.
+    sim.crash(l1);
+    let l2 = sim.wait_for_leader(600);
+    assert_ne!(l2, l1);
+    sim.propose_txn(&[(b"after", Some(b"2"))]).unwrap();
+    sim.tick(6);
+    let good: Vec<NodeId> = (1..=3).filter(|&id| id != l1).collect();
+    assert_eq!(sim.ledger_root(good[0]), sim.ledger_root(good[1]));
+    for &id in &good {
+        let store = sim.nodes[&id].ledger.store();
+        assert_eq!(store.get(b"after").unwrap(), Some(b"2".to_vec()));
+    }
+}
+
+#[test]
+fn restarted_node_rebuilds_ledger_by_replay() {
+    let mut sim = Sim::new(3, 23);
+    let l = sim.wait_for_leader(200);
+    sim.propose_txn(&[(b"a", Some(b"1")), (b"b", Some(b"2"))]).unwrap();
+    sim.propose_txn(&[(b"a", None), (b"c", Some(b"3"))]).unwrap();
+    sim.tick(6);
+    let root = sim.ledger_root(l);
+
+    let f = (1..=3).find(|&id| id != l).unwrap();
+    sim.restart(f);
+    sim.tick(60);
+    assert_eq!(sim.ledger_root(f), root, "replayed ledger must reach the same root");
+    assert!(!sim.nodes[&f].halted);
 }

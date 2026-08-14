@@ -8,12 +8,36 @@
 //! obligations from [`RaftCore::ready`]. See the crate docs for the
 //! driver contract and the incarnation-gated voting model.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 
 use crate::message::{Message, MsgMeta};
 use crate::types::{
     ConfigChange, Entry, EntryKind, HardState, Incarnation, Index, Membership, NodeId, Role, Term,
 };
+
+/// A ledger root as reported by the state machine (the Merkle store's
+/// 32-byte root hash).
+pub type LedgerRoot = [u8; 32];
+
+/// Verification events surfaced to the driver via [`Ready::events`].
+/// These are the dispute outcomes of the verified-commit protocol; the
+/// driver decides the operational reaction (alerting, snapshot repair,
+/// halting).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RaftEvent {
+    /// A quorum confirmed the leader's root at `index`, but this
+    /// follower reported a different root: the follower is the outlier
+    /// and must stop serving and repair via snapshot.
+    OutlierFollower { node: NodeId, index: Index, reported: LedgerRoot },
+    /// A quorum of voters agreed on the same root at `index` and it
+    /// differs from our own: we (the leader) are the outlier. The core
+    /// has already stepped down; the driver must stop serving and
+    /// repair via snapshot.
+    LeaderOutlier { index: Index, quorum_root: LedgerRoot },
+    /// Every voter reported a root at `index` and no root reached a
+    /// quorum: genuine cluster corruption. Halt and page a human.
+    VerificationDeadlock { index: Index },
+}
 
 /// Static configuration for one node.
 #[derive(Debug, Clone)]
@@ -79,8 +103,12 @@ pub struct Ready {
     pub hard_state: Option<HardState>,
     /// Messages to send once the above is durable: `(destination, msg)`.
     pub messages: Vec<(NodeId, Message)>,
-    /// Entries newly committed: apply to the state machine in order.
+    /// Entries newly committed: apply to the state machine in order,
+    /// and report the resulting ledger root per entry via
+    /// [`RaftCore::report_applied`].
     pub committed_entries: Vec<Entry>,
+    /// Verification events (disputes) for the driver to act on.
+    pub events: Vec<RaftEvent>,
 }
 
 impl Ready {
@@ -90,6 +118,7 @@ impl Ready {
             && self.hard_state.is_none()
             && self.messages.is_empty()
             && self.committed_entries.is_empty()
+            && self.events.is_empty()
     }
 }
 
@@ -135,8 +164,25 @@ pub struct RaftCore {
     recovery_active: bool,
     rng: SplitMix64,
 
+    // ── Verified-commit state ───────────────────────────────────────
+    /// Our state machine's latest report: `(applied_index, root)`.
+    last_applied_report: Option<(Index, LedgerRoot)>,
+    /// Highest index whose root a quorum has confirmed.
+    verified: Index,
+    /// Leader: our own roots per index, kept from `verified` upward.
+    root_history: BTreeMap<Index, LedgerRoot>,
+    /// Leader: each voter's latest report.
+    latest_reports: BTreeMap<NodeId, (Index, LedgerRoot)>,
+    /// Leader: highest index at which each peer's root matched ours.
+    match_watermark: BTreeMap<NodeId, Index>,
+    /// Leader: peers already flagged as outliers (event dedupe).
+    disputed: BTreeSet<NodeId>,
+    /// Deadlock event dedupe.
+    deadlock_reported: Option<Index>,
+
     // ── Ready accumulation ──────────────────────────────────────────
     msgs: Vec<(NodeId, Message)>,
+    events: Vec<RaftEvent>,
     /// Index of the first log entry not yet handed to the driver.
     persist_from: Index,
     pending_truncate: Option<Index>,
@@ -177,7 +223,15 @@ impl RaftCore {
             randomized_election_tick: 0,
             recovery_active: false,
             rng: SplitMix64::new(seed),
+            last_applied_report: None,
+            verified: 0,
+            root_history: BTreeMap::new(),
+            latest_reports: BTreeMap::new(),
+            match_watermark: BTreeMap::new(),
+            disputed: BTreeSet::new(),
+            deadlock_reported: None,
             msgs: Vec::new(),
+            events: Vec::new(),
             persist_from,
             pending_truncate: None,
             hard_state_dirty: false,
@@ -233,6 +287,147 @@ impl RaftCore {
     /// recorded in the replicated membership)?
     pub fn self_admitted(&self) -> bool {
         self.membership.voters.get(&self.cfg.id) == Some(&self.cfg.incarnation)
+    }
+
+    /// Highest index whose post-apply ledger root a quorum confirmed.
+    /// On followers this is the leader-propagated watermark, capped at
+    /// the local commit index. Clients asking for `wait: verified`
+    /// block on this.
+    pub fn verified_index(&self) -> Index {
+        self.verified
+    }
+
+    // ── Verified commits ────────────────────────────────────────────
+
+    /// The driver MUST call this after applying a committed entry to
+    /// the ledger, with the ledger root as of that entry (for Noop and
+    /// Config entries: the unchanged current root). Reports ride to the
+    /// leader in AppendResponse; the leader cross-checks them against
+    /// its own roots to advance the verified index and to detect
+    /// divergence (see [`RaftEvent`]).
+    pub fn report_applied(&mut self, index: Index, root: LedgerRoot) {
+        if let Some((prev, _)) = self.last_applied_report {
+            debug_assert!(index >= prev, "applied reports must be monotonic");
+        }
+        self.last_applied_report = Some((index, root));
+        if self.role == Role::Leader {
+            self.root_history.insert(index, root);
+            // Late follower reports may have been waiting for our own
+            // root at this index.
+            let pending: Vec<(NodeId, (Index, LedgerRoot))> = self
+                .latest_reports
+                .iter()
+                .filter(|(_, (i, _))| *i == index)
+                .map(|(&n, &r)| (n, r))
+                .collect();
+            for (node, (i, r)) in pending {
+                self.evaluate_report(node, i, r);
+            }
+            self.advance_verified();
+        }
+    }
+
+    /// Leader: process a follower's `(applied_index, root)` report.
+    fn record_report(&mut self, from: NodeId, index: Index, root: LedgerRoot) {
+        if self.role != Role::Leader || !self.membership.is_voter(from) {
+            return;
+        }
+        match self.latest_reports.get(&from) {
+            Some(&(prev_index, _)) if index < prev_index => return, // stale
+            _ => {}
+        }
+        self.latest_reports.insert(from, (index, root));
+        self.evaluate_report(from, index, root);
+        self.advance_verified();
+    }
+
+    fn evaluate_report(&mut self, from: NodeId, index: Index, root: LedgerRoot) {
+        let own = match self.root_history.get(&index) {
+            Some(r) => *r,
+            None => {
+                // Either we have not applied this far yet (the report
+                // re-evaluates when we do) or the index is below the
+                // trimmed history. Below the verified watermark a
+                // mismatch is impossible to confuse: quorum already
+                // agreed there, so any late divergent report marks the
+                // sender as outlier when it next aligns.
+                return;
+            }
+        };
+        if root == own {
+            let w = self.match_watermark.entry(from).or_insert(0);
+            if index > *w {
+                *w = index;
+            }
+            self.disputed.remove(&from);
+            return;
+        }
+
+        // Divergence at `index`. Attribute the fault: group the latest
+        // reports of all voters at exactly this index.
+        let mut same_as_reporter = 1usize; // the reporter itself
+        let mut same_as_us = 1usize; // ourselves
+        let mut aligned_voters = 1usize; // voters with a report at `index` (incl. us)
+        for (&v, &(i, r)) in &self.latest_reports {
+            if v == from || !self.membership.is_voter(v) || i != index {
+                continue;
+            }
+            aligned_voters += 1;
+            if r == root {
+                same_as_reporter += 1;
+            } else if r == own {
+                same_as_us += 1;
+            }
+        }
+        if self.membership.is_voter(self.cfg.id) {
+            aligned_voters += 1; // we reported at this index (root_history hit)
+        }
+        let quorum = self.membership.quorum();
+
+        if same_as_reporter >= quorum {
+            // A quorum agrees with each other against us: we are the
+            // outlier. Step down; the driver repairs us via snapshot.
+            self.events.push(RaftEvent::LeaderOutlier { index, quorum_root: root });
+            let term = self.term;
+            self.become_follower(term, None);
+        } else if same_as_us >= quorum {
+            // Quorum confirms our root: the reporter is the outlier.
+            if self.disputed.insert(from) {
+                self.events.push(RaftEvent::OutlierFollower { node: from, index, reported: root });
+            }
+        } else if aligned_voters >= self.membership.voters.len()
+            && self.deadlock_reported != Some(index)
+        {
+            // Everyone reported at this index and nobody has a quorum.
+            self.deadlock_reported = Some(index);
+            self.events.push(RaftEvent::VerificationDeadlock { index });
+        }
+    }
+
+    /// Leader: the verified index is the highest index (≤ our own
+    /// applied report) that a quorum of voters has root-confirmed.
+    /// Matching at index i implies matching at every j < i (roots are a
+    /// deterministic chain over the same log), so per-node watermarks
+    /// compose into a quorum watermark.
+    fn advance_verified(&mut self) {
+        let Some((own_applied, _)) = self.last_applied_report else { return };
+        let mut marks: Vec<Index> = Vec::with_capacity(self.membership.voters.len());
+        for &v in self.membership.voters.keys() {
+            if v == self.cfg.id {
+                marks.push(own_applied);
+            } else {
+                marks.push(self.match_watermark.get(&v).copied().unwrap_or(0));
+            }
+        }
+        marks.sort_unstable_by(|a, b| b.cmp(a));
+        let quorum = self.membership.quorum();
+        let quorum_mark = marks.get(quorum - 1).copied().unwrap_or(0);
+        let new_verified = quorum_mark.min(self.commit);
+        if new_verified > self.verified {
+            self.verified = new_verified;
+            // Trim history below the verified watermark (keep it).
+            self.root_history = self.root_history.split_off(&self.verified);
+        }
     }
 
     // ── Time ────────────────────────────────────────────────────────
@@ -332,11 +527,27 @@ impl RaftCore {
             Message::VoteResponse { meta, granted } => {
                 self.handle_vote_response(meta, granted);
             }
-            Message::AppendEntries { meta, prev_log_index, prev_log_term, commit, entries } => {
-                self.handle_append_entries(meta, prev_log_index, prev_log_term, commit, entries);
+            Message::AppendEntries {
+                meta, prev_log_index, prev_log_term, commit, verified, entries,
+            } => {
+                self.handle_append_entries(
+                    meta,
+                    prev_log_index,
+                    prev_log_term,
+                    commit,
+                    verified,
+                    entries,
+                );
             }
-            Message::AppendResponse { meta, success, match_index, conflict_index, .. } => {
+            Message::AppendResponse {
+                meta, success, match_index, conflict_index, applied_root,
+            } => {
                 self.handle_append_response(meta, success, match_index, conflict_index);
+                if success {
+                    if let Some((index, root)) = applied_root {
+                        self.record_report(meta.from, index, root);
+                    }
+                }
             }
         }
     }
@@ -380,6 +591,7 @@ impl RaftCore {
         prev_log_index: Index,
         prev_log_term: Term,
         leader_commit: Index,
+        leader_verified: Index,
         entries: Vec<Entry>,
     ) {
         if meta.term < self.term {
@@ -455,12 +667,20 @@ impl RaftCore {
         let new_commit = leader_commit.min(new_match).max(self.commit);
         self.advance_commit_to(new_commit);
 
+        // Adopt the leader's verified watermark for whatever we have
+        // committed ourselves (monotonic).
+        let v = leader_verified.min(self.commit);
+        if v > self.verified {
+            self.verified = v;
+        }
+
+        let applied_root = self.last_applied_report;
         self.send(meta.from, |m| Message::AppendResponse {
             meta: m,
             success: true,
             match_index: new_match,
             conflict_index: 0,
-            applied_root: None,
+            applied_root,
         });
     }
 
@@ -514,6 +734,13 @@ impl RaftCore {
         self.heartbeat_elapsed = 0;
         self.votes.clear();
         self.progress.clear();
+        // Leader-side verification bookkeeping is meaningless as a
+        // follower; the verified watermark itself is monotonic and kept.
+        self.root_history.clear();
+        self.latest_reports.clear();
+        self.match_watermark.clear();
+        self.disputed.clear();
+        self.deadlock_reported = None;
         self.reset_election_timeout();
     }
 
@@ -550,6 +777,16 @@ impl RaftCore {
         self.heartbeat_elapsed = 0;
         self.votes.clear();
         self.recovery_active = false;
+        // Seed our root history with the state machine's current
+        // report so aligned follower reports compare immediately.
+        self.root_history.clear();
+        self.latest_reports.clear();
+        self.match_watermark.clear();
+        self.disputed.clear();
+        self.deadlock_reported = None;
+        if let Some((i, r)) = self.last_applied_report {
+            self.root_history.insert(i, r);
+        }
         self.sync_progress();
         // Commit-the-term entry (§5.4.2: a leader may only count
         // replicas for entries of its own term).
@@ -662,11 +899,13 @@ impl RaftCore {
             .cloned()
             .collect();
         let commit = self.commit;
+        let verified = self.verified;
         self.send(to, |m| Message::AppendEntries {
             meta: m,
             prev_log_index,
             prev_log_term,
             commit,
+            verified,
             entries,
         });
     }
@@ -783,6 +1022,7 @@ impl RaftCore {
             hard_state,
             messages: std::mem::take(&mut self.msgs),
             committed_entries,
+            events: std::mem::take(&mut self.events),
         }
     }
 

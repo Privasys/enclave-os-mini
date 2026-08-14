@@ -5,11 +5,14 @@ edition = "2021"
 license = "AGPL-3.0"
 description = "Attested Raft consensus core for Enclave OS (Mini) clusters"
 
-# The consensus core is deliberately dependency-free: a sans-I/O state
-# machine (messages in, messages out, ticks in) with a hand-rolled wire
-# codec. Storage, networking and the ledger state machine are wired in
-# by the enclave runtime (see docs/raft.md when it lands with WS3+).
+# The consensus core (core/message/types) is deliberately
+# dependency-free: a sans-I/O state machine with a hand-rolled wire
+# codec. The merkle dependency serves only the ledger adapter
+# (ledger.rs): sealing forks into transactions and applying committed
+# transactions with root-transition verification. Networking and log
+# persistence are wired in by the enclave runtime (WS4).
 [dependencies]
+enclave-os-merkle = { path = "../enclave-os-merkle" }
 
 # Standalone workspace so `cargo test` runs here without the repo root
 # workspace (which excludes module crates; same pattern as

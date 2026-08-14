@@ -46,9 +46,13 @@
 pub mod types;
 pub mod message;
 pub mod core;
+pub mod transaction;
+pub mod ledger;
 
-pub use crate::core::{Config, ProposeError, RaftCore, Ready};
+pub use crate::core::{Config, LedgerRoot, ProposeError, RaftCore, RaftEvent, Ready};
+pub use crate::ledger::{LedgerError, MerkleLedger};
 pub use crate::message::Message;
+pub use crate::transaction::Transaction;
 pub use crate::types::{
     ConfigChange, Entry, EntryKind, HardState, Incarnation, Index, Membership, NodeId, Role, Term,
 };
