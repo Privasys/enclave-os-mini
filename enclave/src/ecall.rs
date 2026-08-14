@@ -597,11 +597,19 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
                     return -36;
                 }
             };
+            // Joining nodes supply the CLUSTER's original genesis
+            // voter list (not including themselves).
+            let genesis_voters: Option<Vec<u64>> = config
+                .extra
+                .get("raft_genesis_voters")
+                .and_then(|v| v.as_array())
+                .map(|a| a.iter().filter_map(|v| v.as_u64()).collect());
             match crate::raftglue::RaftGlue::new(
                 sealed_cfg.master_key(),
                 cluster_key,
                 node_id,
                 peers,
+                genesis_voters,
                 ca,
             ) {
                 Ok(glue) => {

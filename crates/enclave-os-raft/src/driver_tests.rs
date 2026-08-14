@@ -309,3 +309,133 @@ fn driver_restart_absorbs_applied_floor_lag() {
     c.tick_all();
     assert_eq!(c.root(f), c.root(l));
 }
+
+/// A diverged ledger is repaired by full replay: fresh store, zeroed
+/// applied floor, every committed transaction re-applies from the log.
+#[test]
+fn driver_rebuild_repairs_diverged_ledger() {
+    let mut c = MiniCluster::new(3);
+    let l = c.wait_for_leader(300);
+    c.propose_txn(&[(b"a", Some(b"1"))]);
+    c.propose_txn(&[(b"b", Some(b"2"))]);
+    c.tick_all();
+    let root = c.root(l);
+
+    // Corrupt a follower's ledger out-of-band (the host cannot do this
+    // undetected — this models a diverged replica after the fact).
+    let f = (1..=3).find(|&id| id != l).unwrap();
+    c.drivers
+        .get_mut(&f)
+        .unwrap()
+        .ledger_mut()
+        .store_mut()
+        .put_batch(&[(b"__evil__".to_vec(), Some(b"x".to_vec()))])
+        .unwrap();
+    assert_ne!(c.root(f), root);
+
+    // The next committed transaction fails its root_before check.
+    let ops: Vec<(Vec<u8>, Option<Vec<u8>>)> = vec![(b"c".to_vec(), Some(b"3".to_vec()))];
+    let (_, out) = c.drivers.get_mut(&l).unwrap().propose_transaction(&ops).unwrap();
+    c.queue.extend(out.messages);
+    // Pump manually: the diverged follower's step returns Diverged.
+    let mut diverged = false;
+    for _ in 0..10_000 {
+        let Some((to, msg)) = c.queue.pop_front() else { break };
+        match c.drivers.get_mut(&to).unwrap().step(msg) {
+            Ok(out) => c.queue.extend(out.messages),
+            Err(crate::driver::DriverError::Diverged { .. }) => {
+                assert_eq!(to, f);
+                diverged = true;
+            }
+            Err(e) => panic!("unexpected driver error: {e:?}"),
+        }
+    }
+    assert!(diverged, "divergence must be detected");
+    assert!(c.drivers[&f].is_halted());
+
+    // Repair: fresh ledger over the same backend, full replay.
+    let (log_b, ledger_b) = c.backends[&f].clone();
+    c.drivers.remove(&f);
+    let fresh = MerkleStore::create(ledger_b, CK, sk(f)).unwrap();
+    let driver = RaftDriver::rebuild(
+        Config::new(f, 999, f.wrapping_mul(7919).wrapping_add(999)),
+        log_b,
+        LOG_KEY,
+        fresh,
+    )
+    .unwrap();
+    c.drivers.insert(f, driver);
+
+    // The repaired node replays, catches up and re-verifies.
+    for _ in 0..40 {
+        c.tick_all();
+    }
+    assert!(!c.drivers[&f].is_halted());
+    assert_eq!(c.root(f), c.root(l));
+    let store = c.drivers[&f].ledger().store();
+    assert_eq!(store.get(b"c").unwrap(), Some(b"3".to_vec()));
+    assert_eq!(store.get(b"__evil__").unwrap(), None, "corruption gone after rebuild");
+}
+
+/// A brand-new node (not in genesis) joins as a learner via config
+/// change, catches up by log replication, and is promoted to voter.
+#[test]
+fn driver_learner_joins_and_promotes() {
+    let mut c = MiniCluster::new(3);
+    let l = c.wait_for_leader(300);
+    c.propose_txn(&[(b"base", Some(b"1"))]);
+    c.tick_all();
+
+    // Node 4: knows the CLUSTER's genesis voters (1..3), is not one.
+    let log_b = SharedMem::new();
+    let ledger_b = SharedMem::new();
+    let store = MerkleStore::create(ledger_b.clone(), CK, sk(4)).unwrap();
+    let driver = RaftDriver::bootstrap(
+        Config::new(4, 7, 4 * 7919),
+        &[1, 2, 3], // cluster genesis, not including itself
+        log_b.clone(),
+        LOG_KEY,
+        store,
+    )
+    .unwrap();
+    c.drivers.insert(4, driver);
+    c.backends.insert(4, (log_b, ledger_b));
+
+    let (_, out) = c
+        .drivers
+        .get_mut(&l)
+        .unwrap()
+        .propose_conf_change(crate::types::ConfigChange::AddLearner { node: 4 })
+        .unwrap();
+    c.queue.extend(out.messages);
+    c.pump();
+    for _ in 0..20 {
+        c.tick_all();
+    }
+    assert_eq!(c.root(4), c.root(l), "learner failed to catch up");
+    assert!(!c.drivers[&4].core().membership().is_voter(4));
+
+    let inc = c.drivers[&l].core().peer_incarnation(4).expect("leader saw learner");
+    let (_, out) = c
+        .drivers
+        .get_mut(&l)
+        .unwrap()
+        .propose_conf_change(crate::types::ConfigChange::PromoteVoter { node: 4, incarnation: inc })
+        .unwrap();
+    c.queue.extend(out.messages);
+    c.pump();
+    for _ in 0..10 {
+        c.tick_all();
+    }
+    assert!(c.drivers[&l].core().membership().is_voter(4));
+    assert!(c.drivers[&4].core().self_admitted());
+
+    // The new voter counts: 4-voter quorum (3) survives one crash.
+    let crash = (1..=3).find(|&id| id != l).unwrap();
+    c.drivers.remove(&crash);
+    c.propose_txn(&[(b"after", Some(b"2"))]);
+    for _ in 0..10 {
+        c.tick_all();
+    }
+    assert_eq!(c.drivers[&4].ledger().store().get(b"after").unwrap(), Some(b"2".to_vec()));
+}

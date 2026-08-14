@@ -84,6 +84,28 @@ impl<B: KvBackend> RaftDriver<B> {
         Ok(Self { core, ledger, log, applied_floor: 0, halted: false })
     }
 
+    /// Repair a diverged (or discarded) ledger by full replay: zero
+    /// the applied floor and restore with a FRESH ledger store, so
+    /// every committed transaction re-applies from the log. Safe
+    /// because apply is deterministic; the rebuilt state ends at
+    /// exactly the committed history. This is the repair path while
+    /// the log is uncompacted; snapshot streaming replaces it once
+    /// pruning lands.
+    pub fn rebuild(
+        cfg: Config,
+        log_backend: B,
+        log_key: [u8; 32],
+        fresh_ledger: MerkleStore<B>,
+    ) -> Result<Self, DriverError>
+    where
+        B: Clone,
+    {
+        let (mut log, _) = LogStore::open(log_backend.clone(), log_key)?;
+        log.set_applied_floor(0)?;
+        drop(log);
+        Self::restore(cfg, log_backend, log_key, fresh_ledger)
+    }
+
     /// Restart: recover the log, rebuild the core, restore the ledger
     /// from its checkpoint, and reconcile the applied floor.
     pub fn restore(

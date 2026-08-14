@@ -91,6 +91,14 @@ pub struct RaftGlue {
     dial_pending: BTreeMap<u32, NodeId>,
     /// Ticks until the next dial attempt per down peer.
     backoff: BTreeMap<NodeId, u32>,
+    /// Materials for ledger repair-by-replay.
+    node_id: NodeId,
+    ck: [u8; 32],
+    sk: [u8; 32],
+    log_key: [u8; 32],
+    seed: u64,
+    /// One automatic repair per boot; a repeat divergence is a bug.
+    repair_attempted: bool,
     diverged_logged: bool,
     /// Last logged (role, term, leader, commit, verified) for
     /// transition logging.
@@ -103,6 +111,7 @@ impl RaftGlue {
         cluster_key: [u8; 32],
         node_id: NodeId,
         peers: BTreeMap<NodeId, String>,
+        genesis_voters: Option<Vec<NodeId>>,
         ca: CaContext,
     ) -> Result<Self, String> {
         let ck = derive(&cluster_key, b"enclave-os-raft:ck:v1");
@@ -132,15 +141,26 @@ impl RaftGlue {
         // back to genesis re-enters at incarnation 0 until the first
         // committed refresh retires it — documented in the plan,
         // constrained by quorum root confirmation.
-        let incarnation = if exists { random_incarnation } else { 0 };
+        // A joining node supplies the CLUSTER's genesis voters via
+        // config (itself not among them) and enters as a non-member
+        // until the leader commits an AddLearner for it. Bootstrapping
+        // founders default to "all configured nodes are voters".
+        let joining =
+            genesis_voters.as_ref().map(|v| !v.contains(&node_id)).unwrap_or(false);
+        let incarnation = if exists || joining { random_incarnation } else { 0 };
         let cfg = Config::new(node_id, incarnation, seed);
         let driver = if exists {
             RaftDriver::restore(cfg, log_backend, log_key, store)
         } else {
-            // Static-cluster genesis: every configured node is a voter.
-            let mut voters: Vec<NodeId> = peers.keys().copied().collect();
-            voters.push(node_id);
-            voters.sort_unstable();
+            let voters: Vec<NodeId> = match genesis_voters {
+                Some(v) => v,
+                None => {
+                    let mut voters: Vec<NodeId> = peers.keys().copied().collect();
+                    voters.push(node_id);
+                    voters.sort_unstable();
+                    voters
+                }
+            };
             RaftDriver::bootstrap(cfg, &voters, log_backend, log_key, store)
         }
         .map_err(|e| format!("raft driver: {e:?}"))?;
@@ -160,9 +180,39 @@ impl RaftGlue {
             conn_nodes: BTreeMap::new(),
             dial_pending: BTreeMap::new(),
             backoff: BTreeMap::new(),
+            node_id,
+            ck,
+            sk,
+            log_key,
+            seed,
+            repair_attempted: false,
             diverged_logged: false,
             last_logged: None,
         })
+    }
+
+    /// Repair-by-replay: fresh ledger over the same backend, zeroed
+    /// applied floor, full deterministic replay of the committed log.
+    fn repair(&mut self) -> Result<(), String> {
+        let rng = SystemRandom::new();
+        let mut buf = [0u8; 8];
+        rng.fill(&mut buf).map_err(|_| "rng".to_string())?;
+        let incarnation = u64::from_le_bytes(buf);
+        let fresh = MerkleStore::create(
+            OcallBackend::with_table("raft:ledger"),
+            self.ck,
+            self.sk,
+        )
+        .map_err(|e| format!("fresh ledger: {e}"))?;
+        let cfg = Config::new(self.node_id, incarnation, self.seed.wrapping_add(incarnation));
+        self.driver = enclave_os_raft::RaftDriver::rebuild(
+            cfg,
+            OcallBackend::with_table("raft:log"),
+            self.log_key,
+            fresh,
+        )
+        .map_err(|e| format!("rebuild: {e:?}"))?;
+        Ok(())
     }
 
     // ── Event-loop inputs ───────────────────────────────────────────
@@ -261,12 +311,26 @@ impl RaftGlue {
         match f(&mut self.driver) {
             Ok(out) => self.dispatch(out),
             Err(DriverError::Diverged { index, .. }) => {
-                if !self.diverged_logged {
-                    self.diverged_logged = true;
-                    enclave_log_error!(
-                        "raft ledger DIVERGED at index {} — node halted, needs snapshot repair",
+                enclave_log_error!("raft ledger DIVERGED at index {}", index);
+                if self.repair_attempted {
+                    if !self.diverged_logged {
+                        self.diverged_logged = true;
+                        enclave_log_error!(
+                            "raft: divergence AFTER repair — halted, operator needed"
+                        );
+                    }
+                    return;
+                }
+                self.repair_attempted = true;
+                match self.repair() {
+                    Ok(()) => enclave_log_error!(
+                        "raft: ledger rebuilt by replay after divergence at index {}",
                         index
-                    );
+                    ),
+                    Err(e) => {
+                        self.diverged_logged = true;
+                        enclave_log_error!("raft: repair failed: {} — halted", e);
+                    }
                 }
             }
             Err(e) => enclave_log_error!("raft driver error: {:?}", e),
@@ -339,14 +403,28 @@ impl RaftGlue {
                 self.dispatch(out);
                 ok_json(serde_json::json!({ "index": index, "status": "proposed" }))
             }
-            Err(_) => {
-                let leader = self.driver.core().leader_id();
-                err_json_with(serde_json::json!({
-                    "error": "not the leader",
-                    "leader": leader,
-                }))
-            }
+            Err(_) => self.not_leader(),
         }
+    }
+
+    fn propose_member_change(&mut self, cc: enclave_os_raft::ConfigChange) -> Response {
+        match self.driver.propose_conf_change(cc) {
+            Ok((index, out)) => {
+                self.dispatch(out);
+                ok_json(serde_json::json!({ "index": index, "status": "proposed" }))
+            }
+            Err(enclave_os_raft::ProposeError::ConfigChangePending) => {
+                err_json("a membership change is already in flight")
+            }
+            Err(_) => self.not_leader(),
+        }
+    }
+
+    fn not_leader(&self) -> Response {
+        err_json_with(serde_json::json!({
+            "error": "not the leader",
+            "leader": self.driver.core().leader_id(),
+        }))
     }
 }
 
@@ -358,6 +436,17 @@ struct RaftEnvelope {
     raft_status: Option<serde_json::Value>,
     #[serde(default)]
     raft_txn: Option<TxnReq>,
+    #[serde(default)]
+    raft_add_learner: Option<MemberReq>,
+    #[serde(default)]
+    raft_promote: Option<MemberReq>,
+    #[serde(default)]
+    raft_remove: Option<MemberReq>,
+}
+
+#[derive(Deserialize)]
+struct MemberReq {
+    node: u64,
 }
 
 #[derive(Deserialize)]
@@ -403,7 +492,10 @@ impl EnclaveModule for RaftModule {
             Err(_) => return None,
         };
         let is_read = env.raft_status.is_some();
-        let is_write = env.raft_txn.is_some();
+        let is_write = env.raft_txn.is_some()
+            || env.raft_add_learner.is_some()
+            || env.raft_promote.is_some()
+            || env.raft_remove.is_some();
         if !is_read && !is_write {
             return None;
         }
@@ -427,6 +519,24 @@ impl EnclaveModule for RaftModule {
         if env.raft_status.is_some() {
             let status = g.status_json();
             return Some(ok_json(status));
+        }
+        if let Some(req) = env.raft_add_learner {
+            return Some(g.propose_member_change(
+                enclave_os_raft::ConfigChange::AddLearner { node: req.node },
+            ));
+        }
+        if let Some(req) = env.raft_promote {
+            let Some(incarnation) = g.driver.core().peer_incarnation(req.node) else {
+                return Some(err_json("node not seen yet (is the learner connected?)"));
+            };
+            return Some(g.propose_member_change(
+                enclave_os_raft::ConfigChange::PromoteVoter { node: req.node, incarnation },
+            ));
+        }
+        if let Some(req) = env.raft_remove {
+            return Some(g.propose_member_change(
+                enclave_os_raft::ConfigChange::RemoveNode { node: req.node },
+            ));
         }
         if let Some(txn) = env.raft_txn {
             let mut ops: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(txn.ops.len());
