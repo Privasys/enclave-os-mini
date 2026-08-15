@@ -101,6 +101,7 @@ pub struct RaftGlue {
     backoff: BTreeMap<NodeId, u32>,
     /// Materials for ledger repair-by-replay.
     node_id: NodeId,
+    master_key: [u8; 32],
     ck: [u8; 32],
     sk: [u8; 32],
     log_key: [u8; 32],
@@ -182,6 +183,11 @@ impl RaftGlue {
             RaftDriver::bootstrap(cfg, &voters, log_backend, log_key, store)
         }
         .map_err(|e| format!("raft driver: {e:?}"))?;
+        let mut driver = driver;
+        // Commit certificates: derive the signing key from the master
+        // key; the public key rides in Hello and the leader registers
+        // it through the log.
+        driver.set_signer(&master_key);
 
         // Peer links only accept enclaves running the SAME binary
         // unless the operator explicitly disables the pin (needed
@@ -210,6 +216,7 @@ impl RaftGlue {
             dial_pending: BTreeMap::new(),
             backoff: BTreeMap::new(),
             node_id,
+            master_key,
             ck,
             sk,
             log_key,
@@ -225,7 +232,7 @@ impl RaftGlue {
     }
 
     fn own_meta(&self) -> MsgMeta {
-        let Message::Hello { meta } = self.driver.core().hello() else { unreachable!() };
+        let Message::Hello { meta, .. } = self.driver.core().hello() else { unreachable!() };
         meta
     }
 
@@ -250,6 +257,7 @@ impl RaftGlue {
             fresh,
         )
         .map_err(|e| format!("rebuild: {e:?}"))?;
+        self.driver.set_signer(&self.master_key);
         Ok(())
     }
 
@@ -651,6 +659,8 @@ struct RaftEnvelope {
     #[serde(default)]
     raft_status: Option<serde_json::Value>,
     #[serde(default)]
+    raft_certificate: Option<serde_json::Value>,
+    #[serde(default)]
     raft_txn: Option<TxnReq>,
     #[serde(default)]
     raft_add_learner: Option<MemberReq>,
@@ -707,7 +717,7 @@ impl EnclaveModule for RaftModule {
             Ok(e) => e,
             Err(_) => return None,
         };
-        let is_read = env.raft_status.is_some();
+        let is_read = env.raft_status.is_some() || env.raft_certificate.is_some();
         let is_write = env.raft_txn.is_some()
             || env.raft_add_learner.is_some()
             || env.raft_promote.is_some()
@@ -735,6 +745,32 @@ impl EnclaveModule for RaftModule {
         if env.raft_status.is_some() {
             let status = g.status_json();
             return Some(ok_json(status));
+        }
+        if env.raft_certificate.is_some() {
+            let core = g.driver.core();
+            let keys: serde_json::Map<String, serde_json::Value> = core
+                .membership()
+                .keys
+                .iter()
+                .map(|(id, k)| (id.to_string(), serde_json::json!(hex_encode(k))))
+                .collect();
+            let cert = core.latest_certificate().map(|c| {
+                let sigs: serde_json::Map<String, serde_json::Value> = c
+                    .sigs
+                    .iter()
+                    .map(|(id, s)| (id.to_string(), serde_json::json!(hex_encode(s))))
+                    .collect();
+                serde_json::json!({
+                    "index": c.index,
+                    "root": hex_encode(&c.root),
+                    "sigs": sigs,
+                })
+            });
+            return Some(ok_json(serde_json::json!({
+                "certificate": cert,
+                "keys": keys,
+                "quorum": core.membership().quorum(),
+            })));
         }
         if let Some(req) = env.raft_add_learner {
             return Some(g.propose_member_change(

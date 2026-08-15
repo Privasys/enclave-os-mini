@@ -46,12 +46,14 @@
 pub mod types;
 pub mod message;
 pub mod core;
+pub mod certs;
 pub mod transaction;
 pub mod ledger;
 pub mod logstore;
 pub mod driver;
 pub mod transfer;
 
+pub use crate::certs::{verify_sig, CertSigner, CommitCertificate};
 pub use crate::core::{Config, LedgerRoot, ProposeError, RaftCore, RaftEvent, Ready};
 pub use crate::driver::{DriverError, DriverOutput, RaftDriver};
 pub use crate::ledger::{LedgerError, MerkleLedger};

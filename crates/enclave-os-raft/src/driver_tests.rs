@@ -753,3 +753,64 @@ fn snapshot_message_codec_roundtrip() {
     let m = Message::SnapshotAck { meta, seq: 4, done: false };
     assert_eq!(Message::decode(&m.encode()).unwrap(), m);
 }
+
+/// Commit certificates: keys announced via Hello, registered by the
+/// leader through the log, signatures collected from root reports, a
+/// quorum certificate assembled and offline-verifiable — with tampered
+/// signatures and roots rejected.
+#[test]
+fn commit_certificates_assemble_and_verify() {
+    let mut c = MiniCluster::new(3);
+    for id in 1..=3u64 {
+        let seed = [id as u8 + 0x40; 32];
+        c.drivers.get_mut(&id).unwrap().set_signer(&seed);
+    }
+    let l = c.wait_for_leader(300);
+
+    // Hellos carry the followers' signing keys to the leader (the
+    // transport sends these on link establishment).
+    let hellos: Vec<Message> =
+        (1..=3).filter(|&i| i != l).map(|i| c.drivers[&i].core().hello()).collect();
+    for h in hellos {
+        let out = c.drivers.get_mut(&l).unwrap().step(h).unwrap();
+        c.queue.extend(out.messages);
+    }
+    c.pump();
+    // Key registrations commit one config change at a time.
+    for _ in 0..40 {
+        c.tick_all();
+        if c.drivers[&l].core().membership().keys.len() == 3 {
+            break;
+        }
+    }
+    let m = c.drivers[&l].core().membership().clone();
+    assert_eq!(m.keys.len(), 3, "all signing keys registered");
+
+    c.txn(b"certified", b"1");
+    for _ in 0..10 {
+        c.tick_all();
+    }
+
+    let cert = c.drivers[&l].core().latest_certificate().expect("certificate").clone();
+    assert!(cert.sigs.len() >= m.quorum(), "quorum of signatures");
+    assert!(cert.verify(&m), "certificate verifies against registered keys");
+
+    // A tampered signature poisons the certificate.
+    let mut bad = cert.clone();
+    let k = *bad.sigs.keys().next().unwrap();
+    bad.sigs.get_mut(&k).unwrap()[0] ^= 1;
+    assert!(!bad.verify(&m));
+
+    // A tampered root fails every signature.
+    let mut bad = cert.clone();
+    bad.root[0] ^= 1;
+    assert!(!bad.verify(&m));
+
+    // A certificate signed by fewer than a quorum does not verify.
+    let mut thin = cert.clone();
+    while thin.sigs.len() >= m.quorum() {
+        let k = *thin.sigs.keys().next().unwrap();
+        thin.sigs.remove(&k);
+    }
+    assert!(!thin.verify(&m));
+}

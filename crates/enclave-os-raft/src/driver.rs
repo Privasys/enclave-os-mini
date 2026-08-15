@@ -62,6 +62,8 @@ pub struct RaftDriver<B: KvBackend> {
     applied_floor: Index,
     /// Set on divergence: the node stops applying and reporting.
     halted: bool,
+    /// Commit-certificate signer (when configured via `set_signer`).
+    signer: Option<crate::certs::CertSigner>,
 }
 
 impl<B: KvBackend> RaftDriver<B> {
@@ -81,7 +83,7 @@ impl<B: KvBackend> RaftDriver<B> {
         let mut core = RaftCore::new(cfg, genesis, Vec::new(), Default::default());
         // Seed the verification protocol with the ledger's genesis root.
         core.report_applied(0, root);
-        Ok(Self { core, ledger, log, applied_floor: 0, halted: false })
+        Ok(Self { core, ledger, log, applied_floor: 0, halted: false, signer: None })
     }
 
     /// Repair a diverged (or discarded) ledger by full replay: zero
@@ -128,7 +130,7 @@ impl<B: KvBackend> RaftDriver<B> {
         let ledger = MerkleLedger::new(ledger_store);
         let (root, _) = ledger.root();
         core.report_applied(floor, root);
-        Ok(Self { core, ledger, log, applied_floor: floor, halted: false })
+        Ok(Self { core, ledger, log, applied_floor: floor, halted: false, signer: None })
     }
 
     /// Compact the log through `through` (capped at the applied index):
@@ -178,7 +180,7 @@ impl<B: KvBackend> RaftDriver<B> {
         self.applied_floor = index;
         self.halted = false;
         let (root, _) = self.ledger.root();
-        self.core.report_applied(index, root);
+        self.signed_report(index, root);
         Ok(true)
     }
 
@@ -198,6 +200,20 @@ impl<B: KvBackend> RaftDriver<B> {
     /// snapshot streams from it.
     pub fn ledger_pin(&mut self, version: Option<u64>) {
         self.ledger.store_mut().pin_version(version);
+    }
+
+    /// Enable commit-certificate signing: derive this node's P-256 key
+    /// from `seed` (the enclave master key in production) and announce
+    /// the public key. Call right after construction.
+    pub fn set_signer(&mut self, seed: &[u8; 32]) {
+        let signer = crate::certs::CertSigner::from_seed(seed);
+        self.core.set_signing_key_pub(signer.public_key());
+        self.signer = Some(signer);
+    }
+
+    fn signed_report(&mut self, index: Index, root: LedgerRoot) {
+        let sig = self.signer.as_ref().map(|s| s.sign(index, &root));
+        self.core.report_applied_signed(index, root, sig);
     }
 
     // ── Accessors ───────────────────────────────────────────────────
@@ -324,7 +340,7 @@ impl<B: KvBackend> RaftDriver<B> {
                     },
                     _ => self.ledger.root().0,
                 };
-                self.core.report_applied(e.index, root);
+                self.signed_report(e.index, root);
                 last_applied = Some(e.index);
             }
             if let Some(i) = last_applied {

@@ -55,13 +55,19 @@ pub enum Message {
         conflict_index: Index,
         /// Verified-commit report (WS3): `(applied_index, ledger_root)`.
         applied_root: Option<(Index, [u8; 32])>,
+        /// Commit-certificate signature over `applied_root` (64-byte
+        /// P-256 `r ‖ s`), when the node has a signing key.
+        root_sig: Option<Vec<u8>>,
     },
     /// Sent by the dialing side when a peer link establishes, so the
     /// receiver can map the connection to a node id before any
     /// consensus traffic flows (a joining non-member never speaks
-    /// otherwise). Consensus ignores it.
+    /// otherwise). Carries the sender's certificate signing key
+    /// (compressed SEC1 P-256; empty = none). Consensus ignores it
+    /// beyond bookkeeping.
     Hello {
         meta: MsgMeta,
+        signing_key: Vec<u8>,
     },
     /// Leader → follower: a snapshot transfer begins. The stream
     /// reproduces the ledger state as of log `index` (term `term`,
@@ -102,7 +108,7 @@ impl Message {
             | Message::VoteResponse { meta, .. }
             | Message::AppendEntries { meta, .. }
             | Message::AppendResponse { meta, .. }
-            | Message::Hello { meta }
+            | Message::Hello { meta, .. }
             | Message::SnapshotStart { meta, .. }
             | Message::SnapshotChunk { meta, .. }
             | Message::SnapshotAck { meta, .. } => *meta,
@@ -116,7 +122,7 @@ impl Message {
             Message::VoteResponse { meta, .. } => (2, meta),
             Message::AppendEntries { meta, .. } => (3, meta),
             Message::AppendResponse { meta, .. } => (4, meta),
-            Message::Hello { meta } => (5, meta),
+            Message::Hello { meta, .. } => (5, meta),
             Message::SnapshotStart { meta, .. } => (6, meta),
             Message::SnapshotChunk { meta, .. } => (7, meta),
             Message::SnapshotAck { meta, .. } => (8, meta),
@@ -151,7 +157,7 @@ impl Message {
                 }
             }
             Message::AppendResponse {
-                success, match_index, conflict_index, applied_root, ..
+                success, match_index, conflict_index, applied_root, root_sig, ..
             } => {
                 buf.push(*success as u8);
                 buf.extend_from_slice(&match_index.to_le_bytes());
@@ -164,8 +170,19 @@ impl Message {
                     }
                     None => buf.push(0),
                 }
+                match root_sig {
+                    Some(sig) => {
+                        buf.push(1);
+                        buf.extend_from_slice(&(sig.len() as u32).to_le_bytes());
+                        buf.extend_from_slice(sig);
+                    }
+                    None => buf.push(0),
+                }
             }
-            Message::Hello { .. } => {}
+            Message::Hello { signing_key, .. } => {
+                buf.extend_from_slice(&(signing_key.len() as u32).to_le_bytes());
+                buf.extend_from_slice(signing_key);
+            }
             Message::SnapshotStart { index, term, ledger_version, root, membership, .. } => {
                 buf.extend_from_slice(&index.to_le_bytes());
                 buf.extend_from_slice(&term.to_le_bytes());
@@ -251,9 +268,33 @@ impl Message {
                     }
                     _ => return None,
                 };
-                Message::AppendResponse { meta, success, match_index, conflict_index, applied_root }
+                let root_sig = match get_u8(data, &mut off)? {
+                    0 => None,
+                    1 => {
+                        let len = get_u32(data, &mut off)? as usize;
+                        if len > 128 {
+                            return None;
+                        }
+                        Some(get_bytes(data, &mut off, len)?.to_vec())
+                    }
+                    _ => return None,
+                };
+                Message::AppendResponse {
+                    meta,
+                    success,
+                    match_index,
+                    conflict_index,
+                    applied_root,
+                    root_sig,
+                }
             }
-            5 => Message::Hello { meta },
+            5 => {
+                let len = get_u32(data, &mut off)? as usize;
+                if len > 128 {
+                    return None;
+                }
+                Message::Hello { meta, signing_key: get_bytes(data, &mut off, len)?.to_vec() }
+            }
             6 => {
                 let index = get_u64(data, &mut off)?;
                 let term = get_u64(data, &mut off)?;
@@ -378,6 +419,7 @@ mod tests {
             match_index: 12,
             conflict_index: 0,
             applied_root: Some((11, [0xAB; 32])),
+            root_sig: None,
         };
         assert_eq!(Message::decode(&m.encode()).unwrap(), m);
         let m2 = Message::AppendResponse {
@@ -386,6 +428,7 @@ mod tests {
             match_index: 0,
             conflict_index: 8,
             applied_root: None,
+            root_sig: None,
         };
         assert_eq!(Message::decode(&m2.encode()).unwrap(), m2);
     }

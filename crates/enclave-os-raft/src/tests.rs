@@ -851,6 +851,7 @@ fn no_commit_of_old_term_entries_by_counting() {
             match_index: 1,
             conflict_index: 0,
             applied_root: None,
+            root_sig: None,
         });
     }
     assert_eq!(
@@ -867,6 +868,7 @@ fn no_commit_of_old_term_entries_by_counting() {
             match_index: 2,
             conflict_index: 0,
             applied_root: None,
+            root_sig: None,
         });
     }
     assert_eq!(n1.commit_index(), 2);

@@ -66,6 +66,10 @@ pub struct Config {
     /// Seed for the election-timeout jitter (any entropy; the driver
     /// should derive it from in-enclave randomness).
     pub seed: u64,
+    /// This node's commit-certificate public key (compressed SEC1
+    /// P-256), announced in Hello and registered by the leader. Empty
+    /// disables certificate participation.
+    pub signing_key_pub: Vec<u8>,
 }
 
 impl Config {
@@ -78,6 +82,7 @@ impl Config {
             recovery_ticks: 100,
             max_entries_per_msg: 256,
             seed,
+            signing_key_pub: Vec::new(),
         }
     }
 }
@@ -192,6 +197,15 @@ pub struct RaftCore {
     disputed: BTreeSet<NodeId>,
     /// Deadlock event dedupe.
     deadlock_reported: Option<Index>,
+    /// Our latest root-report signature (rides in AppendResponse).
+    last_report_sig: Option<Vec<u8>>,
+    /// Leader: collected report signatures per index (trimmed as
+    /// certificates assemble).
+    sigs_by_index: BTreeMap<Index, BTreeMap<NodeId, Vec<u8>>>,
+    /// The freshest assembled quorum certificate.
+    latest_cert: Option<crate::certs::CommitCertificate>,
+    /// Signing keys observed in Hello frames (leader registers them).
+    seen_keys: BTreeMap<NodeId, Vec<u8>>,
 
     // ── Ready accumulation ──────────────────────────────────────────
     msgs: Vec<(NodeId, Message)>,
@@ -265,6 +279,10 @@ impl RaftCore {
             match_watermark: BTreeMap::new(),
             disputed: BTreeSet::new(),
             deadlock_reported: None,
+            last_report_sig: None,
+            sigs_by_index: BTreeMap::new(),
+            latest_cert: None,
+            seen_keys: BTreeMap::new(),
             msgs: Vec::new(),
             events: Vec::new(),
             persist_from,
@@ -340,6 +358,7 @@ impl RaftCore {
                 term: self.term,
                 incarnation: self.cfg.incarnation,
             },
+            signing_key: self.cfg.signing_key_pub.clone(),
         }
     }
 
@@ -355,6 +374,13 @@ impl RaftCore {
     /// block on this.
     pub fn verified_index(&self) -> Index {
         self.verified
+    }
+
+    /// Set (or replace) this node's commit-certificate public key
+    /// (announced in Hello, registered by the leader). Call right
+    /// after construction, before any messages flow.
+    pub fn set_signing_key_pub(&mut self, key: Vec<u8>) {
+        self.cfg.signing_key_pub = key;
     }
 
     /// Restore-time only: entries at or below `floor` are already
@@ -478,6 +504,17 @@ impl RaftCore {
     /// its own roots to advance the verified index and to detect
     /// divergence (see [`RaftEvent`]).
     pub fn report_applied(&mut self, index: Index, root: LedgerRoot) {
+        self.report_applied_signed(index, root, None)
+    }
+
+    /// [`Self::report_applied`] with a commit-certificate signature
+    /// over `(index, root)` (produced by the driver's signer).
+    pub fn report_applied_signed(
+        &mut self,
+        index: Index,
+        root: LedgerRoot,
+        sig: Option<Vec<u8>>,
+    ) {
         if let Some((prev, _)) = self.last_applied_report {
             debug_assert!(
                 index >= prev,
@@ -488,7 +525,11 @@ impl RaftCore {
             );
         }
         self.last_applied_report = Some((index, root));
+        self.last_report_sig = sig.clone();
         if self.role == Role::Leader {
+            if let Some(sig) = sig {
+                self.stash_sig(index, self.cfg.id, sig);
+            }
             self.root_history.insert(index, root);
             // Late follower reports may have been waiting for our own
             // root at this index.
@@ -506,7 +547,13 @@ impl RaftCore {
     }
 
     /// Leader: process a follower's `(applied_index, root)` report.
-    fn record_report(&mut self, from: NodeId, index: Index, root: LedgerRoot) {
+    fn record_report(
+        &mut self,
+        from: NodeId,
+        index: Index,
+        root: LedgerRoot,
+        sig: Option<Vec<u8>>,
+    ) {
         if self.role != Role::Leader || !self.membership.is_voter(from) {
             return;
         }
@@ -515,8 +562,20 @@ impl RaftCore {
             _ => {}
         }
         self.latest_reports.insert(from, (index, root));
+        if let Some(sig) = sig {
+            self.stash_sig(index, from, sig);
+        }
         self.evaluate_report(from, index, root);
         self.advance_verified();
+    }
+
+    fn stash_sig(&mut self, index: Index, node: NodeId, sig: Vec<u8>) {
+        self.sigs_by_index.entry(index).or_default().insert(node, sig);
+    }
+
+    /// The freshest quorum-signed commit certificate, if one assembled.
+    pub fn latest_certificate(&self) -> Option<&crate::certs::CommitCertificate> {
+        self.latest_cert.as_ref()
     }
 
     fn evaluate_report(&mut self, from: NodeId, index: Index, root: LedgerRoot) {
@@ -605,6 +664,31 @@ impl RaftCore {
             self.verified = new_verified;
             // Trim history below the verified watermark (keep it).
             self.root_history = self.root_history.split_off(&self.verified);
+            self.assemble_certificate();
+        }
+    }
+
+    /// Assemble the freshest quorum certificate from collected report
+    /// signatures (at the highest verified index holding a quorum).
+    fn assemble_certificate(&mut self) {
+        let quorum = self.membership.quorum();
+        let candidate = self
+            .sigs_by_index
+            .range(..=self.verified)
+            .rev()
+            .find(|(_, sigs)| {
+                sigs.keys().filter(|n| self.membership.is_voter(**n)).count() >= quorum
+            })
+            .map(|(&i, sigs)| (i, sigs.clone()));
+        if let Some((index, sigs)) = candidate {
+            if let Some(&root) = self.root_history.get(&index) {
+                if self.latest_cert.as_ref().map(|c| c.index).unwrap_or(0) < index {
+                    self.latest_cert =
+                        Some(crate::certs::CommitCertificate { index, root, sigs });
+                }
+                // Older signature buckets can never beat this cert.
+                self.sigs_by_index = self.sigs_by_index.split_off(&(index + 1));
+            }
         }
     }
 
@@ -718,18 +802,22 @@ impl RaftCore {
                 );
             }
             Message::AppendResponse {
-                meta, success, match_index, conflict_index, applied_root,
+                meta, success, match_index, conflict_index, applied_root, root_sig,
             } => {
                 self.handle_append_response(meta, success, match_index, conflict_index);
                 if success {
                     if let Some((index, root)) = applied_root {
-                        self.record_report(meta.from, index, root);
+                        self.record_report(meta.from, index, root, root_sig);
                     }
                 }
             }
-            Message::Hello { .. } => {
+            Message::Hello { meta, signing_key } => {
                 // Link-layer introduction; the prologue above already
-                // recorded the sender's incarnation.
+                // recorded the sender's incarnation. Remember its
+                // signing key so the leader can register it.
+                if !signing_key.is_empty() {
+                    self.seen_keys.insert(meta.from, signing_key);
+                }
             }
             Message::SnapshotStart { .. }
             | Message::SnapshotChunk { .. }
@@ -790,6 +878,7 @@ impl RaftCore {
                 match_index: 0,
                 conflict_index: 0,
                 applied_root: None,
+root_sig: None,
             });
             return;
         }
@@ -805,12 +894,14 @@ impl RaftCore {
         if prev_log_index < self.commit {
             let commit = self.commit;
             let applied_root = self.last_applied_report;
+            let root_sig = self.last_report_sig.clone();
             self.send(meta.from, |m| Message::AppendResponse {
                 meta: m,
                 success: true,
                 match_index: commit,
                 conflict_index: 0,
                 applied_root,
+                root_sig,
             });
             return;
         }
@@ -824,6 +915,7 @@ impl RaftCore {
                 match_index: 0,
                 conflict_index: conflict,
                 applied_root: None,
+root_sig: None,
             });
             return;
         }
@@ -841,6 +933,7 @@ impl RaftCore {
                 match_index: 0,
                 conflict_index: conflict,
                 applied_root: None,
+root_sig: None,
             });
             return;
         }
@@ -881,12 +974,14 @@ impl RaftCore {
         }
 
         let applied_root = self.last_applied_report;
+        let root_sig = self.last_report_sig.clone();
         self.send(meta.from, |m| Message::AppendResponse {
             meta: m,
             success: true,
             match_index: new_match,
             conflict_index: 0,
             applied_root,
+                root_sig,
         });
     }
 
@@ -946,12 +1041,14 @@ impl RaftCore {
         self.votes.clear();
         self.progress.clear();
         // Leader-side verification bookkeeping is meaningless as a
-        // follower; the verified watermark itself is monotonic and kept.
+        // follower; the verified watermark itself is monotonic and kept
+        // (as is the latest assembled certificate).
         self.root_history.clear();
         self.latest_reports.clear();
         self.match_watermark.clear();
         self.disputed.clear();
         self.deadlock_reported = None;
+        self.sigs_by_index.clear();
         self.reset_election_timeout();
     }
 
@@ -1218,6 +1315,31 @@ impl RaftCore {
             });
         if let Some((node, incarnation)) = stale {
             let _ = self.propose_conf_change(ConfigChange::RefreshIncarnation { node, incarnation });
+            return;
+        }
+
+        // Register commit-certificate signing keys (own first, then any
+        // member whose announced key differs from the registered one).
+        if !self.cfg.signing_key_pub.is_empty()
+            && self.membership.keys.get(&self.cfg.id) != Some(&self.cfg.signing_key_pub)
+        {
+            let cc = ConfigChange::RegisterKey {
+                node: self.cfg.id,
+                key: self.cfg.signing_key_pub.clone(),
+            };
+            let _ = self.propose_conf_change(cc);
+            return;
+        }
+        let unregistered: Option<(NodeId, Vec<u8>)> =
+            self.seen_keys.iter().find_map(|(&id, key)| {
+                if self.membership.contains(id) && self.membership.keys.get(&id) != Some(key) {
+                    Some((id, key.clone()))
+                } else {
+                    None
+                }
+            });
+        if let Some((node, key)) = unregistered {
+            let _ = self.propose_conf_change(ConfigChange::RegisterKey { node, key });
         }
     }
 

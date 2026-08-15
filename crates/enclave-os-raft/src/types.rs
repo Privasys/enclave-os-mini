@@ -86,6 +86,9 @@ pub enum ConfigChange {
     RemoveNode { node: NodeId },
     /// Re-admit a restarted voter under its new incarnation.
     RefreshIncarnation { node: NodeId, incarnation: Incarnation },
+    /// Register (or update) a node's commit-certificate signing key
+    /// (compressed SEC1 P-256 point, 33 bytes).
+    RegisterKey { node: NodeId, key: Vec<u8> },
 }
 
 impl ConfigChange {
@@ -111,6 +114,12 @@ impl ConfigChange {
                 buf.extend_from_slice(&node.to_le_bytes());
                 buf.extend_from_slice(&incarnation.to_le_bytes());
             }
+            Self::RegisterKey { node, key } => {
+                buf.push(5);
+                buf.extend_from_slice(&node.to_le_bytes());
+                buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+                buf.extend_from_slice(key);
+            }
         }
         buf
     }
@@ -128,6 +137,14 @@ impl ConfigChange {
             4 if data.len() == 17 => {
                 Some(Self::RefreshIncarnation { node, incarnation: inc(data)? })
             }
+            5 => {
+                let len =
+                    u32::from_le_bytes(data.get(9..13)?.try_into().ok()?) as usize;
+                if len > 128 || data.len() != 13 + len {
+                    return None;
+                }
+                Some(Self::RegisterKey { node, key: data[13..].to_vec() })
+            }
             _ => None,
         }
     }
@@ -139,6 +156,9 @@ impl ConfigChange {
 pub struct Membership {
     pub voters: BTreeMap<NodeId, Incarnation>,
     pub learners: BTreeSet<NodeId>,
+    /// Commit-certificate signing keys (compressed SEC1 P-256),
+    /// registered via [`ConfigChange::RegisterKey`].
+    pub keys: BTreeMap<NodeId, Vec<u8>>,
 }
 
 impl Membership {
@@ -148,6 +168,7 @@ impl Membership {
         Self {
             voters: voters.iter().map(|&id| (id, 0)).collect(),
             learners: BTreeSet::new(),
+            keys: BTreeMap::new(),
         }
     }
 
@@ -179,6 +200,12 @@ impl Membership {
         buf.extend_from_slice(&(self.learners.len() as u32).to_le_bytes());
         for id in &self.learners {
             buf.extend_from_slice(&id.to_le_bytes());
+        }
+        buf.extend_from_slice(&(self.keys.len() as u32).to_le_bytes());
+        for (id, key) in &self.keys {
+            buf.extend_from_slice(&id.to_le_bytes());
+            buf.extend_from_slice(&(key.len() as u32).to_le_bytes());
+            buf.extend_from_slice(key);
         }
         buf
     }
@@ -213,10 +240,25 @@ impl Membership {
         for _ in 0..lc {
             learners.insert(take_u64(data, &mut off)?);
         }
+        let kc = take_u32(data, &mut off)? as usize;
+        if kc > 4096 {
+            return None;
+        }
+        let mut keys = BTreeMap::new();
+        for _ in 0..kc {
+            let id = take_u64(data, &mut off)?;
+            let len = take_u32(data, &mut off)? as usize;
+            if len > 128 {
+                return None;
+            }
+            let key = data.get(off..off + len)?.to_vec();
+            off += len;
+            keys.insert(id, key);
+        }
         if off != data.len() {
             return None;
         }
-        Some(Self { voters, learners })
+        Some(Self { voters, learners, keys })
     }
 
     /// Apply a single-server change.
@@ -234,10 +276,16 @@ impl Membership {
             ConfigChange::RemoveNode { node } => {
                 self.voters.remove(node);
                 self.learners.remove(node);
+                self.keys.remove(node);
             }
             ConfigChange::RefreshIncarnation { node, incarnation } => {
                 if let Some(rec) = self.voters.get_mut(node) {
                     *rec = *incarnation;
+                }
+            }
+            ConfigChange::RegisterKey { node, key } => {
+                if self.contains(*node) {
+                    self.keys.insert(*node, key.clone());
                 }
             }
         }
