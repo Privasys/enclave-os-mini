@@ -497,11 +497,16 @@ impl RaftGlue {
             }
         }
 
-        // Redial down peers with backoff.
+        // Redial down peers with backoff. Only the HIGHER node id dials
+        // a pair: with both sides dialing, each side's inbound mapping
+        // supersede-closes its own outbound and the two links destroy
+        // each other forever. One deterministic dialer per pair ends
+        // the fight (new nodes join with higher ids, so a joiner dials
+        // every founder).
         let down: Vec<(NodeId, String)> = self
             .peers
             .iter()
-            .filter(|(id, _)| !self.node_conns.contains_key(id))
+            .filter(|(&id, _)| id < self.node_id && !self.node_conns.contains_key(&id))
             .map(|(&id, addr)| (id, addr.clone()))
             .collect();
         for (node, addr) in down {
