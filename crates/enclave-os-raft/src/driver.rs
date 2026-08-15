@@ -182,11 +182,22 @@ impl<B: KvBackend> RaftDriver<B> {
         Ok(true)
     }
 
-    /// Leader side: the snapshot transfer to `node` completed; resume
-    /// appends from the base. Returns the messages to send.
-    pub fn snapshot_transferred(&mut self, node: NodeId) -> Result<DriverOutput, DriverError> {
-        self.core.snapshot_transferred(node);
+    /// Leader side: the snapshot transfer to `node` completed at log
+    /// index `through`; resume appends from there. Returns the
+    /// messages to send.
+    pub fn snapshot_transferred(
+        &mut self,
+        node: NodeId,
+        through: Index,
+    ) -> Result<DriverOutput, DriverError> {
+        self.core.snapshot_transferred(node, through);
         self.process()
+    }
+
+    /// Pin (or release) a ledger version against pruning while a
+    /// snapshot streams from it.
+    pub fn ledger_pin(&mut self, version: Option<u64>) {
+        self.ledger.store_mut().pin_version(version);
     }
 
     // ── Accessors ───────────────────────────────────────────────────

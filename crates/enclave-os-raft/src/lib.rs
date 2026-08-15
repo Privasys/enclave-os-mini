@@ -50,13 +50,17 @@ pub mod transaction;
 pub mod ledger;
 pub mod logstore;
 pub mod driver;
+pub mod transfer;
 
 pub use crate::core::{Config, LedgerRoot, ProposeError, RaftCore, RaftEvent, Ready};
 pub use crate::driver::{DriverError, DriverOutput, RaftDriver};
 pub use crate::ledger::{LedgerError, MerkleLedger};
 pub use crate::logstore::{LogError, LogStore, RecoveredLog};
-pub use crate::message::Message;
+pub use crate::message::{Message, MsgMeta};
 pub use crate::transaction::Transaction;
+pub use crate::transfer::{
+    ReceiverStep, SenderStep, SnapshotReceiver, SnapshotSender, SNAPSHOT_CHUNK_LEAVES,
+};
 pub use crate::types::{
     ConfigChange, Entry, EntryKind, HardState, Incarnation, Index, Membership, NodeId, Role, Term,
 };

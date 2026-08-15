@@ -611,6 +611,13 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
                 .get("raft_pin_measurement")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
+            // Keep roughly this many applied entries in the log;
+            // followers further behind catch up via snapshot transfer.
+            let log_retain = config
+                .extra
+                .get("raft_log_retain")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(1024);
             match crate::raftglue::RaftGlue::new(
                 sealed_cfg.master_key(),
                 cluster_key,
@@ -619,6 +626,7 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
                 genesis_voters,
                 ca,
                 pin_measurement,
+                log_retain,
             ) {
                 Ok(glue) => {
                     crate::raftglue::install(glue);

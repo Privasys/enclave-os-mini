@@ -63,6 +63,32 @@ pub enum Message {
     Hello {
         meta: MsgMeta,
     },
+    /// Leader → follower: a snapshot transfer begins. The stream
+    /// reproduces the ledger state as of log `index` (term `term`,
+    /// membership as of it), at ledger `(ledger_version, root)`.
+    SnapshotStart {
+        meta: MsgMeta,
+        index: Index,
+        term: Term,
+        ledger_version: u64,
+        root: [u8; 32],
+        membership: crate::types::Membership,
+    },
+    /// Leader → follower: one path-ordered batch of ledger leaves.
+    /// Sent one-in-flight, each after the previous chunk's ack.
+    SnapshotChunk {
+        meta: MsgMeta,
+        seq: u64,
+        leaves: Vec<([u8; 32], Vec<u8>)>,
+        done: bool,
+    },
+    /// Follower → leader: chunk `seq` received; with `done`, the
+    /// snapshot verified against the advertised root and installed.
+    SnapshotAck {
+        meta: MsgMeta,
+        seq: u64,
+        done: bool,
+    },
 }
 
 /// Decode caps — a frame that exceeds these is rejected as corrupt.
@@ -76,7 +102,10 @@ impl Message {
             | Message::VoteResponse { meta, .. }
             | Message::AppendEntries { meta, .. }
             | Message::AppendResponse { meta, .. }
-            | Message::Hello { meta } => *meta,
+            | Message::Hello { meta }
+            | Message::SnapshotStart { meta, .. }
+            | Message::SnapshotChunk { meta, .. }
+            | Message::SnapshotAck { meta, .. } => *meta,
         }
     }
 
@@ -88,6 +117,9 @@ impl Message {
             Message::AppendEntries { meta, .. } => (3, meta),
             Message::AppendResponse { meta, .. } => (4, meta),
             Message::Hello { meta } => (5, meta),
+            Message::SnapshotStart { meta, .. } => (6, meta),
+            Message::SnapshotChunk { meta, .. } => (7, meta),
+            Message::SnapshotAck { meta, .. } => (8, meta),
         };
         buf.push(kind);
         buf.extend_from_slice(&meta.from.to_le_bytes());
@@ -134,6 +166,29 @@ impl Message {
                 }
             }
             Message::Hello { .. } => {}
+            Message::SnapshotStart { index, term, ledger_version, root, membership, .. } => {
+                buf.extend_from_slice(&index.to_le_bytes());
+                buf.extend_from_slice(&term.to_le_bytes());
+                buf.extend_from_slice(&ledger_version.to_le_bytes());
+                buf.extend_from_slice(root);
+                let m = membership.encode();
+                buf.extend_from_slice(&(m.len() as u32).to_le_bytes());
+                buf.extend_from_slice(&m);
+            }
+            Message::SnapshotChunk { seq, leaves, done, .. } => {
+                buf.extend_from_slice(&seq.to_le_bytes());
+                buf.push(*done as u8);
+                buf.extend_from_slice(&(leaves.len() as u32).to_le_bytes());
+                for (path, value) in leaves {
+                    buf.extend_from_slice(path);
+                    buf.extend_from_slice(&(value.len() as u32).to_le_bytes());
+                    buf.extend_from_slice(value);
+                }
+            }
+            Message::SnapshotAck { seq, done, .. } => {
+                buf.extend_from_slice(&seq.to_le_bytes());
+                buf.push(*done as u8);
+            }
         }
         buf
     }
@@ -199,6 +254,42 @@ impl Message {
                 Message::AppendResponse { meta, success, match_index, conflict_index, applied_root }
             }
             5 => Message::Hello { meta },
+            6 => {
+                let index = get_u64(data, &mut off)?;
+                let term = get_u64(data, &mut off)?;
+                let ledger_version = get_u64(data, &mut off)?;
+                let root: [u8; 32] = get_bytes(data, &mut off, 32)?.try_into().ok()?;
+                let mlen = get_u32(data, &mut off)? as usize;
+                if mlen > 1024 * 1024 {
+                    return None;
+                }
+                let membership =
+                    crate::types::Membership::decode(get_bytes(data, &mut off, mlen)?)?;
+                Message::SnapshotStart { meta, index, term, ledger_version, root, membership }
+            }
+            7 => {
+                let seq = get_u64(data, &mut off)?;
+                let done = get_u8(data, &mut off)? != 0;
+                let count = get_u32(data, &mut off)? as usize;
+                if count > MAX_ENTRIES_PER_MSG {
+                    return None;
+                }
+                let mut leaves = Vec::with_capacity(count.min(256));
+                for _ in 0..count {
+                    let path: [u8; 32] = get_bytes(data, &mut off, 32)?.try_into().ok()?;
+                    let len = get_u32(data, &mut off)? as usize;
+                    if len > MAX_ENTRY_DATA {
+                        return None;
+                    }
+                    leaves.push((path, get_bytes(data, &mut off, len)?.to_vec()));
+                }
+                Message::SnapshotChunk { meta, seq, leaves, done }
+            }
+            8 => {
+                let seq = get_u64(data, &mut off)?;
+                let done = get_u8(data, &mut off)? != 0;
+                Message::SnapshotAck { meta, seq, done }
+            }
             _ => return None,
         };
         // Reject trailing garbage — frames are exact.

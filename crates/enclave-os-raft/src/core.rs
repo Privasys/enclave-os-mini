@@ -403,19 +403,41 @@ impl RaftCore {
         (through, new_term, m)
     }
 
-    /// Leader: the snapshot transfer to `node` completed at our base
-    /// (appends were paused during it). Mark the base as matched and
+    /// Leader: the snapshot transfer to `node` completed at log index
+    /// `through` (appends were paused during it). Mark it matched and
     /// resume ordinary replication from there.
-    pub fn snapshot_transferred(&mut self, node: NodeId) {
-        let base = self.base_index;
+    pub fn snapshot_transferred(&mut self, node: NodeId, through: Index) {
+        let matched = through.min(self.last_index());
         if let Some(pr) = self.progress.get_mut(&node) {
             pr.needs_snapshot = false;
-            pr.match_index = pr.match_index.max(base);
+            pr.match_index = pr.match_index.max(matched);
             pr.next_index = pr.match_index + 1;
         }
         if self.role == Role::Leader {
+            self.advance_commit();
             self.send_append(node);
         }
+    }
+
+    /// A consistent snapshot descriptor for the CURRENT applied state:
+    /// `(applied_index, its term, membership as of it)`. Pairs with the
+    /// ledger checkpoint captured at the same moment (the driver holds
+    /// both under one borrow).
+    pub fn snapshot_info(&self) -> (Index, Term, Membership) {
+        let idx = self.applied;
+        let term = self.term_at(idx).expect("applied index in log");
+        let mut m = self.base_membership.clone();
+        for e in &self.log {
+            if e.index > idx {
+                break;
+            }
+            if e.kind == EntryKind::Config {
+                if let Some(cc) = ConfigChange::decode(&e.data) {
+                    m.apply(&cc);
+                }
+            }
+        }
+        (idx, term, m)
     }
 
     /// Install a snapshot base received from the leader: the ledger has
@@ -708,6 +730,13 @@ impl RaftCore {
             Message::Hello { .. } => {
                 // Link-layer introduction; the prologue above already
                 // recorded the sender's incarnation.
+            }
+            Message::SnapshotStart { .. }
+            | Message::SnapshotChunk { .. }
+            | Message::SnapshotAck { .. } => {
+                // Snapshot transfer runs OUTSIDE the core (see the
+                // transfer module); the driver routes these before
+                // stepping. Reaching here is a routing bug — ignore.
             }
         }
     }

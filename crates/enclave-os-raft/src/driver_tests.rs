@@ -575,7 +575,7 @@ fn snapshot_transfer_catches_up_lagging_follower() {
 
     // Transfer complete: the leader resumes appends from the base
     // (phase 3's SnapshotAck triggers this over the wire).
-    let out = c.drivers.get_mut(&l).unwrap().snapshot_transferred(f).unwrap();
+    let out = c.drivers.get_mut(&l).unwrap().snapshot_transferred(f, index).unwrap();
     c.queue.extend(out.messages);
     c.pump();
 
@@ -606,4 +606,150 @@ fn maybe_compact_policy() {
     // Span > 2×retain: compacts to applied - retain.
     d.maybe_compact(3).unwrap();
     assert_eq!(d.core().base().0, applied - 3);
+}
+
+/// The full phase-3 wire protocol: SnapshotNeeded fires, the sender
+/// streams Start + ack-paced chunks over Messages, the receiver
+/// rebuilds cross-key, installs, acks done, and appends resume.
+#[test]
+fn wire_snapshot_transfer_protocol() {
+    use crate::message::MsgMeta;
+    use crate::transfer::{ReceiverStep, SenderStep, SnapshotReceiver, SnapshotSender};
+
+    let mut c = MiniCluster::new(3);
+    let l = c.wait_for_leader(300);
+    for i in 0..9u8 {
+        c.txn(&[b'w', i], &[i]);
+    }
+
+    // A follower misses everything past its crash, and the leader
+    // compacts beyond it.
+    let f = (1..=3).find(|&id| id != l).unwrap();
+    drop(c.drivers.remove(&f).unwrap());
+    for i in 9..14u8 {
+        c.txn(&[b'w', i], &[i]);
+    }
+    let applied = c.drivers[&l].core().applied_index();
+    c.drivers.get_mut(&l).unwrap().compact_to(applied).unwrap();
+    c.restart(f, 77);
+    let mut needed = false;
+    for _ in 0..40 {
+        c.tick_all();
+        if c.events.iter().any(|(_, ev)| {
+            matches!(ev, crate::core::RaftEvent::SnapshotNeeded { node, .. } if *node == f)
+        }) {
+            needed = true;
+            break;
+        }
+    }
+    assert!(needed);
+
+    let meta = |from: NodeId| MsgMeta { from, term: 0, incarnation: 0 };
+
+    // Sender start (leader side): pins the ledger version.
+    let (mut sender, start_msg) =
+        SnapshotSender::start(c.drivers.get_mut(&l).unwrap(), f, meta(l));
+
+    // Receiver start (follower side) over a fresh ledger backend.
+    let fresh = SharedMem::new();
+    let Message::SnapshotStart { index, term, ledger_version, root, membership, .. } =
+        start_msg
+    else {
+        panic!("expected SnapshotStart")
+    };
+    let (receiver, first_ack) = SnapshotReceiver::start(
+        l,
+        index,
+        term,
+        ledger_version,
+        root,
+        membership,
+        fresh.clone(),
+        CK,
+        sk(f),
+        meta(f),
+    )
+    .unwrap();
+    let mut receiver = Some(receiver);
+
+    // Ack-paced chunk loop, entirely over Messages.
+    let mut ack = first_ack;
+    let mut rounds = 0;
+    loop {
+        rounds += 1;
+        assert!(rounds < 10_000, "transfer did not converge");
+        let Message::SnapshotAck { seq, done, .. } = ack else { panic!("expected ack") };
+        match sender.on_ack(&c.drivers[&l], meta(l), seq, done).unwrap() {
+            SenderStep::Send(Message::SnapshotChunk { seq, leaves, done, .. }) => {
+                let (next, step) = receiver
+                    .take()
+                    .expect("receiver still active")
+                    .on_chunk(
+                        c.drivers.get_mut(&f).unwrap(),
+                        meta(f),
+                        seq,
+                        leaves,
+                        done,
+                    )
+                    .unwrap();
+                match step {
+                    ReceiverStep::Ack(a) => {
+                        receiver = Some(next.expect("transfer continues"));
+                        ack = a;
+                    }
+                    ReceiverStep::Installed(a) => {
+                        assert!(next.is_none());
+                        ack = a;
+                    }
+                }
+            }
+            SenderStep::Send(_) => panic!("sender must send chunks"),
+            SenderStep::Finished { index } => {
+                c.drivers.get_mut(&l).unwrap().ledger_pin(None);
+                let out =
+                    c.drivers.get_mut(&l).unwrap().snapshot_transferred(f, index).unwrap();
+                c.queue.extend(out.messages);
+                break;
+            }
+            SenderStep::Ignore => panic!("unexpected stale ack"),
+        }
+    }
+    c.backends.get_mut(&f).unwrap().1 = fresh;
+    c.pump();
+
+    // Ordinary replication resumes; the follower converges fully.
+    for _ in 0..40 {
+        c.tick_all();
+    }
+    c.txn(b"tail", b"1");
+    assert_eq!(c.root(f), c.root(l));
+    let store = c.drivers[&f].ledger().store();
+    assert_eq!(store.get(&[b'w', 0]).unwrap(), Some(vec![0]));
+    assert_eq!(store.get(&[b'w', 13]).unwrap(), Some(vec![13]));
+    assert_eq!(store.get(b"tail").unwrap(), Some(b"1".to_vec()));
+    assert!(c.drivers[&f].core().self_admitted());
+}
+
+#[test]
+fn snapshot_message_codec_roundtrip() {
+    use crate::message::MsgMeta;
+    let meta = MsgMeta { from: 1, term: 2, incarnation: 3 };
+    let m = Message::SnapshotStart {
+        meta,
+        index: 9,
+        term: 2,
+        ledger_version: 5,
+        root: [0xAA; 32],
+        membership: Membership::bootstrap(&[1, 2, 3]),
+    };
+    assert_eq!(Message::decode(&m.encode()).unwrap(), m);
+    let m = Message::SnapshotChunk {
+        meta,
+        seq: 4,
+        leaves: vec![([1; 32], b"v1".to_vec()), ([2; 32], Vec::new())],
+        done: true,
+    };
+    assert_eq!(Message::decode(&m.encode()).unwrap(), m);
+    let m = Message::SnapshotAck { meta, seq: 4, done: false };
+    assert_eq!(Message::decode(&m.encode()).unwrap(), m);
 }

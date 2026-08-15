@@ -32,7 +32,8 @@ use enclave_os_common::protocol::{Request, Response};
 
 use enclave_os_merkle::{MerkleStore, OcallBackend};
 use enclave_os_raft::{
-    Config, DriverError, DriverOutput, LogStore, Message, NodeId, RaftDriver, Role,
+    Config, DriverError, DriverOutput, LogStore, Message, MsgMeta, NodeId, RaftDriver,
+    RaftEvent, ReceiverStep, Role, SenderStep, SnapshotReceiver, SnapshotSender,
 };
 
 use crate::enclave_log_error;
@@ -42,6 +43,13 @@ use crate::ratls::attestation::CaContext;
 
 /// Ticks (100 ms each) between redial attempts to a down peer.
 const REDIAL_TICKS: u32 = 20;
+
+/// Compaction check cadence (ticks).
+const COMPACT_EVERY_TICKS: u64 = 64;
+
+/// A snapshot transfer with no progress for this many ticks is dropped
+/// (the pause re-signals and the transfer restarts).
+const TRANSFER_STALL_TICKS: u64 = 100;
 
 static RAFT: OnceLock<Mutex<RaftGlue>> = OnceLock::new();
 
@@ -100,6 +108,14 @@ pub struct RaftGlue {
     /// One automatic repair per boot; a repeat divergence is a bug.
     repair_attempted: bool,
     diverged_logged: bool,
+    /// Keep roughly this many applied entries in the log.
+    log_retain: u64,
+    /// Tick counter (compaction cadence + transfer stall detection).
+    ticks: u64,
+    /// Leader-side snapshot transfers: node → (sender, last activity).
+    snapshot_sends: BTreeMap<NodeId, (SnapshotSender, u64)>,
+    /// Follower-side transfer in progress (one at a time).
+    snapshot_recv: Option<(SnapshotReceiver<OcallBackend>, u64)>,
     /// Last logged (role, term, leader, commit, verified) for
     /// transition logging.
     last_logged: Option<(Role, u64, Option<NodeId>, u64, u64)>,
@@ -114,6 +130,7 @@ impl RaftGlue {
         genesis_voters: Option<Vec<NodeId>>,
         ca: CaContext,
         pin_measurement: bool,
+        log_retain: u64,
     ) -> Result<Self, String> {
         let ck = derive(&cluster_key, b"enclave-os-raft:ck:v1");
         let sk = derive(&master_key, b"enclave-os-raft:sk:v1");
@@ -199,8 +216,17 @@ impl RaftGlue {
             seed,
             repair_attempted: false,
             diverged_logged: false,
+            log_retain,
+            ticks: 0,
+            snapshot_sends: BTreeMap::new(),
+            snapshot_recv: None,
             last_logged: None,
         })
+    }
+
+    fn own_meta(&self) -> MsgMeta {
+        let Message::Hello { meta } = self.driver.core().hello() else { unreachable!() };
+        meta
     }
 
     /// Repair-by-replay: fresh ledger over the same backend, zeroed
@@ -257,7 +283,21 @@ impl RaftGlue {
                     if !self.conn_nodes.contains_key(&cid) {
                         self.map_conn(from, cid);
                     }
-                    self.drive(|d| d.step(msg));
+                    // Snapshot transfer runs outside the core.
+                    match msg {
+                        Message::SnapshotStart {
+                            meta, index, term, ledger_version, root, membership,
+                        } => self.on_snapshot_start(
+                            meta.from, index, term, ledger_version, root, membership,
+                        ),
+                        Message::SnapshotChunk { seq, leaves, done, .. } => {
+                            self.on_snapshot_chunk(seq, leaves, done)
+                        }
+                        Message::SnapshotAck { meta, seq, done } => {
+                            self.on_snapshot_ack(meta.from, seq, done)
+                        }
+                        msg => self.drive(|d| d.step(msg)),
+                    }
                 }
                 PeerEvent::Closed(cid) => {
                     self.dial_pending.remove(&cid);
@@ -267,8 +307,163 @@ impl RaftGlue {
         }
     }
 
+    // ── Snapshot transfer (outside the core) ────────────────────────
+
+    fn send_to(&mut self, node: NodeId, msg: &Message) {
+        if let Some(&cid) = self.node_conns.get(&node) {
+            self.link.send_frame(cid, &msg.encode());
+        }
+    }
+
+    /// Pin the oldest ledger version any active transfer streams from.
+    fn repin(&mut self) {
+        let min = self.snapshot_sends.values().map(|(s, _)| s.ledger_version()).min();
+        self.driver.ledger_pin(min);
+    }
+
+    fn start_snapshot_send(&mut self, node: NodeId) {
+        if self.snapshot_sends.contains_key(&node) {
+            return;
+        }
+        let meta = self.own_meta();
+        let (sender, start_msg) = SnapshotSender::start(&mut self.driver, node, meta);
+        enclave_log_info!(
+            "raft: streaming snapshot to {} at index {} (ledger v{})",
+            node,
+            sender.index(),
+            sender.ledger_version()
+        );
+        self.snapshot_sends.insert(node, (sender, self.ticks));
+        self.repin();
+        self.send_to(node, &start_msg);
+    }
+
+    /// Drop a (failed or stalled) transfer and nudge the core so its
+    /// next append attempt re-detects the lag and restarts it.
+    fn abort_snapshot_send(&mut self, node: NodeId) {
+        if self.snapshot_sends.remove(&node).is_some() {
+            self.repin();
+            self.drive(|d| d.snapshot_transferred(node, 0));
+        }
+    }
+
+    fn on_snapshot_start(
+        &mut self,
+        from: NodeId,
+        index: u64,
+        term: u64,
+        ledger_version: u64,
+        root: [u8; 32],
+        membership: enclave_os_raft::Membership,
+    ) {
+        enclave_log_info!(
+            "raft: receiving snapshot from {} at index {} (ledger v{})",
+            from,
+            index,
+            ledger_version
+        );
+        // Building writes over the live ledger table; this node is
+        // behind anyway, and a crash mid-transfer recovers by
+        // repair-by-replay of the intact local log.
+        let backend = OcallBackend::with_table("raft:ledger");
+        let meta = self.own_meta();
+        match SnapshotReceiver::start(
+            from,
+            index,
+            term,
+            ledger_version,
+            root,
+            membership,
+            backend,
+            self.ck,
+            self.sk,
+            meta,
+        ) {
+            Ok((recv, ack)) => {
+                self.snapshot_recv = Some((recv, self.ticks));
+                self.send_to(from, &ack);
+            }
+            Err(e) => enclave_log_error!("raft: snapshot receive start failed: {:?}", e),
+        }
+    }
+
+    fn on_snapshot_chunk(&mut self, seq: u64, leaves: Vec<([u8; 32], Vec<u8>)>, done: bool) {
+        let Some((recv, _)) = self.snapshot_recv.take() else { return };
+        let from = recv.from;
+        let meta = self.own_meta();
+        match recv.on_chunk(&mut self.driver, meta, seq, leaves, done) {
+            Ok((next, ReceiverStep::Ack(ack))) => {
+                if let Some(n) = next {
+                    self.snapshot_recv = Some((n, self.ticks));
+                }
+                self.send_to(from, &ack);
+            }
+            Ok((_, ReceiverStep::Installed(ack))) => {
+                enclave_log_info!("raft: snapshot installed");
+                self.send_to(from, &ack);
+            }
+            Err(e) => {
+                enclave_log_error!("raft: snapshot receive failed: {:?}", e);
+            }
+        }
+    }
+
+    fn on_snapshot_ack(&mut self, from: NodeId, seq: u64, done: bool) {
+        let meta = self.own_meta();
+        let ticks = self.ticks;
+        let step = {
+            let Some((sender, act)) = self.snapshot_sends.get_mut(&from) else { return };
+            *act = ticks;
+            match sender.on_ack(&self.driver, meta, seq, done) {
+                Ok(s) => s,
+                Err(e) => {
+                    enclave_log_error!("raft: snapshot send failed: {:?}", e);
+                    self.abort_snapshot_send(from);
+                    return;
+                }
+            }
+        };
+        match step {
+            SenderStep::Send(msg) => self.send_to(from, &msg),
+            SenderStep::Finished { index } => {
+                self.snapshot_sends.remove(&from);
+                self.repin();
+                enclave_log_info!("raft: snapshot to {} complete at index {}", from, index);
+                self.drive(|d| d.snapshot_transferred(from, index));
+            }
+            SenderStep::Ignore => {}
+        }
+    }
+
     fn tick(&mut self) {
+        self.ticks += 1;
         self.drive(|d| d.tick());
+
+        // Periodic log compaction (all roles compact their own log).
+        if self.ticks % COMPACT_EVERY_TICKS == 0 {
+            let retain = self.log_retain;
+            if let Err(e) = self.driver.maybe_compact(retain) {
+                enclave_log_error!("raft: compaction failed: {:?}", e);
+            }
+        }
+
+        // Drop stalled transfers; the pause re-signals and they restart.
+        let stalled: Vec<NodeId> = self
+            .snapshot_sends
+            .iter()
+            .filter(|(_, (_, act))| self.ticks.saturating_sub(*act) > TRANSFER_STALL_TICKS)
+            .map(|(&n, _)| n)
+            .collect();
+        for n in stalled {
+            enclave_log_error!("raft: snapshot to {} stalled, retrying", n);
+            self.abort_snapshot_send(n);
+        }
+        if let Some((_, act)) = &self.snapshot_recv {
+            if self.ticks.saturating_sub(*act) > TRANSFER_STALL_TICKS {
+                enclave_log_error!("raft: snapshot receive stalled, dropping");
+                self.snapshot_recv = None;
+            }
+        }
 
         // Log consensus-state transitions (role, term, leader, commit,
         // verified) so cluster health is visible from container logs.
@@ -362,7 +557,10 @@ impl RaftGlue {
             // No link yet: drop — raft retries via heartbeat.
         }
         for ev in out.events {
-            enclave_log_error!("raft verification event: {:?}", ev);
+            match ev {
+                RaftEvent::SnapshotNeeded { node, .. } => self.start_snapshot_send(node),
+                ev => enclave_log_error!("raft verification event: {:?}", ev),
+            }
         }
     }
 
@@ -404,6 +602,7 @@ impl RaftGlue {
             "leader": core.leader_id(),
             "commit": core.commit_index(),
             "verified": core.verified_index(),
+            "log_base": core.base().0,
             "ledger_root": hex_encode(&root),
             "ledger_version": version,
             "admitted": core.self_admitted(),
