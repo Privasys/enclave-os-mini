@@ -115,19 +115,78 @@ impl<B: KvBackend> RaftDriver<B> {
         ledger_store: MerkleStore<B>,
     ) -> Result<Self, DriverError> {
         let (log, recovered) = LogStore::open(log_backend, log_key)?;
-        let mut core =
-            RaftCore::new(cfg, recovered.genesis, recovered.entries, recovered.hard_state);
-        core.set_applied_floor(recovered.applied_floor);
+        let mut core = RaftCore::with_base(
+            cfg,
+            recovered.base_membership,
+            recovered.base_index,
+            recovered.base_term,
+            recovered.entries,
+            recovered.hard_state,
+        );
+        let floor = recovered.applied_floor.max(recovered.base_index);
+        core.set_applied_floor(floor);
         let ledger = MerkleLedger::new(ledger_store);
         let (root, _) = ledger.root();
-        core.report_applied(recovered.applied_floor, root);
-        Ok(Self {
-            core,
-            ledger,
-            log,
-            applied_floor: recovered.applied_floor,
-            halted: false,
-        })
+        core.report_applied(floor, root);
+        Ok(Self { core, ledger, log, applied_floor: floor, halted: false })
+    }
+
+    /// Compact the log through `through` (capped at the applied index):
+    /// discard covered entries in core and store, recording the base.
+    /// The ledger keeps serving — its checkpoint IS the snapshot state.
+    pub fn compact_to(&mut self, through: Index) -> Result<(), DriverError> {
+        let through = through.min(self.core.applied_index());
+        let (old_base, _) = self.core.base();
+        if through <= old_base {
+            return Ok(());
+        }
+        let (idx, term, membership) = self.core.compact(through);
+        self.log.compact(idx, term, &membership)?;
+        Ok(())
+    }
+
+    /// Keep roughly the last `retain` applied entries in the log;
+    /// compact when the retained span grows past twice that.
+    pub fn maybe_compact(&mut self, retain: u64) -> Result<(), DriverError> {
+        let applied = self.core.applied_index();
+        let (base, _) = self.core.base();
+        if applied.saturating_sub(base) > retain.saturating_mul(2) {
+            self.compact_to(applied.saturating_sub(retain))?;
+        }
+        Ok(())
+    }
+
+    /// Install a snapshot received from the leader: `restored_ledger`
+    /// is the finalized [`enclave_os_merkle::SnapshotBuilder`] output
+    /// (already verified against the advertised root and stamped at the
+    /// advertised version), representing the state as of log `index`
+    /// (term `term`, membership as of it). Returns false if the
+    /// snapshot is stale.
+    pub fn install_snapshot_state(
+        &mut self,
+        index: Index,
+        term: u64,
+        membership: crate::types::Membership,
+        restored_ledger: MerkleStore<B>,
+    ) -> Result<bool, DriverError> {
+        if !self.core.install_snapshot(index, term, membership.clone()) {
+            return Ok(false);
+        }
+        self.ledger = MerkleLedger::new(restored_ledger);
+        self.log.install(index, term, &membership)?;
+        self.log.set_applied_floor(index)?;
+        self.applied_floor = index;
+        self.halted = false;
+        let (root, _) = self.ledger.root();
+        self.core.report_applied(index, root);
+        Ok(true)
+    }
+
+    /// Leader side: the snapshot transfer to `node` completed; resume
+    /// appends from the base. Returns the messages to send.
+    pub fn snapshot_transferred(&mut self, node: NodeId) -> Result<DriverOutput, DriverError> {
+        self.core.snapshot_transferred(node);
+        self.process()
     }
 
     // ── Accessors ───────────────────────────────────────────────────

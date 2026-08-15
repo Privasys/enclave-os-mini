@@ -38,12 +38,14 @@ use crate::types::{Entry, HardState, Index, Membership};
 const KEY_HARD_STATE: &[u8] = b"h";
 const KEY_GENESIS: &[u8] = b"g";
 const KEY_APPLIED: &[u8] = b"a";
+const KEY_BASE: &[u8] = b"b";
 const ENTRY_PREFIX: u8 = b'e';
 
 const AAD_ENTRY: &[u8] = b"enclave_os_raft_log_entry";
 const AAD_HS: &[u8] = b"enclave_os_raft_hard_state";
 const AAD_GENESIS: &[u8] = b"enclave_os_raft_genesis";
 const AAD_APPLIED: &[u8] = b"enclave_os_raft_applied";
+const AAD_BASE: &[u8] = b"enclave_os_raft_base";
 
 /// Log persistence failure.
 #[derive(Debug)]
@@ -89,13 +91,20 @@ pub struct RecoveredLog {
     pub entries: Vec<Entry>,
     pub hard_state: HardState,
     pub applied_floor: Index,
+    /// Compaction/snapshot base: `(index, term, membership as of it)`.
+    /// `(0, 0, genesis)` for an uncompacted log.
+    pub base_index: Index,
+    pub base_term: u64,
+    pub base_membership: Membership,
 }
 
 /// Encrypted Raft log over a host KV table.
 pub struct LogStore<B: KvBackend> {
     backend: B,
     cipher: AeadCipher,
-    /// Last persisted entry index (0 = empty log).
+    /// First retained entry index (base_index + 1).
+    first_index: Index,
+    /// Last persisted entry index (= base when the log is empty).
     last_index: Index,
 }
 
@@ -107,7 +116,7 @@ impl<B: KvBackend> LogStore<B> {
             .encrypt(&genesis.encode(), AAD_GENESIS)
             .map_err(|_| LogError::Corrupted("encrypt genesis"))?;
         backend.write_batch(vec![KvBatchOp::Put { key: KEY_GENESIS.to_vec(), value: g }])?;
-        Ok(Self { backend, cipher, last_index: 0 })
+        Ok(Self { backend, cipher, first_index: 1, last_index: 0 })
     }
 
     /// Does a log exist in this table yet?
@@ -176,18 +185,110 @@ impl<B: KvBackend> LogStore<B> {
             start = next;
         }
 
-        // BE index keys scan in index order; verify contiguity from 1.
+        // Compaction/snapshot base, if any.
+        let (base_index, base_term, base_membership) = match backend.get(KEY_BASE)? {
+            Some(ct) => {
+                let pt = cipher
+                    .decrypt(&ct, AAD_BASE)
+                    .map_err(|_| LogError::Corrupted("base auth"))?;
+                if pt.len() < 16 {
+                    return Err(LogError::Corrupted("base decode"));
+                }
+                let idx = u64::from_le_bytes(pt[0..8].try_into().unwrap());
+                let term = u64::from_le_bytes(pt[8..16].try_into().unwrap());
+                let m = Membership::decode(&pt[16..])
+                    .ok_or(LogError::Corrupted("base membership decode"))?;
+                (idx, term, m)
+            }
+            None => (0, 0, genesis.clone()),
+        };
+
+        // BE index keys scan in index order; verify contiguity from the
+        // base (a compaction may have left older entries mid-delete —
+        // treat anything at or below the base as already gone).
+        let entries: Vec<Entry> =
+            entries.into_iter().filter(|e| e.index > base_index).collect();
         for (i, e) in entries.iter().enumerate() {
-            if e.index != i as Index + 1 {
+            if e.index != base_index + i as Index + 1 {
                 return Err(LogError::Corrupted("entry gap"));
             }
         }
-        let last_index = entries.last().map(|e| e.index).unwrap_or(0);
+        let last_index = entries.last().map(|e| e.index).unwrap_or(base_index);
 
         Ok((
-            Self { backend, cipher, last_index },
-            RecoveredLog { genesis, entries, hard_state, applied_floor },
+            Self { backend, cipher, first_index: base_index + 1, last_index },
+            RecoveredLog {
+                genesis,
+                entries,
+                hard_state,
+                applied_floor,
+                base_index,
+                base_term,
+                base_membership,
+            },
         ))
+    }
+
+    /// Persist a compaction: delete entries at or below `through` and
+    /// record the new base, in one atomic batch.
+    pub fn compact(
+        &mut self,
+        through: Index,
+        term: u64,
+        membership: &Membership,
+    ) -> Result<(), LogError> {
+        if through < self.first_index {
+            return Ok(());
+        }
+        let mut ops: Vec<KvBatchOp> = Vec::new();
+        for i in self.first_index..=through.min(self.last_index) {
+            ops.push(KvBatchOp::Delete { key: entry_key(i) });
+        }
+        ops.push(KvBatchOp::Put {
+            key: KEY_BASE.to_vec(),
+            value: self.encode_base(through, term, membership)?,
+        });
+        self.backend.write_batch(ops)?;
+        self.first_index = through + 1;
+        self.last_index = self.last_index.max(through);
+        Ok(())
+    }
+
+    /// Persist a snapshot install: discard the whole retained log and
+    /// set the new base, in one atomic batch.
+    pub fn install(
+        &mut self,
+        index: Index,
+        term: u64,
+        membership: &Membership,
+    ) -> Result<(), LogError> {
+        let mut ops: Vec<KvBatchOp> = Vec::new();
+        for i in self.first_index..=self.last_index {
+            ops.push(KvBatchOp::Delete { key: entry_key(i) });
+        }
+        ops.push(KvBatchOp::Put {
+            key: KEY_BASE.to_vec(),
+            value: self.encode_base(index, term, membership)?,
+        });
+        self.backend.write_batch(ops)?;
+        self.first_index = index + 1;
+        self.last_index = index;
+        Ok(())
+    }
+
+    fn encode_base(
+        &self,
+        index: Index,
+        term: u64,
+        membership: &Membership,
+    ) -> Result<Vec<u8>, LogError> {
+        let mut pt = Vec::with_capacity(16 + 64);
+        pt.extend_from_slice(&index.to_le_bytes());
+        pt.extend_from_slice(&term.to_le_bytes());
+        pt.extend_from_slice(&membership.encode());
+        self.cipher
+            .encrypt(&pt, AAD_BASE)
+            .map_err(|_| LogError::Corrupted("encrypt base"))
     }
 
     /// Persist one [`Ready`]'s durable obligations as a single atomic

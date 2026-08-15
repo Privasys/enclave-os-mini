@@ -37,6 +37,11 @@ pub enum RaftEvent {
     /// Every voter reported a root at `index` and no root reached a
     /// quorum: genuine cluster corruption. Halt and page a human.
     VerificationDeadlock { index: Index },
+    /// This follower is behind our compaction base: the log cannot
+    /// serve it. The driver must stream it a ledger snapshot at (or
+    /// after) `base_index`; appends to it pause until the follower's
+    /// match index passes the base.
+    SnapshotNeeded { node: NodeId, base_index: Index },
 }
 
 /// Static configuration for one node.
@@ -127,6 +132,9 @@ impl Ready {
 struct Progress {
     match_index: Index,
     next_index: Index,
+    /// The peer is behind our compaction base: appends are paused
+    /// until a snapshot transfer (driven outside the core) completes.
+    needs_snapshot: bool,
 }
 
 /// The Raft state machine for one node.
@@ -136,9 +144,14 @@ pub struct RaftCore {
     // ── Durable state (mirrored to the driver via Ready) ────────────
     term: Term,
     voted_for: Option<NodeId>,
-    /// The full log; entry with index `i` lives at position `i - 1`
-    /// (no compaction in v1, first index is 1).
+    /// The retained log; entry with index `i` lives at position
+    /// `i - base_index - 1`.
     log: Vec<Entry>,
+    /// Compaction/snapshot base: everything at or below this index is
+    /// discarded from the log (committed and applied by definition).
+    base_index: Index,
+    /// Term of the entry at `base_index` (0 when uncompacted).
+    base_term: Term,
 
     // ── Volatile state ──────────────────────────────────────────────
     role: Role,
@@ -147,7 +160,7 @@ pub struct RaftCore {
     applied: Index,
     /// Current membership: base + every config entry in the log.
     membership: Membership,
-    /// Membership before the first log entry (genesis in v1).
+    /// Membership as of `base_index` (genesis when uncompacted).
     base_membership: Membership,
     /// Candidate vote tally for the current election.
     votes: BTreeMap<NodeId, bool>,
@@ -190,29 +203,51 @@ pub struct RaftCore {
 }
 
 impl RaftCore {
-    /// Build a core from persisted state. For a fresh cluster use
-    /// [`RaftCore::bootstrap`]. `log` must be contiguous from index 1;
-    /// entries are assumed already persisted by the driver.
+    /// Build a core from persisted state with an uncompacted log
+    /// (base 0). For a fresh cluster use [`RaftCore::bootstrap`]; for
+    /// a compacted log use [`RaftCore::with_base`].
     pub fn new(
         cfg: Config,
         base_membership: Membership,
         log: Vec<Entry>,
         hard_state: HardState,
     ) -> Self {
+        Self::with_base(cfg, base_membership, 0, 0, log, hard_state)
+    }
+
+    /// Build a core whose log starts AFTER a compaction/snapshot base:
+    /// `base_membership` is the membership as of `base_index` (whose
+    /// entry had `base_term`), and `log` must be contiguous from
+    /// `base_index + 1`. Everything at or below the base is committed
+    /// and applied by definition.
+    pub fn with_base(
+        cfg: Config,
+        base_membership: Membership,
+        base_index: Index,
+        base_term: Term,
+        log: Vec<Entry>,
+        hard_state: HardState,
+    ) -> Self {
         for (i, e) in log.iter().enumerate() {
-            assert_eq!(e.index, i as Index + 1, "log must be contiguous from index 1");
+            assert_eq!(
+                e.index,
+                base_index + i as Index + 1,
+                "log must be contiguous from the base"
+            );
         }
-        let persist_from = log.len() as Index + 1;
+        let persist_from = log.last().map(|e| e.index).unwrap_or(base_index) + 1;
         let seed = cfg.seed;
         let mut core = Self {
             cfg,
             term: hard_state.term,
             voted_for: hard_state.voted_for,
             log,
+            base_index,
+            base_term,
             role: Role::Follower,
             leader_id: None,
-            commit: 0,
-            applied: 0,
+            commit: base_index,
+            applied: base_index,
             membership: base_membership.clone(),
             base_membership,
             votes: BTreeMap::new(),
@@ -271,10 +306,23 @@ impl RaftCore {
         &self.log
     }
     pub fn last_index(&self) -> Index {
-        self.log.last().map(|e| e.index).unwrap_or(0)
+        self.log.last().map(|e| e.index).unwrap_or(self.base_index)
     }
     pub fn last_term(&self) -> Term {
-        self.log.last().map(|e| e.term).unwrap_or(0)
+        self.log.last().map(|e| e.term).unwrap_or(self.base_term)
+    }
+    /// The compaction/snapshot base `(index, term)`.
+    pub fn base(&self) -> (Index, Term) {
+        (self.base_index, self.base_term)
+    }
+    pub fn applied_index(&self) -> Index {
+        self.applied
+    }
+
+    /// Log-vector position of index `idx` (valid for
+    /// `base_index < idx ≤ last_index`).
+    fn pos(&self, idx: Index) -> Option<usize> {
+        idx.checked_sub(self.base_index + 1).map(|p| p as usize)
     }
 
     /// Latest incarnation observed from a peer (for the driver to build
@@ -315,8 +363,88 @@ impl RaftCore {
     /// re-delivered through [`Ready::committed_entries`]. Call once,
     /// right after construction, before any tick/step.
     pub fn set_applied_floor(&mut self, floor: Index) {
-        assert_eq!(self.applied, 0, "applied floor must be set before any Ready");
-        self.applied = floor.min(self.last_index());
+        assert_eq!(
+            self.applied, self.base_index,
+            "applied floor must be set before any Ready"
+        );
+        self.applied = floor.clamp(self.base_index, self.last_index());
+    }
+
+    // ── Compaction and snapshots ────────────────────────────────────
+
+    /// Discard log entries at or below `through` (which must be ≤ the
+    /// applied index). Returns the new base `(index, term, membership)`
+    /// for the driver to persist. No-op (returning the current base)
+    /// when `through` is at or below the existing base.
+    pub fn compact(&mut self, through: Index) -> (Index, Term, Membership) {
+        if through <= self.base_index {
+            return (self.base_index, self.base_term, self.base_membership.clone());
+        }
+        assert!(through <= self.applied, "cannot compact unapplied entries");
+        let new_term = self.term_at(through).expect("compact point in log");
+        // Membership as of `through`: base + config entries ≤ through.
+        let mut m = self.base_membership.clone();
+        for e in &self.log {
+            if e.index > through {
+                break;
+            }
+            if e.kind == EntryKind::Config {
+                if let Some(cc) = ConfigChange::decode(&e.data) {
+                    m.apply(&cc);
+                }
+            }
+        }
+        let keep_from = self.pos(through).expect("compact point in log") + 1;
+        self.log.drain(..keep_from);
+        self.base_index = through;
+        self.base_term = new_term;
+        self.base_membership = m.clone();
+        self.persist_from = self.persist_from.max(through + 1);
+        (through, new_term, m)
+    }
+
+    /// Leader: the snapshot transfer to `node` completed at our base
+    /// (appends were paused during it). Mark the base as matched and
+    /// resume ordinary replication from there.
+    pub fn snapshot_transferred(&mut self, node: NodeId) {
+        let base = self.base_index;
+        if let Some(pr) = self.progress.get_mut(&node) {
+            pr.needs_snapshot = false;
+            pr.match_index = pr.match_index.max(base);
+            pr.next_index = pr.match_index + 1;
+        }
+        if self.role == Role::Leader {
+            self.send_append(node);
+        }
+    }
+
+    /// Install a snapshot base received from the leader: the ledger has
+    /// been restored to the state as of `index`, whose entry had
+    /// `term`, under `membership`. Discards the entire retained log.
+    /// Returns false (and does nothing) if the snapshot is stale
+    /// (`index ≤ commit`).
+    pub fn install_snapshot(
+        &mut self,
+        index: Index,
+        term: Term,
+        membership: Membership,
+    ) -> bool {
+        if index <= self.commit {
+            return false;
+        }
+        self.log.clear();
+        self.base_index = index;
+        self.base_term = term;
+        self.base_membership = membership.clone();
+        self.membership = membership;
+        self.commit = index;
+        self.applied = index;
+        self.persist_from = index + 1;
+        self.pending_truncate = None;
+        if self.role == Role::Leader {
+            self.sync_progress();
+        }
+        true
     }
 
     // ── Verified commits ────────────────────────────────────────────
@@ -641,6 +769,23 @@ impl RaftCore {
         self.become_follower(meta.term, Some(meta.from));
         self.recovery_active = false;
 
+        // Everything at or below our commit index is settled (and may
+        // be compacted away): the leader's entries there are ours by
+        // definition. Report the committed prefix so the leader
+        // advances next_index instead of probing a compacted range.
+        if prev_log_index < self.commit {
+            let commit = self.commit;
+            let applied_root = self.last_applied_report;
+            self.send(meta.from, |m| Message::AppendResponse {
+                meta: m,
+                success: true,
+                match_index: commit,
+                conflict_index: 0,
+                applied_root,
+            });
+            return;
+        }
+
         // Consistency check on the previous entry.
         if prev_log_index > self.last_index() {
             let conflict = self.last_index() + 1;
@@ -727,6 +872,7 @@ impl RaftCore {
             return;
         }
         let last = self.last_index();
+        let base = self.base_index;
         let Some(pr) = self.progress.get_mut(&meta.from) else {
             return;
         };
@@ -739,6 +885,10 @@ impl RaftCore {
                 pr.match_index = match_index;
             }
             pr.next_index = pr.match_index + 1;
+            if pr.match_index >= base {
+                // Snapshot installed (or never needed): appends resume.
+                pr.needs_snapshot = false;
+            }
             let more = pr.next_index <= last;
             self.advance_commit();
             if more {
@@ -831,10 +981,13 @@ impl RaftCore {
     // ── Log helpers ─────────────────────────────────────────────────
 
     fn term_at(&self, idx: Index) -> Option<Term> {
-        if idx == 0 {
-            return Some(0);
+        if idx == self.base_index {
+            return Some(self.base_term);
         }
-        self.log.get(idx as usize - 1).map(|e| e.term)
+        if idx < self.base_index {
+            return None; // compacted away
+        }
+        self.pos(idx).and_then(|p| self.log.get(p)).map(|e| e.term)
     }
 
     fn append_local(&mut self, kind: EntryKind, data: Vec<u8>) -> Index {
@@ -865,7 +1018,8 @@ impl RaftCore {
 
     fn truncate_from(&mut self, idx: Index) {
         debug_assert!(idx > self.commit, "never truncate committed entries");
-        self.log.truncate(idx as usize - 1);
+        let pos = self.pos(idx).expect("truncate below base");
+        self.log.truncate(pos);
         self.persist_from = self.persist_from.min(idx);
         self.pending_truncate =
             Some(self.pending_truncate.map_or(idx, |t| t.min(idx)));
@@ -901,7 +1055,11 @@ impl RaftCore {
         for id in members {
             self.progress
                 .entry(id)
-                .or_insert(Progress { match_index: 0, next_index: next_default });
+                .or_insert(Progress {
+                    match_index: 0,
+                    next_index: next_default,
+                    needs_snapshot: false,
+                });
         }
     }
 
@@ -916,17 +1074,27 @@ impl RaftCore {
 
     fn send_append(&mut self, to: NodeId) {
         let Some(pr) = self.progress.get(&to) else { return };
+        if pr.needs_snapshot {
+            return; // transfer in progress, driven outside the core
+        }
         let prev_log_index = pr.next_index - 1;
         let Some(prev_log_term) = self.term_at(prev_log_index) else {
-            // next_index below our first entry: needs a snapshot (WS4);
-            // cannot happen in v1 (no compaction).
+            // The follower is behind our compaction base: the log
+            // cannot serve it, only a snapshot can. Signal the driver
+            // once; cleared when the follower's match passes the base.
+            let base = self.base_index;
+            if let Some(pr) = self.progress.get_mut(&to) {
+                pr.needs_snapshot = true;
+            }
+            self.events.push(RaftEvent::SnapshotNeeded { node: to, base_index: base });
             return;
         };
         let from = pr.next_index;
+        let Some(from_pos) = self.pos(from) else { return };
         let entries: Vec<Entry> = self
             .log
             .iter()
-            .skip(from as usize - 1)
+            .skip(from_pos)
             .take(self.cfg.max_entries_per_msg)
             .cloned()
             .collect();
@@ -982,7 +1150,7 @@ impl RaftCore {
         self.commit = new_commit;
         // A committed RemoveNode(self) deposes a leader.
         for i in (old + 1)..=new_commit {
-            let Some(e) = self.log.get(i as usize - 1) else { break };
+            let Some(e) = self.pos(i).and_then(|p| self.log.get(p)) else { break };
             if e.kind == EntryKind::Config {
                 if let Some(ConfigChange::RemoveNode { node }) = ConfigChange::decode(&e.data) {
                     if node == self.cfg.id && self.role == Role::Leader {
@@ -1028,12 +1196,10 @@ impl RaftCore {
 
     /// Drain accumulated obligations. See the driver contract.
     pub fn ready(&mut self) -> Ready {
-        let entries_to_persist: Vec<Entry> = self
-            .log
-            .iter()
-            .skip(self.persist_from as usize - 1)
-            .cloned()
-            .collect();
+        let entries_to_persist: Vec<Entry> = match self.pos(self.persist_from) {
+            Some(p) => self.log.iter().skip(p).cloned().collect(),
+            None => Vec::new(),
+        };
         self.persist_from = self.last_index() + 1;
 
         let hard_state = if self.hard_state_dirty {
@@ -1044,7 +1210,7 @@ impl RaftCore {
         };
 
         let committed_entries: Vec<Entry> = ((self.applied + 1)..=self.commit)
-            .filter_map(|i| self.log.get(i as usize - 1).cloned())
+            .filter_map(|i| self.pos(i).and_then(|p| self.log.get(p)).cloned())
             .collect();
         // max(): after a restart the applied floor can be ahead of the
         // not-yet-recovered commit index; it must never move backwards.

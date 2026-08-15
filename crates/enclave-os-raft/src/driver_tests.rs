@@ -58,6 +58,8 @@ struct MiniCluster {
     /// Per node: (log backend, ledger backend), kept for restarts.
     backends: BTreeMap<NodeId, (SharedMem, SharedMem)>,
     queue: VecDeque<(NodeId, Message)>,
+    /// Driver events surfaced by any node: `(node, event)`.
+    events: Vec<(NodeId, crate::core::RaftEvent)>,
 }
 
 impl MiniCluster {
@@ -80,7 +82,7 @@ impl MiniCluster {
             drivers.insert(id, driver);
             backends.insert(id, (log_b, ledger_b));
         }
-        Self { drivers, backends, queue: VecDeque::new() }
+        Self { drivers, backends, queue: VecDeque::new(), events: Vec::new() }
     }
 
     fn pump(&mut self) {
@@ -89,6 +91,7 @@ impl MiniCluster {
             let Some(driver) = self.drivers.get_mut(&to) else { continue };
             let out = driver.step(msg).expect("driver step");
             self.queue.extend(out.messages);
+            self.events.extend(out.events.into_iter().map(|e| (to, e)));
         }
         panic!("mini cluster did not quiesce");
     }
@@ -98,6 +101,7 @@ impl MiniCluster {
         for id in ids {
             let out = self.drivers.get_mut(&id).unwrap().tick().expect("driver tick");
             self.queue.extend(out.messages);
+            self.events.extend(out.events.into_iter().map(|e| (id, e)));
         }
         self.pump();
     }
@@ -438,4 +442,168 @@ fn driver_learner_joins_and_promotes() {
         c.tick_all();
     }
     assert_eq!(c.drivers[&4].ledger().store().get(b"after").unwrap(), Some(b"2".to_vec()));
+}
+
+// ── Log compaction + snapshot install (phase 2) ─────────────────────
+
+impl MiniCluster {
+    fn txn(&mut self, k: &[u8], v: &[u8]) {
+        self.propose_txn(&[(k, Some(v))]);
+        self.tick_all();
+    }
+}
+
+#[test]
+fn compaction_preserves_operation_and_restart() {
+    let mut c = MiniCluster::new(3);
+    let l = c.wait_for_leader(300);
+    for i in 0..8u8 {
+        c.txn(&[b'k', i], &[i]);
+    }
+
+    // Compact everywhere through the applied index.
+    let ids: Vec<NodeId> = c.drivers.keys().copied().collect();
+    for id in &ids {
+        let applied = c.drivers[id].core().applied_index();
+        c.drivers.get_mut(id).unwrap().compact_to(applied).unwrap();
+        let (base, _) = c.drivers[id].core().base();
+        assert_eq!(base, applied);
+        assert!(c.drivers[id].core().entries().is_empty());
+    }
+
+    // The cluster keeps committing after compaction.
+    c.txn(b"post", b"1");
+    for id in &ids {
+        assert_eq!(
+            c.drivers[id].ledger().store().get(b"post").unwrap(),
+            Some(b"1".to_vec())
+        );
+    }
+
+    // A restart from the compacted log recovers cleanly.
+    let f = (1..=3).find(|&id| id != l).unwrap();
+    c.restart(f, 41);
+    assert!(!c.drivers[&f].is_halted());
+    for _ in 0..30 {
+        c.tick_all();
+    }
+    c.txn(b"post2", b"2");
+    assert_eq!(
+        c.drivers[&f].ledger().store().get(b"post2").unwrap(),
+        Some(b"2".to_vec())
+    );
+    assert_eq!(c.root(f), c.root(l));
+    assert!(c.drivers[&f].core().self_admitted());
+}
+
+/// A follower that fell behind the leader's compaction base cannot be
+/// served from the log: the leader signals SnapshotNeeded, the driver
+/// streams the ledger via the merkle snapshot primitives, the follower
+/// installs and resumes ordinary replication.
+#[test]
+fn snapshot_transfer_catches_up_lagging_follower() {
+    use enclave_os_merkle::SnapshotBuilder;
+
+    let mut c = MiniCluster::new(3);
+    let l = c.wait_for_leader(300);
+    c.txn(b"a", b"1");
+
+    // Take a follower down, move on without it, then compact past
+    // everything it ever saw.
+    let f = (1..=3).find(|&id| id != l).unwrap();
+    let dead = c.drivers.remove(&f).unwrap();
+    drop(dead);
+    for i in 0..5u8 {
+        c.txn(&[b'x', i], &[i]);
+    }
+    let applied = c.drivers[&l].core().applied_index();
+    c.drivers.get_mut(&l).unwrap().compact_to(applied).unwrap();
+
+    // The follower returns from its old (pre-compaction) state.
+    c.restart(f, 42);
+    let mut snapshot_needed = false;
+    for _ in 0..40 {
+        c.tick_all();
+        let evs = std::mem::take(&mut c.events);
+        for (node, ev) in evs {
+            if let crate::core::RaftEvent::SnapshotNeeded { node: target, .. } = ev {
+                assert_eq!(node, l);
+                assert_eq!(target, f);
+                snapshot_needed = true;
+            }
+        }
+        if snapshot_needed {
+            break;
+        }
+    }
+    assert!(snapshot_needed, "leader must request a snapshot transfer");
+
+    // Driver-level transfer (the wire protocol is phase 3): stream the
+    // leader's ledger at its checkpoint and rebuild on the follower
+    // under the follower's OWN storage key.
+    let (index, term) = c.drivers[&l].core().base();
+    let membership = c.drivers[&l].core().membership().clone();
+    let (root, version) = c.drivers[&l].ledger().root();
+    let mut chunks: Vec<Vec<([u8; 32], Vec<u8>)>> = Vec::new();
+    let mut start_after: Option<[u8; 32]> = None;
+    loop {
+        let (leaves, done) = c.drivers[&l]
+            .ledger()
+            .store()
+            .snapshot_leaves(version, start_after.as_ref(), 3)
+            .unwrap();
+        start_after = leaves.last().map(|(p, _)| *p);
+        chunks.push(leaves);
+        if done {
+            break;
+        }
+    }
+    let fresh_backend = SharedMem::new();
+    let mut builder = SnapshotBuilder::new(fresh_backend.clone(), CK, sk(f)).unwrap();
+    for chunk in chunks {
+        builder.add_leaves(chunk);
+    }
+    let restored = builder.finalize(root, version).unwrap();
+    let installed = c
+        .drivers
+        .get_mut(&f)
+        .unwrap()
+        .install_snapshot_state(index, term, membership, restored)
+        .unwrap();
+    assert!(installed);
+    c.backends.get_mut(&f).unwrap().1 = fresh_backend;
+
+    // Transfer complete: the leader resumes appends from the base
+    // (phase 3's SnapshotAck triggers this over the wire).
+    let out = c.drivers.get_mut(&l).unwrap().snapshot_transferred(f).unwrap();
+    c.queue.extend(out.messages);
+    c.pump();
+
+    // Ordinary replication resumes past the base; everyone converges.
+    for _ in 0..40 {
+        c.tick_all();
+    }
+    c.txn(b"final", b"9");
+    assert_eq!(c.root(f), c.root(l));
+    let store = c.drivers[&f].ledger().store();
+    assert_eq!(store.get(b"a").unwrap(), Some(b"1".to_vec()));
+    assert_eq!(store.get(b"final").unwrap(), Some(b"9".to_vec()));
+    assert!(c.drivers[&f].core().self_admitted(), "re-admitted after install");
+}
+
+#[test]
+fn maybe_compact_policy() {
+    let mut c = MiniCluster::new(3);
+    let l = c.wait_for_leader(300);
+    for i in 0..10u8 {
+        c.txn(&[b'p', i], &[i]);
+    }
+    let d = c.drivers.get_mut(&l).unwrap();
+    let applied = d.core().applied_index();
+    // Span ≤ 2×retain: no-op.
+    d.maybe_compact(applied).unwrap();
+    assert_eq!(d.core().base().0, 0);
+    // Span > 2×retain: compacts to applied - retain.
+    d.maybe_compact(3).unwrap();
+    assert_eq!(d.core().base().0, applied - 3);
 }
