@@ -471,6 +471,9 @@ fn build_ratls_policy(
         },
         expected_oids: Vec::new(),
         attestation_servers: cfg.attestation_servers.clone(),
+        // TCB acceptance stays legacy (Revoked-only) for the vault leg until
+        // the constellation's acceptable set is threaded into VaultKeyConfig.
+        acceptable_tcb_statuses: None,
         // Mutual RA-TLS: present this app's identity (OS signer mints the cert).
         client_identity: Some(ClientCertIdentity {
             code_hash: code_hash.to_vec(),

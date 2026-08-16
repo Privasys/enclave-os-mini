@@ -149,6 +149,9 @@ fn build_ratls_policy(p: wit::RatlsPolicy) -> Result<RaTlsPolicy, String> {
             })
             .collect(),
         attestation_servers: p.attestation_servers,
+        // TCB acceptance stays legacy (Revoked-only) until apps can carry an
+        // acceptable-TCB set in their sealed metadata.
+        acceptable_tcb_statuses: None,
         // App egress presents no client certificate (server attestation only).
         client_identity: None,
         // Set by the caller from the app's sealed metadata, not the app request.

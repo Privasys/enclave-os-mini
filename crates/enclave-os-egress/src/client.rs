@@ -273,6 +273,15 @@ pub struct RaTlsPolicy {
     /// ```
     pub attestation_servers: Vec<String>,
 
+    /// Opt-in Intel TCB-status enforcement on the attestation servers'
+    /// reported `tcbStatus`. `None` (the default) = no acceptance check
+    /// beyond the always-on rejection of `"Revoked"`. `Some(set)` = the
+    /// secure floor (`UpToDate`, `SWHardeningNeeded`) always passes and any
+    /// other reported status must be listed in `set` (`Some(vec![])` =
+    /// strict floor-only). Opt-in so existing callers keep their behaviour
+    /// on fleets that report `ConfigurationAndSWHardeningNeeded`.
+    pub acceptable_tcb_statuses: Option<Vec<String>>,
+
     /// Mutual RA-TLS: when `Some`, the connection presents a client
     /// certificate carrying this (OS-derived) app identity, minted by the
     /// registered [`EnclaveClientCertSigner`] and bound to the server's
@@ -988,7 +997,21 @@ fn verify_ratls_cert(der: &[u8], policy: &RaTlsPolicy) -> Result<(), String> {
     // TEE-agnostic and auto-detects the quote format.  This is the
     // authoritative proof that the quote was produced by genuine TEE
     // hardware and has not been tampered with.
-    crate::attestation::verify_quote(quote, &policy.attestation_servers)?;
+    let verdicts =
+        crate::attestation::verify_quote_statuses(quote, &policy.attestation_servers)?;
+    // Opt-in Intel TCB-status gate (see RaTlsPolicy::acceptable_tcb_statuses):
+    // `None` = no check beyond the always-on Revoked rejection.
+    for v in &verdicts {
+        if !crate::attestation::tcb_status_acceptable(
+            &v.tcb_status,
+            policy.acceptable_tcb_statuses.as_deref(),
+        ) {
+            return Err(format!(
+                "peer platform TCB status {:?} not acceptable under policy",
+                v.tcb_status
+            ));
+        }
+    }
 
     Ok(())
 }

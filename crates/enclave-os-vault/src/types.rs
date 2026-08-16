@@ -437,6 +437,18 @@ pub struct AttestationProfile {
     /// Required X.509 OID extensions on the peer certificate.
     #[serde(default)]
     pub required_oids: Vec<OidRequirement>,
+
+    /// Opt-in Intel TCB-status enforcement. `None` (the default, and what
+    /// every pre-existing stored policy deserialises to) = no TCB acceptance
+    /// check — deliberately, so rolling out this enclave build does not
+    /// reject peers on fleets whose policies have not been updated (the
+    /// production hosts report `ConfigurationAndSWHardeningNeeded`).
+    /// `Some(set)` = enforce: the secure floor (`UpToDate`,
+    /// `SWHardeningNeeded`) always passes, other statuses must be listed in
+    /// `set` (`Some([])` = strict floor-only). `"Revoked"` is never accepted,
+    /// even with `None` — a revoked platform TCB always fails.
+    #[serde(default)]
+    pub acceptable_tcb_statuses: Option<Vec<String>>,
 }
 
 /// A measurement value that identifies a specific enclave build.

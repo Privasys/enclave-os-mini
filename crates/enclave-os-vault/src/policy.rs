@@ -190,7 +190,8 @@ pub fn has_required_roles(claims: &OidcClaims, required_roles: &[String]) -> boo
 ///
 /// Performs (in order):
 ///   1. cert dissection (quote + OID claims + pubkey),
-///   2. attestation server verification of the quote,
+///   2. attestation server verification of the quote (incl. the Intel TCB
+///      status gate against `profile.acceptable_tcb_statuses`),
 ///   3. parse + measurement match against `profile.measurements`,
 ///   4. bidirectional challenge-response binding,
 ///   5. required OID extension match.
@@ -215,8 +216,24 @@ pub(crate) fn tee_matches(
         // Refuse: a TEE principal must list at least one attestation server.
         return false;
     }
-    if enclave_os_egress::attestation::verify_quote(&evidence.evidence, &urls).is_err() {
-        return false;
+    let verdicts =
+        match enclave_os_egress::attestation::verify_quote_statuses(&evidence.evidence, &urls) {
+            Ok(v) => v,
+            Err(_) => return false,
+        };
+    // Enforce the Intel platform TCB status reported by each server against
+    // the profile's acceptable set (opt-in: `None` = legacy policy, no check;
+    // `Some` = secure floor + explicit relaxations; `Revoked` always fails,
+    // opt-in or not). A server that reports no status is accepted for
+    // compatibility — the sgx.fail downgrade gate only tightens when the
+    // hardened attestation server actually derives a status.
+    for v in &verdicts {
+        if !enclave_os_egress::attestation::tcb_status_acceptable(
+            &v.tcb_status,
+            profile.acceptable_tcb_statuses.as_deref(),
+        ) {
+            return false;
+        }
     }
 
     // 3. Parse + measurement match.
@@ -598,6 +615,8 @@ pub fn evaluate_policy_update(
 ///     normalised, so the app-code digest at …65230.3.2 and the app id at
 ///     …3.6 must be byte-identical),
 ///   - identical `attestation_servers` (URL + pinned SPKI, unordered),
+///   - identical `acceptable_tcb_statuses` (unordered — a migration must not
+///     change the TCB acceptance policy),
 ///   - non-empty measurement lists of the SAME TEE family on both sides
 ///     (all-SGX or all-TDX — a runtime roll never changes the TEE type),
 ///   - actually different measurements (an identical profile is a re-stage,
@@ -609,6 +628,17 @@ pub(crate) fn runtime_only_delta(staged: &AttestationProfile, active: &Attestati
     }
     if !same_elements(&staged.attestation_servers, &active.attestation_servers) {
         return false;
+    }
+    // A migration must not smuggle a TCB-policy change past the owner: the
+    // acceptable-TCB set has to be the same policy on both sides (None==None,
+    // or Some sets equal as unordered element sets).
+    match (
+        &staged.acceptable_tcb_statuses,
+        &active.acceptable_tcb_statuses,
+    ) {
+        (None, None) => {}
+        (Some(a), Some(b)) if same_elements(a, b) => {}
+        _ => return false,
     }
     let family = |ms: &[Measurement]| -> Option<bool> {
         // Some(true) = all SGX, Some(false) = all TDX, None = empty or mixed.
@@ -864,6 +894,7 @@ mod auto_migrate_tests {
                     value: app_id.into(),
                 },
             ],
+            acceptable_tcb_statuses: None,
         }
     }
 
@@ -883,6 +914,52 @@ mod auto_migrate_tests {
         let staged = profile("bbbb", "code1", "aid1");
         assert!(runtime_only_delta(&staged, &active));
         // Name is advisory and ignored — already differs in the fixtures.
+    }
+
+    #[test]
+    fn rejects_tcb_set_change_as_runtime_only() {
+        let active = profile("aaaa", "code1", "aid1");
+        // Opting a profile into TCB enforcement (or relaxing/tightening the
+        // set) is a policy change, never an auto-acceptable runtime roll.
+        let mut opted = profile("bbbb", "code1", "aid1");
+        opted.acceptable_tcb_statuses =
+            Some(vec!["ConfigurationAndSWHardeningNeeded".into()]);
+        assert!(!runtime_only_delta(&opted, &active));
+        // Same set (order-insensitive) still qualifies.
+        let mut active2 = profile("aaaa", "code1", "aid1");
+        active2.acceptable_tcb_statuses =
+            Some(vec!["OutOfDate".into(), "ConfigurationNeeded".into()]);
+        let mut staged2 = profile("bbbb", "code1", "aid1");
+        staged2.acceptable_tcb_statuses =
+            Some(vec!["ConfigurationNeeded".into(), "OutOfDate".into()]);
+        assert!(runtime_only_delta(&staged2, &active2));
+    }
+
+    #[test]
+    fn tcb_status_gate() {
+        use enclave_os_egress::attestation::tcb_status_acceptable;
+        let strict: Vec<String> = vec![];
+        let relax = vec!["ConfigurationAndSWHardeningNeeded".to_string()];
+        // Legacy policy (None): no enforcement — anything but Revoked passes.
+        assert!(tcb_status_acceptable("ConfigurationAndSWHardeningNeeded", None));
+        assert!(tcb_status_acceptable("OutOfDate", None));
+        // …but Revoked always fails, opt-in or not.
+        assert!(!tcb_status_acceptable("Revoked", None));
+        // Empty status (server did not derive one) is accepted for compat.
+        assert!(tcb_status_acceptable("", Some(&strict)));
+        // Secure floor always passes under enforcement.
+        assert!(tcb_status_acceptable("UpToDate", Some(&strict)));
+        assert!(tcb_status_acceptable("SWHardeningNeeded", Some(&strict)));
+        // Outside the floor: rejected under strict floor-only…
+        assert!(!tcb_status_acceptable("ConfigurationAndSWHardeningNeeded", Some(&strict)));
+        assert!(!tcb_status_acceptable("OutOfDate", Some(&strict)));
+        // …accepted only when explicitly listed…
+        assert!(tcb_status_acceptable("ConfigurationAndSWHardeningNeeded", Some(&relax)));
+        // …and one relaxation never implies another.
+        assert!(!tcb_status_acceptable("OutOfDate", Some(&relax)));
+        // Revoked is non-overridable, even if a policy lists it.
+        let evil = vec!["Revoked".to_string()];
+        assert!(!tcb_status_acceptable("Revoked", Some(&evil)));
     }
 
     #[test]
