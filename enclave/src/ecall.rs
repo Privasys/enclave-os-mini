@@ -561,9 +561,11 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
     #[cfg(feature = "raft")]
     {
         // Config: raft_node_id (u64, required to activate),
-        // raft_peers ({"<id>": "host:port"}), raft_cluster_key
-        // (hex-64, shared by all replicas — the ledger commitment key
-        // derives from it).
+        // raft_peers ({"<id>": "host:port"}), and the cluster key from
+        // ONE of: raft_vault (the credential lives in the vault
+        // constellation under a grant policy — fetching it IS
+        // admission) or raft_cluster_key (hex-64 operator secret,
+        // standalone/dev only — the host sees it).
         if let Some(node_id) = config.extra.get("raft_node_id").and_then(|v| v.as_u64()) {
             let peers: std::collections::BTreeMap<u64, String> = config
                 .extra
@@ -577,15 +579,55 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
                         .collect()
                 })
                 .unwrap_or_default();
-            let cluster_key: Option<[u8; 32]> = config
-                .extra
-                .get("raft_cluster_key")
-                .and_then(|v| v.as_str())
-                .and_then(enclave_os_common::hex::hex_decode)
-                .and_then(|b| b.try_into().ok());
-            let Some(cluster_key) = cluster_key else {
-                enclave_log_error!("raft: raft_cluster_key missing or not 32 bytes hex");
-                return -36;
+            let cluster_key: [u8; 32] = if let Some(vault) =
+                config.extra.get("raft_vault").and_then(|v| v.as_object())
+            {
+                let get = |k: &str| {
+                    vault.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string()
+                };
+                let vcfg = crate::raftglue::RaftVaultConfig {
+                    mgmt_url: get("mgmt_url"),
+                    environment: {
+                        let e = get("environment");
+                        if e.is_empty() { "production".to_string() } else { e }
+                    },
+                    handle: get("handle"),
+                    grant: get("grant"),
+                    app_id: vault
+                        .get("app_id")
+                        .and_then(|v| v.as_str())
+                        .and_then(enclave_os_common::hex::hex_decode),
+                };
+                if vcfg.mgmt_url.is_empty() || vcfg.handle.is_empty() {
+                    enclave_log_error!("raft: raft_vault needs mgmt_url and handle");
+                    return -36;
+                }
+                match crate::raftglue::resolve_cluster_key(
+                    &sealed_cfg.master_key(),
+                    &vcfg,
+                ) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        enclave_log_error!("raft: cluster credential: {}", e);
+                        return -36;
+                    }
+                }
+            } else {
+                match config
+                    .extra
+                    .get("raft_cluster_key")
+                    .and_then(|v| v.as_str())
+                    .and_then(enclave_os_common::hex::hex_decode)
+                    .and_then(|b| b.try_into().ok())
+                {
+                    Some(k) => k,
+                    None => {
+                        enclave_log_error!(
+                            "raft: need raft_vault or raft_cluster_key (hex-64)"
+                        );
+                        return -36;
+                    }
+                }
             };
             let ca = match crate::ratls::attestation::CaContext::from_parts(
                 sealed_cfg.ca_cert_der.clone(),
@@ -604,13 +646,80 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
                 .get("raft_genesis_voters")
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|v| v.as_u64()).collect());
-            // Peer measurement pinning defaults ON; disable transiently
-            // for a measurement rotation with raft_pin_measurement=false.
+            // Peer measurement pinning defaults ON (admissible set =
+            // own measurement); raft_pin_measurements widens the set
+            // (an upgrade window lists {old, new});
+            // raft_pin_measurement=false disables (transitional only).
             let pin_measurement = config
                 .extra
                 .get("raft_pin_measurement")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
+            let pinned_measurements: Option<Vec<[u8; 32]>> = if !pin_measurement {
+                None
+            } else if let Some(list) = config
+                .extra
+                .get("raft_pin_measurements")
+                .and_then(|v| v.as_array())
+            {
+                let mut set = Vec::with_capacity(list.len());
+                for v in list {
+                    let parsed: Option<[u8; 32]> = v
+                        .as_str()
+                        .and_then(enclave_os_common::hex::hex_decode)
+                        .and_then(|b| b.try_into().ok());
+                    match parsed {
+                        Some(m) => set.push(m),
+                        None => {
+                            enclave_log_error!(
+                                "raft: raft_pin_measurements entries must be 32-byte hex"
+                            );
+                            return -36;
+                        }
+                    }
+                }
+                if set.is_empty() {
+                    enclave_log_error!("raft: raft_pin_measurements must not be empty");
+                    return -36;
+                }
+                Some(set)
+            } else {
+                match crate::ratls::attestation::self_mrenclave() {
+                    Ok(own) => Some(std::vec![own]),
+                    Err(e) => {
+                        enclave_log_error!("raft: self measurement for peer pinning: {}", e);
+                        return -36;
+                    }
+                }
+            };
+            // Acceptable Intel TCB statuses on peer quotes: tri-state
+            // with vault semantics (absent = no check, [] = strict
+            // floor-only, list = floor + list; Revoked never).
+            let acceptable_tcb_statuses: Option<Vec<String>> = config
+                .extra
+                .get("raft_acceptable_tcb_statuses")
+                .and_then(|v| v.as_array())
+                .map(|a| {
+                    a.iter()
+                        .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                        .collect()
+                });
+            if let Some(set) = &acceptable_tcb_statuses {
+                if set.iter().any(|s| s == "Revoked") {
+                    enclave_log_error!(
+                        "raft: Revoked can never be an acceptable TCB status"
+                    );
+                    return -36;
+                }
+            }
+            // Link re-attestation window (fresh quotes): seconds,
+            // default 24 h, 0 disables.
+            let reattest_ticks = config
+                .extra
+                .get("raft_reattest_secs")
+                .and_then(|v| v.as_u64())
+                .unwrap_or(86_400)
+                .saturating_mul(10);
             // Keep roughly this many applied entries in the log;
             // followers further behind catch up via snapshot transfer.
             let log_retain = config
@@ -625,7 +734,11 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
                 peers,
                 genesis_voters,
                 ca,
-                pin_measurement,
+                crate::raftglue::RaftNetConfig {
+                    pinned_measurements,
+                    acceptable_tcb_statuses,
+                    reattest_ticks,
+                },
                 log_retain,
             ) {
                 Ok(glue) => {

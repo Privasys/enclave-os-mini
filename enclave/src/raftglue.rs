@@ -11,12 +11,28 @@
 //! takes it while the state lock is held (st → RAFT order). There is
 //! no RAFT → st path, so no deadlock.
 //!
-//! Cluster keys: the ledger commitment key `ck` derives from the
-//! operator-provisioned `raft_cluster_key` (all replicas share it — the
-//! encryption-independent root requires it), while the ledger storage
-//! key and the log key derive from this enclave's sealed master key
-//! (node-local). In-band attested `ck` provisioning replaces the
-//! operator secret when the join flow lands.
+//! Cluster keys: the ledger commitment key `ck` (all replicas share
+//! it — the encryption-independent root requires it) comes from ONE of
+//! two sources: the vault constellation (`raft_vault` config — the key
+//! is generated inside the first node's enclave, Shamir-split across
+//! the vaults, and released only under the owner-authored grant policy
+//! measurement + TCB checks; fetching the credential IS admission), or
+//! the operator-provisioned `raft_cluster_key` (standalone/dev mode —
+//! the host sees this secret, documented as the weaker model). A
+//! vault-resolved `ck` is sealed node-locally so restarts do not
+//! depend on vault availability. The ledger storage key and the log
+//! key derive from this enclave's sealed master key (node-local).
+//!
+//! Peer admission: beyond the fleet-CA + measurement-set pin enforced
+//! in the TLS layer (see `peerlink`), each established link's peer
+//! quote is sent to the configured attestation servers (central
+//! config, OID 2.7) and gated on the verified MRENCLAVE + the Intel
+//! TCB status against `raft_acceptable_tcb_statuses` — tri-state
+//! exactly like the vault: absent = no TCB check (rollout safety),
+//! `[]` = strict floor-only, a list = floor + list, Revoked never
+//! accepted. Verdicts are cached per cert fingerprint; links older
+//! than the re-attestation window are recycled so fresh quotes are
+//! presented (certs are minted per connection).
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
@@ -50,6 +66,15 @@ const COMPACT_EVERY_TICKS: u64 = 64;
 /// A snapshot transfer with no progress for this many ticks is dropped
 /// (the pause re-signals and the transfer restarts).
 const TRANSFER_STALL_TICKS: u64 = 100;
+
+/// How long a PASSED attestation-server verdict for a peer cert is
+/// cached (1 hour) — keeps the AS off the steady-state hot path.
+const VERIFY_PASS_TICKS: u64 = 36_000;
+
+/// How long a FAILED verdict is cached (1 minute) — rate-limits AS
+/// calls while a rejected peer keeps redialing, without pinning the
+/// rejection long past a TCB recovery.
+const VERIFY_FAIL_TICKS: u64 = 600;
 
 static RAFT: OnceLock<Mutex<RaftGlue>> = OnceLock::new();
 
@@ -86,6 +111,130 @@ fn now_secs() -> u64 {
     enclave_os_common::ocall::get_current_time().unwrap_or(0)
 }
 
+// ── Cluster key resolution (vault-anchored) ─────────────────────────
+
+/// Vault addressing for the cluster credential (config `raft_vault`).
+pub struct RaftVaultConfig {
+    /// Management-service base URL (the vault directory).
+    pub mgmt_url: String,
+    /// Directory environment (`production` / `development`).
+    pub environment: String,
+    /// The cluster key's vault handle — one per cluster.
+    pub handle: String,
+    /// Key-creation grant, needed only on the FIRST boot of the first
+    /// node (the platform mints it with the owner-authored policy).
+    /// Empty on every later boot/node. The grant is an authorisation
+    /// token, not secret material: presenting it requires passing the
+    /// policy's attestation checks over mutual RA-TLS.
+    pub grant: String,
+    /// Optional app identity (raw bytes) to present on the client
+    /// certificate, when the credential policy pins one.
+    pub app_id: Option<Vec<u8>>,
+}
+
+const CK_SEAL_TABLE: &str = "raft:meta";
+const CK_SEAL_RECORD: &[u8] = b"ck.sealed.v1";
+const CK_SEAL_AAD: &[u8] = b"enclave-os-raft:ck-seal:v1";
+
+/// Resolve the cluster key: node-local sealed copy first (restarts do
+/// not depend on vault availability), else fetch from the vault
+/// constellation under the credential's grant policy and seal it.
+/// Fail-closed: no credential, no cluster.
+pub fn resolve_cluster_key(
+    master_key: &[u8; 32],
+    cfg: &RaftVaultConfig,
+) -> Result<[u8; 32], String> {
+    if let Some(ck) = load_sealed_ck(master_key) {
+        enclave_log_info!("raft: cluster key restored from the sealed copy");
+        return Ok(ck);
+    }
+    let ck = fetch_vault_ck(cfg)?;
+    store_sealed_ck(master_key, &ck)?;
+    enclave_log_info!("raft: cluster key resolved from the vault constellation and sealed");
+    Ok(ck)
+}
+
+/// The attested-unwrap leg, reusing the wasm KEK client verbatim: the
+/// key is generated inside the FIRST node's enclave, Shamir-split
+/// across the constellation, and released to later nodes only if they
+/// pass every vault's grant-policy checks (measurement set, OIDs,
+/// acceptable TCB statuses, optional owner approval). No single vault
+/// ever holds the whole key; the host never sees it at all.
+#[cfg(all(feature = "wasm", feature = "egress"))]
+fn fetch_vault_ck(cfg: &RaftVaultConfig) -> Result<[u8; 32], String> {
+    use enclave_os_wasm::vaultkey;
+    let vcfg = vaultkey::discover(&cfg.mgmt_url, &cfg.environment)
+        .map_err(|e| format!("vault discovery: {e}"))?;
+    let code_hash = crate::ratls::attestation::self_mrenclave()
+        .map_err(|e| format!("self measurement: {e}"))?;
+    vaultkey::resolve_or_provision(
+        &vcfg,
+        &cfg.handle,
+        &cfg.grant,
+        &code_hash,
+        cfg.app_id.as_deref(),
+    )
+    .map_err(|e| format!("cluster credential: {e}"))
+}
+
+#[cfg(not(all(feature = "wasm", feature = "egress")))]
+fn fetch_vault_ck(_cfg: &RaftVaultConfig) -> Result<[u8; 32], String> {
+    Err("raft_vault requires a build with the wasm and egress modules \
+         (the cluster flavor); use raft_cluster_key on this build"
+        .to_string())
+}
+
+fn ck_seal_key(master_key: &[u8; 32]) -> [u8; 32] {
+    derive(master_key, b"enclave-os-raft:ckseal:v1")
+}
+
+fn load_sealed_ck(master_key: &[u8; 32]) -> Option<[u8; 32]> {
+    use enclave_os_merkle::KvBackend;
+    let backend = OcallBackend::with_table(CK_SEAL_TABLE);
+    let rec = backend.get(CK_SEAL_RECORD).ok()??;
+    if rec.len() != 12 + 32 + 16 {
+        return None;
+    }
+    let key =
+        ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &ck_seal_key(master_key)).ok()?;
+    let key = ring::aead::LessSafeKey::new(key);
+    let nonce = ring::aead::Nonce::try_assume_unique_for_key(&rec[..12]).ok()?;
+    let mut ct = rec[12..].to_vec();
+    let pt = key
+        .open_in_place(nonce, ring::aead::Aad::from(CK_SEAL_AAD), &mut ct)
+        .ok()?;
+    if pt.len() != 32 {
+        return None;
+    }
+    let mut out = [0u8; 32];
+    out.copy_from_slice(pt);
+    Some(out)
+}
+
+fn store_sealed_ck(master_key: &[u8; 32], ck: &[u8; 32]) -> Result<(), String> {
+    use enclave_os_common::rpc::KvBatchOp;
+    use enclave_os_merkle::KvBackend;
+    let mut nonce_bytes = [0u8; 12];
+    SystemRandom::new()
+        .fill(&mut nonce_bytes)
+        .map_err(|_| "rng (ck seal nonce)".to_string())?;
+    let key = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &ck_seal_key(master_key))
+        .map_err(|_| "ck seal key".to_string())?;
+    let key = ring::aead::LessSafeKey::new(key);
+    let nonce = ring::aead::Nonce::assume_unique_for_key(nonce_bytes);
+    let mut buf = ck.to_vec();
+    key.seal_in_place_append_tag(nonce, ring::aead::Aad::from(CK_SEAL_AAD), &mut buf)
+        .map_err(|_| "ck seal".to_string())?;
+    let mut record = nonce_bytes.to_vec();
+    record.extend_from_slice(&buf);
+    OcallBackend::with_table(CK_SEAL_TABLE)
+        .write_batch(std::vec![KvBatchOp::Put {
+            key: CK_SEAL_RECORD.to_vec(),
+            value: record,
+        }])
+        .map_err(|e| format!("ck seal persist: {e:?}"))
+}
+
 /// The cluster runtime for this node.
 pub struct RaftGlue {
     driver: RaftDriver<OcallBackend>,
@@ -120,6 +269,28 @@ pub struct RaftGlue {
     /// Last logged (role, term, leader, commit, verified) for
     /// transition logging.
     last_logged: Option<(Role, u64, Option<NodeId>, u64, u64)>,
+    /// Intel TCB statuses accepted on peer quotes beyond the secure
+    /// floor (tri-state, vault semantics).
+    acceptable_tcb_statuses: Option<Vec<String>>,
+    /// Recycle links older than this many ticks so fresh quotes are
+    /// presented (0 = off).
+    reattest_ticks: u64,
+    /// Cached attestation-server verdicts: cert fingerprint →
+    /// (passed, expiry tick).
+    verdicts: BTreeMap<[u8; 32], (bool, u64)>,
+    /// Tick each connection completed its handshake (re-attestation).
+    conn_established: BTreeMap<u32, u64>,
+}
+
+/// Peer-admission configuration (from `--extra`, resolved by ecall).
+pub struct RaftNetConfig {
+    /// Admissible peer MRENCLAVEs; `None` disables the local pin
+    /// (`raft_pin_measurement: false`, transitional only).
+    pub pinned_measurements: Option<Vec<[u8; 32]>>,
+    /// Tri-state acceptable-TCB set for peer quotes (vault semantics).
+    pub acceptable_tcb_statuses: Option<Vec<String>>,
+    /// Link max age in ticks before recycling for a fresh quote.
+    pub reattest_ticks: u64,
 }
 
 impl RaftGlue {
@@ -130,7 +301,7 @@ impl RaftGlue {
         peers: BTreeMap<NodeId, String>,
         genesis_voters: Option<Vec<NodeId>>,
         ca: CaContext,
-        pin_measurement: bool,
+        net: RaftNetConfig,
         log_retain: u64,
     ) -> Result<Self, String> {
         let ck = derive(&cluster_key, b"enclave-os-raft:ck:v1");
@@ -189,18 +360,7 @@ impl RaftGlue {
         // it through the log.
         driver.set_signer(&master_key);
 
-        // Peer links only accept enclaves running the SAME binary
-        // unless the operator explicitly disables the pin (needed
-        // transiently during a measurement rotation).
-        let pinned = if pin_measurement {
-            Some(
-                crate::ratls::attestation::self_mrenclave()
-                    .map_err(|e| format!("self measurement for peer pinning: {e}"))?,
-            )
-        } else {
-            None
-        };
-        let link = PeerLink::new(ca, pinned)?;
+        let link = PeerLink::new(ca, net.pinned_measurements)?;
         enclave_log_info!(
             "raft node {} up ({} peers, {})",
             node_id,
@@ -228,6 +388,10 @@ impl RaftGlue {
             snapshot_sends: BTreeMap::new(),
             snapshot_recv: None,
             last_logged: None,
+            acceptable_tcb_statuses: net.acceptable_tcb_statuses,
+            reattest_ticks: net.reattest_ticks,
+            verdicts: BTreeMap::new(),
+            conn_established: BTreeMap::new(),
         })
     }
 
@@ -268,6 +432,16 @@ impl RaftGlue {
         for ev in events {
             match ev {
                 PeerEvent::Established(cid) => {
+                    // Independent quote verification (attestation
+                    // servers) BEFORE the link carries anything. On
+                    // failure the connection is closed; the redial
+                    // path re-verifies (fresh cert, fresh verdict).
+                    if !self.verify_peer(cid) {
+                        self.dial_pending.remove(&cid);
+                        self.link.close(cid);
+                        continue;
+                    }
+                    self.conn_established.insert(cid, self.ticks);
                     if let Some(node) = self.dial_pending.remove(&cid) {
                         self.map_conn(node, cid);
                     }
@@ -309,10 +483,93 @@ impl RaftGlue {
                 }
                 PeerEvent::Closed(cid) => {
                     self.dial_pending.remove(&cid);
+                    self.conn_established.remove(&cid);
                     self.unmap_conn(cid);
                 }
             }
         }
+    }
+
+    // ── Peer admission: attestation-server quote verification ───────
+
+    /// Verify the peer's certificate quote against the configured
+    /// attestation servers (signature chain to the Intel root, QE
+    /// identity, PCK CRL, DEBUG — everything the hardened AS checks)
+    /// and gate the reported `tcbStatus` + AS-verified MRENCLAVE.
+    /// No servers configured = pass (standalone mode: the TLS-layer
+    /// parse pin is the only measurement check). Requires egress; a
+    /// build without it skips (and cannot configure servers anyway).
+    fn verify_peer(&mut self, cid: u32) -> bool {
+        #[cfg(feature = "egress")]
+        {
+            let servers = enclave_os_common::attestation_servers::server_urls();
+            if servers.is_empty() {
+                return true;
+            }
+            let Some(cert) = self.link.peer_cert_der(cid) else {
+                enclave_log_error!("raft: peer conn {} has no certificate", cid);
+                return false;
+            };
+            let fp: [u8; 32] = ring::digest::digest(&ring::digest::SHA256, &cert)
+                .as_ref()
+                .try_into()
+                .unwrap();
+            if let Some(&(passed, expiry)) = self.verdicts.get(&fp) {
+                if self.ticks < expiry {
+                    return passed;
+                }
+            }
+            let passed = match self.verify_peer_cert(&cert) {
+                Ok(()) => true,
+                Err(e) => {
+                    enclave_log_error!("raft: peer conn {} rejected: {}", cid, e);
+                    false
+                }
+            };
+            let ttl = if passed { VERIFY_PASS_TICKS } else { VERIFY_FAIL_TICKS };
+            self.verdicts.insert(fp, (passed, self.ticks + ttl));
+            passed
+        }
+        #[cfg(not(feature = "egress"))]
+        {
+            let _ = cid;
+            true
+        }
+    }
+
+    #[cfg(feature = "egress")]
+    fn verify_peer_cert(&self, cert: &[u8]) -> Result<(), String> {
+        let quote = crate::peerlink::extract_quote(cert)?;
+        let servers = enclave_os_common::attestation_servers::server_urls();
+        let responses =
+            enclave_os_egress::attestation::verify_quote_statuses(&quote, &servers)?;
+        for resp in &responses {
+            // TCB status: tri-state vault semantics (floor + set,
+            // Revoked never, absent set = no check).
+            if !enclave_os_egress::attestation::tcb_status_acceptable(
+                &resp.tcb_status,
+                self.acceptable_tcb_statuses.as_deref(),
+            ) {
+                return Err(format!(
+                    "peer TCB status {:?} not acceptable",
+                    resp.tcb_status
+                ));
+            }
+            // AS-verified measurement must be in the admissible set —
+            // independent of the TLS-layer parse (which a stolen
+            // fleet-CA key could satisfy with a fabricated quote).
+            if let Some(set) = self.link.pinned() {
+                if !resp.mrenclave.is_empty()
+                    && !set.iter().any(|m| resp.mrenclave == hex_encode(m))
+                {
+                    return Err(format!(
+                        "AS-verified MRENCLAVE {} not in the admissible set",
+                        resp.mrenclave
+                    ));
+                }
+            }
+        }
+        Ok(())
     }
 
     // ── Snapshot transfer (outside the core) ────────────────────────
@@ -455,6 +712,32 @@ impl RaftGlue {
             }
         }
 
+        // Re-attestation: recycle links older than the window so both
+        // sides present freshly minted certs (with fresh quotes) and
+        // get re-verified against the attestation servers. The redial
+        // path brings the link back within seconds.
+        if self.reattest_ticks > 0 {
+            let aged: Vec<u32> = self
+                .conn_established
+                .iter()
+                .filter(|(_, &at)| self.ticks.saturating_sub(at) > self.reattest_ticks)
+                .map(|(&cid, _)| cid)
+                .collect();
+            for cid in aged {
+                enclave_log_info!("raft: recycling conn {} for re-attestation", cid);
+                self.conn_established.remove(&cid);
+                self.unmap_conn(cid);
+                self.link.close(cid);
+            }
+        }
+
+        // Expired verdicts are re-checked on next use; drop them so
+        // the cache cannot grow unboundedly under cert churn.
+        if self.ticks % 1024 == 0 {
+            let now = self.ticks;
+            self.verdicts.retain(|_, (_, expiry)| *expiry > now);
+        }
+
         // Drop stalled transfers; the pause re-signals and they restart.
         let stalled: Vec<NodeId> = self
             .snapshot_sends
@@ -582,6 +865,7 @@ impl RaftGlue {
         if let Some(old) = self.node_conns.insert(node, cid) {
             if old != cid {
                 self.conn_nodes.remove(&old);
+                self.conn_established.remove(&old);
                 self.link.close(old);
             }
         }
