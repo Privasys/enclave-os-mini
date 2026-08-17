@@ -1039,6 +1039,53 @@ impl RaftGlue {
         }
     }
 
+    /// Execute a WASM app function against a fork of the ledger and
+    /// propose its write-set through consensus (apply mode). The app
+    /// reaches the fork via `privasys:enclave-os/ledger`; a trap or
+    /// error aborts with nothing proposed.
+    #[cfg(feature = "wasm")]
+    fn propose_wasm_txn(&mut self, call: enclave_os_wasm::protocol::WasmCall) -> Response {
+        use enclave_os_wasm::enclave_sdk::ledger::{with_txn_ledger, TxnLedger};
+
+        let Some(wasm) = enclave_os_wasm::global() else {
+            return err_json("wasm module not available");
+        };
+
+        struct ForkLedger<'a, 'b>(&'a mut enclave_os_merkle::MerkleFork<'b, OcallBackend>);
+        impl TxnLedger for ForkLedger<'_, '_> {
+            fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+                self.0.get(key).map_err(|e| format!("ledger get: {e:?}"))
+            }
+            fn put(&mut self, key: &[u8], value: &[u8]) {
+                self.0.put(key, value);
+            }
+            fn delete(&mut self, key: &[u8]) {
+                self.0.delete(key);
+            }
+        }
+
+        match self.driver.propose_with(|fork| {
+            let mut adapter = ForkLedger(fork);
+            with_txn_ledger(&mut adapter, || wasm.call_for_transaction(&call))
+        }) {
+            Ok((index, returns, out)) => {
+                self.dispatch(out);
+                ok_json(serde_json::json!({
+                    "index": index,
+                    "status": "proposed",
+                    "returns": returns,
+                }))
+            }
+            Err(enclave_os_raft::ProposeError::ExecutorFailed(e)) => {
+                err_json(&format!("transaction failed: {e}"))
+            }
+            Err(enclave_os_raft::ProposeError::ConfigChangePending) => {
+                err_json("a membership change is already in flight")
+            }
+            Err(_) => self.not_leader(),
+        }
+    }
+
     fn propose_member_change(&mut self, cc: enclave_os_raft::ConfigChange) -> Response {
         match self.driver.propose_conf_change(cc) {
             Ok((index, out)) => {
@@ -1070,6 +1117,11 @@ struct RaftEnvelope {
     raft_certificate: Option<serde_json::Value>,
     #[serde(default)]
     raft_txn: Option<TxnReq>,
+    /// Execute a WASM app export inside a cluster transaction
+    /// (`{"app", "function", "params"?, "app_auth"?}` — the WasmCall
+    /// shape, parsed lazily so non-wasm builds reject it cleanly).
+    #[serde(default)]
+    raft_wasm_txn: Option<serde_json::Value>,
     #[serde(default)]
     raft_add_learner: Option<MemberReq>,
     #[serde(default)]
@@ -1127,6 +1179,7 @@ impl EnclaveModule for RaftModule {
         };
         let is_read = env.raft_status.is_some() || env.raft_certificate.is_some();
         let is_write = env.raft_txn.is_some()
+            || env.raft_wasm_txn.is_some()
             || env.raft_add_learner.is_some()
             || env.raft_promote.is_some()
             || env.raft_remove.is_some();
@@ -1197,6 +1250,21 @@ impl EnclaveModule for RaftModule {
             return Some(g.propose_member_change(
                 enclave_os_raft::ConfigChange::RemoveNode { node: req.node },
             ));
+        }
+        if let Some(raw) = env.raft_wasm_txn {
+            #[cfg(feature = "wasm")]
+            {
+                let call: enclave_os_wasm::protocol::WasmCall = match serde_json::from_value(raw) {
+                    Ok(c) => c,
+                    Err(e) => return Some(err_json(&format!("invalid wasm call: {e}"))),
+                };
+                return Some(g.propose_wasm_txn(call));
+            }
+            #[cfg(not(feature = "wasm"))]
+            {
+                let _ = raw;
+                return Some(err_json("this build has no wasm runtime"));
+            }
         }
         if let Some(txn) = env.raft_txn {
             let mut ops: Vec<(Vec<u8>, Option<Vec<u8>>)> = Vec::with_capacity(txn.ops.len());

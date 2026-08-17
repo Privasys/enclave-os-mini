@@ -37,6 +37,10 @@ world enclave-app {
     /// HTTPS egress with TLS termination inside the enclave.
     import privasys:enclave-os/https@0.1.0;
 
+    /// Replicated authenticated ledger (cluster flavor; functions
+    /// error outside a cluster transaction).
+    import privasys:enclave-os/ledger@0.1.0;
+
     // ── WASI (enclave-implemented subset) ─────────────────────────
     //
     // Standard WASI interfaces, re-implemented by the enclave OS.

@@ -394,6 +394,22 @@ impl WasmModule {
     /// If the app is known but not currently compiled in memory, its
     /// WASM bytes are loaded from the sealed KV store and compiled
     /// on the fly (AOT deserialization — very fast).
+    /// Execute one exported function for a CLUSTER TRANSACTION. The
+    /// raft layer authorises the caller (its own envelope gate) and
+    /// installs the transaction-ledger scope around this call; here it
+    /// is a plain dispatch with no platform auth context (an app-level
+    /// `permissions` policy still applies via `call.app_auth`). The
+    /// serialized return values are handed back to the raft layer,
+    /// which commits them alongside the write-set proposal.
+    pub fn call_for_transaction(&self, call: &WasmCall) -> Result<serde_json::Value, String> {
+        match self.dispatch_call(call, None) {
+            WasmResult::Ok { returns, .. } => {
+                serde_json::to_value(&returns).map_err(|e| format!("serialize returns: {e}"))
+            }
+            WasmResult::Error { message, .. } => Err(message),
+        }
+    }
+
     fn dispatch_call(&self, call: &WasmCall, auth: Option<AuthResult>) -> WasmResult {
         // Ensure the app is compiled.  This is a no-op when the app
         // is already in the `loaded` map.

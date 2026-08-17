@@ -271,6 +271,28 @@ impl<B: KvBackend> RaftDriver<B> {
         Ok((index, out))
     }
 
+    /// Leader-side EXECUTED transaction: fork the ledger, hand the
+    /// fork to an executor (e.g. a WASM app running against the
+    /// `ledger` host interface), seal whatever it wrote, propose.
+    /// Returns the executor's output alongside the log index. An
+    /// executor error aborts cleanly — the fork is dropped, nothing
+    /// is proposed, the ledger is untouched.
+    pub fn propose_with<R>(
+        &mut self,
+        execute: impl FnOnce(&mut enclave_os_merkle::MerkleFork<'_, B>) -> Result<R, String>,
+    ) -> Result<(Index, R, DriverOutput), ProposeError> {
+        if self.halted {
+            return Err(ProposeError::NotLeader);
+        }
+        let mut fork = self.ledger.fork();
+        let result = execute(&mut fork).map_err(ProposeError::ExecutorFailed)?;
+        let sealed = fork.seal().map_err(|_| ProposeError::NotLeader)?;
+        let txn: Transaction = sealed.into();
+        let index = self.core.propose(txn.encode())?;
+        let out = self.process().map_err(|_| ProposeError::NotLeader)?;
+        Ok((index, result, out))
+    }
+
     /// Membership change passthrough.
     pub fn propose_conf_change(
         &mut self,

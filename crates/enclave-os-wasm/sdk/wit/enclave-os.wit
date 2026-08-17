@@ -336,3 +336,26 @@ interface attestation {
     /// `@config-api` export or is already configured.
     set-config-complete: func() -> result<_, string>;
 }
+
+/// Replicated, authenticated ledger (cluster flavor only).
+///
+/// Available ONLY while the app executes inside a cluster transaction
+/// (invoked through the platform's transaction path): reads see the
+/// ledger fork at the cluster's committed root, writes buffer into it,
+/// and when the function returns successfully the runtime commits the
+/// write-set through consensus — every replica applies it and a quorum
+/// confirms the resulting ledger root. A trap or error discards every
+/// write. Outside a transaction all functions return an error.
+interface ledger {
+    /// Read a key at the transaction's snapshot (plus its own writes).
+    get: func(key: list<u8>) -> result<option<list<u8>>, string>;
+
+    /// Buffer a write into the transaction.
+    put: func(key: list<u8>, value: list<u8>) -> result<_, string>;
+
+    /// Buffer a delete into the transaction.
+    delete: func(key: list<u8>) -> result<_, string>;
+
+    /// Whether the current invocation runs inside a transaction.
+    in-transaction: func() -> bool;
+}

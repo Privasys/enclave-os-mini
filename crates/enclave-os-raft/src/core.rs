@@ -88,7 +88,7 @@ impl Config {
 }
 
 /// Why a proposal was rejected.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ProposeError {
     /// This node is not the leader (the driver should forward to
     /// [`RaftCore::leader_id`]).
@@ -96,6 +96,9 @@ pub enum ProposeError {
     /// A membership change is still uncommitted; only one may be in
     /// flight at a time.
     ConfigChangePending,
+    /// The transaction executor failed; nothing was proposed and the
+    /// ledger is untouched (the fork was dropped).
+    ExecutorFailed(String),
 }
 
 /// The obligations produced by a batch of `step`/`tick`/`propose`

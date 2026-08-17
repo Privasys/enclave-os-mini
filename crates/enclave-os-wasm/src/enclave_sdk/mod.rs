@@ -33,6 +33,7 @@ pub mod auth;
 pub mod crypto;
 pub mod https;
 pub mod keystore;
+pub mod ledger;
 
 pub use crate::wasi::AppContext;
 pub use keystore::{KeyMaterial, KeyStore};
@@ -52,5 +53,6 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     https::add_to_linker(linker)?;
     auth::add_to_linker(linker)?;
     attestation::add_to_linker(linker)?;
+    ledger::add_to_linker(linker)?;
     Ok(())
 }
