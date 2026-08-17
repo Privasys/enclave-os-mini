@@ -561,11 +561,12 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
     #[cfg(feature = "raft")]
     {
         // Config: raft_node_id (u64, required to activate),
-        // raft_peers ({"<id>": "host:port"}), and the cluster key from
-        // ONE of: raft_vault (the credential lives in the vault
-        // constellation under a grant policy — fetching it IS
-        // admission) or raft_cluster_key (hex-64 operator secret,
-        // standalone/dev only — the host sees it).
+        // raft_peers ({"<id>": "host:port"}), and raft_vault — the
+        // cluster key lives in the vault constellation under a grant
+        // policy and is released by attestation alone: fetching the
+        // credential IS admission. There is no config-supplied key
+        // path — a shared secret in host configuration would hand the
+        // commitment key to the adversary the design defends against.
         if let Some(node_id) = config.extra.get("raft_node_id").and_then(|v| v.as_u64()) {
             let peers: std::collections::BTreeMap<u64, String> = config
                 .extra
@@ -579,59 +580,45 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
                         .collect()
                 })
                 .unwrap_or_default();
-            let mut vault_cfg: Option<crate::raftglue::RaftVaultConfig> = None;
-            let cluster_key: [u8; 32] = if let Some(vault) =
-                config.extra.get("raft_vault").and_then(|v| v.as_object())
-            {
-                let get = |k: &str| {
-                    vault.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string()
-                };
-                let vcfg = crate::raftglue::RaftVaultConfig {
-                    mgmt_url: get("mgmt_url"),
-                    environment: {
-                        let e = get("environment");
-                        if e.is_empty() { "production".to_string() } else { e }
-                    },
-                    handle: get("handle"),
-                    grant: get("grant"),
-                    app_id: vault
-                        .get("app_id")
-                        .and_then(|v| v.as_str())
-                        .and_then(enclave_os_common::hex::hex_decode),
-                };
-                if vcfg.mgmt_url.is_empty() || vcfg.handle.is_empty() {
-                    enclave_log_error!("raft: raft_vault needs mgmt_url and handle");
+            let Some(vault) = config.extra.get("raft_vault").and_then(|v| v.as_object())
+            else {
+                enclave_log_error!(
+                    "raft: raft_vault is required (the cluster key is vault-anchored; \
+                     there is no config-supplied key)"
+                );
+                return -36;
+            };
+            let get = |k: &str| {
+                vault.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string()
+            };
+            let vcfg = crate::raftglue::RaftVaultConfig {
+                mgmt_url: get("mgmt_url"),
+                environment: {
+                    let e = get("environment");
+                    if e.is_empty() { "production".to_string() } else { e }
+                },
+                handle: get("handle"),
+                grant: get("grant"),
+                app_id: vault
+                    .get("app_id")
+                    .and_then(|v| v.as_str())
+                    .and_then(enclave_os_common::hex::hex_decode),
+            };
+            if vcfg.mgmt_url.is_empty() || vcfg.handle.is_empty() {
+                enclave_log_error!("raft: raft_vault needs mgmt_url and handle");
+                return -36;
+            }
+            let cluster_key: [u8; 32] = match crate::raftglue::resolve_cluster_key(
+                &sealed_cfg.master_key(),
+                &vcfg,
+            ) {
+                Ok(k) => k,
+                Err(e) => {
+                    enclave_log_error!("raft: cluster credential: {}", e);
                     return -36;
                 }
-                let key = match crate::raftglue::resolve_cluster_key(
-                    &sealed_cfg.master_key(),
-                    &vcfg,
-                ) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        enclave_log_error!("raft: cluster credential: {}", e);
-                        return -36;
-                    }
-                };
-                vault_cfg = Some(vcfg);
-                key
-            } else {
-                match config
-                    .extra
-                    .get("raft_cluster_key")
-                    .and_then(|v| v.as_str())
-                    .and_then(enclave_os_common::hex::hex_decode)
-                    .and_then(|b| b.try_into().ok())
-                {
-                    Some(k) => k,
-                    None => {
-                        enclave_log_error!(
-                            "raft: need raft_vault or raft_cluster_key (hex-64)"
-                        );
-                        return -36;
-                    }
-                }
             };
+            let vault_cfg = Some(vcfg);
             let ca = match crate::ratls::attestation::CaContext::from_parts(
                 sealed_cfg.ca_cert_der.clone(),
                 sealed_cfg.ca_key_pkcs8.clone(),

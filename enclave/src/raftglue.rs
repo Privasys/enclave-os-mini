@@ -12,16 +12,15 @@
 //! no RAFT → st path, so no deadlock.
 //!
 //! Cluster keys: the ledger commitment key `ck` (all replicas share
-//! it — the encryption-independent root requires it) comes from ONE of
-//! two sources: the vault constellation (`raft_vault` config — the key
-//! is generated inside the first node's enclave, Shamir-split across
-//! the vaults, and released only under the owner-authored grant policy
-//! measurement + TCB checks; fetching the credential IS admission), or
-//! the operator-provisioned `raft_cluster_key` (standalone/dev mode —
-//! the host sees this secret, documented as the weaker model). A
-//! vault-resolved `ck` is sealed node-locally so restarts do not
-//! depend on vault availability. The ledger storage key and the log
-//! key derive from this enclave's sealed master key (node-local).
+//! it — the encryption-independent root requires it) comes from the
+//! vault constellation (`raft_vault` config): the key is generated
+//! inside the first node's enclave, Shamir-split across the vaults,
+//! and released only under the owner-authored grant policy's
+//! measurement + TCB checks — fetching the credential IS admission,
+//! and no shared secret ever exists outside TEEs. The resolved `ck`
+//! is sealed node-locally so restarts do not depend on vault
+//! availability. The ledger storage key and the log key derive from
+//! this enclave's sealed master key (node-local).
 //!
 //! Peer admission: beyond the fleet-CA + measurement-set pin enforced
 //! in the TLS layer (see `peerlink`), each established link's peer
@@ -247,8 +246,8 @@ fn fetch_vault_ck(cfg: &RaftVaultConfig) -> Result<[u8; 32], String> {
 
 #[cfg(not(all(feature = "wasm", feature = "egress")))]
 fn fetch_vault_ck(_cfg: &RaftVaultConfig) -> Result<[u8; 32], String> {
-    Err("raft_vault requires a build with the wasm and egress modules \
-         (the cluster flavor); use raft_cluster_key on this build"
+    Err("the cluster credential requires a build with the wasm and \
+         egress modules (the cluster flavor)"
         .to_string())
 }
 
@@ -679,9 +678,10 @@ impl RaftGlue {
     /// attestation servers (signature chain to the Intel root, QE
     /// identity, PCK CRL, DEBUG — everything the hardened AS checks)
     /// and gate the reported `tcbStatus` + AS-verified MRENCLAVE.
-    /// No servers configured = pass (standalone mode: the TLS-layer
-    /// parse pin is the only measurement check). Requires egress; a
-    /// build without it skips (and cannot configure servers anyway).
+    /// No servers configured = pass (the TLS-layer parse pin is then
+    /// the only measurement check — configure attestation servers in
+    /// any real deployment). Requires egress; a build without it
+    /// skips (and cannot configure servers anyway).
     fn verify_peer(&mut self, cid: u32) -> bool {
         #[cfg(feature = "egress")]
         {
