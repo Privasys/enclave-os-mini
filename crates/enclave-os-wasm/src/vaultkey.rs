@@ -234,6 +234,9 @@ enum VaultRequest {
         material_b64: String,
         grant: String,
     },
+    GetPolicy {
+        handle: String,
+    },
 }
 
 /// Subset of the server's `VaultResponse` we care about.
@@ -243,8 +246,17 @@ struct VaultResponse {
     key_material: Option<KeyMaterialResp>,
     #[serde(rename = "KeyCreated")]
     key_created: Option<KeyCreatedResp>,
+    #[serde(rename = "Policy")]
+    policy: Option<PolicyResp>,
     #[serde(rename = "Error")]
     error: Option<String>,
+}
+
+/// `GetPolicy` response: the policy is walked generically (we only
+/// need the Tees measurement set), so it stays a raw value.
+#[derive(Deserialize)]
+struct PolicyResp {
+    policy: serde_json::Value,
 }
 
 #[derive(Deserialize)]
@@ -437,6 +449,102 @@ pub fn resolve_or_provision(
         ));
     }
     Ok(kek)
+}
+
+/// Read the Tees measurement set of a key's policy from the
+/// constellation. The vault authorises `GetPolicy` by principal
+/// resolution, so the running TEE can read its OWN credential's
+/// policy — this is how a cluster node learns the admissible peer
+/// measurement set from the policy instead of from configuration.
+/// Returns the UNION over reachable vaults (mid-update the vaults may
+/// briefly differ; the union opens an upgrade window as soon as any
+/// vault carries the new measurement) and requires at least one vault
+/// to answer.
+pub fn read_policy_measurements(
+    cfg: &VaultConfig,
+    handle: &str,
+    code_hash: &[u8],
+    app_id: Option<&[u8]>,
+) -> Result<Vec<[u8; 32]>, String> {
+    let root_store = root_store_from_der(cfg.ca_roots_der.iter().cloned())
+        .map_err(|e| format!("vaultkey: bad CA roots: {e}"))?;
+    let policy = build_ratls_policy(cfg, code_hash, app_id)?;
+    let mut set: Vec<[u8; 32]> = Vec::new();
+    let mut answered = 0usize;
+    let mut last_err: Option<String> = None;
+    for ep in &cfg.endpoints {
+        let body = match serde_json::to_vec(&VaultRequest::GetPolicy { handle: handle.into() }) {
+            Ok(b) => b,
+            Err(e) => return Err(format!("marshal GetPolicy: {e}")),
+        };
+        let url = format!("https://{ep}/data");
+        let resp = match https_fetch("POST", &url, &[], Some(&body), &root_store, Some(&policy)) {
+            Ok(r) => r,
+            Err(e) => {
+                last_err = Some(e);
+                continue;
+            }
+        };
+        let vr: VaultResponse = match serde_json::from_slice(&resp.body) {
+            Ok(v) => v,
+            Err(e) => {
+                last_err = Some(format!("decode GetPolicy response: {e}"));
+                continue;
+            }
+        };
+        if let Some(msg) = vr.error {
+            last_err = Some(msg);
+            continue;
+        }
+        let Some(p) = vr.policy else {
+            last_err = Some("vault: GetPolicy returned no policy".into());
+            continue;
+        };
+        answered += 1;
+        collect_mrenclaves(&p.policy, &mut set);
+    }
+    if answered == 0 {
+        return Err(format!(
+            "vaultkey: no vault answered GetPolicy for {handle:?}: {last_err:?}"
+        ));
+    }
+    Ok(set)
+}
+
+/// Collect `principals.tees[].Tee.measurements[].Mrenclave` (hex,
+/// 32 bytes) into `set`, deduplicated. Unknown shapes are skipped —
+/// the pin set only ever narrows admission on top of the vault's own
+/// enforcement.
+fn collect_mrenclaves(policy: &serde_json::Value, set: &mut Vec<[u8; 32]>) {
+    let Some(tees) = policy
+        .get("principals")
+        .and_then(|p| p.get("tees"))
+        .and_then(|t| t.as_array())
+    else {
+        return;
+    };
+    for tee in tees {
+        let Some(measurements) = tee
+            .get("Tee")
+            .and_then(|t| t.get("measurements"))
+            .and_then(|m| m.as_array())
+        else {
+            continue;
+        };
+        for m in measurements {
+            let Some(mr) = m
+                .get("Mrenclave")
+                .and_then(|v| v.as_str())
+                .and_then(hex_decode)
+                .and_then(|b| <[u8; 32]>::try_from(b).ok())
+            else {
+                continue;
+            };
+            if !set.contains(&mr) {
+                set.push(mr);
+            }
+        }
+    }
 }
 
 fn to_kek(v: Vec<u8>) -> Result<[u8; KEK_SIZE], String> {

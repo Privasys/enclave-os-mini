@@ -105,6 +105,14 @@ impl PeerLink {
         self.pinned_measurements.as_deref().map(|v| v.as_slice())
     }
 
+    /// Replace the admissible measurement set. Applies to future
+    /// dials/accepts; existing sessions keep the set they were
+    /// verified under until the re-attestation recycle brings them
+    /// back through a fresh handshake.
+    pub fn set_pinned(&mut self, set: Vec<[u8; 32]>) {
+        self.pinned_measurements = Some(Arc::new(set));
+    }
+
     /// The peer's end-entity certificate (DER) once the handshake is
     /// done — the raft layer verifies its embedded quote against the
     /// attestation servers before admitting the link.

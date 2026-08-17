@@ -579,6 +579,7 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
                         .collect()
                 })
                 .unwrap_or_default();
+            let mut vault_cfg: Option<crate::raftglue::RaftVaultConfig> = None;
             let cluster_key: [u8; 32] = if let Some(vault) =
                 config.extra.get("raft_vault").and_then(|v| v.as_object())
             {
@@ -602,7 +603,7 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
                     enclave_log_error!("raft: raft_vault needs mgmt_url and handle");
                     return -36;
                 }
-                match crate::raftglue::resolve_cluster_key(
+                let key = match crate::raftglue::resolve_cluster_key(
                     &sealed_cfg.master_key(),
                     &vcfg,
                 ) {
@@ -611,7 +612,9 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
                         enclave_log_error!("raft: cluster credential: {}", e);
                         return -36;
                     }
-                }
+                };
+                vault_cfg = Some(vcfg);
+                key
             } else {
                 match config
                     .extra
@@ -655,6 +658,7 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
                 .get("raft_pin_measurement")
                 .and_then(|v| v.as_bool())
                 .unwrap_or(true);
+            let mut pin_from_policy = false;
             let pinned_measurements: Option<Vec<[u8; 32]>> = if !pin_measurement {
                 None
             } else if let Some(list) = config
@@ -684,6 +688,11 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
                 }
                 Some(set)
             } else {
+                // No explicit list: in vault mode the credential
+                // policy becomes the source of truth (fetched by the
+                // glue, refreshed periodically); own measurement is
+                // the boot fallback either way.
+                pin_from_policy = vault_cfg.is_some();
                 match crate::ratls::attestation::self_mrenclave() {
                     Ok(own) => Some(std::vec![own]),
                     Err(e) => {
@@ -738,7 +747,9 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
                     pinned_measurements,
                     acceptable_tcb_statuses,
                     reattest_ticks,
+                    pin_from_policy,
                 },
+                vault_cfg,
                 log_retain,
             ) {
                 Ok(glue) => {
