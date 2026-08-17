@@ -59,7 +59,7 @@ pub use crate::driver::{DriverError, DriverOutput, RaftDriver};
 pub use crate::ledger::{LedgerError, MerkleLedger};
 pub use crate::logstore::{LogError, LogStore, RecoveredLog};
 pub use crate::message::{Message, MsgMeta};
-pub use crate::transaction::Transaction;
+pub use crate::transaction::{ReplayEnvelope, Transaction};
 pub use crate::transfer::{
     ReceiverStep, SenderStep, SnapshotReceiver, SnapshotSender, SNAPSHOT_CHUNK_LEAVES,
 };

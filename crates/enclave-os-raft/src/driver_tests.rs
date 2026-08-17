@@ -814,3 +814,109 @@ fn commit_certificates_assemble_and_verify() {
     }
     assert!(!thin.verify(&m));
 }
+
+// ── Replay mode: deterministic re-execution at apply time ───────────
+
+#[test]
+fn replay_reexecution_verifies_and_converges() {
+    let mut c = MiniCluster::new(3);
+    let l = c.wait_for_leader(50);
+    // Every node re-executes deterministically from the envelope: the
+    // mock app writes value = seed[..8] under the key in params.
+    for d in c.drivers.values_mut() {
+        d.set_replay_verifier(Box::new(|env, fork| {
+            fork.put(&env.params, &env.seed[..8]);
+            Ok(())
+        }));
+    }
+    let env = crate::transaction::ReplayEnvelope {
+        app: b"mock".to_vec(),
+        function: b"credit".to_vec(),
+        params: b"acct".to_vec(),
+        seed: [9; 32],
+        timestamp_ms: 1_234,
+        fuel: 10_000,
+    };
+    let key = env.params.clone();
+    let val = env.seed[..8].to_vec();
+    let (_, _, out) = c
+        .drivers
+        .get_mut(&l)
+        .unwrap()
+        .propose_with(Some(env), move |fork| {
+            fork.put(&key, &val);
+            Ok(())
+        })
+        .expect("propose");
+    c.queue.extend(out.messages);
+    c.pump();
+    for _ in 0..5 {
+        c.tick_all();
+    }
+    // All three applied through re-execution and agree.
+    let r = c.root(1);
+    assert_eq!(r, c.root(2));
+    assert_eq!(r, c.root(3));
+    for d in c.drivers.values() {
+        assert!(!d.is_halted());
+    }
+}
+
+#[test]
+fn replay_divergent_reexecution_fails_closed() {
+    let mut c = MiniCluster::new(3);
+    let l = c.wait_for_leader(50);
+    let bad = *c.drivers.keys().find(|&&id| id != l).unwrap();
+    for (&id, d) in c.drivers.iter_mut() {
+        let divergent = id == bad;
+        d.set_replay_verifier(Box::new(move |env, fork| {
+            if divergent {
+                fork.put(b"evil", b"other");
+            } else {
+                fork.put(&env.params, &env.seed[..8]);
+            }
+            Ok(())
+        }));
+    }
+    let env = crate::transaction::ReplayEnvelope {
+        app: b"mock".to_vec(),
+        function: b"credit".to_vec(),
+        params: b"acct".to_vec(),
+        seed: [7; 32],
+        timestamp_ms: 1,
+        fuel: 10_000,
+    };
+    let key = env.params.clone();
+    let val = env.seed[..8].to_vec();
+    let (_, _, out) = c
+        .drivers
+        .get_mut(&l)
+        .unwrap()
+        .propose_with(Some(env), move |fork| {
+            fork.put(&key, &val);
+            Ok(())
+        })
+        .expect("propose");
+    c.queue.extend(out.messages);
+    // Manual pump: the divergent node halts with Diverged; everyone
+    // else proceeds.
+    let mut diverged = false;
+    let mut hops = 0;
+    while let Some((to, msg)) = c.queue.pop_front() {
+        hops += 1;
+        assert!(hops < 100_000);
+        let Some(d) = c.drivers.get_mut(&to) else { continue };
+        match d.step(msg) {
+            Ok(out) => c.queue.extend(out.messages),
+            Err(crate::driver::DriverError::Diverged { .. }) if to == bad => {
+                diverged = true;
+            }
+            Err(e) => panic!("unexpected driver error: {e:?}"),
+        }
+    }
+    assert!(diverged, "the divergent node must fail closed");
+    assert!(c.drivers[&bad].is_halted());
+    // The honest quorum agrees and is live.
+    let honest: Vec<NodeId> = c.drivers.keys().copied().filter(|&id| id != bad).collect();
+    assert_eq!(c.root(honest[0]), c.root(honest[1]));
+}

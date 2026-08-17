@@ -517,6 +517,10 @@ pub struct AppMeta {
     /// no declared dependencies.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dependencies: Option<Vec<u8>>,
+    /// Replay-mode cluster transactions (see `WasmLoad::txn_replay`):
+    /// imports verified deterministic at load; replicas re-execute.
+    #[serde(default)]
+    pub txn_replay: bool,
 }
 
 // ---------------------------------------------------------------------------
@@ -667,6 +671,7 @@ impl AppRegistry {
         app_id: Option<[u8; 16]>,
         vault: Option<VaultBacking>,
         dependencies: Option<Vec<u8>>,
+        txn_replay: bool,
     ) -> Result<AppMeta, String> {
         if self.known.contains_key(name) {
             return Err(format!("app '{}' is already loaded", name));
@@ -679,6 +684,31 @@ impl AppRegistry {
 
         // ── Deserialize (AOT) ──────────────────────────────────────
         let component = self.engine.deserialize(wasm_bytes)?;
+
+        // ── Transaction world (replay mode): load-time import
+        //    verification ────────────────────────────────────────────
+        // A replay-mode app must be deterministic: HTTPS egress and
+        // raw sockets are non-deterministic inputs and are rejected AT
+        // LOAD, not at call time — the operator learns immediately,
+        // and the measured runtime provably cannot run a replay app
+        // that could observe the network. wasi:random and the clocks
+        // STAY importable: inside a transaction they serve the shared
+        // per-transaction DRBG and the frozen timestamp.
+        if txn_replay {
+            for (import_name, _) in
+                component.component_type().imports(self.engine.engine())
+            {
+                if import_name.starts_with("privasys:enclave-os/https")
+                    || import_name.starts_with("wasi:sockets/")
+                {
+                    return Err(format!(
+                        "replay-mode app imports non-deterministic interface \
+                         '{import_name}' — https and sockets are unavailable in \
+                         replay transactions"
+                    ));
+                }
+            }
+        }
 
         // ── Trial instantiation ────────────────────────────────────
         // Eagerly verify that the component can be linked against the
@@ -859,6 +889,7 @@ impl AppRegistry {
             vault_handle: vault.as_ref().map(|vb| vb.handle.clone()),
             config_complete,
             dependencies,
+            txn_replay,
         };
         self.known.insert(name.to_string(), meta.clone());
         // Wire the freeze gate: when a config_api function is declared, the app
@@ -897,6 +928,11 @@ impl AppRegistry {
     /// Used during startup to restore app identities from the sealed
     /// KV store.  The component stays uncompiled until the first
     /// `wasm_call` triggers [`ensure_loaded()`](Self::ensure_loaded).
+    /// Metadata of a known (registered) app.
+    pub fn app_meta(&self, name: &str) -> Option<&AppMeta> {
+        self.known.get(name)
+    }
+
     pub fn register_known(&mut self, meta: AppMeta) {
         // Restore the freeze gate from the sealed KV. An app that persisted a
         // config_complete marker keeps its configured state across the restart

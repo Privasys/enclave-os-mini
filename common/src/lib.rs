@@ -36,6 +36,9 @@ pub mod oidc;
 pub mod aead;
 
 #[cfg(feature = "crypto")]
+pub mod drbg;
+
+#[cfg(feature = "crypto")]
 pub mod attestation_servers;
 
 /// Re-export `ring::digest` for downstream crates that need hashing.

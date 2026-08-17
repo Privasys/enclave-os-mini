@@ -118,6 +118,66 @@ fn now_secs() -> u64 {
     enclave_os_common::ocall::get_current_time().unwrap_or(0)
 }
 
+/// Adapt a raft ledger fork to the wasm `ledger` host interface.
+#[cfg(feature = "wasm")]
+struct ForkLedger<'a, 'b>(&'a mut enclave_os_merkle::MerkleFork<'b, OcallBackend>);
+
+#[cfg(feature = "wasm")]
+impl enclave_os_wasm::enclave_sdk::ledger::TxnLedger for ForkLedger<'_, '_> {
+    fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
+        self.0.get(key).map_err(|e| format!("ledger get: {e:?}"))
+    }
+    fn put(&mut self, key: &[u8], value: &[u8]) {
+        self.0.put(key, value);
+    }
+    fn delete(&mut self, key: &[u8]) {
+        self.0.delete(key);
+    }
+}
+
+/// The replay verifier every node installs: rebuild the call from the
+/// committed envelope and re-execute it under the SAME deterministic
+/// scope (seeded DRBG, frozen clock); the driver then requires the
+/// write-set to match. Fail-closed on any error (missing app, decode
+/// failure, trap) — a replica that cannot verify must not apply.
+#[cfg(feature = "wasm")]
+fn replay_verify(
+    env: &enclave_os_raft::ReplayEnvelope,
+    fork: &mut enclave_os_merkle::MerkleFork<'_, OcallBackend>,
+) -> Result<(), String> {
+    use enclave_os_wasm::enclave_sdk::ledger::{
+        with_determinism, with_txn_ledger, TxnDeterminism,
+    };
+    let Some(wasm) = enclave_os_wasm::global() else {
+        return Err("wasm runtime not available for replay verification".into());
+    };
+    let app = String::from_utf8(env.app.clone())
+        .map_err(|_| "replay envelope: app name is not UTF-8".to_string())?;
+    let function = String::from_utf8(env.function.clone())
+        .map_err(|_| "replay envelope: function name is not UTF-8".to_string())?;
+    let params: Vec<enclave_os_wasm::protocol::WasmParam> =
+        serde_json::from_slice(&env.params)
+            .map_err(|e| format!("replay envelope: params decode: {e}"))?;
+    let call = enclave_os_wasm::protocol::WasmCall {
+        app,
+        function,
+        params,
+        app_auth: None,
+        billing_approved: None,
+    };
+    let mut adapter = ForkLedger(fork);
+    with_txn_ledger(&mut adapter, || {
+        with_determinism(
+            TxnDeterminism {
+                drbg: enclave_os_common::drbg::HmacDrbg::new(&env.seed),
+                timestamp_ms: env.timestamp_ms,
+            },
+            || wasm.call_for_transaction(&call),
+        )
+    })
+    .map(|_| ())
+}
+
 // ── Cluster key resolution (vault-anchored) ─────────────────────────
 
 /// Vault addressing for the cluster credential (config `raft_vault`).
@@ -400,6 +460,10 @@ impl RaftGlue {
         // key; the public key rides in Hello and the leader registers
         // it through the log.
         driver.set_signer(&master_key);
+        // Replay-mode verification: re-execute committed envelopes
+        // deterministically before applying (see replay_verify).
+        #[cfg(feature = "wasm")]
+        driver.set_replay_verifier(Box::new(replay_verify));
 
         // Policy-sourced pin: in vault mode without an explicit list,
         // the admissible set = the credential policy's Tees ∪ own
@@ -533,6 +597,14 @@ impl RaftGlue {
         )
         .map_err(|e| format!("rebuild: {e:?}"))?;
         self.driver.set_signer(&self.master_key);
+        // The rebuilt driver must verify replay envelopes too:
+        // without this, repair-by-replay would degrade replay-mode
+        // entries to trusted write-set application — precisely what
+        // replay mode exists to forbid. With it, a replica that still
+        // cannot re-execute (e.g. the app is missing) halts for the
+        // operator after the single repair attempt, fail-closed.
+        #[cfg(feature = "wasm")]
+        self.driver.set_replay_verifier(Box::new(replay_verify));
         Ok(())
     }
 
@@ -1040,33 +1112,50 @@ impl RaftGlue {
     }
 
     /// Execute a WASM app function against a fork of the ledger and
-    /// propose its write-set through consensus (apply mode). The app
-    /// reaches the fork via `privasys:enclave-os/ledger`; a trap or
-    /// error aborts with nothing proposed.
+    /// propose its write-set through consensus. Apply-mode apps ship
+    /// the write-set; replay-mode apps additionally commit an
+    /// envelope (seed, frozen clock, fuel) and every replica
+    /// re-executes deterministically to verify. A trap or error
+    /// aborts with nothing proposed.
     #[cfg(feature = "wasm")]
     fn propose_wasm_txn(&mut self, call: enclave_os_wasm::protocol::WasmCall) -> Response {
-        use enclave_os_wasm::enclave_sdk::ledger::{with_txn_ledger, TxnLedger};
+        use enclave_os_wasm::enclave_sdk::ledger::with_txn_ledger;
 
         let Some(wasm) = enclave_os_wasm::global() else {
             return err_json("wasm module not available");
         };
 
-        struct ForkLedger<'a, 'b>(&'a mut enclave_os_merkle::MerkleFork<'b, OcallBackend>);
-        impl TxnLedger for ForkLedger<'_, '_> {
-            fn get(&mut self, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
-                self.0.get(key).map_err(|e| format!("ledger get: {e:?}"))
+        // Replay-mode apps get a committed determinism envelope.
+        let replay = if wasm.txn_replay(&call.app) {
+            let mut seed = [0u8; 32];
+            if SystemRandom::new().fill(&mut seed).is_err() {
+                return err_json("rng (transaction seed)");
             }
-            fn put(&mut self, key: &[u8], value: &[u8]) {
-                self.0.put(key, value);
-            }
-            fn delete(&mut self, key: &[u8]) {
-                self.0.delete(key);
-            }
-        }
+            Some(enclave_os_raft::ReplayEnvelope {
+                app: call.app.clone().into_bytes(),
+                function: call.function.clone().into_bytes(),
+                params: serde_json::to_vec(&call.params).unwrap_or_default(),
+                seed,
+                timestamp_ms: now_secs().saturating_mul(1_000),
+                fuel: wasm.app_max_fuel(&call.app).unwrap_or(0),
+            })
+        } else {
+            None
+        };
+        let det_env = replay.clone();
 
-        match self.driver.propose_with(|fork| {
+        match self.driver.propose_with(replay, |fork| {
             let mut adapter = ForkLedger(fork);
-            with_txn_ledger(&mut adapter, || wasm.call_for_transaction(&call))
+            with_txn_ledger(&mut adapter, || match &det_env {
+                Some(env) => enclave_os_wasm::enclave_sdk::ledger::with_determinism(
+                    enclave_os_wasm::enclave_sdk::ledger::TxnDeterminism {
+                        drbg: enclave_os_common::drbg::HmacDrbg::new(&env.seed),
+                        timestamp_ms: env.timestamp_ms,
+                    },
+                    || wasm.call_for_transaction(&call),
+                ),
+                None => wasm.call_for_transaction(&call),
+            })
         }) {
             Ok((index, returns, out)) => {
                 self.dispatch(out);

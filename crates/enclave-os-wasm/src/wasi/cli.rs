@@ -32,13 +32,20 @@ fn add_random(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
     let mut inst = linker.instance("wasi:random/random@0.2.0")?;
 
     // get-random-bytes: func(len: u64) -> list<u8>
+    //
+    // In a replay-mode cluster transaction the bytes come from the
+    // SHARED per-transaction DRBG (seeded from the committed entry)
+    // instead of the hardware: every replica replaying the entry sees
+    // the exact same stream. Outside a transaction: RDRAND as ever.
     inst.func_wrap(
         "get-random-bytes",
         |_store: StoreContextMut<'_, AppContext>, (len,): (u64,)| {
             let capped = (len as usize).min(65536);
             let mut buf = vec![0u8; capped];
-            getrandom::getrandom(&mut buf)
-                .map_err(|e| wasmtime::Error::msg(format!("getrandom failed: {}", e)))?;
+            if !crate::enclave_sdk::ledger::det_fill(&mut buf) {
+                getrandom::getrandom(&mut buf)
+                    .map_err(|e| wasmtime::Error::msg(format!("getrandom failed: {}", e)))?;
+            }
             Ok((buf,))
         },
     )?;
@@ -48,8 +55,10 @@ fn add_random(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
         "get-random-u64",
         |_store: StoreContextMut<'_, AppContext>, _params: ()| {
             let mut buf = [0u8; 8];
-            getrandom::getrandom(&mut buf)
-                .map_err(|e| wasmtime::Error::msg(format!("getrandom failed: {}", e)))?;
+            if !crate::enclave_sdk::ledger::det_fill(&mut buf) {
+                getrandom::getrandom(&mut buf)
+                    .map_err(|e| wasmtime::Error::msg(format!("getrandom failed: {}", e)))?;
+            }
             Ok((u64::from_le_bytes(buf),))
         },
     )?;
@@ -69,8 +78,10 @@ fn add_random_insecure(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::
         |_store: StoreContextMut<'_, AppContext>, (len,): (u64,)| {
             let capped = (len as usize).min(65536);
             let mut buf = vec![0u8; capped];
-            getrandom::getrandom(&mut buf)
-                .map_err(|e| wasmtime::Error::msg(format!("getrandom: {}", e)))?;
+            if !crate::enclave_sdk::ledger::det_fill(&mut buf) {
+                getrandom::getrandom(&mut buf)
+                    .map_err(|e| wasmtime::Error::msg(format!("getrandom: {}", e)))?;
+            }
             Ok((buf,))
         },
     )?;
@@ -79,8 +90,10 @@ fn add_random_insecure(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::
         "get-insecure-random-u64",
         |_store: StoreContextMut<'_, AppContext>, _params: ()| {
             let mut buf = [0u8; 8];
-            getrandom::getrandom(&mut buf)
-                .map_err(|e| wasmtime::Error::msg(format!("getrandom: {}", e)))?;
+            if !crate::enclave_sdk::ledger::det_fill(&mut buf) {
+                getrandom::getrandom(&mut buf)
+                    .map_err(|e| wasmtime::Error::msg(format!("getrandom: {}", e)))?;
+            }
             Ok((u64::from_le_bytes(buf),))
         },
     )?;
@@ -99,7 +112,9 @@ fn add_random_insecure_seed(linker: &mut Linker<AppContext>) -> Result<(), wasmt
         "insecure-seed",
         |_store: StoreContextMut<'_, AppContext>, _params: ()| {
             let mut buf = [0u8; 16];
-            getrandom::getrandom(&mut buf).ok();
+            if !crate::enclave_sdk::ledger::det_fill(&mut buf) {
+                getrandom::getrandom(&mut buf).ok();
+            }
             let lo = u64::from_le_bytes(buf[..8].try_into().unwrap());
             let hi = u64::from_le_bytes(buf[8..].try_into().unwrap());
             Ok(((lo, hi),))
@@ -127,12 +142,18 @@ fn add_wall_clock(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error
          _params: &[wasmtime::component::Val],
          results: &mut [wasmtime::component::Val]| {
             use wasmtime::component::Val;
-            let secs = get_time_secs();
+            // Replay-mode transactions run against the FROZEN clock
+            // committed in the entry, so replicas re-execute
+            // identically.
+            let (secs, nanos) = match crate::enclave_sdk::ledger::det_timestamp_ms() {
+                Some(ms) => (ms / 1_000, ((ms % 1_000) as u32) * 1_000_000),
+                None => (get_time_secs(), 0),
+            };
             // Return a record { seconds, nanoseconds } — flattened as two vals.
             results[0] = Val::Record(
                 vec![
                     ("seconds".into(), Val::U64(secs)),
-                    ("nanoseconds".into(), Val::U32(0)),
+                    ("nanoseconds".into(), Val::U32(nanos)),
                 ]
                 .into(),
             );
@@ -173,8 +194,11 @@ fn add_monotonic_clock(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::
     inst.func_wrap(
         "now",
         |_store: StoreContextMut<'_, AppContext>, _params: ()| {
-            let secs = get_time_secs();
-            let nanos = secs.saturating_mul(1_000_000_000);
+            // Frozen inside a replay transaction (see wall-clock).
+            let nanos = match crate::enclave_sdk::ledger::det_timestamp_ms() {
+                Some(ms) => ms.saturating_mul(1_000_000),
+                None => get_time_secs().saturating_mul(1_000_000_000),
+            };
             Ok((nanos,))
         },
     )?;

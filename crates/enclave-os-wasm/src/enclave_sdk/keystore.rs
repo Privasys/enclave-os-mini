@@ -181,6 +181,9 @@ fn deserialize_key_material(data: &[u8]) -> Option<KeyMaterial> {
 
 impl keystore_wit::Host for AppContext {
     fn generate_symmetric_key(&mut self, key_name: String) -> Result<(), String> {
+        if super::ledger::in_replay() {
+            return Err("key generation is not deterministic and cannot run inside a replay transaction".into());
+        }
         if key_name.is_empty() {
             return Err("key name cannot be empty".into());
         }
@@ -201,6 +204,9 @@ impl keystore_wit::Host for AppContext {
         key_name: String,
         algorithm: crypto_wit::SignAlgorithm,
     ) -> Result<(), String> {
+        if super::ledger::in_replay() {
+            return Err("key generation is not deterministic and cannot run inside a replay transaction".into());
+        }
         if key_name.is_empty() {
             return Err("key name cannot be empty".into());
         }
@@ -230,6 +236,9 @@ impl keystore_wit::Host for AppContext {
         key_name: String,
         algorithm: crypto_wit::HmacAlgorithm,
     ) -> Result<(), String> {
+        if super::ledger::in_replay() {
+            return Err("key generation is not deterministic and cannot run inside a replay transaction".into());
+        }
         if key_name.is_empty() {
             return Err("key name cannot be empty".into());
         }

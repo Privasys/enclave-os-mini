@@ -243,6 +243,7 @@ impl WasmModule {
         app_id: Option<[u8; 16]>,
         vault: Option<crate::registry::VaultBacking>,
         dependencies: Option<Vec<u8>>,
+        txn_replay: bool,
     ) -> Result<(), String> {
         // Load into the registry (compile + introspect + per-app key)
         let meta = {
@@ -264,6 +265,7 @@ impl WasmModule {
                 app_id,
                 vault,
                 dependencies,
+                txn_replay,
             )?
         };
 
@@ -394,6 +396,24 @@ impl WasmModule {
     /// If the app is known but not currently compiled in memory, its
     /// WASM bytes are loaded from the sealed KV store and compiled
     /// on the fly (AOT deserialization — very fast).
+    /// Whether an app was loaded in replay mode (replicas re-execute
+    /// its transactions deterministically). Unknown apps are `false`.
+    pub fn txn_replay(&self, app: &str) -> bool {
+        self.registry
+            .lock()
+            .ok()
+            .and_then(|r| r.app_meta(app).map(|m| m.txn_replay))
+            .unwrap_or(false)
+    }
+
+    /// The app's per-call fuel budget (recorded in replay envelopes).
+    pub fn app_max_fuel(&self, app: &str) -> Option<u64> {
+        self.registry
+            .lock()
+            .ok()
+            .and_then(|r| r.app_meta(app).map(|m| m.max_fuel))
+    }
+
     /// Execute one exported function for a CLUSTER TRANSACTION. The
     /// raft layer authorises the caller (its own envelope gate) and
     /// installs the transaction-ledger scope around this call; here it
@@ -1776,6 +1796,7 @@ impl EnclaveModule for WasmModule {
                 app_id,
                 vault,
                 dependencies,
+                load.txn_replay,
             ) {
                 Ok(()) => {
                     // Return the loaded app's info

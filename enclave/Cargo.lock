@@ -483,6 +483,7 @@ dependencies = [
  "enclave-os-fido2",
  "enclave-os-kvstore",
  "getrandom",
+ "p256",
  "ring",
  "serde",
  "serde_json",

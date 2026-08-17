@@ -181,6 +181,31 @@ impl crypto_wit::Host for AppContext {
         data: Vec<u8>,
     ) -> Result<Vec<u8>, String> {
         self.usage.crypto_sign_calls += 1;
+        // Replay-mode transactions need DETERMINISTIC signatures so
+        // replicas re-produce them byte-identically: P-256 switches to
+        // RFC 6979 (RustCrypto p256, same ASN.1 DER output); P-384 has
+        // no deterministic path here and is refused in a transaction.
+        if super::ledger::in_replay() {
+            return match algorithm {
+                crypto_wit::SignAlgorithm::EcdsaP256Sha256 => {
+                    use p256::ecdsa::signature::Signer;
+                    use p256::pkcs8::DecodePrivateKey;
+                    let pkcs8 = self
+                        .keystore
+                        .get_signing(&key_name)
+                        .ok_or_else(|| "key not found or not a signing key".to_string())?;
+                    let sk = p256::ecdsa::SigningKey::from_pkcs8_der(&pkcs8)
+                        .map_err(|_| "failed to load signing key (RFC 6979)".to_string())?;
+                    let sig: p256::ecdsa::DerSignature = sk.sign(&data);
+                    Ok(sig.as_bytes().to_vec())
+                }
+                crypto_wit::SignAlgorithm::EcdsaP384Sha384 => Err(
+                    "P-384 signing is not deterministic and cannot run inside a \
+                     replay transaction (use ecdsa-p256-sha256)"
+                        .to_string(),
+                ),
+            };
+        }
         let signing_algo = match algorithm {
             crypto_wit::SignAlgorithm::EcdsaP256Sha256 => {
                 &signature::ECDSA_P256_SHA256_ASN1_SIGNING
@@ -291,9 +316,13 @@ impl crypto_wit::Host for AppContext {
         }
         self.usage.crypto_random_bytes += len as i64;
 
-        let rng = SystemRandom::new();
         let mut buf = vec![0u8; len];
-        rng.fill(&mut buf).map_err(|_| "RNG failed".to_string())?;
+        // Same shared per-transaction DRBG as wasi:random — ALL
+        // guest-visible randomness draws from one iterating stream.
+        if !super::ledger::det_fill(&mut buf) {
+            let rng = SystemRandom::new();
+            rng.fill(&mut buf).map_err(|_| "RNG failed".to_string())?;
+        }
         Ok(buf)
     }
 }

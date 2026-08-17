@@ -77,6 +77,64 @@ pub fn with_txn_ledger<R>(ledger: &mut dyn TxnLedger, f: impl FnOnce() -> R) -> 
     f()
 }
 
+// =========================================================================
+//  Deterministic execution scope (replay mode)
+// =========================================================================
+
+/// Determinism context for a REPLAY-mode transaction: one shared DRBG
+/// (every guest-visible randomness source draws from it, every draw
+/// advances it — a replica replaying the same seed reproduces the
+/// exact stream) and a frozen wall-clock.
+pub struct TxnDeterminism {
+    pub drbg: enclave_os_common::drbg::HmacDrbg,
+    /// Frozen wall-clock, milliseconds since the epoch (committed in
+    /// the entry; both clocks serve it for the whole execution).
+    pub timestamp_ms: u64,
+}
+
+std::thread_local! {
+    static DET: core::cell::RefCell<Option<TxnDeterminism>> =
+        const { core::cell::RefCell::new(None) };
+}
+
+/// Run `f` with the deterministic scope installed (replay-mode
+/// execution on the leader AND on every verifying replica). Restores
+/// the previous state on exit, including unwind.
+pub fn with_determinism<R>(det: TxnDeterminism, f: impl FnOnce() -> R) -> R {
+    struct Guard(Option<TxnDeterminism>);
+    impl Drop for Guard {
+        fn drop(&mut self) {
+            DET.with(|d| *d.borrow_mut() = self.0.take());
+        }
+    }
+    let _guard = Guard(DET.with(|d| d.borrow_mut().replace(det)));
+    f()
+}
+
+/// Whether the current invocation runs under a deterministic
+/// (replay-mode) scope.
+pub fn in_replay() -> bool {
+    DET.with(|d| d.borrow().is_some())
+}
+
+/// Fill `buf` from the transaction DRBG when the deterministic scope
+/// is active. Returns false (buf untouched) outside a scope — the
+/// caller then uses hardware randomness.
+pub fn det_fill(buf: &mut [u8]) -> bool {
+    DET.with(|d| match d.borrow_mut().as_mut() {
+        Some(det) => {
+            det.drbg.fill(buf);
+            true
+        }
+        None => false,
+    })
+}
+
+/// The frozen wall-clock of the active deterministic scope.
+pub fn det_timestamp_ms() -> Option<u64> {
+    DET.with(|d| d.borrow().as_ref().map(|det| det.timestamp_ms))
+}
+
 /// Access the active ledger, or fail with the out-of-scope error.
 fn with_active<R>(
     f: impl FnOnce(&mut dyn TxnLedger) -> R,

@@ -102,6 +102,7 @@ impl From<SealedFork> for Transaction {
             root_after: sealed.root_after,
             version_after: sealed.version_after,
             ops: sealed.ops,
+            replay: None,
         }
     }
 }

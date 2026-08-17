@@ -18,7 +18,7 @@ name = "enclave_os_wasm"
 
 [dependencies]
 # Shared types, module trait, OCall vtable, hex utils, JWT/JWKS verification
-enclave-os-common = { path = "../../common", features = ["jwt"] }
+enclave-os-common = { path = "../../common", features = ["jwt", "crypto"] }
 enclave-os-kvstore = { path = "../enclave-os-kvstore" }
 enclave-os-egress = { path = "../enclave-os-egress" }
 
@@ -67,6 +67,9 @@ wasmtime = { git = "https://github.com/Privasys/wasmtime", tag = "privasys-v0.2.
 
 # Crypto (SHA-256 for WASM code hashing, RNG for WASI random)
 ring = "0.17"
+# RFC 6979 deterministic ECDSA for replay-mode transactions (same
+# crate/pin as the raft commit certificates; pkcs8 for key loading).
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "std", "pkcs8"] }
 
 # Serialization for WasmCall / WasmResult protocol
 serde = { version = "1", features = ["derive"] }

@@ -64,6 +64,16 @@ pub struct RaftDriver<B: KvBackend> {
     halted: bool,
     /// Commit-certificate signer (when configured via `set_signer`).
     signer: Option<crate::certs::CertSigner>,
+    /// Replay-mode re-execution hook (see `set_replay_verifier`).
+    replay_verifier: Option<
+        Box<
+            dyn for<'a> FnMut(
+                &crate::transaction::ReplayEnvelope,
+                &mut enclave_os_merkle::MerkleFork<'a, B>,
+            ) -> Result<(), String>
+                + Send,
+        >,
+    >,
 }
 
 impl<B: KvBackend> RaftDriver<B> {
@@ -83,7 +93,7 @@ impl<B: KvBackend> RaftDriver<B> {
         let mut core = RaftCore::new(cfg, genesis, Vec::new(), Default::default());
         // Seed the verification protocol with the ledger's genesis root.
         core.report_applied(0, root);
-        Ok(Self { core, ledger, log, applied_floor: 0, halted: false, signer: None })
+        Ok(Self { core, ledger, log, applied_floor: 0, halted: false, signer: None, replay_verifier: None })
     }
 
     /// Repair a diverged (or discarded) ledger by full replay: zero
@@ -130,7 +140,7 @@ impl<B: KvBackend> RaftDriver<B> {
         let ledger = MerkleLedger::new(ledger_store);
         let (root, _) = ledger.root();
         core.report_applied(floor, root);
-        Ok(Self { core, ledger, log, applied_floor: floor, halted: false, signer: None })
+        Ok(Self { core, ledger, log, applied_floor: floor, halted: false, signer: None, replay_verifier: None })
     }
 
     /// Compact the log through `through` (capped at the applied index):
@@ -277,8 +287,15 @@ impl<B: KvBackend> RaftDriver<B> {
     /// Returns the executor's output alongside the log index. An
     /// executor error aborts cleanly — the fork is dropped, nothing
     /// is proposed, the ledger is untouched.
+    ///
+    /// With a `replay` envelope the entry additionally carries what
+    /// every replica needs to RE-EXECUTE the call and verify it
+    /// reproduces this exact write-set (see `set_replay_verifier`);
+    /// the executor must have run under the same deterministic scope
+    /// the envelope describes.
     pub fn propose_with<R>(
         &mut self,
+        replay: Option<crate::transaction::ReplayEnvelope>,
         execute: impl FnOnce(&mut enclave_os_merkle::MerkleFork<'_, B>) -> Result<R, String>,
     ) -> Result<(Index, R, DriverOutput), ProposeError> {
         if self.halted {
@@ -287,10 +304,33 @@ impl<B: KvBackend> RaftDriver<B> {
         let mut fork = self.ledger.fork();
         let result = execute(&mut fork).map_err(ProposeError::ExecutorFailed)?;
         let sealed = fork.seal().map_err(|_| ProposeError::NotLeader)?;
-        let txn: Transaction = sealed.into();
+        let mut txn: Transaction = sealed.into();
+        txn.replay = replay;
         let index = self.core.propose(txn.encode())?;
         let out = self.process().map_err(|_| ProposeError::NotLeader)?;
         Ok((index, result, out))
+    }
+
+    /// Install the replay verifier: called at apply time for every
+    /// committed transaction that carries a replay envelope, with a
+    /// fresh fork at the entry's `root_before`. The verifier
+    /// re-executes the call deterministically (same seed / frozen
+    /// clock / fuel); the driver then requires the re-produced
+    /// write-set to equal the shipped one, else the node fails closed
+    /// as diverged. Without a verifier installed, envelopes are
+    /// applied WITHOUT re-execution (apply-mode degradation) — the
+    /// enclave installs one whenever the wasm runtime is present.
+    pub fn set_replay_verifier(
+        &mut self,
+        verifier: Box<
+            dyn for<'a> FnMut(
+                &crate::transaction::ReplayEnvelope,
+                &mut enclave_os_merkle::MerkleFork<'a, B>,
+            ) -> Result<(), String>
+                + Send,
+        >,
+    ) {
+        self.replay_verifier = Some(verifier);
     }
 
     /// Membership change passthrough.
@@ -331,6 +371,45 @@ impl<B: KvBackend> RaftDriver<B> {
                         Some(txn) => {
                             let (root_now, _) = self.ledger.root();
                             if txn.root_before == root_now {
+                                // Replay mode: re-execute the call
+                                // deterministically and require it to
+                                // reproduce the shipped write-set
+                                // before applying anything. A replay
+                                // failure or mismatch is divergence:
+                                // fail closed.
+                                if let (Some(env), Some(verifier)) =
+                                    (&txn.replay, self.replay_verifier.as_mut())
+                                {
+                                    let mut fork = self.ledger.fork();
+                                    let outcome = verifier(env, &mut fork)
+                                        .and_then(|()| {
+                                            fork.seal().map_err(|e| {
+                                                std::format!("seal: {e:?}")
+                                            })
+                                        });
+                                    match outcome {
+                                        Ok(sealed)
+                                            if sealed.ops == txn.ops
+                                                && sealed.root_after
+                                                    == txn.root_after => {}
+                                        Ok(sealed) => {
+                                            self.halted = true;
+                                            return Err(DriverError::Diverged {
+                                                index: e.index,
+                                                expected: txn.root_after,
+                                                found: sealed.root_after,
+                                            });
+                                        }
+                                        Err(_) => {
+                                            self.halted = true;
+                                            return Err(DriverError::Diverged {
+                                                index: e.index,
+                                                expected: txn.root_after,
+                                                found: root_now,
+                                            });
+                                        }
+                                    }
+                                }
                                 match self.ledger.apply(&txn) {
                                     Ok((r, _)) => r,
                                     Err(LedgerError::RootMismatch { expected, found }) => {
