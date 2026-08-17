@@ -70,6 +70,9 @@ fn build_engine_config() -> Config {
     config.wasm_exceptions(true);
     config.native_unwind_info(false);
     config.signals_based_traps(false);
+    // Must match the enclave engine: fuel metering is compiled into
+    // the generated code, so a cwasm built without it cannot load.
+    config.consume_fuel(true);
 
     // ── SGX-appropriate limits ─────────────────────────────────
     config.memory_reservation(4 * 1024 * 1024);

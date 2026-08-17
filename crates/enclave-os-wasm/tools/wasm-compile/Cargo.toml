@@ -25,3 +25,8 @@ wasmtime = { git = "https://github.com/Privasys/wasmtime", tag = "privasys-v0.2.
 ] }
 
 clap = { version = "4", features = ["derive"] }
+
+# Standalone: do not join the enclave-os-wasm crate's workspace above
+# (the tool builds on the plain host toolchain, outside the enclave
+# dependency graph).
+[workspace]
