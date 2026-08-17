@@ -1847,6 +1847,9 @@ impl EnclaveModule for WasmModule {
                         rot.new_vault_ca_roots.as_deref().unwrap_or(&[]),
                         rot.new_vault_threshold.unwrap_or(0),
                         rot.new_vault_oidc_issuer.as_deref().unwrap_or(""),
+                        rot.new_vault_acceptable_tcb_statuses
+                            .clone()
+                            .unwrap_or_default(),
                     ) {
                         Ok(c) => Some(c),
                         Err(e) => {

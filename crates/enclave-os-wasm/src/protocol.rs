@@ -206,6 +206,10 @@ pub struct WasmRotateKey {
     /// selection for a later re-author).
     #[serde(default)]
     pub new_vault_oidc_issuer: Option<String>,
+    /// TARGET constellation acceptable Intel TCB statuses (empty/absent =
+    /// no TCB acceptance check on the dial).
+    #[serde(default)]
+    pub new_vault_acceptable_tcb_statuses: Option<Vec<String>>,
 }
 
 /// Host-driven billing freeze command.

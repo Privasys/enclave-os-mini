@@ -77,6 +77,14 @@ pub struct VaultConfig {
     /// e.g. `https://privasys.id`). Only needed to re-author on migration.
     #[serde(default)]
     pub oidc_issuer: String,
+    /// Intel TCB statuses accepted (beyond the secure floor) when verifying the
+    /// VAULTS' quotes on this leg — from the constellation's
+    /// `acceptable_tcb_statuses`. Empty (incl. every pre-existing sealed
+    /// selection) = no TCB acceptance check on the dial, matching the
+    /// constellation-unset case; `Revoked` is rejected by the egress gate
+    /// whenever enforcement is on.
+    #[serde(default)]
+    pub acceptable_tcb_statuses: Vec<String>,
 }
 
 impl VaultConfig {
@@ -101,6 +109,7 @@ impl VaultConfig {
         ca_roots_hex: &[String],
         threshold: usize,
         oidc_issuer: &str,
+        acceptable_tcb_statuses: Vec<String>,
     ) -> Result<VaultConfig, String> {
         if endpoints.is_empty() {
             return Err("vaultkey: target constellation has no endpoints".into());
@@ -122,6 +131,7 @@ impl VaultConfig {
             attestation_servers: std::vec![attestation_server.to_string()],
             ca_roots_der,
             oidc_issuer: oidc_issuer.to_string(),
+            acceptable_tcb_statuses,
         })
     }
 }
@@ -151,6 +161,10 @@ struct DirConstellation {
     /// for the enclave-driven path (inc.4); empty on an older directory.
     #[serde(default)]
     ca_roots: Vec<String>,
+    /// Constellation's acceptable Intel TCB statuses (empty on an older
+    /// directory = no enforcement on the dial).
+    #[serde(default)]
+    acceptable_tcb_statuses: Vec<String>,
 }
 
 #[derive(Deserialize)]
@@ -283,6 +297,7 @@ pub fn discover(mgmt_url: &str, environment: &str) -> Result<VaultConfig, String
         attestation_servers: std::vec![con.attestation_server.clone()],
         ca_roots_der,
         oidc_issuer: con.oidc_issuer.clone(),
+        acceptable_tcb_statuses: con.acceptable_tcb_statuses.clone(),
     })
 }
 
@@ -471,9 +486,13 @@ fn build_ratls_policy(
         },
         expected_oids: Vec::new(),
         attestation_servers: cfg.attestation_servers.clone(),
-        // TCB acceptance stays legacy (Revoked-only) for the vault leg until
-        // the constellation's acceptable set is threaded into VaultKeyConfig.
-        acceptable_tcb_statuses: None,
+        // Enforce the constellation's acceptable-TCB set on the vault's quote
+        // (empty set = legacy no-check, matching an unset constellation).
+        acceptable_tcb_statuses: if cfg.acceptable_tcb_statuses.is_empty() {
+            None
+        } else {
+            Some(cfg.acceptable_tcb_statuses.clone())
+        },
         // Mutual RA-TLS: present this app's identity (OS signer mints the cert).
         client_identity: Some(ClientCertIdentity {
             code_hash: code_hash.to_vec(),
