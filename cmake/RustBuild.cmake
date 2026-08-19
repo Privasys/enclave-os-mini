@@ -53,7 +53,7 @@ function(rust_build_host CRATE_DIR OUTPUT_NAME)
 endfunction()
 
 # ---------------------------------------------------------------------------
-# rust_build_enclave(CRATE_DIR OUTPUT_NAME [FEATURES])
+# rust_build_enclave(CRATE_DIR OUTPUT_NAME FEATURES [TARGET_DIR])
 #   Build an enclave-side Rust crate (staticlib) with the SGX sysroot.
 #   Requires the sgx_sysroot target to have been built first (from the
 #   Teaclave fork's CMakeLists.txt).
@@ -63,9 +63,8 @@ endfunction()
 #     so that the caller controls exactly which modules are compiled in.
 #     When empty, default features are used.
 # ---------------------------------------------------------------------------
-function(rust_build_enclave CRATE_DIR OUTPUT_NAME)
-    # Optional 3rd argument: features
-    set(_FEATURES "${ARGN}")
+function(rust_build_enclave CRATE_DIR OUTPUT_NAME FEATURES)
+    set(_FEATURES "${FEATURES}")
 
     if(NOT TEACLAVE_CHECKOUT)
         message(FATAL_ERROR "TEACLAVE_CHECKOUT not set. Run resolve_teaclave() first.")
