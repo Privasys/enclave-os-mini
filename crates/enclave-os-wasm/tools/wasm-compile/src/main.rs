@@ -49,6 +49,29 @@ struct Cli {
     output: Option<PathBuf>,
 }
 
+/// Exact enabled `wasmparser::WasmFeatures` bits for the pinned wasmtime.
+///
+/// Recording the full bitset catches newly enabled proposal defaults at the
+/// compatibility boundary: a wasmtime pin bump that silently turns on a new
+/// proposal changes execution semantics and would otherwise ship unnoticed.
+/// On mismatch, review the new default set against `build_engine_config`
+/// (and the runtime `WasmEngine::new()`), then re-freeze this constant as a
+/// deliberate decision.
+const WASM_FEATURE_BITS: u64 = 0x0000_000c_010b_fcff;
+
+/// Fail closed if the pinned wasmtime's enabled-proposal set drifted.
+fn verify_frozen_features(engine: &Engine) -> Result<(), String> {
+    let bits = engine.get_wasm_features().bits();
+    if bits != WASM_FEATURE_BITS {
+        return Err(format!(
+            "wasmtime enabled-proposal set drifted: got {:#018x}, frozen {:#018x} — \
+             review the new defaults and re-freeze WASM_FEATURE_BITS deliberately",
+            bits, WASM_FEATURE_BITS
+        ));
+    }
+    Ok(())
+}
+
 /// Build the wasmtime Engine configuration.
 ///
 /// **This MUST stay in sync with `WasmEngine::new()` in
@@ -116,6 +139,10 @@ fn main() {
         eprintln!("error: engine creation failed: {}", e);
         std::process::exit(1);
     });
+    if let Err(e) = verify_frozen_features(&engine) {
+        eprintln!("error: {}", e);
+        std::process::exit(1);
+    }
 
     // AOT compile
     eprintln!("Compiling...");
@@ -144,4 +171,22 @@ fn main() {
         cwasm.len()
     );
     eprintln!("Done.");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{build_engine_config, verify_frozen_features};
+
+    #[test]
+    fn enabled_proposal_set_stays_frozen() {
+        let mut config = build_engine_config();
+        // Explicit AOT target: the production artefact targets Linux/SGX and
+        // this keeps the test host-independent (Windows hosts reject
+        // `native_unwind_info(false)` for native engines).
+        config.target("x86_64-unknown-linux-gnu").expect("target");
+        let engine = super::Engine::new(&config).expect("engine");
+        if let Err(e) = verify_frozen_features(&engine) {
+            panic!("{e}");
+        }
+    }
 }
