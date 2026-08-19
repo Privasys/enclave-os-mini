@@ -69,6 +69,7 @@ points CMake at the composition crate that registers the WASM module.
 |------------|---------|-------------|
 | `CMAKE_BUILD_TYPE` | `Debug` | `Release` for production (LTO, no debug symbols) |
 | `RUST_ENCLAVE_SOURCE_ROOT` | source checkout | Source prefix remapped to `/workspace` for path-independent enclave measurements |
+| `SOURCE_DATE_EPOCH` | `0` | Stable build epoch fed to Cargo for reproducible enclave artifacts |
 | `ENABLE_WASM` | `OFF` | Enable the WASM runtime module |
 | `WASM_ENCLAVE_DIR` | *(none)* | Path to the WASM composition crate (required when `ENABLE_WASM=ON`) |
 
