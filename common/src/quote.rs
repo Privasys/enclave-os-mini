@@ -322,3 +322,51 @@ pub fn compute_report_data_hash(pubkey_bytes: &[u8], binding: &[u8]) -> ring::di
     preimage.extend_from_slice(binding);
     ring::digest::digest(&ring::digest::SHA512, &preimage)
 }
+
+// ---------------------------------------------------------------------------
+//  Bidirectional challenge-response verification (requires `ring`)
+// ---------------------------------------------------------------------------
+
+/// Verify that a peer certificate's quote `report_data` commits to the
+/// challenge nonce we sent during the TLS handshake, and to the session
+/// channel binder.
+///
+/// This is the shared TEE check for challenge-mode RA-TLS, used by every
+/// component that authenticates a TEE peer (vault key policies, cluster peer
+/// links, …). It covers SGX and TDX evidence alike ([`extract_report_data`]
+/// handles both quote formats).
+///
+/// Bidirectional challenge-response is **mandatory** for any TEE
+/// authentication. If `nonce` is `None` we refuse: the TLS layer must have
+/// sent a challenge. `channel_binder` is the 32-byte binder derived from this
+/// session's handshake key schedule (read post-handshake from the
+/// connection's `ratls_channel_binder()`); when present the peer's quote must
+/// commit to `nonce || binder`, so a relayed cert from another session fails
+/// closed. It is `None` only on a non-TLS-1.3 handshake.
+#[cfg(feature = "crypto")]
+pub fn verify_challenge_binding(
+    evidence: &[u8],
+    pubkey_raw: &[u8],
+    nonce: Option<&[u8]>,
+    channel_binder: Option<&[u8]>,
+) -> Result<(), String> {
+    let nonce = nonce.ok_or_else(|| {
+        "TLS challenge nonce missing; bidirectional challenge-response is required".to_string()
+    })?;
+    let actual =
+        extract_report_data(evidence).map_err(|e| format!("report_data extraction: {e}"))?;
+    let spki = build_p256_spki_der(pubkey_raw);
+    let mut binding = nonce.to_vec();
+    if let Some(binder) = channel_binder {
+        binding.extend_from_slice(binder);
+    }
+    let expected = compute_report_data_hash(&spki, &binding);
+    if actual[..] != expected.as_ref()[..] {
+        return Err(
+            "bidirectional challenge-response failed: peer cert report_data \
+             does not commit to the challenge nonce and session binder"
+                .into(),
+        );
+    }
+    Ok(())
+}

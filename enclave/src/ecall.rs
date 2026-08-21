@@ -625,17 +625,13 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
                 enclave_log_error!("raft: raft_vault needs mgmt_url and handle");
                 return -36;
             }
-            let cluster_key: [u8; 32] = match crate::raftglue::resolve_cluster_key(
-                &sealed_cfg.master_key(),
-                &vcfg,
-            ) {
+            let cluster_key: [u8; 32] = match crate::raftglue::resolve_cluster_key(&vcfg) {
                 Ok(k) => k,
                 Err(e) => {
                     enclave_log_error!("raft: cluster credential: {}", e);
                     return -36;
                 }
             };
-            let vault_cfg = Some(vcfg);
             let ca = match crate::ratls::attestation::CaContext::from_parts(
                 sealed_cfg.ca_cert_der.clone(),
                 sealed_cfg.ca_key_pkcs8.clone(),
@@ -653,58 +649,22 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
                 .get("raft_genesis_voters")
                 .and_then(|v| v.as_array())
                 .map(|a| a.iter().filter_map(|v| v.as_u64()).collect());
-            // Peer measurement pinning defaults ON (admissible set =
-            // own measurement); raft_pin_measurements widens the set
-            // (an upgrade window lists {old, new});
-            // raft_pin_measurement=false disables (transitional only).
-            let pin_measurement = config
-                .extra
-                .get("raft_pin_measurement")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(true);
-            let mut pin_from_policy = false;
-            let pinned_measurements: Option<Vec<[u8; 32]>> = if !pin_measurement {
-                None
-            } else if let Some(list) = config
-                .extra
-                .get("raft_pin_measurements")
-                .and_then(|v| v.as_array())
+            // Peer measurement pinning is policy-sourced, always: the
+            // credential policy's Tees (owner-approved, refreshed
+            // periodically) are the SOLE source of the admissible set.
+            // The former config overrides are gone — refuse them
+            // loudly rather than silently changing admission
+            // semantics (same precedent as raft_cluster_key).
+            if config.extra.contains_key("raft_pin_measurements")
+                || config.extra.contains_key("raft_pin_measurement")
             {
-                let mut set = Vec::with_capacity(list.len());
-                for v in list {
-                    let parsed: Option<[u8; 32]> = v
-                        .as_str()
-                        .and_then(enclave_os_common::hex::hex_decode)
-                        .and_then(|b| b.try_into().ok());
-                    match parsed {
-                        Some(m) => set.push(m),
-                        None => {
-                            enclave_log_error!(
-                                "raft: raft_pin_measurements entries must be 32-byte hex"
-                            );
-                            return -36;
-                        }
-                    }
-                }
-                if set.is_empty() {
-                    enclave_log_error!("raft: raft_pin_measurements must not be empty");
-                    return -36;
-                }
-                Some(set)
-            } else {
-                // No explicit list: in vault mode the credential
-                // policy becomes the source of truth (fetched by the
-                // glue, refreshed periodically); own measurement is
-                // the boot fallback either way.
-                pin_from_policy = vault_cfg.is_some();
-                match crate::ratls::attestation::self_mrenclave() {
-                    Ok(own) => Some(std::vec![own]),
-                    Err(e) => {
-                        enclave_log_error!("raft: self measurement for peer pinning: {}", e);
-                        return -36;
-                    }
-                }
-            };
+                enclave_log_error!(
+                    "raft: raft_pin_measurements / raft_pin_measurement were removed — \
+                     the credential policy is the sole source of the admissible \
+                     measurement set (stage + promote a Tee profile for upgrades)"
+                );
+                return -36;
+            }
             // Acceptable Intel TCB statuses on peer quotes: tri-state
             // with vault semantics (absent = no check, [] = strict
             // floor-only, list = floor + list; Revoked never).
@@ -748,12 +708,10 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
                 genesis_voters,
                 ca,
                 crate::raftglue::RaftNetConfig {
-                    pinned_measurements,
                     acceptable_tcb_statuses,
                     reattest_ticks,
-                    pin_from_policy,
                 },
-                vault_cfg,
+                vcfg,
                 log_retain,
             ) {
                 Ok(glue) => {

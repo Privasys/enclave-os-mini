@@ -17,21 +17,24 @@
 //! inside the first node's enclave, Shamir-split across the vaults,
 //! and released only under the owner-authored grant policy's
 //! measurement + TCB checks — fetching the credential IS admission,
-//! and no shared secret ever exists outside TEEs. The resolved `ck`
-//! is sealed node-locally so restarts do not depend on vault
-//! availability. The ledger storage key and the log key derive from
-//! this enclave's sealed master key (node-local).
+//! and no shared secret ever exists outside TEEs. Every boot fetches
+//! it fresh (no node-local copy): a measurement the owner removes
+//! from the policy cannot rejoin after its next restart, and no key
+//! material lingers at rest. The ledger storage key and the log key
+//! derive from this enclave's sealed master key (node-local).
 //!
-//! Peer admission: beyond the fleet-CA + measurement-set pin enforced
-//! in the TLS layer (see `peerlink`), each established link's peer
-//! quote is sent to the configured attestation servers (central
-//! config, OID 2.7) and gated on the verified MRENCLAVE + the Intel
-//! TCB status against `raft_acceptable_tcb_statuses` — tri-state
-//! exactly like the vault: absent = no TCB check (rollout safety),
-//! `[]` = strict floor-only, a list = floor + list, Revoked never
-//! accepted. Verdicts are cached per cert fingerprint; links older
-//! than the re-attestation window are recycled so fresh quotes are
-//! presented (certs are minted per connection).
+//! Peer admission: beyond the fleet-CA chain + bidirectional
+//! challenge-response binding + policy-sourced measurement pin
+//! enforced by `peerlink` (via the shared TEE checker), each
+//! established link's peer quote is sent to the configured
+//! attestation servers (central config, OID 2.7) and gated on the
+//! verified MRENCLAVE + the Intel TCB status against
+//! `raft_acceptable_tcb_statuses` — tri-state exactly like the vault:
+//! absent = no TCB check (rollout safety), `[]` = strict floor-only,
+//! a list = floor + list, Revoked never accepted. Verdicts are cached
+//! per cert fingerprint; links older than the re-attestation window
+//! are recycled so fresh quotes are presented (certs are minted per
+//! connection).
 
 use std::collections::BTreeMap;
 use std::sync::{Mutex, OnceLock};
@@ -199,25 +202,15 @@ pub struct RaftVaultConfig {
     pub app_id: Option<Vec<u8>>,
 }
 
-const CK_SEAL_TABLE: &str = "raft:meta";
-const CK_SEAL_RECORD: &[u8] = b"ck.sealed.v1";
-const CK_SEAL_AAD: &[u8] = b"enclave-os-raft:ck-seal:v1";
-
-/// Resolve the cluster key: node-local sealed copy first (restarts do
-/// not depend on vault availability), else fetch from the vault
-/// constellation under the credential's grant policy and seal it.
-/// Fail-closed: no credential, no cluster.
-pub fn resolve_cluster_key(
-    master_key: &[u8; 32],
-    cfg: &RaftVaultConfig,
-) -> Result<[u8; 32], String> {
-    if let Some(ck) = load_sealed_ck(master_key) {
-        enclave_log_info!("raft: cluster key restored from the sealed copy");
-        return Ok(ck);
-    }
+/// Resolve the cluster key: fetch it from the vault constellation
+/// under the credential's grant policy, on EVERY boot. There is no
+/// node-local copy — revocation (removing a measurement from the
+/// policy) is therefore total at the node's next restart, and no key
+/// material lingers at rest (which also keeps the design free of any
+/// sealing primitive). Fail-closed: no credential, no cluster.
+pub fn resolve_cluster_key(cfg: &RaftVaultConfig) -> Result<[u8; 32], String> {
     let ck = fetch_vault_ck(cfg)?;
-    store_sealed_ck(master_key, &ck)?;
-    enclave_log_info!("raft: cluster key resolved from the vault constellation and sealed");
+    enclave_log_info!("raft: cluster key resolved from the vault constellation");
     Ok(ck)
 }
 
@@ -269,57 +262,6 @@ fn fetch_policy_measurements(_cfg: &RaftVaultConfig) -> Result<Vec<[u8; 32]>, St
     Err("policy-sourced pinning requires the cluster flavor".to_string())
 }
 
-fn ck_seal_key(master_key: &[u8; 32]) -> [u8; 32] {
-    derive(master_key, b"enclave-os-raft:ckseal:v1")
-}
-
-fn load_sealed_ck(master_key: &[u8; 32]) -> Option<[u8; 32]> {
-    use enclave_os_merkle::KvBackend;
-    let backend = OcallBackend::with_table(CK_SEAL_TABLE);
-    let rec = backend.get(CK_SEAL_RECORD).ok()??;
-    if rec.len() != 12 + 32 + 16 {
-        return None;
-    }
-    let key =
-        ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &ck_seal_key(master_key)).ok()?;
-    let key = ring::aead::LessSafeKey::new(key);
-    let nonce = ring::aead::Nonce::try_assume_unique_for_key(&rec[..12]).ok()?;
-    let mut ct = rec[12..].to_vec();
-    let pt = key
-        .open_in_place(nonce, ring::aead::Aad::from(CK_SEAL_AAD), &mut ct)
-        .ok()?;
-    if pt.len() != 32 {
-        return None;
-    }
-    let mut out = [0u8; 32];
-    out.copy_from_slice(pt);
-    Some(out)
-}
-
-fn store_sealed_ck(master_key: &[u8; 32], ck: &[u8; 32]) -> Result<(), String> {
-    use enclave_os_common::rpc::KvBatchOp;
-    use enclave_os_merkle::KvBackend;
-    let mut nonce_bytes = [0u8; 12];
-    SystemRandom::new()
-        .fill(&mut nonce_bytes)
-        .map_err(|_| "rng (ck seal nonce)".to_string())?;
-    let key = ring::aead::UnboundKey::new(&ring::aead::AES_256_GCM, &ck_seal_key(master_key))
-        .map_err(|_| "ck seal key".to_string())?;
-    let key = ring::aead::LessSafeKey::new(key);
-    let nonce = ring::aead::Nonce::assume_unique_for_key(nonce_bytes);
-    let mut buf = ck.to_vec();
-    key.seal_in_place_append_tag(nonce, ring::aead::Aad::from(CK_SEAL_AAD), &mut buf)
-        .map_err(|_| "ck seal".to_string())?;
-    let mut record = nonce_bytes.to_vec();
-    record.extend_from_slice(&buf);
-    OcallBackend::with_table(CK_SEAL_TABLE)
-        .write_batch(std::vec![KvBatchOp::Put {
-            key: CK_SEAL_RECORD.to_vec(),
-            value: record,
-        }])
-        .map_err(|e| format!("ck seal persist: {e:?}"))
-}
-
 /// The cluster runtime for this node.
 pub struct RaftGlue {
     driver: RaftDriver<OcallBackend>,
@@ -366,30 +308,17 @@ pub struct RaftGlue {
     /// Tick each connection completed its handshake (re-attestation).
     conn_established: BTreeMap<u32, u64>,
     /// Vault addressing, kept for the policy-sourced pin refresh.
-    vault: Option<RaftVaultConfig>,
-    /// The pin set follows the credential policy (vault mode without
-    /// an explicit `raft_pin_measurements` list).
-    pin_from_policy: bool,
-    /// Own measurement, always included in a policy-sourced pin set.
-    own_measurement: Option<[u8; 32]>,
+    vault: RaftVaultConfig,
+    /// Own measurement, always included in the policy-sourced pin set.
+    own_measurement: [u8; 32],
 }
 
 /// Peer-admission configuration (from `--extra`, resolved by ecall).
 pub struct RaftNetConfig {
-    /// Admissible peer MRENCLAVEs; `None` disables the local pin
-    /// (`raft_pin_measurement: false`, transitional only).
-    pub pinned_measurements: Option<Vec<[u8; 32]>>,
     /// Tri-state acceptable-TCB set for peer quotes (vault semantics).
     pub acceptable_tcb_statuses: Option<Vec<String>>,
     /// Link max age in ticks before recycling for a fresh quote.
     pub reattest_ticks: u64,
-    /// Vault mode without an explicit pin list: the admissible set is
-    /// read from the credential policy's Tees (own measurement always
-    /// included) at startup and refreshed periodically — the policy is
-    /// the single source of truth, so an owner-approved measurement
-    /// change opens/closes the upgrade window without touching node
-    /// configuration.
-    pub pin_from_policy: bool,
 }
 
 impl RaftGlue {
@@ -401,7 +330,7 @@ impl RaftGlue {
         genesis_voters: Option<Vec<NodeId>>,
         ca: CaContext,
         net: RaftNetConfig,
-        vault: Option<RaftVaultConfig>,
+        vault: RaftVaultConfig,
         log_retain: u64,
     ) -> Result<Self, String> {
         let ck = derive(&cluster_key, b"enclave-os-raft:ck:v1");
@@ -464,38 +393,23 @@ impl RaftGlue {
         #[cfg(feature = "wasm")]
         driver.set_replay_verifier(Box::new(replay_verify));
 
-        // Policy-sourced pin: in vault mode without an explicit list,
-        // the admissible set = the credential policy's Tees ∪ own
-        // measurement. If the vaults are unreachable right now (e.g.
-        // this boot came up from the sealed ck copy) fall back to
-        // own-only; the periodic refresh recovers the full set.
-        let own_measurement = net
-            .pinned_measurements
-            .as_ref()
-            .map(|_| crate::ratls::attestation::self_mrenclave())
-            .transpose()
+        // Policy-sourced pin: the admissible set = the credential
+        // policy's Tees ∪ own measurement, fetched at boot alongside
+        // the credential itself, FAIL-CLOSED. The policy is the sole
+        // source of truth for peer admission — there is no config
+        // override and no degraded (own-only) fallback; the periodic
+        // refresh keeps running nodes on the owner-approved set.
+        let own_measurement = crate::ratls::attestation::self_mrenclave()
             .map_err(|e| format!("self measurement: {e}"))?;
-        let mut pinned = net.pinned_measurements;
-        if net.pin_from_policy {
-            if let (Some(v), Some(own)) = (vault.as_ref(), own_measurement) {
-                match fetch_policy_measurements(v) {
-                    Ok(mut set) => {
-                        if !set.contains(&own) {
-                            set.push(own);
-                        }
-                        enclave_log_info!(
-                            "raft: admissible measurement set from policy ({} entries)",
-                            set.len()
-                        );
-                        pinned = Some(set);
-                    }
-                    Err(e) => enclave_log_error!(
-                        "raft: policy pin fetch failed ({}), starting own-only",
-                        e
-                    ),
-                }
-            }
+        let mut pinned = fetch_policy_measurements(&vault)
+            .map_err(|e| format!("policy measurement fetch: {e}"))?;
+        if !pinned.contains(&own_measurement) {
+            pinned.push(own_measurement);
         }
+        enclave_log_info!(
+            "raft: admissible measurement set from policy ({} entries)",
+            pinned.len()
+        );
         let link = PeerLink::new(ca, pinned)?;
         enclave_log_info!(
             "raft node {} up ({} peers, {})",
@@ -529,34 +443,26 @@ impl RaftGlue {
             verdicts: BTreeMap::new(),
             conn_established: BTreeMap::new(),
             vault,
-            pin_from_policy: net.pin_from_policy,
             own_measurement,
         })
     }
 
-    /// Periodic policy-pin refresh (vault mode): re-read the
-    /// credential policy's Tees and swap the admissible set when it
-    /// changed. New connections verify against the new set at once;
-    /// existing links roll through re-attestation recycling.
+    /// Periodic policy-pin refresh: re-read the credential policy's
+    /// Tees and swap the admissible set when it changed. New
+    /// connections verify against the new set at once; existing links
+    /// roll through re-attestation recycling.
     fn refresh_policy_pin(&mut self) {
-        let (Some(v), Some(own)) = (self.vault.clone(), self.own_measurement) else {
-            return;
-        };
+        let (v, own) = (self.vault.clone(), self.own_measurement);
         match fetch_policy_measurements(&v) {
             Ok(mut set) => {
                 if !set.contains(&own) {
                     set.push(own);
                 }
-                let current = self.link.pinned().map(|s| s.to_vec());
+                let mut current = self.link.pinned().to_vec();
+                current.sort_unstable();
                 let mut sorted = set.clone();
                 sorted.sort_unstable();
-                let changed = match current {
-                    Some(mut c) => {
-                        c.sort_unstable();
-                        c != sorted
-                    }
-                    None => true,
-                };
+                let changed = current != sorted;
                 if changed {
                     enclave_log_info!(
                         "raft: admissible measurement set updated from policy ({} entries)",
@@ -610,7 +516,7 @@ impl RaftGlue {
     // ── Event-loop inputs ───────────────────────────────────────────
 
     fn handle_peer_msg(&mut self, msg_type: ChannelMsgType, conn_id: u32, payload: &[u8]) {
-        let events = self.link.handle_message(msg_type, conn_id, payload, now_secs());
+        let events = self.link.handle_message(msg_type, conn_id, payload);
         for ev in events {
             match ev {
                 PeerEvent::Established(cid) => {
@@ -678,10 +584,10 @@ impl RaftGlue {
     /// attestation servers (signature chain to the Intel root, QE
     /// identity, PCK CRL, DEBUG — everything the hardened AS checks)
     /// and gate the reported `tcbStatus` + AS-verified MRENCLAVE.
-    /// No servers configured = pass (the TLS-layer parse pin is then
-    /// the only measurement check — configure attestation servers in
-    /// any real deployment). Requires egress; a build without it
-    /// skips (and cannot configure servers anyway).
+    /// No servers configured = pass (peerlink's local challenge-mode
+    /// checks are then the only measurement gate — configure
+    /// attestation servers in any real deployment). Requires egress; a
+    /// build without it skips (and cannot configure servers anyway).
     fn verify_peer(&mut self, cid: u32) -> bool {
         #[cfg(feature = "egress")]
         {
@@ -739,17 +645,16 @@ impl RaftGlue {
                 ));
             }
             // AS-verified measurement must be in the admissible set —
-            // independent of the TLS-layer parse (which a stolen
+            // independent of the local quote parse (which a stolen
             // fleet-CA key could satisfy with a fabricated quote).
-            if let Some(set) = self.link.pinned() {
-                if !resp.mrenclave.is_empty()
-                    && !set.iter().any(|m| resp.mrenclave == hex_encode(m))
-                {
-                    return Err(format!(
-                        "AS-verified MRENCLAVE {} not in the admissible set",
-                        resp.mrenclave
-                    ));
-                }
+            let set = self.link.pinned();
+            if !resp.mrenclave.is_empty()
+                && !set.iter().any(|m| resp.mrenclave == hex_encode(m))
+            {
+                return Err(format!(
+                    "AS-verified MRENCLAVE {} not in the admissible set",
+                    resp.mrenclave
+                ));
             }
         }
         Ok(())
@@ -914,11 +819,11 @@ impl RaftGlue {
             }
         }
 
-        // Policy-sourced pin refresh (vault mode): the credential
-        // policy is the single source of truth for the admissible
-        // measurement set; an owner-approved change reaches running
-        // nodes within this cadence.
-        if self.pin_from_policy && self.ticks % PIN_REFRESH_TICKS == 0 {
+        // Policy-sourced pin refresh: the credential policy is the
+        // single source of truth for the admissible measurement set;
+        // an owner-approved change reaches running nodes within this
+        // cadence.
+        if self.ticks % PIN_REFRESH_TICKS == 0 {
             self.refresh_policy_pin();
         }
 
@@ -990,7 +895,7 @@ impl RaftGlue {
                 continue;
             }
             *b = REDIAL_TICKS;
-            match self.link.dial(&addr, now_secs()) {
+            match self.link.dial(&addr) {
                 Ok(cid) => {
                     self.dial_pending.insert(cid, node);
                 }
