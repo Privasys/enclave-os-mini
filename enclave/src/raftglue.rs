@@ -45,6 +45,7 @@ use serde::Deserialize;
 
 use enclave_os_common::channel::ChannelMsgType;
 use enclave_os_common::hex::{hex_decode, hex_encode};
+use enclave_os_common::quote::TeeMeasurement;
 use enclave_os_common::modules::{EnclaveModule, RequestContext};
 use enclave_os_common::protocol::{Request, Response};
 
@@ -182,13 +183,45 @@ fn replay_verify(
 
 // ── Cluster key resolution (vault-anchored) ─────────────────────────
 
+/// How the node finds its vault constellation.
+#[derive(Clone)]
+pub enum VaultAddressing {
+    /// Platform path: discover the active constellation from the
+    /// management-service vault directory.
+    Directory {
+        /// Management-service base URL (the vault directory).
+        mgmt_url: String,
+        /// Directory environment (`production` / `dev`).
+        environment: String,
+    },
+    /// BYOK path: the constellation's coordinates are supplied inline
+    /// (customer-owned vaults; no platform directory involved).
+    /// Addressing is not trust — the vaults still have to pass RA-TLS
+    /// against the pinned build + the attestation server, and the key
+    /// policy inside them stays the authorisation boundary.
+    Direct {
+        /// Vault endpoints, `"host:port"` each.
+        endpoints: Vec<String>,
+        /// The vault build's MRENCLAVE (hex).
+        mrenclave_hex: String,
+        /// Attestation-server URL confirming the vaults' quotes.
+        attestation_server: String,
+        /// DER trust anchors (hex) the vault leaves chain to.
+        ca_roots_hex: Vec<String>,
+        /// Shamir threshold (k of n). 0 = default 2.
+        threshold: usize,
+        /// OIDC issuer of the owner principal / grant signer.
+        oidc_issuer: String,
+        /// TCB statuses accepted on the VAULTS' quotes.
+        acceptable_tcb_statuses: Vec<String>,
+    },
+}
+
 /// Vault addressing for the cluster credential (config `raft_vault`).
 #[derive(Clone)]
 pub struct RaftVaultConfig {
-    /// Management-service base URL (the vault directory).
-    pub mgmt_url: String,
-    /// Directory environment (`production` / `development`).
-    pub environment: String,
+    /// Where the constellation lives (directory discovery or direct).
+    pub addressing: VaultAddressing,
     /// The cluster key's vault handle — one per cluster.
     pub handle: String,
     /// Key-creation grant, needed only on the FIRST boot of the first
@@ -220,11 +253,41 @@ pub fn resolve_cluster_key(cfg: &RaftVaultConfig) -> Result<[u8; 32], String> {
 /// pass every vault's grant-policy checks (measurement set, OIDs,
 /// acceptable TCB statuses, optional owner approval). No single vault
 /// ever holds the whole key; the host never sees it at all.
+/// Build the vaultkey [`VaultConfig`] from the configured addressing:
+/// directory discovery (platform) or inline coordinates (BYOK).
+#[cfg(all(feature = "wasm", feature = "egress"))]
+fn vault_config(cfg: &RaftVaultConfig) -> Result<enclave_os_wasm::vaultkey::VaultConfig, String> {
+    use enclave_os_wasm::vaultkey;
+    match &cfg.addressing {
+        VaultAddressing::Directory { mgmt_url, environment } => {
+            vaultkey::discover(mgmt_url, environment)
+                .map_err(|e| format!("vault discovery: {e}"))
+        }
+        VaultAddressing::Direct {
+            endpoints,
+            mrenclave_hex,
+            attestation_server,
+            ca_roots_hex,
+            threshold,
+            oidc_issuer,
+            acceptable_tcb_statuses,
+        } => vaultkey::VaultConfig::from_parts(
+            endpoints.clone(),
+            mrenclave_hex,
+            attestation_server,
+            ca_roots_hex,
+            *threshold,
+            oidc_issuer,
+            acceptable_tcb_statuses.clone(),
+        )
+        .map_err(|e| format!("vault constellation config: {e}")),
+    }
+}
+
 #[cfg(all(feature = "wasm", feature = "egress"))]
 fn fetch_vault_ck(cfg: &RaftVaultConfig) -> Result<[u8; 32], String> {
     use enclave_os_wasm::vaultkey;
-    let vcfg = vaultkey::discover(&cfg.mgmt_url, &cfg.environment)
-        .map_err(|e| format!("vault discovery: {e}"))?;
+    let vcfg = vault_config(cfg)?;
     let code_hash = crate::ratls::attestation::self_mrenclave()
         .map_err(|e| format!("self measurement: {e}"))?;
     vaultkey::resolve_or_provision(
@@ -248,17 +311,16 @@ fn fetch_vault_ck(_cfg: &RaftVaultConfig) -> Result<[u8; 32], String> {
 /// Tees (the vault authorises `GetPolicy` by principal resolution, so
 /// the node reads its OWN credential's policy).
 #[cfg(all(feature = "wasm", feature = "egress"))]
-fn fetch_policy_measurements(cfg: &RaftVaultConfig) -> Result<Vec<[u8; 32]>, String> {
+fn fetch_policy_measurements(cfg: &RaftVaultConfig) -> Result<Vec<TeeMeasurement>, String> {
     use enclave_os_wasm::vaultkey;
-    let vcfg = vaultkey::discover(&cfg.mgmt_url, &cfg.environment)
-        .map_err(|e| format!("vault discovery: {e}"))?;
+    let vcfg = vault_config(cfg)?;
     let code_hash = crate::ratls::attestation::self_mrenclave()
         .map_err(|e| format!("self measurement: {e}"))?;
     vaultkey::read_policy_measurements(&vcfg, &cfg.handle, &code_hash, cfg.app_id.as_deref())
 }
 
 #[cfg(not(all(feature = "wasm", feature = "egress")))]
-fn fetch_policy_measurements(_cfg: &RaftVaultConfig) -> Result<Vec<[u8; 32]>, String> {
+fn fetch_policy_measurements(_cfg: &RaftVaultConfig) -> Result<Vec<TeeMeasurement>, String> {
     Err("policy-sourced pinning requires the cluster flavor".to_string())
 }
 
@@ -310,7 +372,7 @@ pub struct RaftGlue {
     /// Vault addressing, kept for the policy-sourced pin refresh.
     vault: RaftVaultConfig,
     /// Own measurement, always included in the policy-sourced pin set.
-    own_measurement: [u8; 32],
+    own_measurement: TeeMeasurement,
 }
 
 /// Peer-admission configuration (from `--extra`, resolved by ecall).
@@ -399,12 +461,14 @@ impl RaftGlue {
         // source of truth for peer admission — there is no config
         // override and no degraded (own-only) fallback; the periodic
         // refresh keeps running nodes on the owner-approved set.
-        let own_measurement = crate::ratls::attestation::self_mrenclave()
-            .map_err(|e| format!("self measurement: {e}"))?;
+        let own_measurement = TeeMeasurement::Sgx(
+            crate::ratls::attestation::self_mrenclave()
+                .map_err(|e| format!("self measurement: {e}"))?,
+        );
         let mut pinned = fetch_policy_measurements(&vault)
             .map_err(|e| format!("policy measurement fetch: {e}"))?;
         if !pinned.contains(&own_measurement) {
-            pinned.push(own_measurement);
+            pinned.push(own_measurement.clone());
         }
         enclave_log_info!(
             "raft: admissible measurement set from policy ({} entries)",
@@ -452,7 +516,7 @@ impl RaftGlue {
     /// connections verify against the new set at once; existing links
     /// roll through re-attestation recycling.
     fn refresh_policy_pin(&mut self) {
-        let (v, own) = (self.vault.clone(), self.own_measurement);
+        let (v, own) = (self.vault.clone(), self.own_measurement.clone());
         match fetch_policy_measurements(&v) {
             Ok(mut set) => {
                 if !set.contains(&own) {
@@ -647,9 +711,16 @@ impl RaftGlue {
             // AS-verified measurement must be in the admissible set —
             // independent of the local quote parse (which a stolen
             // fleet-CA key could satisfy with a fabricated quote).
+            // The AS reports MRENCLAVE for SGX only; for TDX the AS
+            // authenticates the same quote bytes the local (challenge-
+            // bound) parse pinned, so the local check carries the
+            // measurement gate there.
             let set = self.link.pinned();
             if !resp.mrenclave.is_empty()
-                && !set.iter().any(|m| resp.mrenclave == hex_encode(m))
+                && !set.iter().any(|m| match m {
+                    TeeMeasurement::Sgx(mr) => resp.mrenclave == hex_encode(mr),
+                    TeeMeasurement::Tdx { .. } => false,
+                })
             {
                 return Err(format!(
                     "AS-verified MRENCLAVE {} not in the admissible set",

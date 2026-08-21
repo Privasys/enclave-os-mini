@@ -107,6 +107,49 @@ pub struct QuoteIdentity {
     pub rtmr2: Option<String>,
 }
 
+/// A TEE-typed measurement identity, as pinned by a key policy's Tee
+/// profiles. This is the shared admission currency: policy readers
+/// produce it, peer verifiers compare a parsed [`QuoteIdentity`]
+/// against it — SGX and TDX alike.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
+pub enum TeeMeasurement {
+    /// SGX: the 32-byte MRENCLAVE.
+    Sgx([u8; 32]),
+    /// TDX: the platform-build identity — MRTD plus the image-derived
+    /// RTMR1/RTMR2 (48 bytes each), exactly what a key policy pins.
+    Tdx {
+        mrtd: [u8; 48],
+        rtmr1: [u8; 48],
+        rtmr2: [u8; 48],
+    },
+}
+
+impl TeeMeasurement {
+    /// Short human-readable label for logs (TEE type + measurement prefix).
+    pub fn describe(&self) -> String {
+        match self {
+            TeeMeasurement::Sgx(m) => format!("sgx:{}", &hex_encode(m)[..16]),
+            TeeMeasurement::Tdx { mrtd, .. } => format!("tdx:{}", &hex_encode(mrtd)[..16]),
+        }
+    }
+}
+
+impl QuoteIdentity {
+    /// Does this parsed quote identity match a pinned TEE measurement?
+    /// TEE types must agree; for TDX every pinned register must match.
+    pub fn matches(&self, m: &TeeMeasurement) -> bool {
+        match (self.tee, m) {
+            (TeeType::Sgx, TeeMeasurement::Sgx(mr)) => self.measurement == hex_encode(mr),
+            (TeeType::Tdx, TeeMeasurement::Tdx { mrtd, rtmr1, rtmr2 }) => {
+                self.measurement == hex_encode(mrtd)
+                    && self.rtmr1.as_deref() == Some(hex_encode(rtmr1).as_str())
+                    && self.rtmr2.as_deref() == Some(hex_encode(rtmr2).as_str())
+            }
+            _ => false,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 //  Parsing
 // ---------------------------------------------------------------------------

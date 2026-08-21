@@ -465,11 +465,11 @@ pub fn read_policy_measurements(
     handle: &str,
     code_hash: &[u8],
     app_id: Option<&[u8]>,
-) -> Result<Vec<[u8; 32]>, String> {
+) -> Result<Vec<enclave_os_common::quote::TeeMeasurement>, String> {
     let root_store = root_store_from_der(cfg.ca_roots_der.iter().cloned())
         .map_err(|e| format!("vaultkey: bad CA roots: {e}"))?;
     let policy = build_ratls_policy(cfg, code_hash, app_id)?;
-    let mut set: Vec<[u8; 32]> = Vec::new();
+    let mut set: Vec<enclave_os_common::quote::TeeMeasurement> = Vec::new();
     let mut answered = 0usize;
     let mut last_err: Option<String> = None;
     for ep in &cfg.endpoints {
@@ -501,7 +501,7 @@ pub fn read_policy_measurements(
             continue;
         };
         answered += 1;
-        collect_mrenclaves(&p.policy, &mut set);
+        collect_measurements(&p.policy, &mut set);
     }
     if answered == 0 {
         return Err(format!(
@@ -511,17 +511,27 @@ pub fn read_policy_measurements(
     Ok(set)
 }
 
-/// Collect `principals.tees[].Tee.measurements[].Mrenclave` (hex,
-/// 32 bytes) into `set`, deduplicated. Unknown shapes are skipped —
-/// the pin set only ever narrows admission on top of the vault's own
-/// enforcement.
-fn collect_mrenclaves(policy: &serde_json::Value, set: &mut Vec<[u8; 32]>) {
+/// Collect `principals.tees[].Tee.measurements[]` into `set`, TEE-typed
+/// and deduplicated: `{"Mrenclave": <hex32>}` (SGX) and
+/// `{"Tdx": {"mrtd", "rtmr1", "rtmr2"}}` (48-byte hex each) are both
+/// recognised. Unknown shapes are skipped — the pin set only ever
+/// narrows admission on top of the vault's own enforcement.
+fn collect_measurements(
+    policy: &serde_json::Value,
+    set: &mut Vec<enclave_os_common::quote::TeeMeasurement>,
+) {
+    use enclave_os_common::quote::TeeMeasurement;
     let Some(tees) = policy
         .get("principals")
         .and_then(|p| p.get("tees"))
         .and_then(|t| t.as_array())
     else {
         return;
+    };
+    let hex48 = |v: Option<&serde_json::Value>| -> Option<[u8; 48]> {
+        v.and_then(|v| v.as_str())
+            .and_then(hex_decode)
+            .and_then(|b| <[u8; 48]>::try_from(b).ok())
     };
     for tee in tees {
         let Some(measurements) = tee
@@ -532,16 +542,31 @@ fn collect_mrenclaves(policy: &serde_json::Value, set: &mut Vec<[u8; 32]>) {
             continue;
         };
         for m in measurements {
-            let Some(mr) = m
+            let parsed = if let Some(mr) = m
                 .get("Mrenclave")
                 .and_then(|v| v.as_str())
                 .and_then(hex_decode)
                 .and_then(|b| <[u8; 32]>::try_from(b).ok())
-            else {
-                continue;
+            {
+                Some(TeeMeasurement::Sgx(mr))
+            } else if let Some(tdx) = m.get("Tdx") {
+                match (
+                    hex48(tdx.get("mrtd")),
+                    hex48(tdx.get("rtmr1")),
+                    hex48(tdx.get("rtmr2")),
+                ) {
+                    (Some(mrtd), Some(rtmr1), Some(rtmr2)) => {
+                        Some(TeeMeasurement::Tdx { mrtd, rtmr1, rtmr2 })
+                    }
+                    _ => None,
+                }
+            } else {
+                None
             };
-            if !set.contains(&mr) {
-                set.push(mr);
+            if let Some(p) = parsed {
+                if !set.contains(&p) {
+                    set.push(p);
+                }
             }
         }
     }

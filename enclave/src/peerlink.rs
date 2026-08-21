@@ -50,6 +50,8 @@ use enclave_os_common::channel::{
     self, ChannelMsgType, conn_id_is_outbound, conn_id_is_peer_inbound, CONN_ID_OUTBOUND_BASE,
 };
 
+use enclave_os_common::quote::TeeMeasurement;
+
 use crate::enclave_log_error;
 use crate::ratls::attestation::{self, CaContext, CertMode};
 
@@ -98,17 +100,17 @@ struct PeerSession {
 pub struct PeerLink {
     ca: CaContext,
     fleet_roots: Arc<RootCertStore>,
-    /// The peer's certificate must carry a quote whose measurement is
-    /// IN this set. The set is sourced from the cluster credential's
-    /// policy (own measurement always included); an owner-approved
-    /// upgrade window widens it to {old, new}.
-    pinned_measurements: Arc<Vec<[u8; 32]>>,
+    /// The peer's certificate must carry a quote whose TEE-typed
+    /// measurement is IN this set. The set is sourced from the cluster
+    /// credential's policy (own measurement always included); an
+    /// owner-approved upgrade window widens it to {old, new}.
+    pinned_measurements: Arc<Vec<TeeMeasurement>>,
     sessions: BTreeMap<u32, PeerSession>,
     next_out: u32,
 }
 
 impl PeerLink {
-    pub fn new(ca: CaContext, pinned_measurements: Vec<[u8; 32]>) -> Result<Self, String> {
+    pub fn new(ca: CaContext, pinned_measurements: Vec<TeeMeasurement>) -> Result<Self, String> {
         let mut roots = RootCertStore::empty();
         roots
             .add(CertificateDer::from(ca.ca_cert_der.clone()))
@@ -123,7 +125,7 @@ impl PeerLink {
     }
 
     /// The admissible measurement set.
-    pub fn pinned(&self) -> &[[u8; 32]] {
+    pub fn pinned(&self) -> &[TeeMeasurement] {
         self.pinned_measurements.as_slice()
     }
 
@@ -131,7 +133,7 @@ impl PeerLink {
     /// dials/accepts; existing sessions keep the set they were
     /// verified under until the re-attestation recycle brings them
     /// back through a fresh handshake.
-    pub fn set_pinned(&mut self, set: Vec<[u8; 32]>) {
+    pub fn set_pinned(&mut self, set: Vec<TeeMeasurement>) {
         self.pinned_measurements = Arc::new(set);
     }
 
@@ -486,13 +488,10 @@ impl PeerLink {
         )?;
         let identity = enclave_os_common::quote::parse_quote(&quote)
             .map_err(|e| format!("peer quote: {e}"))?;
-        if !self
-            .pinned_measurements
-            .iter()
-            .any(|m| identity.measurement == enclave_os_common::hex::hex_encode(m))
-        {
+        if !self.pinned_measurements.iter().any(|m| identity.matches(m)) {
             return Err(format!(
-                "peer measurement {} not in the admissible set ({} entries)",
+                "peer measurement {:?}:{} not in the admissible set ({} entries)",
+                identity.tee,
                 identity.measurement,
                 self.pinned_measurements.len()
             ));

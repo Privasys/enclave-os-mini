@@ -608,12 +608,62 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
             let get = |k: &str| {
                 vault.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string()
             };
+            let str_list = |v: Option<&serde_json::Value>| -> Vec<String> {
+                v.and_then(|v| v.as_array())
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|s| s.as_str().map(|s| s.to_string()))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            };
+            // Addressing: the platform directory (mgmt_url) or an
+            // inline constellation (BYOK — customer-owned vaults, no
+            // platform involvement). Exactly one of the two.
+            let addressing = if let Some(c) =
+                vault.get("constellation").and_then(|v| v.as_object())
+            {
+                if vault.contains_key("mgmt_url") {
+                    enclave_log_error!(
+                        "raft: raft_vault takes either mgmt_url (directory) or \
+                         constellation (direct), not both"
+                    );
+                    return -36;
+                }
+                let cget = |k: &str| {
+                    c.get(k).and_then(|v| v.as_str()).unwrap_or("").to_string()
+                };
+                crate::raftglue::VaultAddressing::Direct {
+                    endpoints: str_list(c.get("endpoints")),
+                    mrenclave_hex: cget("mrenclave"),
+                    attestation_server: cget("attestation_server"),
+                    ca_roots_hex: str_list(c.get("ca_roots")),
+                    threshold: c
+                        .get("threshold")
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(0) as usize,
+                    oidc_issuer: cget("oidc_issuer"),
+                    acceptable_tcb_statuses: str_list(c.get("acceptable_tcb_statuses")),
+                }
+            } else {
+                let mgmt_url = get("mgmt_url");
+                if mgmt_url.is_empty() {
+                    enclave_log_error!(
+                        "raft: raft_vault needs mgmt_url (directory) or \
+                         constellation (direct)"
+                    );
+                    return -36;
+                }
+                crate::raftglue::VaultAddressing::Directory {
+                    mgmt_url,
+                    environment: {
+                        let e = get("environment");
+                        if e.is_empty() { "production".to_string() } else { e }
+                    },
+                }
+            };
             let vcfg = crate::raftglue::RaftVaultConfig {
-                mgmt_url: get("mgmt_url"),
-                environment: {
-                    let e = get("environment");
-                    if e.is_empty() { "production".to_string() } else { e }
-                },
+                addressing,
                 handle: get("handle"),
                 grant: get("grant"),
                 app_id: vault
@@ -621,8 +671,8 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
                     .and_then(|v| v.as_str())
                     .and_then(enclave_os_common::hex::hex_decode),
             };
-            if vcfg.mgmt_url.is_empty() || vcfg.handle.is_empty() {
-                enclave_log_error!("raft: raft_vault needs mgmt_url and handle");
+            if vcfg.handle.is_empty() {
+                enclave_log_error!("raft: raft_vault needs a handle");
                 return -36;
             }
             let cluster_key: [u8; 32] = match crate::raftglue::resolve_cluster_key(&vcfg) {
