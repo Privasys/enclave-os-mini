@@ -804,6 +804,14 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
         // lifetime, which matches the module's intended scope.
         let wasm_static: &'static enclave_os_wasm::WasmModule = Box::leak(Box::new(wasm));
         enclave_os_wasm::install_global(wasm_static);
+        // Sovereign sealing root (sovereign-data framework, Phase 1): a
+        // domain-separated derivative of the MRENCLAVE-sealed master key.
+        // The wasm crate receives only the derivative, never the master
+        // key; the `sealing.get-seal-key` host function binds it further
+        // to each calling app's own code hash.
+        enclave_os_wasm::install_sovereign_root(
+            enclave_os_wasm::sovereign_seal::derive_sovereign_root(sealed_cfg.master_key()),
+        );
         crate::modules::register_module(Box::new(enclave_os_wasm::WasmModuleHandle(wasm_static)));
         _module_count += 1;
     }

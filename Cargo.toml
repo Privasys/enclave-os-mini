@@ -6,6 +6,7 @@ members = [
     "common",
     "host",
     "tests/integration",
+    "tests/sovereign-seal-unit",
     "tests/wasm-docs-unit",
 ]
 exclude = [

@@ -72,6 +72,7 @@ pub mod jwks_fetcher;
 pub mod metrics;
 pub mod protocol;
 pub mod registry;
+pub mod sovereign_seal;
 #[cfg(target_vendor = "teaclave")]
 pub mod sgx_platform;
 pub mod vaultkey;
@@ -378,6 +379,20 @@ impl WasmModule {
             self.persist_meta_to_kv(name, &meta);
         }
         Ok(())
+    }
+
+    /// The code hash (SHA-256 of the module, attested at OID 3.2) of a
+    /// known app. Used by the `sealing.get-seal-key` host function to
+    /// bind the sovereign sealing key S_N to the calling app's current
+    /// code — see [`crate::sovereign_seal`].
+    pub fn app_code_hash(&self, name: &str) -> Result<[u8; 32], String> {
+        let reg = self
+            .registry
+            .lock()
+            .map_err(|_| String::from("registry lock poisoned"))?;
+        reg.app_code_hash(name)
+            .copied()
+            .ok_or_else(|| format!("unknown app: '{}'", name))
     }
 
     /// Apply or lift the host-driven billing freeze for `name`.
@@ -1524,6 +1539,24 @@ pub fn install_global(m: &'static WasmModule) {
 /// programmer-error and return a host-side error to the guest.
 pub fn global() -> Option<&'static WasmModule> {
     WASM_MODULE_GLOBAL.get().copied()
+}
+
+// The sovereign sealing root (the sovereign-data framework, Phase 1):
+// a domain-separated derivative of the MRENCLAVE-sealed runtime master
+// key, installed once by the enclave init code. The raw master key
+// never enters this crate. See [`sovereign_seal`].
+static SOVEREIGN_ROOT: OnceLock<[u8; 32]> = OnceLock::new();
+
+/// Install the sovereign sealing root. Call exactly once during enclave
+/// initialisation, with `sovereign_seal::derive_sovereign_root(master)`.
+/// Subsequent calls are silently ignored.
+pub fn install_sovereign_root(root: [u8; 32]) {
+    let _ = SOVEREIGN_ROOT.set(root);
+}
+
+/// Borrow the sovereign sealing root, or `None` before installation.
+pub(crate) fn sovereign_root() -> Option<&'static [u8; 32]> {
+    SOVEREIGN_ROOT.get()
 }
 
 /// Boxable adapter so the `'static` reference can be re-registered

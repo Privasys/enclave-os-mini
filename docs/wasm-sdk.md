@@ -81,6 +81,14 @@ TLS terminates **inside the enclave** using rustls + Mozilla root CAs. The host 
 
 **Plain HTTP is not supported.** Only `https://` URLs are accepted — requests to `http://` are rejected. Supported methods: GET, POST, PUT, DELETE, PATCH, HEAD, OPTIONS.
 
+### Sealing (`privasys:enclave-os/sealing@0.1.0`)
+
+| Function | Description |
+|----------|-------------|
+| `get-seal-key()` | The calling app's current version-bound sealing key S_N (32 bytes) plus the code hash it is bound to |
+
+S_N derives from the runtime's MRENCLAVE-sealed root **and** the app's own code hash (the value attested at OID 3.2), so a new build of the app receives a different key. An app flags data as user-owned by keeping each data owner's wallet-delivered key element wrapped under S_N: after an upgrade the wrap is unreadable until the owner's wallet re-delivers the element, which makes an app upgrade a consent boundary. Record the returned code hash beside anything sealed under the key so a later version can name which S_N a blob needs. The call errors during ledger replay.
+
 ---
 
 ## WASI Interfaces (enclave-implemented)

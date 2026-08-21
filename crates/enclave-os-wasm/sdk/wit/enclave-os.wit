@@ -359,3 +359,20 @@ interface ledger {
     /// Whether the current invocation runs inside a transaction.
     in-transaction: func() -> bool;
 }
+
+/// Version-bound sovereign sealing keys (the sovereign-data framework).
+///
+/// An app flags data as user-owned and keeps each data owner's
+/// wallet-delivered key element wrapped under S_N, a sealing key bound
+/// to the RUNTIME's MRENCLAVE-sealed root AND this app's own code hash
+/// (OID 3.2). A new build of the app receives a DIFFERENT key, so the
+/// wrap is unreadable to upgraded code until the data owner's wallet
+/// re-delivers the element: an app upgrade is a consent boundary.
+interface sealing {
+    /// The calling app's CURRENT sealing key S_N (32 bytes) and the
+    /// code hash it is bound to (32 bytes). Record the code hash beside
+    /// anything sealed under the key, so a later version can name which
+    /// S_N a blob needs. Errors during ledger replay and before the
+    /// runtime root is initialised.
+    get-seal-key: func() -> result<tuple<list<u8>, list<u8>>, string>;
+}

@@ -11,6 +11,7 @@
 //! | `privasys:enclave-os/keystore@0.1.0` | Key generation / import / export / lifecycle |
 //! | `privasys:enclave-os/https@0.1.0` | Secure HTTPS egress (TLS inside enclave) |
 //! | `privasys:enclave-os/auth@0.1.0` | Caller identity & role management |
+//! | `privasys:enclave-os/sealing@0.1.0` | Version-bound sovereign sealing key (S_N) |
 //!
 //! ## Security model
 //!
@@ -34,6 +35,7 @@ pub mod crypto;
 pub mod https;
 pub mod keystore;
 pub mod ledger;
+pub mod sealing;
 
 pub use crate::wasi::AppContext;
 pub use keystore::{KeyMaterial, KeyStore};
@@ -54,5 +56,6 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
     auth::add_to_linker(linker)?;
     attestation::add_to_linker(linker)?;
     ledger::add_to_linker(linker)?;
+    sealing::add_to_linker(linker)?;
     Ok(())
 }

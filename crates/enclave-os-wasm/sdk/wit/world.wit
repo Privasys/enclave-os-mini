@@ -41,6 +41,11 @@ world enclave-app {
     /// error outside a cluster transaction).
     import privasys:enclave-os/ledger@0.1.0;
 
+    /// Version-bound sovereign sealing key (S_N): bound to the runtime's
+    /// MRENCLAVE-sealed root and this app's own code hash, so an app
+    /// upgrade is a consent boundary for user-owned data.
+    import privasys:enclave-os/sealing@0.1.0;
+
     // ── WASI (enclave-implemented subset) ─────────────────────────
     //
     // Standard WASI interfaces, re-implemented by the enclave OS.
