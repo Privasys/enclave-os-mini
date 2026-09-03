@@ -73,7 +73,7 @@ struct Cli {
     /// Comma-separated list of attestation server URLs for remote quote
     /// verification.  e.g. "https://as.privasys.org/verify,https://as.customer.com/verify"
     /// The list is hashed into the config Merkle tree (leaf: egress.attestation_servers)
-    /// and embedded as X.509 OID 1.3.6.1.4.1.65230.2.7.
+    /// and embedded as X.509 OID 1.3.6.1.4.1.65230.2.3.
     #[arg(long, value_delimiter = ',')]
     attestation_servers: Option<Vec<String>>,
 
