@@ -189,7 +189,7 @@ fn measurement_from_canonical(s: &str) -> DepMeasurement {
 
 /// Decode the canonical encoding. Rejects truncated or trailing-byte input. Used
 /// to validate a dependency set the platform supplies before the runtime seals it
-/// into OID 65230.6.1.
+/// into OID 65230.7.1.
 pub fn decode_dependency_set(bytes: &[u8]) -> Result<DependencySet, &'static str> {
     let mut r = CanonicalReader { buf: bytes, off: 0 };
     let count = r.u32()?;

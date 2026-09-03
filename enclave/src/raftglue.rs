@@ -672,7 +672,11 @@ impl RaftGlue {
                     return passed;
                 }
             }
-            let passed = match self.verify_peer_cert(&cert) {
+            let Some(quote) = self.link.peer_quote(cid) else {
+                enclave_log_error!("raft: peer conn {} presented no evidence", cid);
+                return false;
+            };
+            let passed = match self.verify_peer_quote(&quote) {
                 Ok(()) => true,
                 Err(e) => {
                     enclave_log_error!("raft: peer conn {} rejected: {}", cid, e);
@@ -691,8 +695,7 @@ impl RaftGlue {
     }
 
     #[cfg(feature = "egress")]
-    fn verify_peer_cert(&self, cert: &[u8]) -> Result<(), String> {
-        let quote = crate::peerlink::extract_quote(cert)?;
+    fn verify_peer_quote(&self, quote: &[u8]) -> Result<(), String> {
         let servers = enclave_os_common::attestation_servers::server_urls();
         let responses =
             enclave_os_egress::attestation::verify_quote_statuses(&quote, &servers)?;

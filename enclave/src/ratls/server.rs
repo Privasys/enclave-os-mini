@@ -31,7 +31,7 @@ use std::vec::Vec;
 
 use crate::modules;
 use crate::ocall;
-use crate::ratls::attestation::{self, CaContext, CertMode};
+use crate::ratls::attestation::{self, CaContext, LeafKey};
 use crate::ratls::cert_store;
 use crate::ratls::session::RaTlsSession;
 use crate::{enclave_log_info, enclave_log_error};
@@ -44,8 +44,6 @@ use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, UnixT
 use rustls::server::Acceptor;
 use rustls::server::danger::{ClientCertVerified, ClientCertVerifier};
 use rustls::{DigitallySignedStruct, DistinguishedName, Error as TlsError, ServerConfig, SignatureScheme};
-use rustls::server::RaTlsBindCertificate;
-use rustls::sign::CertifiedKey;
 
 // ========================================================================
 //  Session states
@@ -98,8 +96,15 @@ pub struct IngressServer {
     data_tx: &'static SpscProducer,
     /// Shutdown flag.
     shutdown: bool,
-    /// Per-hostname cached deterministic TLS configs.
+    /// Per-hostname cached TLS configs (leaf certificate + key).
     cached_configs: BTreeMap<String, CachedConfig>,
+    /// Per-hostname leaf keys, kept 24 h across re-mints (RA-TLS v2).
+    leaf_keys: BTreeMap<String, LeafKey>,
+    /// Every answerable leaf key by SHA-256(SPKI): current keys and keys
+    /// rotated less than 15 minutes ago (the `leaf` of an attest request).
+    leaf_by_spki: BTreeMap<[u8; 32], LeafKey>,
+    /// Deterministic quotes, one per leaf key, cached for the key's lifetime.
+    det_quotes: BTreeMap<[u8; 32], DetQuote>,
 }
 
 /// A cached ServerConfig for deterministic (non-challenge) connections.
@@ -109,6 +114,16 @@ struct CachedConfig {
     /// CertStore generation at the time this config was created.
     /// Used to detect stale caches after app register/unregister.
     store_generation: u64,
+    /// SHA-256(SPKI) of the leaf key the config serves.
+    spki_hash: [u8; 32],
+}
+
+/// The deterministic quote of a leaf key: report_data commits to the key and
+/// the minute it was minted.
+struct DetQuote {
+    quote: Vec<u8>,
+    quote_time: String,
+    minted: u64,
 }
 
 impl IngressServer {
@@ -124,6 +139,9 @@ impl IngressServer {
             data_tx,
             shutdown: false,
             cached_configs: BTreeMap::new(),
+            leaf_keys: BTreeMap::new(),
+            leaf_by_spki: BTreeMap::new(),
+            det_quotes: BTreeMap::new(),
         }
     }
 
@@ -352,18 +370,25 @@ impl IngressServer {
         // OIDC claims are populated per-request in handle_http_request()
         // because different requests in the same session may carry
         // different tokens (or none — e.g. GET /healthz).
-        let base_ctx = enclave_os_common::modules::RequestContext {
-            peer_cert_der: session.peer_cert_der(),
-            client_challenge_nonce: session.client_challenge_nonce().cloned(),
-            channel_binder: session.ratls_channel_binder(),
-            oidc_claims: None,
-        };
-
         loop {
             match session.recv_http_request() {
                 Ok(Some(http_req)) => {
                     let close = http_req.connection_close;
-                    let result = handle_http_request_with_session(&http_req, &base_ctx);
+                    // RA-TLS v2 evidence endpoint: served here, where the TLS
+                    // session (its exporter, its peer certificate) is at hand.
+                    // Every other request sees the peer evidence accepted so
+                    // far on this connection and the connection's tag.
+                    let result = if http_req.path == enclave_os_common::attest::ATTEST_PATH {
+                        self.handle_attest(session, &http_req)
+                    } else {
+                        let base_ctx = enclave_os_common::modules::RequestContext {
+                            peer_cert_der: session.peer_cert_der(),
+                            peer_evidence: session.peer_evidence().cloned(),
+                            attestation: session.attestation().to_string(),
+                            oidc_claims: None,
+                        };
+                        handle_http_request_with_session(&http_req, &base_ctx)
+                    };
 
                     // Send HTTP response
                     let send_close = close || result.shutdown;
@@ -476,10 +501,8 @@ impl IngressServer {
             enclave_log_info!("SNI: {} (conn_id={})", sni, conn_id);
         }
 
-        // Build per-connection TLS config (includes client challenge nonce)
-        let tls_result = self.tls_config_for(
-            &hello.challenge_nonce, &hello.sni,
-        )?;
+        // Build the TLS config for this SNI (the v2 leaf, no evidence).
+        let tls_result = self.tls_config_for(&hello.sni)?;
 
         // Create the ServerConnection
         let server_conn = match accepted.into_connection(tls_result.config) {
@@ -492,11 +515,7 @@ impl IngressServer {
             }
         };
 
-        // Wrap in our session type, storing the client challenge nonce
-        let mut session = RaTlsSession::new(
-            server_conn,
-            tls_result.client_challenge_nonce,
-        );
+        let mut session = RaTlsSession::new(server_conn);
 
         // Collect any initial handshake output (ServerHello, etc.)
         let output = session.collect_tls_output()
@@ -512,55 +531,39 @@ impl IngressServer {
     //  TLS config resolution (same logic as before)
     // ====================================================================
 
-    /// Obtain a `ServerConfig` for this connection.
-    ///
-    /// - If `nonce` is present → challenge mode (fresh cert, per-app if
-    ///   SNI matches).  Also returns a client challenge nonce.
-    /// - Otherwise → deterministic mode (cached by hostname, per-app if
-    ///   SNI matches).  No client challenge nonce.
+    /// Obtain a `ServerConfig` for this connection: the v2 leaf of the SNI,
+    /// minted for the hostname's current leaf key. The config is cached until
+    /// the key rotates (24 h) or the cert store changes (an app registered,
+    /// a dependency set updated); a store change re-mints with the SAME key,
+    /// so a deterministic quote minted for it stays valid.
     fn tls_config_for(
         &mut self,
-        nonce: &Option<Vec<u8>>,
         sni: &Option<String>,
     ) -> Result<TlsConfigResult, String> {
-        // Resolve per-app identity from the global CertStore
         let app_data = sni.as_deref()
             .and_then(|h| cert_store::cert_store().resolve(h));
-
-        if let Some(n) = nonce {
-            // binder=None here: pre-handshake mint has no key schedule yet.
-            // The channel binder is injected by the deferred mint hook (later
-            // slice), which re-mints with the handshake secret available.
-            let mode = CertMode::Challenge { nonce: n.clone(), binder: None };
-            return build_tls_config(&self.ca, mode, app_data.as_ref());
-        }
-
-        // Deterministic: check per-hostname cache
         let cache_key = sni.clone().unwrap_or_default();
         let now = ocall::get_current_time().unwrap_or(0);
         let current_gen = cert_store::cert_store().generation();
+        let key = self.leaf_key_for(&cache_key, now)?;
 
         if let Some(cached) = self.cached_configs.get(&cache_key) {
-            if now < cached.expires_at && cached.store_generation == current_gen {
-                return Ok(TlsConfigResult {
-                    config: cached.config.clone(),
-                    client_challenge_nonce: None,
-                });
+            if now < cached.expires_at
+                && cached.store_generation == current_gen
+                && cached.spki_hash == key.spki_hash
+            {
+                return Ok(TlsConfigResult { config: cached.config.clone() });
             }
         }
 
-        let mode = CertMode::Deterministic { creation_time: now };
-        let tls_result = build_tls_config(&self.ca, mode, app_data.as_ref())?;
-
+        let tls_result = build_tls_config(&self.ca, &key, app_data.as_ref(), now)?;
         self.cached_configs.insert(cache_key, CachedConfig {
             config: tls_result.config.clone(),
-            expires_at: now + attestation::DETERMINISTIC_VALIDITY_SECS,
+            expires_at: key.created + attestation::DETERMINISTIC_VALIDITY_SECS,
             store_generation: current_gen,
+            spki_hash: key.spki_hash,
         });
-        Ok(TlsConfigResult {
-            config: tls_result.config,
-            client_challenge_nonce: None, // deterministic mode: no nonce
-        })
+        Ok(tls_result)
     }
 
     // ====================================================================
@@ -681,66 +684,20 @@ impl ClientCertVerifier for PermissiveClientAuth {
 /// Result of building a TLS config for a single connection.
 struct TlsConfigResult {
     config: Arc<ServerConfig>,
-    /// Client challenge nonce (present only in challenge-response mode).
-    client_challenge_nonce: Option<Vec<u8>>,
 }
 
-/// Per-connection RA-TLS channel-binding minter. Captures the challenge
-/// context so that at the TLS 1.3 Certificate-emit seam (once the handshake
-/// secret exists) it can re-mint the leaf with the 32-byte session channel
-/// binder folded into the quote's `report_data`.
-struct ChannelBindingMinter {
-    ca: CaContext,
-    nonce: Vec<u8>,
-    app: Option<cert_store::AppCertData>,
-}
-
-impl core::fmt::Debug for ChannelBindingMinter {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // Never print the captured CA key / nonce.
-        f.debug_struct("ChannelBindingMinter").finish_non_exhaustive()
-    }
-}
-
-impl RaTlsBindCertificate for ChannelBindingMinter {
-    fn bind_certificate(&self, binder: &[u8; 32]) -> Option<Arc<CertifiedKey>> {
-        let mode = CertMode::Challenge {
-            nonce: self.nonce.clone(),
-            binder: Some(*binder),
-        };
-        let result = match &self.app {
-            Some(a) => attestation::generate_app_certificate(&self.ca, mode, a),
-            None => attestation::generate_ratls_certificate(&self.ca, mode),
-        }
-        .ok()?;
-        let certs: Vec<CertificateDer<'static>> = result
-            .cert_chain_der
-            .into_iter()
-            .map(|der| CertificateDer::from(der).into_owned())
-            .collect();
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(result.pkcs8_key));
-        CertifiedKey::from_der(certs, key, &default_provider())
-            .ok()
-            .map(Arc::new)
-    }
-}
-
-/// Build a `ServerConfig` from an RA-TLS certificate.
+/// Build a `ServerConfig` serving the v2 leaf of `key` (per-app when `app` is
+/// given), with optional client certificates (a caller that presents one
+/// proves it after the handshake, see `handle_attest`).
 fn build_tls_config(
     ca: &CaContext,
-    mode: CertMode,
+    key: &LeafKey,
     app: Option<&cert_store::AppCertData>,
+    now: u64,
 ) -> Result<TlsConfigResult, String> {
-    // Capture the challenge nonce for the channel-binding hook before `mode`
-    // is consumed by the initial (placeholder) mint below.
-    let challenge_nonce = match &mode {
-        CertMode::Challenge { nonce, .. } => Some(nonce.clone()),
-        CertMode::Deterministic { .. } => None,
-    };
-
     let result = match app {
-        Some(a) => attestation::generate_app_certificate(ca, mode, a)?,
-        None => attestation::generate_ratls_certificate(ca, mode)?,
+        Some(a) => attestation::generate_app_certificate(ca, key, a, now)?,
+        None => attestation::generate_ratls_certificate(ca, key, now)?,
     };
 
     let certs: Vec<CertificateDer<'static>> = result.cert_chain_der
@@ -750,35 +707,14 @@ fn build_tls_config(
 
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(result.pkcs8_key));
 
-    let mut config = ServerConfig::builder_with_provider(Arc::new(default_provider()))
+    let config = ServerConfig::builder_with_provider(Arc::new(default_provider()))
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| format!("TLS config error: {:?}", e))?
         .with_client_cert_verifier(Arc::new(PermissiveClientAuth))
         .with_single_cert(certs, key)
         .map_err(|e| format!("cert chain error: {:?}", e))?;
 
-    // Inject the client's challenge nonce into the CertificateRequest
-    // extension 0xFFBB so the client can verify it against its own nonce
-    // (bidirectional challenge-response RA-TLS).
-    if let Some(ref nonce) = result.client_challenge_nonce {
-        config.ratls_challenge = Some(nonce.clone());
-    }
-
-    // Channel binding: install the per-connection re-mint hook for challenge
-    // connections so the served leaf's quote commits to this TLS session. It
-    // fires once the handshake secret is derived (the TLS 1.3 emit seam).
-    if let Some(nonce) = challenge_nonce {
-        config.ratls_bind_certificate = Some(Arc::new(ChannelBindingMinter {
-            ca: ca.clone(),
-            nonce,
-            app: app.cloned(),
-        }));
-    }
-
-    Ok(TlsConfigResult {
-        config: Arc::new(config),
-        client_challenge_nonce: result.client_challenge_nonce,
-    })
+    Ok(TlsConfigResult { config: Arc::new(config) })
 }
 
 // ---------------------------------------------------------------------------
@@ -1047,6 +983,7 @@ fn path_requires_sealed(path: &str) -> bool {
     !matches!(
         path,
         "/__privasys/session-bootstrap"
+            | "/__privasys/attest"
             | "/healthz"
             | "/readyz"
             | "/status"
@@ -1322,8 +1259,8 @@ fn handle_fido2_request(
 
     let ctx = enclave_os_common::modules::RequestContext {
         peer_cert_der: base_ctx.peer_cert_der.clone(),
-        client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
-        channel_binder: base_ctx.channel_binder.clone(),
+        peer_evidence: base_ctx.peer_evidence.clone(),
+        attestation: base_ctx.attestation.clone(),
         oidc_claims,
     };
 
@@ -1419,8 +1356,8 @@ fn handle_data_request_http(
 
     let ctx = enclave_os_common::modules::RequestContext {
         peer_cert_der: base_ctx.peer_cert_der.clone(),
-        client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
-        channel_binder: base_ctx.channel_binder.clone(),
+        peer_evidence: base_ctx.peer_evidence.clone(),
+        attestation: base_ctx.attestation.clone(),
         oidc_claims,
     };
 
@@ -1497,8 +1434,8 @@ fn handle_rpc_request(
 
     let ctx = enclave_os_common::modules::RequestContext {
         peer_cert_der: base_ctx.peer_cert_der.clone(),
-        client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
-        channel_binder: base_ctx.channel_binder.clone(),
+        peer_evidence: base_ctx.peer_evidence.clone(),
+        attestation: base_ctx.attestation.clone(),
         oidc_claims,
     };
 
@@ -1635,8 +1572,8 @@ fn handle_mcp_tools_request(
 
     let ctx = enclave_os_common::modules::RequestContext {
         peer_cert_der: base_ctx.peer_cert_der.clone(),
-        client_challenge_nonce: base_ctx.client_challenge_nonce.clone(),
-        channel_binder: base_ctx.channel_binder.clone(),
+        peer_evidence: base_ctx.peer_evidence.clone(),
+        attestation: base_ctx.attestation.clone(),
         oidc_claims,
     };
 
@@ -2025,4 +1962,217 @@ fn base64_decode_standard(input: &str) -> Result<Vec<u8>, String> {
         if chunk[3] != b'=' { out.push(triple as u8); }
     }
     Ok(out)
+}
+
+// ---------------------------------------------------------------------------
+//  RA-TLS v2 evidence endpoint (POST /__privasys/attest)
+// ---------------------------------------------------------------------------
+
+/// How long a rotated leaf key stays answerable after its successor exists.
+const PREVIOUS_KEY_RETENTION_SECS: u64 = 15 * 60;
+
+impl IngressServer {
+    /// The leaf key of an SNI, rotated at its 24-hour lifetime; rotated keys
+    /// stay answerable for 15 minutes so a client that received the old leaf
+    /// just before a rotation can still be served.
+    fn leaf_key_for(&mut self, sni: &str, now: u64) -> Result<LeafKey, String> {
+        let retire_before = now.saturating_sub(attestation::DETERMINISTIC_VALIDITY_SECS + PREVIOUS_KEY_RETENTION_SECS);
+        let stale: Vec<[u8; 32]> = self
+            .leaf_by_spki
+            .iter()
+            .filter(|(_, k)| k.created < retire_before)
+            .map(|(h, _)| *h)
+            .collect();
+        for h in stale {
+            self.leaf_by_spki.remove(&h);
+            self.det_quotes.remove(&h);
+        }
+        if let Some(k) = self.leaf_keys.get(sni) {
+            if now < k.created + attestation::DETERMINISTIC_VALIDITY_SECS {
+                return Ok(k.clone());
+            }
+        }
+        let k = attestation::new_leaf_key(now)?;
+        self.leaf_keys.insert(sni.to_string(), k.clone());
+        self.leaf_by_spki.insert(k.spki_hash, k.clone());
+        Ok(k)
+    }
+
+    /// The cached deterministic quote of a leaf key, minted on first use.
+    fn deterministic_quote(&mut self, key: &LeafKey, now: u64) -> Result<(Vec<u8>, String), String> {
+        if let Some(d) = self.det_quotes.get(&key.spki_hash) {
+            if now < d.minted + attestation::DETERMINISTIC_VALIDITY_SECS {
+                return Ok((d.quote.clone(), d.quote_time.clone()));
+            }
+        }
+        let quote_time = enclave_os_common::attest::format_quote_time(now as i64);
+        let rd = enclave_os_common::attest::deterministic_report_data(&key.spki_der, &quote_time, None);
+        let quote = attestation::sgx_quote(&rd)?;
+        self.det_quotes.insert(
+            key.spki_hash,
+            DetQuote { quote: quote.clone(), quote_time: quote_time.clone(), minted: now },
+        );
+        Ok((quote, quote_time))
+    }
+
+    /// Serve `POST /__privasys/attest` on `session`: deterministic or challenge
+    /// evidence for the leaf the client received, or accept the client's own
+    /// evidence (present) on a mutual leg.
+    fn handle_attest(
+        &mut self,
+        session: &mut RaTlsSession,
+        http_req: &enclave_os_common::protocol::HttpRequest,
+    ) -> HttpHandleResult {
+        use enclave_os_common::protocol::HttpMethod;
+        use enclave_os_common::attest::{
+            self as at, AttestRequest, AttestResponse, CONTEXT_LEN, EXPORTER_LABEL_CLIENT,
+            EXPORTER_LABEL_SERVER, PROTOCOL_VERSION,
+        };
+
+        if http_req.method != HttpMethod::Post {
+            return HttpHandleResult::err(405, "method not allowed");
+        }
+        // The gateway's terminate path serves the public certificate; evidence
+        // cannot be bound to that outer leg.
+        if http_req.edge_terminated {
+            return HttpHandleResult::err(404, "no evidence on the gateway terminate path");
+        }
+        let req: AttestRequest = match serde_json::from_slice(&http_req.body) {
+            Ok(r) => r,
+            Err(_) => return HttpHandleResult::err(400, "malformed attest request"),
+        };
+        if req.v != PROTOCOL_VERSION {
+            return HttpHandleResult::err(400, "unsupported protocol version");
+        }
+        let now = ocall::get_current_time().unwrap_or(0);
+
+        match req.mode.as_str() {
+            "deterministic" | "challenge" => {
+                let leaf = match at::b64_decode(&req.leaf) {
+                    Ok(h) if h.len() == 32 => {
+                        let mut a = [0u8; 32];
+                        a.copy_from_slice(&h);
+                        a
+                    }
+                    _ => return HttpHandleResult::err(400, "leaf must be the base64url SHA-256 of the leaf SPKI"),
+                };
+                let Some(key) = self.leaf_by_spki.get(&leaf).cloned() else {
+                    return HttpHandleResult::err(404, "unknown leaf");
+                };
+                let (quote, quote_time) = if req.mode == "deterministic" {
+                    match self.deterministic_quote(&key, now) {
+                        Ok(v) => v,
+                        Err(e) => {
+                            enclave_log_error!("deterministic quote failed: {}", e);
+                            return HttpHandleResult::err(503, "quote provider unavailable");
+                        }
+                    }
+                } else {
+                    let ctx = match req.context.as_deref().map(at::b64_decode) {
+                        Some(Ok(c)) if c.len() == CONTEXT_LEN => c,
+                        _ => return HttpHandleResult::err(400, "context must be 32 bytes, base64url"),
+                    };
+                    let hctx = match session.export_hctx(EXPORTER_LABEL_SERVER, &ctx) {
+                        Ok(h) => h,
+                        Err(_) => return HttpHandleResult::err(400, "exporter unavailable on this connection"),
+                    };
+                    let rd = at::challenge_report_data(&key.spki_der, &ctx, &hctx, None);
+                    match attestation::sgx_quote(&rd) {
+                        Ok(q) => (q, at::format_quote_time(now as i64)),
+                        Err(e) => {
+                            enclave_log_error!("challenge quote failed: {}", e);
+                            return HttpHandleResult::err(503, "quote provider unavailable");
+                        }
+                    }
+                };
+                session.set_attestation(if req.mode == "deterministic" { "deterministic" } else { "challenge" });
+                let mut resp = AttestResponse {
+                    v: PROTOCOL_VERSION,
+                    mode: req.mode.clone(),
+                    tee: "sgx".to_string(),
+                    quote: at::b64_encode(&quote),
+                    gpu_evidence: None,
+                    quote_time,
+                    client_evidence: "none".to_string(),
+                    client_context: None,
+                    error: None,
+                };
+                // A caller that presented a client certificate must prove it:
+                // a mutual leg. The context is remembered for the present message.
+                if session.peer_cert_der().is_some() {
+                    use ring::rand::{SecureRandom, SystemRandom};
+                    let mut cc = [0u8; CONTEXT_LEN];
+                    if SystemRandom::new().fill(&mut cc).is_err() {
+                        return HttpHandleResult::err(500, "rng");
+                    }
+                    session.set_client_context(cc);
+                    resp.client_evidence = "required".to_string();
+                    resp.client_context = Some(at::b64_encode(&cc));
+                }
+                HttpHandleResult::ok(serde_json::to_vec(&resp).unwrap_or_default())
+            }
+            "present" => {
+                let Some(peer_der) = session.peer_cert_der() else {
+                    return HttpHandleResult::err(400, "no client certificate on this connection");
+                };
+                let Some(cc) = session.take_client_context() else {
+                    return HttpHandleResult::err(400, "no pending client_context for this connection");
+                };
+                match req.context.as_deref().map(at::b64_decode) {
+                    Some(Ok(c)) if c == cc => {}
+                    _ => return HttpHandleResult::err(400, "context does not match the client_context issued"),
+                }
+                let quote = match req.quote.as_deref().map(at::b64_decode) {
+                    Some(Ok(q)) if !q.is_empty() => q,
+                    _ => return HttpHandleResult::err(400, "quote must be base64url"),
+                };
+                let gpu_evidence = match req.gpu_evidence.as_deref().filter(|g| !g.is_empty()).map(at::b64_decode) {
+                    Some(Ok(g)) => Some(g),
+                    Some(Err(_)) => return HttpHandleResult::err(400, "gpu_evidence must be base64url"),
+                    None => None,
+                };
+                let tee = req.tee.clone().unwrap_or_else(|| "sgx".to_string());
+                let quote_time = req.quote_time.clone().unwrap_or_default();
+                if at::check_quote_time(&quote_time, now as i64).is_err() {
+                    return HttpHandleResult::err(400, "quote_time out of range");
+                }
+                // The peer's leaf key.
+                let spki = {
+                    use x509_parser::prelude::*;
+                    match X509Certificate::from_der(&peer_der) {
+                        Ok((_, cert)) => enclave_os_common::quote::build_p256_spki_der(
+                            cert.public_key().subject_public_key.as_ref(),
+                        ),
+                        Err(_) => return HttpHandleResult::err(400, "unparseable client certificate"),
+                    }
+                };
+                let hctx = match session.export_hctx(EXPORTER_LABEL_CLIENT, &cc) {
+                    Ok(h) => h,
+                    Err(_) => return HttpHandleResult::err(400, "exporter unavailable on this connection"),
+                };
+                let expected = at::client_report_data(&spki, &cc, &hctx, gpu_evidence.as_deref());
+                let actual = match enclave_os_common::quote::extract_report_data(&quote) {
+                    Ok(rd) => rd,
+                    Err(_) => return HttpHandleResult::err(400, "quote has no report_data"),
+                };
+                if actual[..] != expected[..] {
+                    return HttpHandleResult::err(403, "client evidence does not commit to the presented certificate and this connection");
+                }
+                session.set_peer_evidence(enclave_os_common::modules::PeerEvidence {
+                    tee,
+                    quote,
+                    gpu_evidence,
+                    quote_time,
+                });
+                HttpHandleResult {
+                    status: 204,
+                    body: Vec::new(),
+                    shutdown: false,
+                    content_type: None,
+                    extra_headers: Vec::new(),
+                }
+            }
+            _ => HttpHandleResult::err(400, "unknown mode"),
+        }
+    }
 }

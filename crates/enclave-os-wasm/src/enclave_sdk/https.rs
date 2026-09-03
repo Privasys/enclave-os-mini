@@ -129,8 +129,11 @@ fn build_ratls_policy(p: wit::RatlsPolicy) -> Result<RaTlsPolicy, String> {
         a
     });
 
+    // RA-TLS v2: a caller-supplied nonce selects challenge mode (the SDK's
+    // own context and exporter value bind the evidence; the nonce bytes are
+    // not used), none selects the deterministic tier.
     let report_data = match p.challenge_nonce {
-        Some(nonce) => ReportDataBinding::ChallengeResponse { nonce },
+        Some(_) => ReportDataBinding::ChallengeResponse,
         None => ReportDataBinding::Deterministic,
     };
 

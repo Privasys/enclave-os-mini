@@ -29,7 +29,6 @@ use std::collections::BTreeMap;
 use std::io::{Read, Write};
 use std::sync::Arc;
 
-use ring::rand::{SecureRandom, SystemRandom};
 use rustls::pki_types::{
     CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer, ServerName, UnixTime,
 };
@@ -39,7 +38,7 @@ use rustls::client::danger::{
 use rustls::client::{ResolvesClientCert, WebPkiServerVerifier};
 use rustls::crypto::ring::default_provider;
 use rustls::crypto::CryptoProvider;
-use rustls::server::{Acceptor, RaTlsBindCertificate, WebPkiClientVerifier};
+use rustls::server::{Acceptor, WebPkiClientVerifier};
 use rustls::sign::CertifiedKey;
 use rustls::{
     CertificateError, ClientConfig, ClientConnection, Connection, DigitallySignedStruct,
@@ -53,7 +52,7 @@ use enclave_os_common::channel::{
 use enclave_os_common::quote::TeeMeasurement;
 
 use crate::enclave_log_error;
-use crate::ratls::attestation::{self, CaContext, CertMode};
+use crate::ratls::attestation::{self, CaContext};
 
 /// Max frame payload (a raft AppendEntries batch or snapshot chunk).
 const MAX_FRAME: usize = 8 * 1024 * 1024;
@@ -86,14 +85,20 @@ enum SessionState {
 
 struct PeerSession {
     state: SessionState,
-    /// Plaintext assembly buffer for frame extraction.
     rx: Vec<u8>,
     established_reported: bool,
-    /// The challenge nonce WE issued to the peer for this connection.
-    /// Outbound: sent in the ClientHello extension `0xFFBB`. Inbound:
-    /// sent in the CertificateRequest extension `0xFFBB`. The peer's
-    /// quote must commit to it (plus the session channel binder).
-    our_nonce: Option<Vec<u8>>,
+    /// Whether we dialled (client role) or accepted (server role); the two
+    /// roles use different exporter labels for their evidence.
+    is_client: bool,
+    /// DER SubjectPublicKeyInfo of the leaf we presented.
+    our_spki: Vec<u8>,
+    /// Our evidence frame has been sent (once the handshake completed).
+    evidence_sent: bool,
+    /// The peer's evidence frame was verified: its quote commits to its
+    /// leaf key and this connection, and its measurement is admissible.
+    peer_attested: bool,
+    /// The peer's verified quote (for the raft glue's attestation-server gate).
+    peer_quote: Option<Vec<u8>>,
 }
 
 /// Mutual RA-TLS peer sessions over the data channel.
@@ -152,10 +157,10 @@ impl PeerLink {
     /// challenge nonce in extension `0xFFBB`) is emitted immediately
     /// (the proxy buffers it until TCP connects). Returns the conn_id.
     pub fn dial(&mut self, addr: &str) -> Result<u32, String> {
-        let mut nonce = vec![0u8; 32];
-        SystemRandom::new()
-            .fill(&mut nonce)
-            .map_err(|_| "rng (peer challenge nonce)".to_string())?;
+        let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
+        let leaf = attestation::new_leaf_key(now)?;
+        let minted = attestation::generate_ratls_certificate(&self.ca, &leaf, now)?;
+        let our_spki = leaf.spki_der.clone();
 
         let provider = Arc::new(default_provider());
         let verifier = FleetCaVerifier::new(self.fleet_roots.clone())?;
@@ -164,19 +169,10 @@ impl PeerLink {
             .map_err(|e| format!("peer client config: {e:?}"))?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(verifier))
-            // Our client certificate is minted at the TLS 1.3
-            // Certificate-emit seam, bound to the SERVER's challenge
-            // nonce (CertificateRequest extension 0xFFBB) plus this
-            // session's channel binder. No challenge → we decline and
-            // the handshake fails (challenge mode is mandatory).
-            .with_client_cert_resolver(Arc::new(PeerClientAuth {
-                ca: self.ca.clone(),
-                provider,
-            }));
+            // Our fleet leaf (no evidence): the peer verifies it against the
+            // fleet CA in the handshake and our evidence frame afterwards.
+            .with_client_cert_resolver(Arc::new(PeerClientAuth::new(minted, &provider)?));
         cfg.enable_sni = false;
-        // Our challenge to the server: its certificate quote must
-        // commit to this nonce (plus the channel binder).
-        cfg.ratls_challenge = Some(nonce.clone());
 
         // The name is not verified (no SAN on RA-TLS leaves); any
         // syntactically valid ServerName satisfies rustls.
@@ -195,7 +191,11 @@ impl PeerLink {
                 state: SessionState::Tls(Connection::Client(conn)),
                 rx: Vec::new(),
                 established_reported: false,
-                our_nonce: Some(nonce),
+                is_client: true,
+                our_spki,
+                evidence_sent: false,
+                peer_attested: false,
+                peer_quote: None,
             },
         );
         // Push the ClientHello out right away.
@@ -222,7 +222,11 @@ impl PeerLink {
                         state: SessionState::AwaitingHello(Vec::new()),
                         rx: Vec::new(),
                         established_reported: false,
-                        our_nonce: None,
+                        is_client: false,
+                        our_spki: Vec::new(),
+                        evidence_sent: false,
+                        peer_attested: false,
+                        peer_quote: None,
                     },
                 );
             }
@@ -246,8 +250,7 @@ impl PeerLink {
 
     /// Try to build the inbound TLS session from the accumulated
     /// ClientHello bytes. `Ok(None)` = incomplete, keep buffering.
-    /// On success returns the connection and OUR challenge nonce for
-    /// the client (sent in the CertificateRequest extension `0xFFBB`).
+    /// On success returns the connection and the SPKI of the leaf we serve.
     fn accept_inbound(
         &self,
         buf: &[u8],
@@ -268,24 +271,10 @@ impl PeerLink {
             Err(e) => return Err(format!("peer hello accept: {e:?}")),
         };
 
-        let hello = attestation::parse_client_hello(buf);
-        let Some(client_nonce) = hello.challenge_nonce else {
-            return Err(
-                "peer sent no RA-TLS challenge (challenge mode is mandatory on peer links)"
-                    .to_string(),
-            );
-        };
-
-        // Initial mint binds the client's nonce; the fork's bind hook
-        // re-mints at the Certificate-emit seam once the handshake
-        // secret exists, folding in the channel binder.
-        let minted = attestation::generate_ratls_certificate(
-            &self.ca,
-            CertMode::Challenge { nonce: client_nonce.clone(), binder: None },
-        )?;
-        let our_nonce = minted
-            .client_challenge_nonce
-            .ok_or_else(|| "challenge mint produced no client nonce".to_string())?;
+        let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
+        let leaf = attestation::new_leaf_key(now)?;
+        let minted = attestation::generate_ratls_certificate(&self.ca, &leaf, now)?;
+        let our_spki = leaf.spki_der.clone();
         let chain: Vec<CertificateDer<'static>> = minted
             .cert_chain_der
             .into_iter()
@@ -300,26 +289,17 @@ impl PeerLink {
         )
         .build()
         .map_err(|e| format!("peer client verifier: {e:?}"))?;
-        let mut cfg = ServerConfig::builder_with_provider(Arc::new(default_provider()))
+        let cfg = ServerConfig::builder_with_provider(Arc::new(default_provider()))
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|e| format!("peer server config: {e:?}"))?
             .with_client_cert_verifier(client_verifier)
             .with_single_cert(chain, key)
             .map_err(|e| format!("peer server cert: {e:?}"))?;
-        // Our challenge to the client (CertificateRequest ext 0xFFBB):
-        // its client certificate quote must commit to it.
-        cfg.ratls_challenge = Some(our_nonce.clone());
-        // Re-mint our leaf with the session channel binder at the
-        // emit seam so our quote commits to this exact TLS session.
-        cfg.ratls_bind_certificate = Some(Arc::new(PeerBindingMinter {
-            ca: self.ca.clone(),
-            nonce: client_nonce,
-        }));
 
         let conn = accepted
             .into_connection(Arc::new(cfg))
             .map_err(|e| format!("peer server conn: {e:?}"))?;
-        Ok(Some((conn, our_nonce)))
+        Ok(Some((conn, our_spki)))
     }
 
     /// Feed inbound TLS bytes, emit output, extract frames.
@@ -354,10 +334,10 @@ impl PeerLink {
         if let HelloStep::Complete(buf) = step {
             match self.accept_inbound(&buf) {
                 Ok(None) => {} // incomplete — keep buffering
-                Ok(Some((conn, our_nonce))) => {
+                Ok(Some((conn, our_spki))) => {
                     let Some(session) = self.sessions.get_mut(&conn_id) else { return };
                     session.state = SessionState::Tls(Connection::Server(conn));
-                    session.our_nonce = Some(our_nonce);
+                    session.our_spki = our_spki;
                     // Flush the server flight; no plaintext yet.
                     self.pump_out(conn_id);
                 }
@@ -440,52 +420,109 @@ impl PeerLink {
             return;
         }
         if established {
-            // Local RA-TLS checks at the established seam: challenge
-            // binding (nonce + channel binder) and the measurement
-            // pin, via the shared TEE checker. Fail-closed.
-            if let Err(e) = self.verify_established(conn_id) {
-                enclave_log_error!("peer conn {} rejected: {}", conn_id, e);
+            // RA-TLS v2 peer link: once the handshake completes each side
+            // sends its evidence frame (quote committing to its own leaf key
+            // and this connection's exporter value for its role). Raft frames
+            // flow only after the peer's evidence verified.
+            if let Err(e) = self.send_evidence(conn_id) {
+                enclave_log_error!("peer conn {} evidence: {}", conn_id, e);
                 self.drop_session(conn_id, events);
                 return;
             }
-            events.push(PeerEvent::Established(conn_id));
         }
         for f in frames {
-            events.push(PeerEvent::Frame(conn_id, f));
+            let attested = self.sessions.get(&conn_id).map(|s| s.peer_attested).unwrap_or(false);
+            if attested {
+                events.push(PeerEvent::Frame(conn_id, f));
+                continue;
+            }
+            match self.verify_peer_evidence(conn_id, &f) {
+                Ok(()) => events.push(PeerEvent::Established(conn_id)),
+                Err(e) => {
+                    enclave_log_error!("peer conn {} rejected: {}", conn_id, e);
+                    self.drop_session(conn_id, events);
+                    return;
+                }
+            }
         }
         self.pump_out(conn_id);
     }
 
-    /// Verify the peer at the established seam: its certificate quote
-    /// must commit to OUR challenge nonce plus this session's channel
-    /// binder (bidirectional challenge-response), and its measurement
-    /// must be in the admissible set. Uses the shared TEE checker
-    /// (`enclave_os_common::quote` — SGX and TDX alike). This parses
-    /// the quote but cannot verify its signature; the raft glue's
-    /// attestation-server gate covers that.
-    fn verify_established(&self, conn_id: u32) -> Result<(), String> {
-        let session = self
-            .sessions
-            .get(&conn_id)
-            .ok_or_else(|| "session gone".to_string())?;
-        let SessionState::Tls(ref conn) = session.state else {
-            return Err("session not in TLS state".to_string());
+    /// Send our evidence frame once the handshake completed: an SGX quote
+    /// whose report_data is `SHA-512(SHA-256(our SPKI) || hctx)` with
+    /// `hctx = TLS-Exporter(<label of our role>, "", 32)`, so it commits to
+    /// our leaf key and to this connection.
+    fn send_evidence(&mut self, conn_id: u32) -> Result<(), String> {
+        use enclave_os_common::attest as at;
+        let (label, spki, quote_time) = {
+            let session = self.sessions.get(&conn_id).ok_or_else(|| "session gone".to_string())?;
+            if session.evidence_sent {
+                return Ok(());
+            }
+            let label = if session.is_client { at::EXPORTER_LABEL_PEER_CLIENT } else { at::EXPORTER_LABEL_PEER_SERVER };
+            let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
+            (label, session.our_spki.clone(), at::format_quote_time(now as i64))
         };
-        let cert = conn
-            .peer_certificates()
-            .and_then(|certs| certs.first())
-            .ok_or_else(|| "no peer certificate".to_string())?;
-        let (quote, pubkey_raw) = dissect_peer_cert(cert.as_ref())?;
-        let binder = match conn {
-            Connection::Client(c) => c.ratls_channel_binder().map(|b| b.to_vec()),
-            Connection::Server(c) => c.ratls_channel_binder().map(|b| b.to_vec()),
+        let hctx = self.exporter(conn_id, label)?;
+        let rd = at::report_data(&spki, &hctx);
+        let quote = attestation::sgx_quote(&rd)?;
+        let msg = at::AttestRequest {
+            v: at::PROTOCOL_VERSION,
+            mode: "peer".to_string(),
+            leaf: String::new(),
+            context: None,
+            tee: Some("sgx".to_string()),
+            quote: Some(at::b64_encode(&quote)),
+            gpu_evidence: None,
+            quote_time: Some(quote_time),
         };
-        enclave_os_common::quote::verify_challenge_binding(
-            &quote,
-            &pubkey_raw,
-            session.our_nonce.as_deref(),
-            binder.as_deref(),
-        )?;
+        let frame = serde_json::to_vec(&msg).map_err(|e| format!("peer evidence: {e}"))?;
+        if let Some(session) = self.sessions.get_mut(&conn_id) {
+            session.evidence_sent = true;
+        }
+        if !self.send_frame(conn_id, &frame) {
+            return Err("peer evidence frame not sent".into());
+        }
+        Ok(())
+    }
+
+    /// Verify the peer's evidence frame: its quote must commit to ITS leaf
+    /// key and this connection (the exporter value for the peer's role), and
+    /// its measurement must be in the admissible set. This parses the quote
+    /// but cannot verify its signature; the raft glue's attestation-server
+    /// gate covers that.
+    fn verify_peer_evidence(&mut self, conn_id: u32, frame: &[u8]) -> Result<(), String> {
+        use enclave_os_common::attest as at;
+        let msg: at::AttestRequest =
+            serde_json::from_slice(frame).map_err(|_| "first peer frame is not an evidence frame".to_string())?;
+        if msg.v != at::PROTOCOL_VERSION || msg.mode != "peer" {
+            return Err("peer evidence frame: bad version or mode".into());
+        }
+        let quote = at::b64_decode(msg.quote.as_deref().unwrap_or(""))?;
+        let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
+        at::check_quote_time(msg.quote_time.as_deref().unwrap_or(""), now as i64)?;
+        let (peer_label, cert) = {
+            let session = self.sessions.get(&conn_id).ok_or_else(|| "session gone".to_string())?;
+            let SessionState::Tls(ref conn) = session.state else {
+                return Err("session not in TLS state".to_string());
+            };
+            let cert = conn
+                .peer_certificates()
+                .and_then(|certs| certs.first())
+                .map(|c| c.as_ref().to_vec())
+                .ok_or_else(|| "no peer certificate".to_string())?;
+            // The peer's role is the opposite of ours.
+            let label = if session.is_client { at::EXPORTER_LABEL_PEER_SERVER } else { at::EXPORTER_LABEL_PEER_CLIENT };
+            (label, cert)
+        };
+        let peer_spki = peer_spki(&cert)?;
+        let hctx = self.exporter(conn_id, peer_label)?;
+        let expected = at::report_data(&peer_spki, &hctx);
+        let actual = enclave_os_common::quote::extract_report_data(&quote)
+            .map_err(|e| format!("peer quote: {e}"))?;
+        if actual[..] != expected[..] {
+            return Err("peer evidence does not commit to its leaf key and this connection".into());
+        }
         let identity = enclave_os_common::quote::parse_quote(&quote)
             .map_err(|e| format!("peer quote: {e}"))?;
         if !self.pinned_measurements.iter().any(|m| identity.matches(m)) {
@@ -496,7 +533,31 @@ impl PeerLink {
                 self.pinned_measurements.len()
             ));
         }
+        if let Some(session) = self.sessions.get_mut(&conn_id) {
+            session.peer_attested = true;
+            session.peer_quote = Some(quote);
+        }
         Ok(())
+    }
+
+    /// The 32-byte RFC 8446 exporter value of a session for `label` and an
+    /// empty context.
+    fn exporter(&self, conn_id: u32, label: &[u8]) -> Result<[u8; 32], String> {
+        let session = self.sessions.get(&conn_id).ok_or_else(|| "session gone".to_string())?;
+        let SessionState::Tls(ref conn) = session.state else {
+            return Err("session not in TLS state".to_string());
+        };
+        let out = match conn {
+            Connection::Client(c) => c.export_keying_material([0u8; 32], label, Some(&[])),
+            Connection::Server(c) => c.export_keying_material([0u8; 32], label, Some(&[])),
+        };
+        out.map_err(|e| format!("exporter: {e}"))
+    }
+
+    /// The peer's verified quote (after its evidence frame), for the raft
+    /// glue's attestation-server gate.
+    pub fn peer_quote(&self, conn_id: u32) -> Option<Vec<u8>> {
+        self.sessions.get(&conn_id).and_then(|s| s.peer_quote.clone())
     }
 
     /// Send a frame on an established session. Returns false if the
@@ -568,57 +629,51 @@ impl PeerLink {
 
 // ── Certificate dissection (shared-checker input) ───────────────────
 
-/// Extract the raw attestation quote (SGX or TDX extension) and the
-/// raw subject public key from a peer certificate. The quote goes to
-/// the shared TEE checker locally and to the attestation servers for
-/// independent verification.
-fn dissect_peer_cert(cert_der: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+/// The DER SubjectPublicKeyInfo of a peer certificate (its leaf key). A v1
+/// leaf (quote inside the certificate) is rejected.
+fn peer_spki(cert_der: &[u8]) -> Result<Vec<u8>, String> {
     use x509_parser::prelude::*;
     let (_, cert) = X509Certificate::from_der(cert_der)
         .map_err(|_| "peer cert: DER parse failed".to_string())?;
-    let quote = cert
-        .extensions()
-        .iter()
-        .find(|ext| {
-            let oid = ext.oid.to_id_string();
-            oid == enclave_os_common::oids::SGX_QUOTE_OID_STR
-                || oid == enclave_os_common::oids::TDX_QUOTE_OID_STR
-        })
-        .map(|ext| ext.value.to_vec())
-        .ok_or_else(|| "peer cert: no attestation quote extension".to_string())?;
-    let pubkey_raw = cert
-        .tbs_certificate
-        .subject_pki
-        .subject_public_key
-        .as_ref()
-        .to_vec();
-    Ok((quote, pubkey_raw))
+    if cert.extensions().iter().any(|ext| {
+        let oid = ext.oid.to_id_string();
+        oid == enclave_os_common::oids::SGX_QUOTE_OID_STR
+            || oid == enclave_os_common::oids::TDX_QUOTE_OID_STR
+    }) {
+        return Err("peer cert: v1 certificate (evidence inside the certificate)".into());
+    }
+    Ok(enclave_os_common::quote::build_p256_spki_der(
+        cert.tbs_certificate.subject_pki.subject_public_key.as_ref(),
+    ))
 }
 
-/// Extract the raw attestation quote from a peer certificate. Public:
-/// the raft layer sends this quote to the attestation servers for
-/// independent verification (signature chain, TCB status) after the
-/// handshake.
-pub fn extract_quote(cert_der: &[u8]) -> Result<Vec<u8>, String> {
-    dissect_peer_cert(cert_der).map(|(quote, _)| quote)
-}
+// ── Fleet identity for outbound peer connections ───────────────────
 
-// ── Challenge-bound identity minting ────────────────────────────────
-
-/// Client-certificate resolver for outbound peer connections: at the
-/// TLS 1.3 Certificate-emit seam, mint a fresh fleet cert whose quote
-/// commits to the SERVER's challenge nonce (CertificateRequest
-/// extension `0xFFBB`) plus this session's channel binder. Declines
-/// without a challenge — a peer that does not challenge us is not one
-/// of ours, and the handshake fails.
+/// Client-certificate resolver for outbound peer connections: presents the
+/// fleet leaf minted at dial time (no evidence; our evidence frame follows the
+/// handshake).
 struct PeerClientAuth {
-    ca: CaContext,
-    provider: Arc<CryptoProvider>,
+    certified: Arc<CertifiedKey>,
+}
+
+impl PeerClientAuth {
+    fn new(minted: attestation::CertGenerationResult, provider: &Arc<CryptoProvider>) -> Result<Self, String> {
+        let certs: Vec<CertificateDer<'static>> = minted
+            .cert_chain_der
+            .into_iter()
+            .map(CertificateDer::from)
+            .collect();
+        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(minted.pkcs8_key));
+        let signing_key = provider
+            .key_provider
+            .load_private_key(key)
+            .map_err(|e| format!("peer client key: {e:?}"))?;
+        Ok(Self { certified: Arc::new(CertifiedKey::new(certs, signing_key)) })
+    }
 }
 
 impl core::fmt::Debug for PeerClientAuth {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // Never print the captured CA key material.
         f.debug_struct("PeerClientAuth").finish_non_exhaustive()
     }
 }
@@ -628,65 +683,12 @@ impl ResolvesClientCert for PeerClientAuth {
         &self,
         _root_hint_subjects: &[&[u8]],
         _sigschemes: &[SignatureScheme],
-        ratls_challenge: Option<&[u8]>,
-        ratls_channel_binder: Option<&[u8]>,
     ) -> Option<Arc<CertifiedKey>> {
-        let challenge = ratls_challenge?;
-        let binder: Option<[u8; 32]> =
-            ratls_channel_binder.and_then(|b| b.try_into().ok());
-        let minted = attestation::generate_ratls_certificate(
-            &self.ca,
-            CertMode::Challenge { nonce: challenge.to_vec(), binder },
-        )
-        .ok()?;
-        let certs: Vec<CertificateDer<'static>> = minted
-            .cert_chain_der
-            .into_iter()
-            .map(CertificateDer::from)
-            .collect();
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(minted.pkcs8_key));
-        let signing_key = self.provider.key_provider.load_private_key(key).ok()?;
-        Some(Arc::new(CertifiedKey::new(certs, signing_key)))
+        Some(self.certified.clone())
     }
 
     fn has_certs(&self) -> bool {
         true
-    }
-}
-
-/// Server-side re-mint hook: once the handshake secret exists (the
-/// TLS 1.3 Certificate-emit seam), re-mint our leaf with the session
-/// channel binder folded into the quote's `report_data`, so our
-/// evidence commits to this exact TLS session.
-struct PeerBindingMinter {
-    ca: CaContext,
-    /// The CLIENT's challenge nonce from its ClientHello.
-    nonce: Vec<u8>,
-}
-
-impl core::fmt::Debug for PeerBindingMinter {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        // Never print the captured CA key / nonce.
-        f.debug_struct("PeerBindingMinter").finish_non_exhaustive()
-    }
-}
-
-impl RaTlsBindCertificate for PeerBindingMinter {
-    fn bind_certificate(&self, binder: &[u8; 32]) -> Option<Arc<CertifiedKey>> {
-        let minted = attestation::generate_ratls_certificate(
-            &self.ca,
-            CertMode::Challenge { nonce: self.nonce.clone(), binder: Some(*binder) },
-        )
-        .ok()?;
-        let certs: Vec<CertificateDer<'static>> = minted
-            .cert_chain_der
-            .into_iter()
-            .map(|der| CertificateDer::from(der).into_owned())
-            .collect();
-        let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(minted.pkcs8_key));
-        CertifiedKey::from_der(certs, key, &default_provider())
-            .ok()
-            .map(Arc::new)
     }
 }
 

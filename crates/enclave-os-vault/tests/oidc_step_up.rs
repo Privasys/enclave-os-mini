@@ -39,7 +39,8 @@ fn owner_policy(sub: &str, ops: Vec<Operation>) -> KeyPolicy {
 fn ctx_with_amr(sub: &str, amr: &[&str]) -> RequestContext {
     RequestContext {
         peer_cert_der: None,
-        client_challenge_nonce: None,
+        peer_evidence: None,
+        attestation: "none".into(),
         oidc_claims: Some(OidcClaims {
             sub: sub.to_string(),
             roles: Vec::new(),
@@ -64,7 +65,8 @@ fn ctx_step_up(
 ) -> RequestContext {
     RequestContext {
         peer_cert_der: None,
-        client_challenge_nonce: None,
+        peer_evidence: None,
+        attestation: "none".into(),
         oidc_claims: Some(OidcClaims {
             sub: sub.to_string(),
             roles: Vec::new(),

@@ -31,10 +31,14 @@ pub struct RaTlsSession {
     tls_conn: rustls::ServerConnection,
     /// Accumulation buffer for incomplete application-level frames.
     read_buf: Vec<u8>,
-    /// Random nonce sent to the client via the TLS CertificateRequest
-    /// extension `0xFFBB` (challenge mode only).  The client binds it
-    /// into its own attestation report_data.
-    client_challenge_nonce: Option<Vec<u8>>,
+    /// Attestation tag of this connection: "none" until the client asks for
+    /// evidence after the handshake, then "deterministic" or "challenge".
+    attestation: &'static str,
+    /// Client context issued in the last attest response that required
+    /// client evidence (mutual leg), consumed by the present message.
+    client_context: Option<[u8; 32]>,
+    /// The peer's evidence accepted at present time (binding verified).
+    peer_evidence: Option<enclave_os_common::modules::PeerEvidence>,
     /// FIDO2 identity, set after a successful FIDO2 ceremony on this
     /// session.  When present, subsequent requests on this TLS session
     /// are authenticated without tokens.
@@ -63,15 +67,15 @@ impl RaTlsSession {
     /// The caller (IngressServer) is responsible for creating the
     /// ServerConnection from the Acceptor flow.
     ///
-    /// `client_challenge_nonce` is the random nonce sent to the client
-    /// via the TLS CertificateRequest extension `0xFFBB` (challenge mode
-    /// only).  It will be used later to verify the client's RA-TLS cert
-    /// report_data.
-    pub fn new(
-        tls_conn: rustls::ServerConnection,
-        client_challenge_nonce: Option<Vec<u8>>,
-    ) -> Self {
-        Self { tls_conn, read_buf: Vec::new(), client_challenge_nonce, fido2_identity: None }
+    pub fn new(tls_conn: rustls::ServerConnection) -> Self {
+        Self {
+            tls_conn,
+            read_buf: Vec::new(),
+            attestation: "none",
+            client_context: None,
+            peer_evidence: None,
+            fido2_identity: None,
+        }
     }
 
     /// Whether the TLS handshake is still in progress.
@@ -331,20 +335,43 @@ impl RaTlsSession {
             .map(|cert| cert.as_ref().to_vec())
     }
 
-    /// Return the client challenge nonce stored for this connection.
-    ///
-    /// Present only when the server generated a challenge-mode certificate.
-    /// The nonce is sent to the client via the TLS CertificateRequest
-    /// extension `0xFFBB`.
-    pub fn client_challenge_nonce(&self) -> Option<&Vec<u8>> {
-        self.client_challenge_nonce.as_ref()
+    /// Attestation tag of this connection ("none", "deterministic", "challenge").
+    pub fn attestation(&self) -> &'static str {
+        self.attestation
     }
 
-    /// Return this session's 32-byte RA-TLS channel binder (TLS 1.3), derived
-    /// from the handshake key schedule. Used to verify a mutual-auth client
-    /// cert's channel binding post-handshake.
-    pub fn ratls_channel_binder(&self) -> Option<Vec<u8>> {
-        self.tls_conn.ratls_channel_binder().map(|b| b.to_vec())
+    /// Record what the client asked for after the handshake.
+    pub fn set_attestation(&mut self, tag: &'static str) {
+        self.attestation = tag;
+    }
+
+    /// Remember the client context issued with an attest response that
+    /// requires client evidence.
+    pub fn set_client_context(&mut self, ctx: [u8; 32]) {
+        self.client_context = Some(ctx);
+    }
+
+    /// Take the pending client context (one present per response).
+    pub fn take_client_context(&mut self) -> Option<[u8; 32]> {
+        self.client_context.take()
+    }
+
+    /// The peer's evidence accepted at present time, if any.
+    pub fn peer_evidence(&self) -> Option<&enclave_os_common::modules::PeerEvidence> {
+        self.peer_evidence.as_ref()
+    }
+
+    /// Record the peer's verified evidence.
+    pub fn set_peer_evidence(&mut self, ev: enclave_os_common::modules::PeerEvidence) {
+        self.peer_evidence = Some(ev);
+    }
+
+    /// The 32-byte RFC 8446 exporter value of this connection for `label` and
+    /// `context`, keyed by exporter_master_secret (RA-TLS v2 binding).
+    pub fn export_hctx(&self, label: &[u8], context: &[u8]) -> Result<[u8; 32], String> {
+        self.tls_conn
+            .export_keying_material([0u8; 32], label, Some(context))
+            .map_err(|e| format!("exporter: {e}"))
     }
 
     /// Return the FIDO2 identity for this session, if authenticated.

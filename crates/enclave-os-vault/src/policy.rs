@@ -29,7 +29,7 @@ use enclave_os_common::hex::hex_encode;
 use enclave_os_common::modules::RequestContext;
 use enclave_os_common::oidc::OidcClaims;
 
-use crate::quote::{dissect_peer_cert, parse_quote, verify_challenge_binding, TeeType};
+use crate::quote::{dissect_peer_cert, parse_quote, TeeType};
 use crate::signing::verify_approval_token;
 use crate::types::{
     ApprovalToken, AttestationProfile, Condition, KeyPolicy, Measurement, Mutability, Operation,
@@ -137,7 +137,7 @@ pub fn resolve_caller(
     if let Some(peer_der) = ctx.peer_cert_der.as_deref() {
         for (i, p) in policy.principals.tees.iter().enumerate() {
             if let Principal::Tee(profile) = p {
-                if tee_matches(profile, peer_der, ctx.client_challenge_nonce.as_deref(), ctx.channel_binder.as_deref()) {
+                if tee_matches(profile, peer_der, ctx.peer_evidence.as_ref()) {
                     return Some((PrincipalRef::Tee(i as u32), CallerRole::Tee));
                 }
             }
@@ -193,15 +193,18 @@ pub fn has_required_roles(claims: &OidcClaims, required_roles: &[String]) -> boo
 ///   2. attestation server verification of the quote (incl. the Intel TCB
 ///      status gate against `profile.acceptable_tcb_statuses`),
 ///   3. parse + measurement match against `profile.measurements`,
-///   4. bidirectional challenge-response binding,
+///   4. the peer's evidence, presented after the handshake and bound by the
+///      ingress server to the peer's leaf key and this connection (RA-TLS v2),
 ///   5. required OID extension match.
 pub(crate) fn tee_matches(
     profile: &AttestationProfile,
     peer_der: &[u8],
-    challenge_nonce: Option<&[u8]>,
-    channel_binder: Option<&[u8]>,
+    peer_evidence: Option<&enclave_os_common::modules::PeerEvidence>,
 ) -> bool {
-    let evidence = match dissect_peer_cert(peer_der) {
+    // A TEE principal must have presented evidence for its leaf on this
+    // connection; a v2 leaf carries none itself.
+    let Some(pe) = peer_evidence else { return false };
+    let evidence = match dissect_peer_cert(peer_der, &pe.quote) {
         Ok(e) => e,
         Err(_) => return false,
     };
@@ -245,17 +248,10 @@ pub(crate) fn tee_matches(
         return false;
     }
 
-    // 4. Challenge binding.
-    if verify_challenge_binding(
-        &evidence.evidence,
-        &evidence.pubkey_raw,
-        challenge_nonce,
-        channel_binder,
-    )
-    .is_err()
-    {
-        return false;
-    }
+    // 4. Binding: verified by the ingress server when the peer presented its
+    // evidence (report_data over the leaf key, the client context and the
+    // connection's exporter value); the evidence reaches this policy only
+    // after that check.
 
     // 5. Required OIDs.
     for req in &profile.required_oids {
@@ -396,7 +392,7 @@ fn evaluate_conditions(
                 let peer = ctx.peer_cert_der.as_deref().ok_or_else(|| {
                     "AttestationMatches: no peer RA-TLS cert in request".to_string()
                 })?;
-                if !tee_matches(profile, peer, ctx.client_challenge_nonce.as_deref(), ctx.channel_binder.as_deref()) {
+                if !tee_matches(profile, peer, ctx.peer_evidence.as_ref()) {
                     return Err(format!(
                         "AttestationMatches: peer does not match profile '{}'",
                         profile.name

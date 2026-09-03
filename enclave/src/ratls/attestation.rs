@@ -1,28 +1,20 @@
 // Copyright (c) Privasys. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
-//! SGX attestation integration for RA-TLS.
+//! SGX attestation integration for RA-TLS v2.
 //!
-//! Generates X.509 certificates containing SGX quotes:
+//! The leaf certificate identifies the enclave (leaf key, chain to the
+//! intermediary CA, Privasys OIDs) and carries no evidence. A leaf key lives
+//! 24 hours and is kept across re-mints that only change extension values (an
+//! app registered, a dependency set changed), so a deterministic quote minted
+//! for the key stays valid across such a re-mint. Evidence is served after the
+//! handshake by `POST /__privasys/attest` (see `server.rs`):
 //!
-//!   - Reads extension 0xFFBB in ClientHello for the challenge nonce
-//!   - `report_data = SHA-512(SHA-256(SPKI_DER) || binding)`
-//!   - SGX quote embedded in a custom X.509 extension at Intel OID
-//!
-//! Two modes:
-//!
-//! | Mode          | Binding                       | Validity | Caching |
-//! |---------------|-------------------------------|----------|---------|
-//! | Challenge     | nonce from 0xFFBB             | 5 min    | no      |
-//! | Deterministic | creation_time "YYYY-MM-DDTHH:MMZ" | 24 h | yes  |
-//!
-//! In deterministic mode the binding is the minute-truncated creation time
-//! formatted as `"YYYY-MM-DDTHH:MMZ"`, and the leaf's `NotBefore` is set to
-//! that same minute so a verifier reproduces the binding from the certificate
-//! alone. This matches the container (TDX) issuer, so both TEE types share one
-//! verification path. (Earlier builds bound an 8-byte little-endian
-//! `creation_time` that was not recoverable from the cert, which forced
-//! verifiers to skip the SGX deterministic key-to-quote check entirely.)
+//! ```text
+//! deterministic: report_data = SHA-512( SHA-256(SPKI_DER) || quote_time )   cached 24 h per key
+//! challenge:     report_data = SHA-512( SHA-256(SPKI_DER) || context || hctx )
+//!                hctx = TLS-Exporter("EXPORTER-privasys-ratls-attest-v2", context, 32)
+//! ```
 
 use std::string::String;
 use std::vec::Vec;
@@ -31,39 +23,19 @@ use ring::rand::SystemRandom;
 use ring::signature::{self, EcdsaKeyPair, ECDSA_P256_SHA256_ASN1_SIGNING};
 use time::OffsetDateTime;
 
-use enclave_os_common::oids::{
-    SGX_QUOTE_OID, CONFIG_MERKLE_ROOT_OID, APP_CONFIG_MERKLE_ROOT_OID,
-};
+use enclave_os_common::oids::{APP_CONFIG_MERKLE_ROOT_OID, CONFIG_MERKLE_ROOT_OID};
 
 use crate::ratls::cert_store::AppCertData;
 
-/// Certificate validity for challenge-response mode (5 minutes).
-pub const CHALLENGE_VALIDITY_SECS: u64 = 300;
-
-/// Certificate validity for deterministic mode (24 hours).
+/// Lifetime of a serving leaf and of its key (24 hours).
 pub const DETERMINISTIC_VALIDITY_SECS: u64 = 86400;
+
+/// Validity of a minted client identity (1 hour).
+pub const CLIENT_IDENTITY_VALIDITY_SECS: u64 = 3600;
 
 // ---------------------------------------------------------------------------
 //  Types
 // ---------------------------------------------------------------------------
-
-/// How the leaf certificate is bound to attestation evidence.
-pub enum CertMode {
-    /// Challenge-response: nonce extracted from ClientHello extension 0xFFBB.
-    /// Produces a short-lived cert (5 min) with a fresh key + quote.
-    ///
-    /// `binder`, when present, is the 32-byte TLS channel binder derived from
-    /// the handshake key schedule. It is folded into `report_data`
-    /// (`SHA-512(SHA-256(SPKI) || nonce || binder)`) and marks the leaf with
-    /// the RA-TLS Channel Binding OID (2.9), pinning the quote to this TLS
-    /// session. `None` reproduces the legacy nonce-only preimage.
-    Challenge { nonce: Vec<u8>, binder: Option<[u8; 32]> },
-    /// Deterministic: binding = the minute-truncated `creation_time` formatted
-    /// as `"YYYY-MM-DDTHH:MMZ"`. The leaf's `NotBefore` is set to the same
-    /// minute so a verifier reproduces the binding from the cert. Valid 24 h,
-    /// cacheable. `creation_time` is seconds since the Unix epoch.
-    Deterministic { creation_time: u64 },
-}
 
 /// Intermediary CA context provided to the enclave at startup.
 ///
@@ -88,7 +60,6 @@ impl CaContext {
     /// Performs a basic validation that the key material is usable
     /// (i.e. it can be parsed as an ECDSA P-256 key pair).
     pub fn from_parts(ca_cert_der: Vec<u8>, ca_key_pkcs8: Vec<u8>) -> Result<Self, String> {
-        // Validate that the key can be loaded
         let rng = SystemRandom::new();
         let _ = EcdsaKeyPair::from_pkcs8(
             &ECDSA_P256_SHA256_ASN1_SIGNING,
@@ -104,24 +75,46 @@ impl CaContext {
     }
 }
 
+/// A serving leaf key, kept for [`DETERMINISTIC_VALIDITY_SECS`] across
+/// re-mints of the certificate.
+#[derive(Clone)]
+pub struct LeafKey {
+    /// PKCS#8 private key.
+    pub pkcs8: Vec<u8>,
+    /// DER `SubjectPublicKeyInfo` (91 bytes), the input of every
+    /// `report_data` recipe.
+    pub spki_der: Vec<u8>,
+    /// SHA-256 of `spki_der`: the `leaf` id clients name in an attest request.
+    pub spki_hash: [u8; 32],
+    /// Creation time (seconds since the Unix epoch).
+    pub created: u64,
+}
+
+/// Generate a fresh leaf key.
+pub fn new_leaf_key(now: u64) -> Result<LeafKey, String> {
+    let (pkcs8, key_pair) = generate_keypair().map_err(|e| e.to_string())?;
+    let raw_ec_point = signature::KeyPair::public_key(&key_pair).as_ref();
+    let spki_der = enclave_os_common::quote::build_p256_spki_der(raw_ec_point);
+    let mut spki_hash = [0u8; 32];
+    spki_hash.copy_from_slice(digest::digest(&digest::SHA256, &spki_der).as_ref());
+    Ok(LeafKey { pkcs8, spki_der, spki_hash, created: now })
+}
+
+/// Result of certificate generation.
+pub struct CertGenerationResult {
+    /// DER-encoded certificate chain (leaf, then the intermediary CA).
+    pub cert_chain_der: Vec<Vec<u8>>,
+    /// PKCS#8 private key of the leaf.
+    pub pkcs8_key: Vec<u8>,
+}
+
 // ---------------------------------------------------------------------------
 //  Public API
 // ---------------------------------------------------------------------------
 
-/// Compute the 64-byte `report_data` that goes into the SGX quote.
-///
-/// ```text
-/// report_data = SHA-512( SHA-256(SPKI_DER) || binding )
-/// ```
-///
-/// The `spki_der` argument must be the full DER-encoded
-/// `SubjectPublicKeyInfo` (91 bytes for P-256).  This matches the
-/// standard "Public Key SHA-256" fingerprint shown by X.509 certificate
-/// viewers, making browser-side verification straightforward.
-///
-/// * **Challenge mode**: `binding` = nonce from ClientHello ext 0xFFBB
-/// * **Deterministic mode**: `binding` = creation time as the ASCII string
-///   `"YYYY-MM-DDTHH:MMZ"` (minute precision), recoverable from `NotBefore`
+/// Compute the 64-byte `report_data` that goes into the SGX quote:
+/// `SHA-512( SHA-256(SPKI_DER) || binding )`, with `spki_der` the full DER
+/// `SubjectPublicKeyInfo` (91 bytes for P-256).
 pub fn compute_report_data(spki_der: &[u8], binding: &[u8]) -> [u8; 64] {
     let pubkey_hash = digest::digest(&digest::SHA256, spki_der);
     let mut preimage = Vec::with_capacity(32 + binding.len());
@@ -133,90 +126,42 @@ pub fn compute_report_data(spki_der: &[u8], binding: &[u8]) -> [u8; 64] {
     out
 }
 
-/// Result of an RA-TLS certificate generation.
-///
-/// Contains the certificate chain, private key, and an optional
-/// client challenge nonce (only in challenge-response mode).
-pub struct CertGenerationResult {
-    /// DER-encoded certificate chain: `[leaf_cert_der, ca_cert_der]`.
-    pub cert_chain_der: Vec<Vec<u8>>,
-    /// PKCS#8-encoded private key for the leaf cert.
-    pub pkcs8_key: Vec<u8>,
-    /// Random nonce for the client to bind into its own RA-TLS certificate
-    /// (challenge-response mode only).  Sent via TLS CertificateRequest
-    /// extension `0xFFBB`, not embedded in the X.509 certificate.
-    pub client_challenge_nonce: Option<Vec<u8>>,
-}
-
-/// Generate an RA-TLS leaf certificate signed by the intermediary CA.
-///
-/// Returns a [`CertGenerationResult`] containing the cert chain, key,
-/// and an optional client challenge nonce.  When `mode` is
-/// [`CertMode::Challenge`], a 32-byte random nonce is generated and
-/// returned in [`CertGenerationResult::client_challenge_nonce`].  The
-/// server sends this nonce to the client via a TLS CertificateRequest
-/// extension (`0xFFBB`) for bidirectional challenge-response attestation.
+/// Generate the enclave-wide RA-TLS leaf for `key`, signed by the CA, carrying
+/// the platform OIDs (config Merkle root, attestation servers hash, module
+/// OIDs) and no evidence. Valid from `now` until the key's 24-hour lifetime.
 pub fn generate_ratls_certificate(
     ca: &CaContext,
-    mode: CertMode,
+    key: &LeafKey,
+    now: u64,
 ) -> Result<CertGenerationResult, String> {
-    let is_challenge = matches!(mode, CertMode::Challenge { .. });
-    let ctx = prepare_attestation(&mode)?;
-
-    // Collect enclave-wide extensions
     let mut extensions: Vec<(&'static [u64], Vec<u8>)> = Vec::new();
     if let Some(root) = crate::config_merkle_root() {
         extensions.push((CONFIG_MERKLE_ROOT_OID, root.to_vec()));
     }
-    // Core OID: attestation servers hash (queried fresh — reflects runtime updates)
     if let Some(h) = enclave_os_common::attestation_servers::hash() {
         extensions.push((enclave_os_common::oids::ATTESTATION_SERVERS_HASH_OID, h.to_vec()));
     }
     for oid in &crate::modules::collect_module_oids() {
         extensions.push((oid.oid, oid.value.clone()));
     }
-
-    // In challenge mode, generate a client challenge nonce (sent via
-    // TLS CertificateRequest extension 0xFFBB, not embedded in the cert)
-    let client_challenge_nonce = if is_challenge {
-        Some(generate_random_nonce()?)
-    } else {
-        None
-    };
-
-    let leaf_der = build_leaf_cert(
-        &ctx.pkcs8_bytes, &ctx.quote, ctx.not_before, ctx.not_after, ca,
-        "Enclave OS RA-TLS", &extensions,
-    )?;
-
+    let (nb, na) = leaf_validity(key, now)?;
+    let leaf_der = build_leaf_cert(&key.pkcs8, nb, na, ca, "Enclave OS RA-TLS", &extensions)?;
     Ok(CertGenerationResult {
         cert_chain_der: vec![leaf_der, ca.ca_cert_der.clone()],
-        pkcs8_key: ctx.pkcs8_bytes,
-        client_challenge_nonce,
+        pkcs8_key: key.pkcs8.clone(),
     })
 }
 
-/// Generate a per-app RA-TLS leaf certificate signed by the CA.
-///
-/// Like [`generate_ratls_certificate()`] but the leaf cert contains
-/// per-app data instead of enclave-wide module OIDs:
-/// - Per-app config Merkle root (OID `1.3.6.1.4.1.65230.3.1`)
-/// - Per-app code hash (OID `1.3.6.1.4.1.65230.3.2`)
-/// - Per-app key source (OID `1.3.6.1.4.1.65230.3.4`)
-/// - Per-app OID extensions flagged by config entries
-/// - SGX quote (same as the enclave-wide cert)
-/// - Subject CN = app hostname (for SNI matching)
-///
-/// Returns a [`CertGenerationResult`].
+/// Generate a per-app RA-TLS leaf for `key`: the app's config Merkle root
+/// (OID 5.1) and its identity extensions (code digest 4.2, key source 6.1,
+/// configuration hash 5.2, app id 4.1, dependency set 7.1, app-defined 5.4.*),
+/// subject CN = app hostname (SNI). No evidence.
 pub fn generate_app_certificate(
     ca: &CaContext,
-    mode: CertMode,
+    key: &LeafKey,
     app: &AppCertData,
+    now: u64,
 ) -> Result<CertGenerationResult, String> {
-    let is_challenge = matches!(mode, CertMode::Challenge { .. });
-    let ctx = prepare_attestation(&mode)?;
-
-    // Collect per-app extensions
     let mut extensions: Vec<(&'static [u64], Vec<u8>)> = Vec::new();
     if app.merkle_root != [0u8; 32] {
         extensions.push((APP_CONFIG_MERKLE_ROOT_OID, app.merkle_root.to_vec()));
@@ -224,76 +169,54 @@ pub fn generate_app_certificate(
     for (oid, value) in &app.oid_extensions {
         extensions.push((*oid, value.clone()));
     }
-
-    // In challenge mode, generate a client challenge nonce (sent via
-    // TLS CertificateRequest extension 0xFFBB, not embedded in the cert)
-    let client_challenge_nonce = if is_challenge {
-        Some(generate_random_nonce()?)
-    } else {
-        None
-    };
-
-    let leaf_der = build_leaf_cert(
-        &ctx.pkcs8_bytes, &ctx.quote, ctx.not_before, ctx.not_after, ca,
-        &app.hostname, &extensions,
-    )?;
-
+    let (nb, na) = leaf_validity(key, now)?;
+    let leaf_der = build_leaf_cert(&key.pkcs8, nb, na, ca, &app.hostname, &extensions)?;
     Ok(CertGenerationResult {
         cert_chain_der: vec![leaf_der, ca.ca_cert_der.clone()],
-        pkcs8_key: ctx.pkcs8_bytes,
-        client_challenge_nonce,
+        pkcs8_key: key.pkcs8.clone(),
     })
 }
 
-/// Mint a client RA-TLS certificate for authenticating to an Enclave Vault
-/// as a `Principal::Tee`. The CA-signed leaf carries the SGX quote (its
-/// `ReportData` bound to the vault's `challenge` via
-/// `SHA-512(SHA-256(SPKI) || challenge)`) plus the app's measurement: the
-/// cwasm code hash at OID 3.2 and, when present, the app-id at OID 3.6 — the
-/// exact identity the vault's `tee_matches` authorises for a share export.
-///
-/// This is the WASM/SGX analog of the container path's
-/// `enclave-os-virtual` `vaultkey/clientcert.go` `mintIdentity`. The closure
-/// behind [`enclave_os_egress::VaultClientCertResolver`] calls this with the
-/// nonce the vault sends in its `CertificateRequest` (ext `0xFFBB`). Returns
-/// `(cert_chain_der, pkcs8_key_der)`.
-pub fn mint_vault_client_cert(
+fn leaf_validity(key: &LeafKey, now: u64) -> Result<(OffsetDateTime, OffsetDateTime), String> {
+    let nb = OffsetDateTime::from_unix_timestamp(now.saturating_sub(60) as i64)
+        .map_err(|e| format!("not_before out of range: {e}"))?;
+    let na = OffsetDateTime::from_unix_timestamp((key.created + DETERMINISTIC_VALIDITY_SECS) as i64)
+        .map_err(|e| format!("not_after out of range: {e}"))?;
+    Ok((nb, na))
+}
+
+/// Mint this enclave's client identity for a mutual leg (a vault, an app-to-app
+/// call): a fresh key, the app's code digest (OID 4.2) and, when present, its
+/// app id (OID 4.1), signed by the CA, valid one hour, no evidence. Evidence for
+/// it is minted per connection with [`sgx_quote`] over the report_data the
+/// verifier predicts (`client_report_data`). Returns
+/// `(cert_chain_der, pkcs8_key_der, spki_hash)`.
+pub fn mint_client_identity(
     ca: &CaContext,
-    challenge: &[u8],
-    channel_binder: Option<&[u8]>,
     cwasm_code_hash: &[u8],
     app_id: Option<&[u8]>,
-) -> Result<(Vec<Vec<u8>>, Vec<u8>), String> {
+    now: u64,
+) -> Result<(Vec<Vec<u8>>, Vec<u8>, [u8; 32]), String> {
+    let key = new_leaf_key(now)?;
     let mut oid_extensions: Vec<(&'static [u64], Vec<u8>)> = Vec::new();
-    oid_extensions.push((
-        enclave_os_common::oids::APP_CODE_HASH_OID,
-        cwasm_code_hash.to_vec(),
-    ));
-    // MR_APP: bind to this specific app. Omitted (MR_ENCLAVE shape) when no
-    // app-id is supplied, keeping back-compat with pre-app-id deployments.
+    oid_extensions.push((enclave_os_common::oids::APP_CODE_HASH_OID, cwasm_code_hash.to_vec()));
     if let Some(id) = app_id {
         if !id.is_empty() {
             oid_extensions.push((enclave_os_common::oids::APP_ID_OID, id.to_vec()));
         }
     }
-    let app = AppCertData {
-        hostname: String::from("vault-client"),
-        merkle_root: [0u8; 32],
-        oid_extensions,
-    };
-    // Fold the session channel binder (TLS 1.3) into the quote's report_data so
-    // the vault can confirm this client cert commits to the live session and is
-    // not a relayed identity. Absent (e.g. TLS 1.2) leaves the nonce-only form.
-    let binder: Option<[u8; 32]> = channel_binder.and_then(|b| b.try_into().ok());
-    let result = generate_app_certificate(
-        ca,
-        CertMode::Challenge {
-            nonce: challenge.to_vec(),
-            binder,
-        },
-        &app,
-    )?;
-    Ok((result.cert_chain_der, result.pkcs8_key))
+    let nb = OffsetDateTime::from_unix_timestamp(now.saturating_sub(60) as i64)
+        .map_err(|e| format!("not_before out of range: {e}"))?;
+    let na = OffsetDateTime::from_unix_timestamp((now + CLIENT_IDENTITY_VALIDITY_SECS) as i64)
+        .map_err(|e| format!("not_after out of range: {e}"))?;
+    let leaf_der = build_leaf_cert(&key.pkcs8, nb, na, ca, "enclave-os client", &oid_extensions)?;
+    Ok((vec![leaf_der, ca.ca_cert_der.clone()], key.pkcs8, key.spki_hash))
+}
+
+/// Produce an SGX DCAP quote over `report_data` (the attest endpoint and the
+/// client-evidence path).
+pub fn sgx_quote(report_data: &[u8; 64]) -> Result<Vec<u8>, String> {
+    generate_sgx_quote(report_data)
 }
 
 /// Generate an ECDSA P-256 key pair and return `(pkcs8_bytes, key_pair)`.
@@ -309,111 +232,6 @@ pub fn generate_keypair() -> Result<(Vec<u8>, EcdsaKeyPair), &'static str> {
     )
     .map_err(|_| "Failed to parse generated key")?;
     Ok((pkcs8_bytes, key_pair))
-}
-
-/// Generate a cryptographically random 32-byte nonce using `ring`'s
-/// `SystemRandom` (backed by `rdrand` inside the SGX enclave).
-fn generate_random_nonce() -> Result<Vec<u8>, String> {
-    use ring::rand::SecureRandom;
-    let rng = SystemRandom::new();
-    let mut nonce = vec![0u8; 32];
-    rng.fill(&mut nonce)
-        .map_err(|_| String::from("random nonce generation failed"))?;
-    Ok(nonce)
-}
-
-// ---------------------------------------------------------------------------
-//  Attestation preparation (key gen + quote)
-// ---------------------------------------------------------------------------
-
-/// Internal context produced by [`prepare_attestation()`].
-struct AttestationContext {
-    pkcs8_bytes: Vec<u8>,
-    quote: Vec<u8>,
-    /// Leaf validity window. In deterministic mode `not_before` is the
-    /// minute-truncated creation time that the ReportData binding is derived
-    /// from, so it must land verbatim in the certificate.
-    not_before: OffsetDateTime,
-    not_after: OffsetDateTime,
-}
-
-/// Generate a fresh ECDSA key pair, compute report_data from the mode,
-/// and obtain an SGX quote.  Shared by enclave-wide and per-app cert
-/// generation.
-fn prepare_attestation(mode: &CertMode) -> Result<AttestationContext, String> {
-    let rng = SystemRandom::new();
-    let pkcs8 = EcdsaKeyPair::generate_pkcs8(&ECDSA_P256_SHA256_ASN1_SIGNING, &rng)
-        .map_err(|_| String::from("Key generation failed"))?;
-    let pkcs8_bytes = pkcs8.as_ref().to_vec();
-
-    let key_pair = EcdsaKeyPair::from_pkcs8(
-        &ECDSA_P256_SHA256_ASN1_SIGNING,
-        &pkcs8_bytes,
-        &rng,
-    )
-    .map_err(|_| String::from("Failed to parse generated key"))?;
-
-    // Build the full SPKI DER (91 bytes) from the raw EC point (65 bytes).
-    // This matches what Go's x509.MarshalPKIXPublicKey and standard X.509
-    // certificate viewers produce, so SHA-256(SPKI_DER) equals the
-    // "Public Key SHA-256" fingerprint visible in any cert inspector.
-    let raw_ec_point = signature::KeyPair::public_key(&key_pair).as_ref();
-    let spki_der = enclave_os_common::quote::build_p256_spki_der(raw_ec_point);
-
-    let (report_data, not_before, not_after) = match mode {
-        CertMode::Challenge { nonce, binder } => {
-            // report_data = SHA-512(SHA-256(SPKI) || nonce [|| binder]).
-            // When a channel binder is present, append it so the quote pins
-            // this TLS session to the shared key schedule (channel binding).
-            let binding = match binder {
-                Some(b) => {
-                    let mut v = nonce.clone();
-                    v.extend_from_slice(b);
-                    v
-                }
-                None => nonce.clone(),
-            };
-            (
-                compute_report_data(&spki_der, &binding),
-                // Wide window; freshness is proved by the quote + the 5-min cache
-                // TTL, and the challenge verifier binds the nonce, not NotBefore.
-                rcgen::date_time_ymd(2024, 1, 1),
-                rcgen::date_time_ymd(2030, 12, 31),
-            )
-        }
-        CertMode::Deterministic { creation_time } => {
-            // Minute-truncate so the binding is stable across the cert's life
-            // and reproducible from NotBefore. Bind the ASCII "YYYY-MM-DDTHH:MMZ"
-            // form (matches the container/TDX issuer); NotBefore carries it.
-            let minute = creation_time - (creation_time % 60);
-            let nb = OffsetDateTime::from_unix_timestamp(minute as i64)
-                .map_err(|e| format!("creation_time out of range: {e}"))?;
-            let na = OffsetDateTime::from_unix_timestamp(
-                (minute + DETERMINISTIC_VALIDITY_SECS) as i64,
-            )
-            .map_err(|e| format!("not_after out of range: {e}"))?;
-            let binding = format_ratls_time(&nb);
-            (compute_report_data(&spki_der, binding.as_bytes()), nb, na)
-        }
-    };
-
-    let quote = generate_sgx_quote(&report_data)?;
-    Ok(AttestationContext { pkcs8_bytes, quote, not_before, not_after })
-}
-
-/// Format an `OffsetDateTime` as the deterministic binding string
-/// `"YYYY-MM-DDTHH:MMZ"` (UTC, minute precision). Must match byte-for-byte the
-/// string a verifier reconstructs from the certificate's `NotBefore`, and the
-/// container/TDX issuer's `reportTimeFormat`.
-fn format_ratls_time(t: &OffsetDateTime) -> String {
-    format!(
-        "{:04}-{:02}-{:02}T{:02}:{:02}Z",
-        t.year(),
-        t.month() as u8,
-        t.day(),
-        t.hour(),
-        t.minute()
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -435,7 +253,6 @@ fn generate_sgx_quote(report_data: &[u8; 64]) -> Result<Vec<u8>, String> {
 
     let rpc = crate::rpc_client_ref();
 
-    // Phase 1: Get QE target info from the host (via DCAP QL)
     let target_info_bytes = rpc.qe_get_target_info()
         .map_err(|e| format!("QeGetTargetInfo RPC failed: status={}", e))?;
 
@@ -451,7 +268,6 @@ fn generate_sgx_quote(report_data: &[u8; 64]) -> Result<Vec<u8>, String> {
         core::ptr::read_unaligned(target_info_bytes.as_ptr() as *const TargetInfo)
     };
 
-    // Phase 2: Create SGX report targeting the QE
     let mut rd = ReportData::default();
     rd.d.copy_from_slice(report_data);
 
@@ -465,7 +281,6 @@ fn generate_sgx_quote(report_data: &[u8; 64]) -> Result<Vec<u8>, String> {
         )
     };
 
-    // Phase 3: Ask the host to get a DCAP Quote v3 from the QE
     let quote = rpc.qe_get_quote(report_bytes)
         .map_err(|e| format!("QeGetQuote RPC failed: status={}", e))?;
 
@@ -501,8 +316,7 @@ pub fn quote_binding_nonce(nonce: &[u8]) -> Result<Vec<u8>, String> {
 /// MRENCLAVE is independent of the report target, so a local SGX report suffices.
 /// It sits at byte offset 64 of the SGX ReportBody (the first field of the
 /// Report), so we read it from the report bytes rather than depend on the SDK
-/// fork's struct field names — matching how the rest of this module treats
-/// reports and quotes as opaque bytes.
+/// fork's struct field names.
 #[cfg(not(feature = "mock"))]
 pub fn self_mrenclave() -> Result<[u8; 32], String> {
     use sgx_types::types::{ReportData, TargetInfo};
@@ -540,7 +354,6 @@ pub fn self_mrenclave() -> Result<[u8; 32], String> {
 
 #[cfg(feature = "mock")]
 pub fn self_mrenclave() -> Result<[u8; 32], String> {
-    // Deterministic dummy for host/mock builds.
     Ok([0x11u8; 32])
 }
 
@@ -548,14 +361,11 @@ pub fn self_mrenclave() -> Result<[u8; 32], String> {
 //  Certificate building with rcgen
 // ---------------------------------------------------------------------------
 
-/// Build a leaf certificate signed by the intermediary CA.
-///
-/// The SGX quote goes into [`SGX_QUOTE_OID`]. Additional X.509 extensions
-/// (config Merkle roots, module OIDs, per-app OIDs) are passed via
-/// `extensions`. The `common_name` is set as the Subject CN.
+/// Build a leaf certificate signed by the intermediary CA carrying
+/// `extensions` (Privasys OIDs) and no evidence. `common_name` is the Subject
+/// CN (the app hostname, or the enclave-wide name).
 fn build_leaf_cert(
     leaf_pkcs8: &[u8],
-    quote: &[u8],
     not_before: OffsetDateTime,
     not_after: OffsetDateTime,
     ca: &CaContext,
@@ -572,7 +382,6 @@ fn build_leaf_cert(
     let ca_params = CertificateParams::from_ca_cert_der(&ca_cert_der)
         .map_err(|e| format!("CA cert parse: {}", e))?;
 
-    // --- Leaf key pair ---
     let leaf_pkcs8_der = PrivatePkcs8KeyDer::from(leaf_pkcs8.to_vec());
     let leaf_key = KeyPair::from_pkcs8_der_and_sign_algo(
         &leaf_pkcs8_der,
@@ -580,18 +389,13 @@ fn build_leaf_cert(
     )
     .map_err(|e| format!("leaf key: {}", e))?;
 
-    // --- Leaf params ---
     let mut leaf_params = CertificateParams::new(Vec::<String>::new())
         .map_err(|e| format!("leaf params: {}", e))?;
 
-    // CN is always the app hostname (or enclave-wide fallback name).
     leaf_params.distinguished_name.push(
         DnType::CommonName,
         DnValue::Utf8String(common_name.into()),
     );
-
-    // Copy C, ST, L, O, OU from the intermediate CA so the leaf's
-    // subject matches the issuer's organisation fields.
     for dn_type in &[
         DnType::CountryName,
         DnType::StateOrProvinceName,
@@ -604,17 +408,9 @@ fn build_leaf_cert(
         }
     }
 
-    // Validity window. Challenge mode passes a wide window (freshness is proved
-    // by the quote); deterministic mode passes the minute-truncated creation
-    // time as NotBefore so a verifier reproduces the ReportData binding.
     leaf_params.not_before = not_before;
     leaf_params.not_after = not_after;
 
-    // SGX quote
-    let quote_ext = CustomExtension::from_oid_content(SGX_QUOTE_OID, quote.to_vec());
-    leaf_params.custom_extensions.push(quote_ext);
-
-    // Caller-supplied extensions (Merkle roots, module OIDs, per-app OIDs)
     for (oid, value) in extensions {
         let ext = CustomExtension::from_oid_content(*oid, value.clone());
         leaf_params.custom_extensions.push(ext);
@@ -622,7 +418,6 @@ fn build_leaf_cert(
 
     leaf_params.is_ca = IsCa::NoCa;
 
-    // --- CA key pair + certificate ---
     let ca_pkcs8_der = PrivatePkcs8KeyDer::from(ca.ca_key_pkcs8.clone());
     let ca_key = KeyPair::from_pkcs8_der_and_sign_algo(
         &ca_pkcs8_der,
@@ -633,7 +428,6 @@ fn build_leaf_cert(
     let ca_cert = ca_params.self_signed(&ca_key)
         .map_err(|e| format!("CA cert reconstruct: {}", e))?;
 
-    // --- Sign leaf with CA ---
     let leaf_cert = leaf_params
         .signed_by(&leaf_key, &ca_cert, &ca_key)
         .map_err(|e| format!("leaf signing: {}", e))?;
@@ -642,7 +436,7 @@ fn build_leaf_cert(
 }
 
 // ---------------------------------------------------------------------------
-//  ClientHello parser — combined SNI + challenge nonce extraction
+//  ClientHello parser (SNI)
 // ---------------------------------------------------------------------------
 
 /// Information extracted from a TLS ClientHello message.

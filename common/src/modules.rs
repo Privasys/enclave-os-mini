@@ -77,6 +77,20 @@ pub struct AppIdentity {
 //  Request context
 // ---------------------------------------------------------------------------
 
+/// A peer's attestation evidence, accepted on the server side of a mutual leg
+/// (RA-TLS v2).
+#[derive(Debug, Clone)]
+pub struct PeerEvidence {
+    /// Evidence family: "sgx", "tdx", "tdx-gpu".
+    pub tee: String,
+    /// Raw DCAP quote.
+    pub quote: Vec<u8>,
+    /// NVIDIA CC evidence, when present.
+    pub gpu_evidence: Option<Vec<u8>>,
+    /// Minute the quote was minted (`YYYY-MM-DDTHH:MMZ`).
+    pub quote_time: String,
+}
+
 /// Per-request context passed to [`EnclaveModule::handle()`].
 ///
 /// Carries optional metadata extracted from the TLS session and OIDC auth.
@@ -87,15 +101,19 @@ pub struct RequestContext {
     /// handshake (mutual RA-TLS). `None` for regular browser clients.
     pub peer_cert_der: Option<Vec<u8>>,
 
-    /// Random nonce sent to the client via the TLS CertificateRequest
-    /// extension `0xFFBB` for bidirectional challenge-response attestation.
-    pub client_challenge_nonce: Option<Vec<u8>>,
+    /// The peer's attestation evidence for this connection (RA-TLS v2 mutual
+    /// leg): the quote the client presented after the handshake, whose
+    /// `report_data` the ingress server verified against the peer's leaf key,
+    /// the client context it issued and this connection's exporter value.
+    /// `None` when the client presented no evidence. A verifier that
+    /// authorises a TEE principal takes the quote from here, never from the
+    /// certificate (a v2 leaf carries none), and skips the binding check
+    /// (done at present time).
+    pub peer_evidence: Option<PeerEvidence>,
 
-    /// 32-byte RA-TLS channel binder for this TLS session (TLS 1.3), derived
-    /// from the handshake key schedule. A mutual-auth verifier folds it into the
-    /// expected client-cert `report_data` so a relayed client cert from another
-    /// session fails closed. `None` on non-TLS-1.3 handshakes.
-    pub channel_binder: Option<Vec<u8>>,
+    /// Attestation tag of the connection: "none", "deterministic" or
+    /// "challenge" (what the client asked for after the handshake).
+    pub attestation: String,
 
     /// Verified OIDC claims extracted from the `"auth"` field in the
     /// JSON envelope.  `None` when no bearer token was provided (e.g.

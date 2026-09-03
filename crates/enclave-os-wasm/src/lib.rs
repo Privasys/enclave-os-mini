@@ -104,7 +104,7 @@ use crate::registry::AppRegistry;
 //  OID for WASM apps combined code hash — imported from common
 // ---------------------------------------------------------------------------
 
-pub use enclave_os_common::oids::WASM_APPS_HASH_OID;
+pub use enclave_os_common::oids::COMBINED_WORKLOADS_HASH_OID;
 
 use crate::registry::AppMeta;
 
@@ -2193,7 +2193,7 @@ impl EnclaveModule for WasmModule {
         }
 
         vec![ModuleOid {
-            oid: WASM_APPS_HASH_OID,
+            oid: COMBINED_WORKLOADS_HASH_OID,
             value: combined.to_vec(),
         }]
     }

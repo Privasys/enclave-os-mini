@@ -773,8 +773,8 @@ mod module_tests {
     fn ctx(oidc_claims: Option<OidcClaims>) -> RequestContext {
         RequestContext {
             peer_cert_der: None,
-            client_challenge_nonce: None,
-            channel_binder: None,
+            peer_evidence: None,
+            attestation: "none".into(),
             oidc_claims,
         }
     }

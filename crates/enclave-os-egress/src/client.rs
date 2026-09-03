@@ -18,7 +18,6 @@ use std::vec::Vec;
 
 use core::mem;
 
-use ring::digest;
 use enclave_os_common::ocall;
 use zeroize::Zeroizing;
 
@@ -52,7 +51,7 @@ pub use rustls::RootCertStore;
 pub use enclave_os_common::oids::{
     CONFIG_MERKLE_ROOT_OID_STR as OID_CONFIG_MERKLE_ROOT,
     EGRESS_CA_HASH_OID_STR as OID_EGRESS_CA_HASH,
-    WASM_APPS_HASH_OID_STR as OID_WASM_APPS_HASH,
+    COMBINED_WORKLOADS_HASH_OID_STR as OID_WASM_APPS_HASH,
     ATTESTATION_SERVERS_HASH_OID_STR as OID_ATTESTATION_SERVERS_HASH,
 };
 
@@ -151,25 +150,16 @@ const MOCK_PREFIX: &[u8] = b"MOCK_QUOTE:";
 /// | TDX | Full SPKI DER (91 B) | `NotBefore` as `"YYYY-MM-DDTHH:MMZ"` | Client nonce |
 #[derive(Debug, Clone)]
 pub enum ReportDataBinding {
-    /// Deterministic — reproduced from the certificate alone.
-    ///
-    /// * **TDX**: `SHA-512(SHA-256(SPKI DER) || NotBefore "YYYY-MM-DDTHH:MMZ")`
-    /// * **SGX**: verification is **skipped** because `creation_time`
-    ///   (8-byte LE epoch used as binding) is not recoverable from the
-    ///   certificate's `NotBefore` (enclave-os sets it to a fixed date).
+    /// Deterministic (RA-TLS v2 "trust the TEE" tier): the runtime's cached
+    /// quote, `SHA-512(SHA-256(SPKI DER) || quote_time)` with `quote_time`
+    /// carried in the attest response. No session binding.
     Deterministic,
 
-    /// Challenge-response — binding is a client-supplied nonce.
-    ///
-    /// * **TDX**: `SHA-512(SHA-256(SPKI DER) || nonce)`
-    /// * **SGX**: `SHA-512(SHA-256(raw EC point) || nonce)`
-    ///
-    /// The nonce is typically sent in TLS ClientHello extension `0xFFBB`
-    /// and must be **exactly** the bytes the server used as binding.
-    ChallengeResponse {
-        /// The nonce bytes that were included in the ClientHello.
-        nonce: Vec<u8>,
-    },
+    /// Challenge mode (RA-TLS v2, the default tier): after the handshake the
+    /// client asks for a quote bound to a fresh context and this connection's
+    /// RFC 8446 exporter value, `SHA-512(SHA-256(SPKI DER) || context || hctx)`.
+    /// Level 3 binding.
+    ChallengeResponse,
 }
 
 /// An expected X.509 extension OID and its value.
@@ -385,7 +375,7 @@ fn https_request_inner(
     root_store: &RootCertStore,
     ratls: Option<&RaTlsPolicy>,
 ) -> Result<HttpResponse, String> {
-    let tls_config = build_client_config(root_store, ratls)
+    let (tls_config, identity_auth) = build_client_config(root_store, ratls)
         .map_err(|e| e.to_string())?;
 
     let fd = ocall::net_tcp_connect(host, port)
@@ -399,12 +389,13 @@ fn https_request_inner(
     tls_handshake(fd, &mut tls_conn)
         .map_err(|e| format!("TLS handshake failed: {e}"))?;
 
-    // RA-TLS channel binding: in challenge mode a server's quote MUST commit to
-    // this TLS session (report_data folds the session binder). Verify it with
-    // the binder before sending any request data. Fails closed on a relayed or
-    // co-located quote that cannot commit to this session.
+    // RA-TLS v2: the evidence exchange runs after the handshake and before
+    // any request data. The quote is verified against the policy
+    // (measurements, report_data predicted from the leaf key and, in
+    // challenge mode, from our context and this connection's exporter value,
+    // attestation servers, dependencies). Fails closed.
     if let Some(policy) = ratls {
-        verify_channel_binding(&tls_conn, policy)?;
+        attest_exchange(fd, &mut tls_conn, policy, identity_auth.as_ref())?;
     }
 
     // Send the HTTP request.
@@ -516,17 +507,15 @@ pub struct ClientCertIdentity {
 /// name which app identity to present (via the policy) — the OS stamps the
 /// real measurement and signs.
 pub trait EnclaveClientCertSigner: Send + Sync {
-    /// Mint a client cert carrying `identity`, with the SGX quote's ReportData
-    /// bound to the server's `challenge` (ext `0xFFBB`) and, when present, the
-    /// session `channel_binder` (`nonce || binder`), so the quote commits to
-    /// this exact TLS session. Returns `(cert_chain_der, pkcs8_key_der)`, or
-    /// `None` to decline.
-    fn sign(
-        &self,
-        challenge: &[u8],
-        channel_binder: Option<&[u8]>,
-        identity: &ClientCertIdentity,
-    ) -> Option<(Vec<Vec<u8>>, Vec<u8>)>;
+    /// Mint a client identity carrying `identity` (code digest OID 4.2, app id
+    /// OID 4.1), no evidence. Returns `(cert_chain_der, pkcs8_key_der)`, or
+    /// `None` to decline. `now` is seconds since the epoch.
+    fn identity(&self, identity: &ClientCertIdentity, now: u64) -> Option<(Vec<Vec<u8>>, Vec<u8>)>;
+
+    /// Produce the SGX quote over `report_data` that proves the identity on one
+    /// connection (the verifier predicted `report_data` from the identity key,
+    /// its client context and the connection's exporter value).
+    fn evidence(&self, report_data: &[u8; 64]) -> Option<Vec<u8>>;
 }
 
 static CLIENT_CERT_SIGNER: OnceLock<&'static dyn EnclaveClientCertSigner> = OnceLock::new();
@@ -577,29 +566,34 @@ pub fn enclave_self_mrenclave() -> Option<[u8; 32]> {
 }
 
 /// Adapter that presents the enclave's client identity during the handshake,
-/// minting via the registered [`EnclaveClientCertSigner`] and binding to the
-/// server's RA-TLS challenge (fork `CertificateRequest` extension `0xFFBB`).
+/// minted via the registered [`EnclaveClientCertSigner`]. The identity carries
+/// no evidence; evidence is presented after the handshake when the server
+/// requires it (see `attest_exchange`).
 #[derive(Debug)]
-struct ChallengeBoundClientAuth {
+struct IdentityClientAuth {
     identity: ClientCertIdentity,
     provider: Arc<CryptoProvider>,
+    /// DER of the leaf presented in the handshake, for the present step.
+    presented: std::sync::Mutex<Option<Vec<u8>>>,
 }
 
-impl ResolvesClientCert for ChallengeBoundClientAuth {
+impl IdentityClientAuth {
+    fn presented_leaf(&self) -> Option<Vec<u8>> {
+        self.presented.lock().ok().and_then(|g| g.clone())
+    }
+}
+
+impl ResolvesClientCert for IdentityClientAuth {
     fn resolve(
         &self,
         _root_hint_subjects: &[&[u8]],
         _sigschemes: &[SignatureScheme],
-        ratls_challenge: Option<&[u8]>,
-        ratls_channel_binder: Option<&[u8]>,
     ) -> Option<Arc<CertifiedKey>> {
-        // Bidirectional challenge-response is mandatory: without the server's
-        // nonce we cannot bind a fresh quote, so decline rather than present
-        // an unbound identity. The channel binder (present on TLS 1.3) is folded
-        // in too, so the client cert's quote commits to this exact session.
-        let challenge = ratls_challenge?;
         let signer = *CLIENT_CERT_SIGNER.get()?;
-        let (chain_der, pkcs8) = signer.sign(challenge, ratls_channel_binder, &self.identity)?;
+        let (chain_der, pkcs8) = signer.identity(&self.identity, now_unix())?;
+        if let Ok(mut g) = self.presented.lock() {
+            *g = chain_der.first().cloned();
+        }
         let certs: Vec<CertificateDer<'static>> =
             chain_der.into_iter().map(CertificateDer::from).collect();
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(pkcs8));
@@ -625,7 +619,8 @@ impl ResolvesClientCert for ChallengeBoundClientAuth {
 fn build_client_config(
     root_store: &RootCertStore,
     ratls: Option<&RaTlsPolicy>,
-) -> Result<Arc<ClientConfig>, &'static str> {
+) -> Result<(Arc<ClientConfig>, Option<Arc<IdentityClientAuth>>), &'static str> {
+    let mut identity_auth: Option<Arc<IdentityClientAuth>> = None;
     let provider = Arc::new(default_provider());
 
     let config = if let Some(policy) = ratls {
@@ -644,38 +639,34 @@ fn build_client_config(
         };
 
         let wants_client_cert = ClientConfig::builder_with_provider(provider.clone())
-            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+            .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|_| "TLS config error")?
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(verifier));
-        let mut cfg = match &policy.client_identity {
-            Some(identity) => wants_client_cert.with_client_cert_resolver(Arc::new(
-                ChallengeBoundClientAuth {
+        let cfg = match &policy.client_identity {
+            Some(identity) => {
+                let auth = Arc::new(IdentityClientAuth {
                     identity: identity.clone(),
                     provider: provider.clone(),
-                },
-            )),
+                    presented: std::sync::Mutex::new(None),
+                });
+                identity_auth = Some(auth.clone());
+                wants_client_cert.with_client_cert_resolver(auth)
+            }
             None => wants_client_cert.with_no_client_auth(),
         };
-
-        // When the policy uses challenge-response attestation, inject the
-        // nonce into the ClientHello extension 0xFFBB so the remote server
-        // can bind its attestation quote to our challenge.
-        if let ReportDataBinding::ChallengeResponse { ref nonce } = policy.report_data {
-            cfg.ratls_challenge = Some(nonce.clone());
-        }
 
         cfg
     } else {
         // Standard TLS — no RA-TLS verification.
         ClientConfig::builder_with_provider(provider)
-            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
+            .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|_| "TLS config error")?
             .with_root_certificates(root_store.clone())
             .with_no_client_auth()
     };
 
-    Ok(Arc::new(config))
+    Ok((Arc::new(config), identity_auth))
 }
 
 /// Perform the TLS handshake with cursor-based multi-record reads.
@@ -902,8 +893,10 @@ impl ServerCertVerifier for RaTlsVerifier {
             Err(e) => return Err(e),
         }
 
-        // 2. RA-TLS attestation verification (the real identity check).
-        verify_ratls_cert(end_entity.as_ref(), &self.policy)
+        // 2. Certificate-level RA-TLS checks: a v2 leaf (no evidence inside
+        //    the certificate) and the expected configuration OIDs. The
+        //    evidence itself is verified after the handshake (attest_exchange).
+        verify_ratls_leaf(end_entity.as_ref(), &self.policy)
             .map_err(Error::General)?;
 
         Ok(ServerCertVerified::assertion())
@@ -936,86 +929,156 @@ impl ServerCertVerifier for RaTlsVerifier {
 //  RA-TLS verification logic
 // =========================================================================
 
-/// Verify the RA-TLS attestation evidence in a DER-encoded leaf certificate.
-fn verify_ratls_cert(der: &[u8], policy: &RaTlsPolicy) -> Result<(), String> {
+/// Certificate-level RA-TLS checks, run inside the handshake: the leaf must be
+/// a v2 leaf (no evidence inside the certificate) and carry the expected
+/// configuration OIDs. Measurements, report_data, the attestation servers and
+/// the dependency set are checked against the evidence after the handshake
+/// ([`attest_exchange`]).
+fn verify_ratls_leaf(der: &[u8], policy: &RaTlsPolicy) -> Result<(), String> {
     let (_, cert) = X509Certificate::from_der(der)
         .map_err(|_| "RA-TLS: failed to parse leaf certificate DER".to_string())?;
+    if cert.extensions().iter().any(|ext| {
+        let oid = ext.oid.to_id_string();
+        oid == oids::SGX_QUOTE_OID_STR || oid == oids::TDX_QUOTE_OID_STR
+    }) {
+        return Err(
+            "RA-TLS: v1 certificate (evidence inside the certificate) is not accepted by a v2 verifier"
+                .into(),
+        );
+    }
+    verify_expected_oids(&cert, &policy.expected_oids)
+}
 
-    // --- Find the expected attestation extension ---
-    let expected_oid = match policy.tee {
-        TeeType::Sgx => oids::SGX_QUOTE_OID_STR,
-        TeeType::Tdx => oids::TDX_QUOTE_OID_STR,
+fn now_unix() -> u64 {
+    enclave_os_common::ocall::get_current_time().unwrap_or(0)
+}
+
+/// The RA-TLS v2 evidence exchange on an established connection, before any
+/// application data: request the server's evidence in the policy's mode,
+/// verify it, and present our own evidence when the server requires it.
+fn attest_exchange(
+    fd: i32,
+    tls_conn: &mut ClientConnection,
+    policy: &RaTlsPolicy,
+    identity: Option<&Arc<IdentityClientAuth>>,
+) -> Result<(), String> {
+    use crate::attest::{self, AttestationMode};
+
+    let leaf_der: Vec<u8> = tls_conn
+        .peer_certificates()
+        .and_then(|c| c.first())
+        .map(|c| c.as_ref().to_vec())
+        .ok_or_else(|| "RA-TLS: no peer certificate".to_string())?;
+    let (_, cert) = X509Certificate::from_der(&leaf_der)
+        .map_err(|_| "RA-TLS: failed to parse leaf certificate DER".to_string())?;
+    let spki_der = enclave_os_common::quote::build_p256_spki_der(
+        cert.public_key().subject_public_key.as_ref(),
+    );
+
+    let mode = match policy.report_data {
+        ReportDataBinding::ChallengeResponse => AttestationMode::Challenge,
+        ReportDataBinding::Deterministic => AttestationMode::Deterministic,
     };
+    let mut req = attest::AttestRequest {
+        v: attest::PROTOCOL_VERSION,
+        mode: mode.as_str().to_string(),
+        leaf: attest::leaf_id(&spki_der),
+        context: None,
+        tee: None,
+        quote: None,
+        gpu_evidence: None,
+        quote_time: None,
+    };
+    let mut context = None;
+    let mut hctx = None;
+    if mode == AttestationMode::Challenge {
+        use ring::rand::{SecureRandom, SystemRandom};
+        let mut ctx = [0u8; attest::CONTEXT_LEN];
+        SystemRandom::new()
+            .fill(&mut ctx)
+            .map_err(|_| "RA-TLS: rng (context)".to_string())?;
+        let h = tls_conn
+            .export_keying_material([0u8; attest::HCTX_LEN], attest::EXPORTER_LABEL_SERVER, Some(&ctx))
+            .map_err(|e| format!("RA-TLS: exporter: {e}"))?;
+        req.context = Some(attest::b64_encode(&ctx));
+        context = Some(ctx);
+        hctx = Some(h);
+    }
+    let body = serde_json::to_vec(&req).map_err(|e| format!("RA-TLS: attest request: {e}"))?;
+    let (status, resp_body) = http_round_trip(fd, tls_conn, attest::ATTEST_PATH, &body)?;
+    if status == 404 {
+        return Err("RA-TLS: server has no v2 evidence endpoint (/__privasys/attest)".into());
+    }
+    if status != 200 {
+        return Err(format!(
+            "RA-TLS: attest failed ({status}): {}",
+            String::from_utf8_lossy(&resp_body).trim()
+        ));
+    }
+    let (ev, client_context) =
+        attest::parse_response(&resp_body, mode, context, hctx, now_unix() as i64)?;
+    verify_evidence(&cert, &spki_der, &ev, policy)?;
 
-    let quote_ext = cert
-        .extensions()
-        .iter()
-        .find(|ext| ext.oid.to_id_string() == expected_oid)
-        .ok_or_else(|| {
-            format!(
-                "RA-TLS: no {} attestation quote found in certificate (expected OID {})",
-                match policy.tee {
-                    TeeType::Sgx => "SGX",
-                    TeeType::Tdx => "TDX",
-                },
-                expected_oid
-            )
+    if let Some(cc) = client_context {
+        let identity = identity.ok_or_else(|| {
+            "RA-TLS: server requires client evidence but this policy presents no identity".to_string()
         })?;
+        present_client_evidence(fd, tls_conn, identity, cc)?;
+    }
+    Ok(())
+}
 
-    let quote = quote_ext.value;
-
-    // --- Parse quote via sgx_types and verify measurements + ReportData ---
+/// Verify a server's evidence against the policy: evidence family, measurement
+/// registers, report_data predicted from the leaf key and the evidence (never
+/// taken from the peer), the attested dependency set, then the attestation
+/// servers (signature chain, TCB).
+fn verify_evidence(
+    cert: &X509Certificate<'_>,
+    spki_der: &[u8],
+    ev: &crate::attest::Evidence,
+    policy: &RaTlsPolicy,
+) -> Result<(), String> {
     #[cfg(feature = "mock")]
-    let is_mock = quote.starts_with(MOCK_PREFIX);
+    let is_mock = ev.quote.starts_with(MOCK_PREFIX);
     #[cfg(not(feature = "mock"))]
     let is_mock = false;
 
-    // Peer measurement registers, captured for the attested-dependency check.
+    match (policy.tee, ev.tee.as_str()) {
+        (TeeType::Sgx, "sgx") | (TeeType::Tdx, "tdx") | (TeeType::Tdx, "tdx-gpu") => {}
+        (t, got) => return Err(format!("RA-TLS: expected {t:?} evidence, got {got:?}")),
+    }
+
     let mut peer_mrenclave: Option<[u8; 32]> = None;
     let mut peer_mrtd: Option<[u8; 48]> = None;
-
     if !is_mock {
-        match policy.tee {
+        let actual: Vec<u8> = match policy.tee {
             TeeType::Sgx => {
-                let q = parse_quote3(quote)?;
+                let q = parse_quote3(&ev.quote)?;
                 verify_sgx_measurements(&q, policy)?;
-                verify_sgx_report_data(&q, &cert, policy)?;
                 peer_mrenclave = Some(q.report_body.mr_enclave.m);
+                q.report_body.report_data.d.to_vec()
             }
             TeeType::Tdx => {
-                let q = parse_quote4(quote)?;
+                let q = parse_quote4(&ev.quote)?;
                 verify_tdx_measurements(&q, policy)?;
-                verify_tdx_report_data(&q, &cert, policy)?;
                 peer_mrtd = Some(q.report_body.mr_td.m);
+                q.report_body.report_data.d.to_vec()
             }
+        };
+        let expected = crate::attest::expected_report_data(spki_der, ev)?;
+        if actual != expected {
+            return Err(format!(
+                "RA-TLS: report_data mismatch ({} mode): the evidence does not commit to this leaf and connection",
+                ev.mode.as_str()
+            ));
         }
-    }
-
-    // --- Verify configuration OIDs ---
-    verify_expected_oids(&cert, &policy.expected_oids)?;
-
-    // --- Enforce attested cross-enclave dependencies (fail closed) ---
-    // Runtime-owned: if the peer's app-id (OID 3.6) is one this app pins as a
-    // dependency, the peer must match the pinned identity, regardless of the
-    // app-supplied policy above. Skipped in mock mode (no real measurement).
-    if !is_mock {
         if let Some(ref deps) = policy.dependencies {
-            verify_dependencies(&cert, policy.tee, peer_mrenclave, peer_mrtd, deps)?;
+            verify_dependencies(cert, policy.tee, peer_mrenclave, peer_mrtd, deps)?;
         }
     }
 
-    // --- Verify quote via attestation server(s) ---
-    //
-    // After all local checks pass, send the raw quote to each configured
-    // attestation server for full cryptographic verification (signature
-    // chain, TCB status, platform identity).  The attestation server is
-    // TEE-agnostic and auto-detects the quote format.  This is the
-    // authoritative proof that the quote was produced by genuine TEE
-    // hardware and has not been tampered with.
     let verdicts =
-        crate::attestation::verify_quote_statuses(quote, &policy.attestation_servers)?;
-    // Opt-in Intel TCB-status gate (see RaTlsPolicy::acceptable_tcb_statuses):
-    // `None` = no check beyond the always-on Revoked rejection.
+        crate::attestation::verify_quote_statuses(&ev.quote, &policy.attestation_servers)?;
     for v in &verdicts {
         if !crate::attestation::tcb_status_acceptable(
             &v.tcb_status,
@@ -1027,9 +1090,138 @@ fn verify_ratls_cert(der: &[u8], policy: &RaTlsPolicy) -> Result<(), String> {
             ));
         }
     }
-
     Ok(())
 }
+
+/// Answer a server that requires client evidence: quote our presented
+/// identity's key with the server's client context and this connection's
+/// client exporter value, through the registered signer.
+fn present_client_evidence(
+    fd: i32,
+    tls_conn: &mut ClientConnection,
+    identity: &Arc<IdentityClientAuth>,
+    client_context: [u8; crate::attest::CONTEXT_LEN],
+) -> Result<(), String> {
+    use crate::attest;
+    let signer = *CLIENT_CERT_SIGNER
+        .get()
+        .ok_or_else(|| "RA-TLS: no client identity signer registered".to_string())?;
+    let leaf = identity
+        .presented_leaf()
+        .ok_or_else(|| "RA-TLS: no client identity was presented in the handshake".to_string())?;
+    let (_, cert) = X509Certificate::from_der(&leaf)
+        .map_err(|_| "RA-TLS: failed to parse our identity leaf".to_string())?;
+    let spki_der = enclave_os_common::quote::build_p256_spki_der(
+        cert.public_key().subject_public_key.as_ref(),
+    );
+    let hctx = tls_conn
+        .export_keying_material([0u8; attest::HCTX_LEN], attest::EXPORTER_LABEL_CLIENT, Some(&client_context))
+        .map_err(|e| format!("RA-TLS: exporter: {e}"))?;
+    let rd = attest::client_report_data(&spki_der, &client_context, &hctx, None);
+    let quote = signer
+        .evidence(&rd)
+        .ok_or_else(|| "RA-TLS: client evidence declined by the signer".to_string())?;
+    let msg = attest::AttestRequest {
+        v: attest::PROTOCOL_VERSION,
+        mode: "present".to_string(),
+        leaf: String::new(),
+        context: Some(attest::b64_encode(&client_context)),
+        tee: Some("sgx".to_string()),
+        quote: Some(attest::b64_encode(&quote)),
+        gpu_evidence: None,
+        quote_time: Some(attest::format_quote_time(now_unix() as i64)),
+    };
+    let body = serde_json::to_vec(&msg).map_err(|e| format!("RA-TLS: present: {e}"))?;
+    let (status, resp_body) = http_round_trip(fd, tls_conn, attest::ATTEST_PATH, &body)?;
+    if status != 204 && status != 200 {
+        return Err(format!(
+            "RA-TLS: client evidence rejected ({status}): {}",
+            String::from_utf8_lossy(&resp_body).trim()
+        ));
+    }
+    Ok(())
+}
+
+/// One HTTP/1.1 POST and its response on the established connection, which
+/// stays open for the application request that follows.
+fn http_round_trip(
+    fd: i32,
+    tls_conn: &mut ClientConnection,
+    path: &str,
+    body: &[u8],
+) -> Result<(u16, Vec<u8>), String> {
+    let mut request = format!(
+        "POST {path} HTTP/1.1\r\nHost: enclave\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    request.extend_from_slice(body);
+    {
+        let mut writer = tls_conn.writer();
+        writer
+            .write_all(&request)
+            .map_err(|e| format!("RA-TLS: attest write failed: {e}"))?;
+    }
+    flush_tls(fd, tls_conn).map_err(|_| "RA-TLS: attest flush failed".to_string())?;
+
+    let mut data: Vec<u8> = Vec::new();
+    let mut net_buf = vec![0u8; 16384];
+    let mut app_buf = vec![0u8; 16384];
+    loop {
+        if response_complete(&data) {
+            break;
+        }
+        let n = match ocall::net_recv(fd, &mut net_buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => return Err(format!("RA-TLS: attest read failed: {e}")),
+        };
+        let mut cursor = std::io::Cursor::new(&net_buf[..n]);
+        while (cursor.position() as usize) < n {
+            match tls_conn.read_tls(&mut cursor) {
+                Ok(0) => break,
+                Ok(_) => {
+                    tls_conn
+                        .process_new_packets()
+                        .map_err(|e| format!("TLS error: {:?}", e))?;
+                    loop {
+                        match tls_conn.reader().read(&mut app_buf) {
+                            Ok(0) => break,
+                            Ok(m) => data.extend_from_slice(&app_buf[..m]),
+                            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+                            Err(_) => break,
+                        }
+                    }
+                }
+                Err(e) => return Err(format!("read_tls error: {:?}", e)),
+            }
+        }
+        if data.len() > crate::attest::MAX_MESSAGE + 4096 {
+            return Err("RA-TLS: attest response too large".into());
+        }
+    }
+    let (status, _headers, body) = parse_http_response(&data)?;
+    Ok((status, body))
+}
+
+/// Whether `data` holds a complete HTTP/1.1 response (headers and, when a
+/// Content-Length is announced, the whole body).
+fn response_complete(data: &[u8]) -> bool {
+    let Some(pos) = data.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return false;
+    };
+    let head = String::from_utf8_lossy(&data[..pos]);
+    let mut content_length = 0usize;
+    for line in head.lines().skip(1) {
+        if let Some((k, v)) = line.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("content-length") {
+                content_length = v.trim().parse().unwrap_or(0);
+            }
+        }
+    }
+    data.len() >= pos + 4 + content_length
+}
+
 
 /// Verify expected configuration OIDs in the certificate.
 ///
@@ -1238,165 +1430,6 @@ fn verify_tdx_measurements(quote: &Quote4, policy: &RaTlsPolicy) -> Result<(), S
 //  ReportData verification — deterministic & challenge-response
 // =========================================================================
 
-/// Verify the SGX quote's ReportData field.
-///
-/// | Mode | pubkey | binding |
-/// |------|--------|---------|
-/// | ChallengeResponse | SPKI DER (91 B) | client nonce |
-/// | Deterministic | SPKI DER (91 B) | `NotBefore` as `"YYYY-MM-DDTHH:MMZ"` |
-fn verify_sgx_report_data(
-    quote: &Quote3,
-    cert: &X509Certificate<'_>,
-    policy: &RaTlsPolicy,
-) -> Result<(), String> {
-    // SGX (enclave-os) uses the full SPKI DER (91 bytes for P-256), matching
-    // Go's x509.MarshalPKIXPublicKey and standard X.509 certificate viewers'
-    // "Public Key SHA-256" fingerprint.
-    let ec_point = cert.public_key().subject_public_key.as_ref();
-    let spki_der = enclave_os_common::quote::build_p256_spki_der(ec_point);
-
-    match &policy.report_data {
-        ReportDataBinding::ChallengeResponse { .. } => {
-            // In challenge mode report_data folds this session's channel binder,
-            // which is not available in this cert-verifier callback. The full
-            // check runs post-handshake in verify_channel_binding, before any
-            // application data is sent. Nothing to do here.
-        }
-        ReportDataBinding::Deterministic => {
-            // SGX sets NotBefore to the minute-truncated creation time and binds
-            // "YYYY-MM-DDTHH:MMZ", same as the container/TDX issuer, so the
-            // binding is reproducible from the certificate.
-            let not_before = cert.validity().not_before.to_datetime();
-            let binding = format!(
-                "{:04}-{:02}-{:02}T{:02}:{:02}Z",
-                not_before.year(),
-                not_before.month() as u8,
-                not_before.day(),
-                not_before.hour(),
-                not_before.minute(),
-            );
-            let expected = compute_report_data_hash(&spki_der, binding.as_bytes());
-            if quote.report_body.report_data.d != expected.as_ref() {
-                return Err("RA-TLS: SGX ReportData mismatch (deterministic)".into());
-            }
-        }
-    }
-    Ok(())
-}
-
-/// Verify the TDX quote's ReportData field.
-///
-/// | Mode | pubkey | binding |
-/// |------|--------|---------|
-/// | Deterministic | SPKI DER (91 B) | `NotBefore` as `"YYYY-MM-DDTHH:MMZ"` |
-/// | ChallengeResponse | SPKI DER (91 B) | client nonce |
-fn verify_tdx_report_data(
-    quote: &Quote4,
-    cert: &X509Certificate<'_>,
-    policy: &RaTlsPolicy,
-) -> Result<(), String> {
-    let ec_point = cert.public_key().subject_public_key.as_ref();
-    let spki_der = enclave_os_common::quote::build_p256_spki_der(ec_point);
-
-    match &policy.report_data {
-        ReportDataBinding::Deterministic => {
-            let not_before = cert.validity().not_before.to_datetime();
-            let binding = format!(
-                "{:04}-{:02}-{:02}T{:02}:{:02}Z",
-                not_before.year(),
-                not_before.month() as u8,
-                not_before.day(),
-                not_before.hour(),
-                not_before.minute(),
-            );
-            let expected = compute_report_data_hash(&spki_der, binding.as_bytes());
-            if quote.report_body.report_data.d != expected.as_ref() {
-                return Err("RA-TLS: TDX ReportData mismatch (deterministic)".into());
-            }
-        }
-        ReportDataBinding::ChallengeResponse { .. } => {
-            // In challenge mode report_data folds this session's channel binder,
-            // verified post-handshake in verify_channel_binding before any
-            // application data is sent. Nothing to do here.
-        }
-    }
-    Ok(())
-}
-
-/// Post-handshake RA-TLS channel-binding check (client verifying the server).
-///
-/// In challenge mode a server's quote's report_data is
-/// `SHA-512(SHA-256(SPKI) || nonce || binder)`. The binder is a 32-byte value
-/// derived from the shared handshake key schedule and is only available after
-/// ServerHello, so it cannot be checked in the cert-verifier callback. Here —
-/// after the handshake completes but before any application data is sent —
-/// recompute report_data WITH the binder (obtained from our own key schedule
-/// via `ratls_channel_binder`) and verify it. Binding is mandatory: a relayed,
-/// co-located, or unbound quote fails, because it cannot commit to this
-/// session's binder. Deterministic mode cannot channel-bind (cached quote); it
-/// is fully verified in the cert-verifier callback, so this is a no-op there.
-fn verify_channel_binding(
-    tls_conn: &ClientConnection,
-    policy: &RaTlsPolicy,
-) -> Result<(), String> {
-    let nonce = match &policy.report_data {
-        ReportDataBinding::ChallengeResponse { nonce } => nonce.clone(),
-        ReportDataBinding::Deterministic => return Ok(()),
-    };
-
-    let certs = tls_conn
-        .peer_certificates()
-        .ok_or_else(|| "RA-TLS: no peer certificate for channel-binding check".to_string())?;
-    let leaf = certs
-        .first()
-        .ok_or_else(|| "RA-TLS: empty peer certificate chain".to_string())?;
-    let (_, cert) = X509Certificate::from_der(leaf)
-        .map_err(|_| "RA-TLS: failed to parse leaf for channel binding".to_string())?;
-
-    let binder = tls_conn
-        .ratls_channel_binder()
-        .ok_or_else(|| "RA-TLS: channel binder unavailable".to_string())?;
-
-    let mut binding = nonce;
-    binding.extend_from_slice(&binder);
-
-    let ec_point = cert.public_key().subject_public_key.as_ref();
-    let spki_der = enclave_os_common::quote::build_p256_spki_der(ec_point);
-    let expected = compute_report_data_hash(&spki_der, &binding);
-
-    let expected_oid = match policy.tee {
-        TeeType::Sgx => oids::SGX_QUOTE_OID_STR,
-        TeeType::Tdx => oids::TDX_QUOTE_OID_STR,
-    };
-    let quote_ext = cert
-        .extensions()
-        .iter()
-        .find(|e| e.oid.to_id_string() == expected_oid)
-        .ok_or_else(|| "RA-TLS: no quote for channel-binding check".to_string())?;
-
-    match policy.tee {
-        TeeType::Sgx => {
-            let q = parse_quote3(quote_ext.value)?;
-            if q.report_body.report_data.d != expected.as_ref() {
-                return Err("RA-TLS: channel-binding mismatch (SGX) — quote does not commit to this TLS session".into());
-            }
-        }
-        TeeType::Tdx => {
-            let q = parse_quote4(quote_ext.value)?;
-            if q.report_body.report_data.d != expected.as_ref() {
-                return Err("RA-TLS: channel-binding mismatch (TDX) — quote does not commit to this TLS session".into());
-            }
-        }
-    }
-    Ok(())
-}
-
-/// `SHA-512( SHA-256(spki_der) || binding )`
-///
-/// Re-exported from [`enclave_os_common::quote::compute_report_data_hash`].
-fn compute_report_data_hash(pubkey_bytes: &[u8], binding: &[u8]) -> digest::Digest {
-    enclave_os_common::quote::compute_report_data_hash(pubkey_bytes, binding)
-}
 
 #[cfg(test)]
 mod redaction_tests {

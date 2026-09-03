@@ -21,6 +21,10 @@ pub mod oids;
 pub mod protocol;
 pub mod queue;
 pub mod quote;
+
+/// RA-TLS v2 attestation protocol (messages and `report_data` recipes).
+#[cfg(feature = "crypto")]
+pub mod attest;
 pub mod rpc;
 pub mod types;
 

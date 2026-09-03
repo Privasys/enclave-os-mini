@@ -605,18 +605,14 @@ fn build_ratls_policy(
     code_hash: &[u8],
     app_id: Option<&[u8]>,
 ) -> Result<RaTlsPolicy, String> {
-    let mut nonce = [0u8; 32];
-    SystemRandom::new()
-        .fill(&mut nonce)
-        .map_err(|_| "vaultkey: rng (nonce)")?;
     Ok(RaTlsPolicy {
         tee: TeeType::Sgx,
         mr_enclave: Some(cfg.mrenclave),
         mr_signer: None,
         mr_td: None,
-        report_data: ReportDataBinding::ChallengeResponse {
-            nonce: nonce.to_vec(),
-        },
+        // Challenge mode: the vault's evidence is bound to this connection's
+        // exporter value and a fresh context (RA-TLS v2).
+        report_data: ReportDataBinding::ChallengeResponse,
         expected_oids: Vec::new(),
         attestation_servers: cfg.attestation_servers.clone(),
         // Enforce the constellation's acceptable-TCB set on the vault's quote

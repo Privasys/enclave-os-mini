@@ -28,7 +28,7 @@ const TDX_QUOTE_OID_STR: &str = enclave_os_common::oids::TDX_QUOTE_OID_STR;
 const CLAIM_OIDS: &[&str] = &[
     enclave_os_common::oids::CONFIG_MERKLE_ROOT_OID_STR,
     enclave_os_common::oids::EGRESS_CA_HASH_OID_STR,
-    enclave_os_common::oids::WASM_APPS_HASH_OID_STR,
+    enclave_os_common::oids::COMBINED_WORKLOADS_HASH_OID_STR,
     enclave_os_common::oids::ATTESTATION_SERVERS_HASH_OID_STR,
     enclave_os_common::oids::APP_CONFIG_MERKLE_ROOT_OID_STR,
     enclave_os_common::oids::APP_CODE_HASH_OID_STR,
@@ -42,9 +42,11 @@ const CLAIM_OIDS: &[&str] = &[
 //  Cert dissection
 // ---------------------------------------------------------------------------
 
-/// What a vault learns from a remote TEE's RA-TLS certificate.
+/// What a vault learns from a remote TEE's RA-TLS certificate and the
+/// evidence it presented after the handshake.
 pub struct PeerEvidence {
-    /// Raw SGX/TDX quote bytes from the cert extension.
+    /// Raw SGX/TDX quote bytes (from the attest present message, never from
+    /// the certificate: a v2 leaf carries none).
     pub evidence: Vec<u8>,
     /// All known Privasys OID extensions present on the cert (`oid`, hex `value`).
     pub oid_claims: Vec<(String, String)>,
@@ -52,26 +54,26 @@ pub struct PeerEvidence {
     pub pubkey_raw: Vec<u8>,
 }
 
-/// Parse the peer certificate and pull out the attestation evidence,
-/// OID claims and public key.
-pub fn dissect_peer_cert(der: &[u8]) -> Result<PeerEvidence, String> {
+/// Parse the peer certificate (OID claims, public key) and pair it with the
+/// quote the peer presented. A v1 leaf (quote inside the certificate) is
+/// rejected. An empty `quote` yields the claims and key only, for callers
+/// that need no evidence (grant binding by app id).
+pub fn dissect_peer_cert(der: &[u8], quote: &[u8]) -> Result<PeerEvidence, String> {
     use x509_parser::prelude::{FromDer, X509Certificate};
 
     let (_, cert) =
         X509Certificate::from_der(der).map_err(|e| format!("invalid X.509 DER: {e}"))?;
 
-    let mut quote_bytes: Option<Vec<u8>> = None;
     let mut oid_claims = Vec::new();
     for ext in cert.extensions() {
         let oid_str = ext.oid.to_id_string();
         if oid_str == SGX_QUOTE_OID_STR || oid_str == TDX_QUOTE_OID_STR {
-            quote_bytes = Some(ext.value.to_vec());
+            return Err("v1 RA-TLS certificate (evidence inside the certificate) is not accepted".into());
         } else if CLAIM_OIDS.contains(&oid_str.as_str()) {
             oid_claims.push((oid_str, hex_encode(ext.value)));
         }
     }
-    let evidence = quote_bytes
-        .ok_or_else(|| "peer certificate has no SGX/TDX attestation extension".to_string())?;
+    let evidence = quote.to_vec();
 
     let pubkey_raw = cert
         .tbs_certificate
@@ -90,11 +92,3 @@ pub fn dissect_peer_cert(der: &[u8]) -> Result<PeerEvidence, String> {
     })
 }
 
-/// Verify that the peer (client) cert's `report_data` field commits to the
-/// challenge nonce we sent during the TLS handshake, and to the session
-/// channel binder.
-///
-/// The implementation is the shared TEE check in
-/// [`enclave_os_common::quote::verify_challenge_binding`], re-exported here
-/// for existing callers.
-pub use enclave_os_common::quote::verify_challenge_binding;

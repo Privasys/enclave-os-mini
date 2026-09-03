@@ -105,7 +105,7 @@ fn bind_caller(grant: &KeyCreationGrant, peer_der: &[u8]) -> Result<(), String> 
     }
 
     // Attested app-id: the cert's OID 3.6 app-id equals the grant scope's app-id.
-    let evidence = crate::quote::dissect_peer_cert(peer_der)?;
+    let evidence = crate::quote::dissect_peer_cert(peer_der, &[])?;
     let caller_app_id = evidence
         .oid_claims
         .iter()

@@ -46,7 +46,7 @@ mock = ["enclave-os-egress?/mock", "enclave-os-vault?/mock"]
 egress  = ["dep:enclave-os-egress"]
 kvstore = ["dep:enclave-os-kvstore"]
 merkle  = ["dep:enclave-os-merkle"]
-raft    = ["dep:enclave-os-raft", "dep:enclave-os-merkle", "dep:x509-parser"]
+raft    = ["dep:enclave-os-raft", "dep:enclave-os-merkle"]
 vault   = ["dep:enclave-os-vault", "kvstore", "egress"]
 wasm    = ["dep:enclave-os-wasm", "kvstore", "egress"]
 fido2   = ["dep:enclave-os-fido2", "kvstore", "enclave-os-wasm?/fido2", "enclave-os-wasm?/app-auth"]
@@ -66,9 +66,9 @@ sgx_tse    = { git = "https://github.com/Privasys/teaclave-sgx-sdk", tag = "priv
 # ECDSA verification (sgx_ecdsa_verify) for EncAuth vouchers.
 sgx_crypto = { git = "https://github.com/Privasys/teaclave-sgx-sdk", tag = "privasys-v0.4.0" }
 
-# Lightweight TLS – rustls is a pure-Rust TLS 1.3 library (Privasys fork with RA-TLS 0xFFBB extension).
+# Lightweight TLS: upstream rustls (RA-TLS v2 needs only the RFC 8446 exporter).
 # In SGX we use ring for crypto (it has SGX support via teaclave).
-rustls = { git = "https://github.com/Privasys/rustls", tag = "privasys-v0.8.1", default-features = false, features = ["ring", "tls12", "std"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 # ring for low-level crypto (AEAD, key generation)
 ring = "0.17"
 # getrandom 0.2 (pulled by ring) selects its Linux backend on the Teaclave
@@ -94,7 +94,7 @@ enclave-os-kvstore = { path = "../crates/enclave-os-kvstore", optional = true }
 enclave-os-merkle  = { path = "../crates/enclave-os-merkle", optional = true }
 enclave-os-raft    = { path = "../crates/enclave-os-raft", optional = true }
 # Peer-link measurement pinning: parse the peer cert's quote OID
-x509-parser        = { version = "0.16", optional = true }
+x509-parser        = { version = "0.16" }
 enclave-os-vault   = { path = "../crates/enclave-os-vault", optional = true }
 enclave-os-wasm    = { path = "../crates/enclave-os-wasm", optional = true }
 enclave-os-fido2   = { path = "../crates/enclave-os-fido2", optional = true }
