@@ -1147,6 +1147,20 @@ fn monitoring_required_error(
     }
 }
 
+/// Whether a presented client leaf carries the workload app-id extension
+/// (OID 1.3.6.1.4.1.65230.4.1), i.e. claims to be a fleet-minted enclave
+/// identity that must be backed by evidence on this connection.
+fn leaf_claims_enclave_identity(der: &[u8]) -> bool {
+    use x509_parser::prelude::*;
+    match X509Certificate::from_der(der) {
+        Ok((_, cert)) => cert
+            .extensions()
+            .iter()
+            .any(|e| e.oid.to_id_string() == enclave_os_common::oids::APP_ID_OID_STR),
+        Err(_) => false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 //  SetAttestationServers handler (HTTP)
 // ---------------------------------------------------------------------------
@@ -2097,9 +2111,16 @@ impl IngressServer {
                     client_context: None,
                     error: None,
                 };
-                // A caller that presented a client certificate must prove it:
-                // a mutual leg. The context is remembered for the present message.
-                if session.peer_cert_der().is_some() {
+                // A caller whose client certificate claims a fleet identity (the
+                // workload app-id extension) must prove it: a mutual leg, and the
+                // context is remembered for the present message. A bare key-holder
+                // certificate (a CLI user with a holder-of-key grant) claims no
+                // enclave identity, gets no evidence demand and no Tee principal.
+                if session
+                    .peer_cert_der()
+                    .map(|d| leaf_claims_enclave_identity(&d))
+                    .unwrap_or(false)
+                {
                     use ring::rand::{SecureRandom, SystemRandom};
                     let mut cc = [0u8; CONTEXT_LEN];
                     if SystemRandom::new().fill(&mut cc).is_err() {
