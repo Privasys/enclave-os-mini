@@ -233,16 +233,39 @@ pub unsafe extern "C" fn wasmtime_mmap_new(
     0
 }
 
-/// Remap memory (resize). Zero the new region.
+/// Remap memory (resize). Zero the region and report whether it worked.
+///
+/// Neither backing allocator can grow a region in place: the code pool is a
+/// bump allocator with no resize, and a heap block is fixed at its address.
+/// A growing remap is therefore refused rather than reported as successful.
+///
+/// This previously ignored `old_size`, always returned 0, and zeroed
+/// `page_align(new_size)` bytes at `addr`. When `new_size` exceeded the
+/// original allocation from `wasmtime_mmap_new` that write ran past the end of
+/// the allocation, and wasmtime was told a larger region existed when it did
+/// not.
 #[no_mangle]
 pub unsafe extern "C" fn wasmtime_mmap_remap(
     addr: *mut u8,
-    _old_size: usize,
+    old_size: usize,
     new_size: usize,
     _prot_flags: u32,
 ) -> i32 {
-    let aligned = page_align(new_size);
-    ptr::write_bytes(addr, 0, aligned);
+    let old_aligned = page_align(old_size);
+    let new_aligned = page_align(new_size);
+
+    if new_aligned > old_aligned {
+        enclave_os_common::enclave_log_info!(
+            "[sgx_platform] mmap: remap {:p} {} -> {} bytes refused (no in-place grow)",
+            addr,
+            old_aligned,
+            new_aligned
+        );
+        return -1;
+    }
+
+    // Shrink or no-op: the write stays inside the existing allocation.
+    ptr::write_bytes(addr, 0, new_aligned);
     0
 }
 
