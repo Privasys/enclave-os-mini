@@ -66,34 +66,24 @@ pub(crate) fn validate_material(
 //  Wrap / Unwrap (AES-256-GCM)
 // ---------------------------------------------------------------------------
 
-/// AES-256-GCM seal. Returns `(ciphertext_with_tag, iv)` — IV is either
-/// the caller-supplied 12 bytes or a freshly generated random one.
+/// AES-256-GCM seal. Returns `(ciphertext_with_tag, iv)`.
+///
+/// The nonce is always freshly generated here and never taken from a caller.
+/// GCM survives only while a nonce is never repeated under one key, and a
+/// caller that supplies the nonce can repeat it — which leaks the XOR of the
+/// plaintexts and the GHASH authentication key, enabling forgery. There is
+/// deliberately no parameter to override it.
 pub(crate) fn aes_gcm_seal(
     key_bytes: &[u8],
     plaintext: &[u8],
     aad: &[u8],
-    iv: Option<&[u8]>,
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
-    let nonce_bytes: [u8; NONCE_LEN] = match iv {
-        Some(b) if b.len() == NONCE_LEN => {
-            let mut a = [0u8; NONCE_LEN];
-            a.copy_from_slice(b);
-            a
-        }
-        Some(b) => {
-            return Err(format!(
-                "AES-GCM nonce must be {} bytes, got {}",
-                NONCE_LEN,
-                b.len()
-            ))
-        }
-        None => {
-            let mut a = [0u8; NONCE_LEN];
-            SystemRandom::new()
-                .fill(&mut a)
-                .map_err(|_| "rng failed".to_string())?;
-            a
-        }
+    let nonce_bytes: [u8; NONCE_LEN] = {
+        let mut a = [0u8; NONCE_LEN];
+        SystemRandom::new()
+            .fill(&mut a)
+            .map_err(|_| "rng failed".to_string())?;
+        a
     };
 
     let unbound =

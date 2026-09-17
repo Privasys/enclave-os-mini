@@ -100,8 +100,16 @@ pub enum VaultRequest {
     // --- In-enclave crypto ops -------------------------------------------
     /// AES-256-GCM encrypt with a `KeyType::Aes256GcmKey`.
     ///
-    /// `iv_b64` must be exactly 12 bytes; if absent the vault generates
-    /// one. The response always echoes the IV used.
+    /// The vault always generates the IV and echoes it in the response.
+    ///
+    /// `iv_b64` is REJECTED. It is retained on the wire only so that a client
+    /// still sending one gets an explicit error instead of a silently
+    /// different ciphertext. A caller-chosen nonce lets one key wrap many
+    /// plaintexts under a repeated nonce, and GCM nonce reuse is a break
+    /// rather than a degradation: it leaks the XOR of the plaintexts and the
+    /// GHASH authentication key, after which forgery is possible. Because
+    /// Wrap and Unwrap are separately grantable operations, that turns
+    /// wrap-only access into decrypt-and-forge access.
     Wrap {
         handle: String,
         plaintext_b64: String,

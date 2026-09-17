@@ -769,14 +769,17 @@ fn handle_wrap(
         },
         None => Vec::new(),
     };
-    let iv_vec = match iv_b64 {
-        Some(s) => match URL_SAFE_NO_PAD.decode(s) {
-            Ok(b) => Some(b),
-            Err(e) => return VaultResponse::Error(format!("iv base64: {e}")),
-        },
-        None => None,
-    };
-    match crypto::aes_gcm_seal(&record.material, &plaintext, &aad, iv_vec.as_deref()) {
+    // A caller-chosen nonce is refused: see the `Wrap` doc comment. Fail
+    // loudly rather than ignoring the field, so a client that believes it is
+    // fixing the nonce never receives a ciphertext under a different one.
+    if iv_b64.is_some() {
+        return VaultResponse::Error(
+            "wrap does not accept a caller-supplied iv: the vault generates the nonce \
+             and returns it (GCM nonce reuse breaks confidentiality and authenticity)"
+                .to_string(),
+        );
+    }
+    match crypto::aes_gcm_seal(&record.material, &plaintext, &aad) {
         Ok((ciphertext, iv)) => VaultResponse::Wrapped { ciphertext, iv },
         Err(e) => VaultResponse::Error(e),
     }
