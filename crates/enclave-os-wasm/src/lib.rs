@@ -945,10 +945,20 @@ impl WasmModule {
     /// the control plane on team changes — no redeploy). Transitional
     /// fallback: a verified platform `sub` on the owners team. Legacy
     /// fallback: the pre-standard Owner behaviour (FIDO2/app-OIDC
-    /// verification + owners membership) while clients migrate. Loads
-    /// carrying neither an app id nor an owners team are admitted with a
-    /// log — enforcement becomes possible when the platform redeploys
-    /// them with the new payload. Everything else fails closed.
+    /// verification + owners membership) while clients migrate.
+    /// Everything fails closed.
+    ///
+    /// A load carrying neither an app id nor an owners team used to be
+    /// ADMITTED here with a log line, so any caller could reach such an
+    /// app's `@config-api`. That was deliberate and transitional, pending
+    /// the platform redeploying those apps with the new payload — but it
+    /// was a live fail-open while one existed, and it was reported as such
+    /// on 2026-09-17. It is now refused.
+    ///
+    /// Vault-backed apps were never affected: `load_app` already requires a
+    /// valid app_id for them. The apps that could reach this branch were
+    /// non-vault-backed ones deployed outside the platform, including the
+    /// CI and doc payloads that omit both fields.
     fn check_configure_authz(
         &self,
         call: &WasmCall,
@@ -961,13 +971,14 @@ impl WasmModule {
 
         if app_id.is_none() && owners.is_empty() {
             enclave_os_common::enclave_log_info!(
-                "configure gate: app '{}' has neither app_id nor owners (legacy load) — admitting",
+                "configure gate: refusing app '{}' — it carries neither app_id nor owners",
                 call.app
             );
-            return Ok(AuthResult {
-                roles: Vec::new(),
-                user_id: None,
-            });
+            return Err(deny(format!(
+                "configure is owner/admin-only: app '{}' was loaded without an app_id or an \
+                 owners team, so no caller can be authorised for it; redeploy it from the platform",
+                call.app,
+            )));
         }
 
         let token = match call.app_auth.as_deref() {
