@@ -1821,39 +1821,27 @@ fn dispatch_and_respond(
 
 /// Verify an OIDC bearer token against the global OIDC configuration.
 ///
-/// When the `wasm` feature is enabled (which brings in `enclave-os-wasm` and
-/// egress), full ES256 signature verification is performed via JWKS with
-/// automatic key discovery and caching.  The `alg:none` algorithm is
-/// explicitly rejected.
+/// Requires the `egress` feature, which carries the JWKS fetcher: full ES256
+/// signature verification with automatic key discovery and caching. The
+/// `alg:none` algorithm is explicitly rejected. Every composition that
+/// authenticates users enables egress (`vault` and `wasm` both pull it in).
 ///
-/// When running without egress, falls back to payload-only decoding over the
-/// RA-TLS channel (signature not verified cryptographically).
+/// Without egress there is no trusted key source, so a token cannot be
+/// verified and is refused — see the `cfg(not(egress))` definition below.
+/// RA-TLS authenticates the channel, not the bearer: it does not establish
+/// that the party presenting a token is its subject, so it is not a substitute
+/// for checking the signature.
+#[cfg(feature = "egress")]
 fn verify_oidc_token(token: &str) -> Result<enclave_os_common::oidc::OidcClaims, String> {
     let config = crate::oidc_config()
         .ok_or_else(|| "OIDC not configured".to_string())?;
 
     // ── Signature verification + payload decode ──────────────────────
-    #[cfg(feature = "wasm")]
-    let claims: serde_json::Value = {
-        enclave_os_wasm::jwks_fetcher::verify_jwt_signature(
-            token,
-            &config.issuer,
-            &config.jwks_uri,
-        )?
-    };
-
-    #[cfg(not(feature = "wasm"))]
-    let claims: serde_json::Value = {
-        // Fallback: decode payload without signature check (RA-TLS channel)
-        let parts: Vec<&str> = token.splitn(3, '.').collect();
-        if parts.len() != 3 {
-            return Err("malformed JWT: expected 3 dot-separated parts".into());
-        }
-        let payload_bytes = base64_url_decode(parts[1])
-            .map_err(|e| format!("JWT payload base64: {e}"))?;
-        serde_json::from_slice(&payload_bytes)
-            .map_err(|e| format!("JWT payload JSON: {e}"))?
-    };
+    let claims: serde_json::Value = enclave_os_egress::jwks::verify_jwt_signature(
+        token,
+        &config.issuer,
+        &config.jwks_uri,
+    )?;
 
     // Validate issuer
     let iss = claims.get("iss")
@@ -1916,66 +1904,15 @@ fn verify_oidc_token(token: &str) -> Result<enclave_os_common::oidc::OidcClaims,
     Ok(oc)
 }
 
-/// Decode base64url (no padding) to bytes.
-#[cfg_attr(feature = "wasm", allow(dead_code))]
-fn base64_url_decode(input: &str) -> Result<Vec<u8>, String> {
-    // Replace URL-safe chars with standard base64 chars
-    let standard: String = input.chars().map(|c| match c {
-        '-' => '+',
-        '_' => '/',
-        c => c,
-    }).collect();
-
-    // Add padding if needed
-    let padded = match standard.len() % 4 {
-        2 => format!("{}==", standard),
-        3 => format!("{}=", standard),
-        _ => standard,
-    };
-
-    // Use a simple base64 decoder — no external dep needed since
-    // we already link ring which provides what we need, but for
-    // simplicity we manually decode:
-    base64_decode_standard(&padded)
-}
-
-/// Standard base64 decode (with padding).
-#[cfg_attr(feature = "wasm", allow(dead_code))]
-fn base64_decode_standard(input: &str) -> Result<Vec<u8>, String> {
-    const CHARS: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
-
-    fn val(c: u8) -> Result<u8, String> {
-        match c {
-            b'A'..=b'Z' => Ok(c - b'A'),
-            b'a'..=b'z' => Ok(c - b'a' + 26),
-            b'0'..=b'9' => Ok(c - b'0' + 52),
-            b'+' => Ok(62),
-            b'/' => Ok(63),
-            b'=' => Ok(0),
-            _ => Err(format!("invalid base64 char: {}", c as char)),
-        }
-    }
-    let _ = CHARS; // suppress unused warning
-
-    let bytes = input.as_bytes();
-    if bytes.len() % 4 != 0 {
-        return Err("base64 input length not multiple of 4".into());
-    }
-
-    let mut out = Vec::with_capacity(bytes.len() * 3 / 4);
-    for chunk in bytes.chunks(4) {
-        let a = val(chunk[0])?;
-        let b = val(chunk[1])?;
-        let c_val = val(chunk[2])?;
-        let d = val(chunk[3])?;
-
-        let triple = ((a as u32) << 18) | ((b as u32) << 12) | ((c_val as u32) << 6) | (d as u32);
-
-        out.push((triple >> 16) as u8);
-        if chunk[2] != b'=' { out.push((triple >> 8) as u8); }
-        if chunk[3] != b'=' { out.push(triple as u8); }
-    }
-    Ok(out)
+/// Refuse every bearer when the build has no trusted key source.
+///
+/// Egress carries the JWKS fetcher, so without it there is no way to check a
+/// token's signature. Decoding the payload and reading `iss`/`aud`/`exp` from
+/// it would constrain only what the presenter chose to write, which is not
+/// authentication. This mirrors the same refusal on the encauth path.
+#[cfg(not(feature = "egress"))]
+fn verify_oidc_token(_token: &str) -> Result<enclave_os_common::oidc::OidcClaims, String> {
+    Err("no trusted idp key source (egress disabled)".into())
 }
 
 // ---------------------------------------------------------------------------
