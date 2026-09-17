@@ -121,6 +121,11 @@ fn bind_caller(grant: &KeyCreationGrant, peer_der: &[u8]) -> Result<(), String> 
             grant.scope
         )
     })?;
+    // Case-insensitive is safe here, and not a way for two apps to share one
+    // grant: an app-id is a UUID rendered as canonical lowercase hex
+    // ([0-9a-f]{32}, AppIDHex in the runtime, the same encoding the IdP pins
+    // roles to), so no two distinct app-ids differ only by case. Folding case
+    // only tolerates a mis-cased grant scope naming the same single app.
     if caller_app_id.eq_ignore_ascii_case(scope_app_id) {
         Ok(())
     } else {
