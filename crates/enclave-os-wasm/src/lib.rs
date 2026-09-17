@@ -2762,11 +2762,23 @@ fn verify_app_token(
         return Err(format!("JWT audience does not contain '{}'", oidc.audience));
     }
 
-    // Validate expiry
-    if let Some(exp) = claims.get("exp").and_then(|v| v.as_u64()) {
-        let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
-        if now > exp {
-            return Err("JWT token expired".into());
+    // Validate expiry. `exp` is REQUIRED: the check used to be skipped
+    // entirely for a token that carried none, which left the token valid for
+    // as long as the signing key was. A clock failure is likewise fatal --
+    // defaulting `now` to 0 made every token look unexpired.
+    let now = enclave_os_common::ocall::get_current_time()
+        .map_err(|_| "cannot validate token lifetime: no trusted time".to_string())?;
+    let exp = claims
+        .get("exp")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| "JWT missing 'exp' claim".to_string())?;
+    if now > exp {
+        return Err("JWT token expired".into());
+    }
+    // `nbf` is optional, but honoured when present.
+    if let Some(nbf) = claims.get("nbf").and_then(|v| v.as_u64()) {
+        if now < nbf {
+            return Err("JWT not yet valid".into());
         }
     }
 
