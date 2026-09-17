@@ -19,4 +19,5 @@ pub use roles::{
     remove_user_roles,
     set_default_roles,
     set_user_roles,
+    validate_user_handle,
 };
