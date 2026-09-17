@@ -160,6 +160,21 @@ impl<'a> CanonicalReader<'a> {
         self.off += 4;
         Ok(n)
     }
+    /// Read a length prefix that is about to drive an allocation.
+    ///
+    /// A four-byte count can name billions of items, and `Vec::with_capacity`
+    /// reserves for all of them before a single one is read, so a short input
+    /// claiming a huge count turns into a huge eager allocation. Every item
+    /// costs at least `min_item_bytes` in the encoding, so a count that could
+    /// not possibly fit in what is left is refused before reserving anything.
+    fn count(&mut self, min_item_bytes: usize) -> Result<usize, &'static str> {
+        let n = self.u32()?;
+        let remaining = self.buf.len() - self.off;
+        if n > remaining / min_item_bytes {
+            return Err("dependency set count exceeds remaining input");
+        }
+        Ok(n)
+    }
     fn bytes(&mut self) -> Result<Vec<u8>, &'static str> {
         let n = self.u32()?;
         if self.off + n > self.buf.len() {
@@ -192,16 +207,18 @@ fn measurement_from_canonical(s: &str) -> DepMeasurement {
 /// into OID 65230.7.1.
 pub fn decode_dependency_set(bytes: &[u8]) -> Result<DependencySet, &'static str> {
     let mut r = CanonicalReader { buf: bytes, off: 0 };
-    let count = r.u32()?;
+    // An entry costs at least: app_id len (4) + m_count (4) + o_count (4)
+    // + folded_identity len (4).
+    let count = r.count(16)?;
     let mut entries = Vec::with_capacity(count);
     for _ in 0..count {
         let app_id = r.string()?;
-        let m_count = r.u32()?;
+        let m_count = r.count(4)?;
         let mut measurements = Vec::with_capacity(m_count);
         for _ in 0..m_count {
             measurements.push(measurement_from_canonical(&r.string()?));
         }
-        let o_count = r.u32()?;
+        let o_count = r.count(8)?;
         let mut required_oids = Vec::with_capacity(o_count);
         for _ in 0..o_count {
             let oid = r.string()?;
@@ -347,5 +364,29 @@ mod tests {
     fn canonicalize_is_idempotent_and_matches_vector() {
         let enc = encode_dependency_set(&sample());
         assert_eq!(crate::hex::hex_encode(&canonicalize_encoded(&enc).unwrap()), GO_ENCODE_HEX);
+    }
+
+    #[test]
+    fn refuses_a_count_that_cannot_fit_in_the_input() {
+        // Four bytes claiming ~4 billion entries and nothing after them. The
+        // allocation used to be reserved before any of those entries was read.
+        let mut bytes = alloc::vec::Vec::new();
+        bytes.extend_from_slice(&u32::MAX.to_be_bytes());
+        assert!(decode_dependency_set(&bytes).is_err());
+
+        // Same shape for the nested measurement and required-oid counts: one
+        // entry whose app_id is empty, then a huge measurement count.
+        let mut nested = alloc::vec::Vec::new();
+        nested.extend_from_slice(&1u32.to_be_bytes()); // one entry
+        nested.extend_from_slice(&0u32.to_be_bytes()); // empty app_id
+        nested.extend_from_slice(&u32::MAX.to_be_bytes()); // measurements
+        assert!(decode_dependency_set(&nested).is_err());
+    }
+
+    #[test]
+    fn still_round_trips_a_real_set() {
+        // The bound must not reject anything legitimate.
+        let enc = encode_dependency_set(&sample());
+        assert_eq!(decode_dependency_set(&enc).unwrap(), sample().normalised());
     }
 }
