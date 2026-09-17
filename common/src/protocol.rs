@@ -381,9 +381,21 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
         if h.name.eq_ignore_ascii_case("content-length") {
             let val = core::str::from_utf8(h.value)
                 .map_err(|_| HttpParseError::InvalidContentLength)?;
-            content_length = Some(
-                val.trim().parse().map_err(|_| HttpParseError::InvalidContentLength)?,
-            );
+            let parsed: usize = val
+                .trim()
+                .parse()
+                .map_err(|_| HttpParseError::InvalidContentLength)?;
+            // RFC 7230 3.3.3: a message carrying conflicting Content-Length
+            // values must be rejected. The loop used to assign on every match
+            // with no break, so the last occurrence silently won -- and where
+            // a front-end honours the first, that disagreement is what request
+            // smuggling is built on. Repeating the same value is permitted.
+            if let Some(seen) = content_length {
+                if seen != parsed {
+                    return Err(HttpParseError::InvalidContentLength);
+                }
+            }
+            content_length = Some(parsed);
         } else if h.name.eq_ignore_ascii_case("authorization") {
             if let Ok(val) = core::str::from_utf8(h.value) {
                 if let Some(token) = val.strip_prefix("Bearer ") {
@@ -725,5 +737,31 @@ mod tests {
         let raw = b"POST /rpc/app/fn HTTP/1.1\r\nContent-Length: 2\r\n\r\nhi";
         let (req, _) = parse_http_request(raw).unwrap();
         assert!(req.billing_approved.is_none());
+    }
+
+    #[test]
+    fn refuses_conflicting_content_length() {
+        // RFC 7230 3.3.3. The loop used to assign on every match with no
+        // break, so the last value silently won; a front-end honouring the
+        // first value is the disagreement request smuggling is built on.
+        let raw = b"POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nContent-Length: 6\r\n\r\nhello";
+        assert!(matches!(
+            parse_http_request(raw),
+            Err(HttpParseError::InvalidContentLength)
+        ));
+    }
+
+    #[test]
+    fn accepts_a_repeated_identical_content_length() {
+        let raw = b"POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nContent-Length: 5\r\n\r\nhello";
+        let (req, _) = parse_http_request(raw).expect("identical repeats are legal");
+        assert_eq!(req.body, b"hello".to_vec());
+    }
+
+    #[test]
+    fn accepts_a_single_content_length() {
+        let raw = b"POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello";
+        let (req, _) = parse_http_request(raw).expect("ordinary request");
+        assert_eq!(req.body, b"hello".to_vec());
     }
 }
