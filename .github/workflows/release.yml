@@ -58,28 +58,41 @@ jobs:
     runs-on: ubuntu-24.04
     outputs:
       flavor: ${{ steps.r.outputs.flavor }}
+      flavors: ${{ steps.r.outputs.flavors }}
       version: ${{ steps.r.outputs.version }}
     steps:
       - id: r
         run: |
           REF='${{ github.ref_name }}'
+          # FLAVORS is the build matrix. On a tag or a dispatch it is the single
+          # resolved flavour, so the release path is unchanged. A PR builds BOTH,
+          # because they are not interchangeable: `base` is the only flavour that
+          # compiles the `cfg(not(feature = "egress"))` arm of verify_oidc_token,
+          # which is now the code that refuses a bearer when the build has no
+          # trusted key source. Building only `wasm` type-checked everything
+          # except the branch that matters most.
           if [ '${{ github.event_name }}' = 'workflow_dispatch' ]; then
               FLAVOR='${{ inputs.flavor }}'
+              FLAVORS="[\"${FLAVOR}\"]"
               VERSION="${REF}"
           elif [ '${{ github.event_name }}' = 'pull_request' ]; then
               FLAVOR=wasm
+              FLAVORS='["base","wasm"]'
               VERSION="pr-${{ github.event.pull_request.number }}"
           elif [[ "${REF}" == wasm-v* ]]; then
               FLAVOR=wasm
+              FLAVORS='["wasm"]'
               VERSION="${REF#wasm-}"
           elif [[ "${REF}" == v* ]]; then
               FLAVOR=base
+              FLAVORS='["base"]'
               VERSION="${REF}"
           else
               echo "ERROR: tag '${REF}' does not match v* or wasm-v*" >&2
               exit 1
           fi
           echo "flavor=${FLAVOR}"   | tee -a "$GITHUB_OUTPUT"
+          echo "flavors=${FLAVORS}" | tee -a "$GITHUB_OUTPUT"
           echo "version=${VERSION}" | tee -a "$GITHUB_OUTPUT"
 
   # ────────────────────────────────────────────────────────────────────────
@@ -125,6 +138,10 @@ jobs:
     needs: [resolve, build-image]
     if: always() && needs.resolve.result == 'success' && (needs.build-image.result == 'success' || needs.build-image.result == 'skipped')
     runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        flavor: ${{ fromJSON(needs.resolve.outputs.flavors) }}
     steps:
       - uses: actions/checkout@v6
         with:
@@ -136,13 +153,13 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Build enclave in container (flavor=${{ needs.resolve.outputs.flavor }})
+      - name: Build enclave in container (flavor=${{ matrix.flavor }})
         run: |
           docker run --rm \
             -v "${{ github.workspace }}:/src" \
             -e CARGO_INCREMENTAL=0 \
             -e SOURCE_DATE_EPOCH=0 \
-            -e FLAVOR='${{ needs.resolve.outputs.flavor }}' \
+            -e FLAVOR='${{ matrix.flavor }}' \
             ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:latest
 
       - name: Fix build output permissions
@@ -153,7 +170,7 @@ jobs:
         run: |
           MRENCLAVE=$(cat build/mrenclave.txt)
           echo "mrenclave=${MRENCLAVE}" >> "$GITHUB_OUTPUT"
-          echo "## ${{ needs.resolve.outputs.flavor }} — MRENCLAVE" >> "$GITHUB_STEP_SUMMARY"
+          echo "## ${{ matrix.flavor }} — MRENCLAVE" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
           echo "${MRENCLAVE}" >> "$GITHUB_STEP_SUMMARY"
           echo '```' >> "$GITHUB_STEP_SUMMARY"
@@ -162,7 +179,7 @@ jobs:
         run: |
           cat > build/build-manifest.json <<EOF
           {
-            "flavor": "${{ needs.resolve.outputs.flavor }}",
+            "flavor": "${{ matrix.flavor }}",
             "version": "${{ needs.resolve.outputs.version }}",
             "tag": "${{ github.ref_name }}",
             "commit": "${{ github.sha }}",
@@ -179,7 +196,7 @@ jobs:
       - name: Upload artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: enclave-build-${{ needs.resolve.outputs.flavor }}
+          name: enclave-build-${{ matrix.flavor }}
           path: |
             build/bin/enclave.signed.so
             build/mrenclave.txt

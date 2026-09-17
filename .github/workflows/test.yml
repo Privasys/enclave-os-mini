@@ -1,0 +1,78 @@
+# Copyright (c) Privasys. All rights reserved.
+#
+# Host-side unit tests.
+#
+# This repository had roughly 300 tests and nothing that ran them: release.yml
+# builds the enclave and never invokes `cargo test`. Worse, the crates under
+# `crates/` are not workspace members, so a root `cargo test` could not reach
+# them even by accident — each is its own workspace and has to be named.
+#
+# Three crates (vault, wasm, egress) cannot be built for the host at all: they
+# pull in sgx_types transitively. Their unit tests are reachable only inside
+# the SGX build container, or by proxying an individual source file into a
+# workspace member the way tests/wasm-docs-unit does.
+
+name: Test
+
+on:
+  push:
+    branches: [main]
+    paths-ignore:
+      - "**.md"
+      - "docs/**"
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  workspace:
+    name: workspace (common, host, tests/*)
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+
+      # Two things are not obvious here:
+      #
+      # `crypto` is not a default feature, and the dependency-set and JWT tests
+      # are gated on `#[cfg(all(test, feature = "crypto"))]` — without it they
+      # silently do not compile, which is indistinguishable from passing.
+      #
+      # `enclave-os-host` is excluded because its build script links the SGX
+      # SDK, which no plain runner has. It is covered by the enclave build in
+      # release.yml instead.
+      - name: Test workspace (with crypto)
+        run: cargo test --workspace --exclude enclave-os-host --features enclave-os-common/crypto
+
+      - name: Test workspace (default features)
+        run: cargo test --workspace --exclude enclave-os-host
+
+  crates:
+    name: crate ${{ matrix.crate }}
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        # Host-buildable crates only. vault, wasm and egress need SGX.
+        crate:
+          - enclave-os-kvstore
+          - enclave-os-app-auth
+          - enclave-os-fido2
+          - enclave-os-merkle
+          - enclave-os-raft
+    steps:
+      - uses: actions/checkout@v6
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: crates/${{ matrix.crate }}
+
+      - name: Test
+        run: cargo test --manifest-path crates/${{ matrix.crate }}/Cargo.toml
