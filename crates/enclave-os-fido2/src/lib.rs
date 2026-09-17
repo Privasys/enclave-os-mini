@@ -437,9 +437,16 @@ impl Fido2Module {
         }
 
         // 7. Verify sign count (strict clone detection per WebAuthn §7.2 step 17)
-        //    If the new signCount is nonzero but not greater than the stored value,
-        //    reject — the authenticator may have been cloned.
-        if auth_data.sign_count != 0 && auth_data.sign_count <= record.sign_count {
+        //    The spec's condition is that EITHER count being nonzero makes a
+        //    non-increasing count a clone signal. Testing only the incoming
+        //    count let a response reporting 0 skip the comparison even when
+        //    the stored record had already counted -- which is exactly what a
+        //    cloned authenticator sends. A permanently-zero counter (the
+        //    authenticator does not support one) still passes, because then
+        //    both sides are 0.
+        if (auth_data.sign_count != 0 || record.sign_count != 0)
+            && auth_data.sign_count <= record.sign_count
+        {
             return Fido2Response::Error {
                 error: format!(
                     "sign count not increasing ({} <= {}) — possible cloned authenticator",
