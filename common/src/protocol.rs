@@ -541,6 +541,57 @@ pub fn format_http_response_with_headers(
     resp
 }
 
+/// Check the parts of an outbound HTTP/1.1 request before they are
+/// interpolated into the request line and header block.
+///
+/// The egress client builds requests by string formatting, and a WASM guest
+/// supplies the URL and every extra header. Without this check a CR or LF in
+/// any of them ends the line early and lets the guest write its own request
+/// line or headers, and a space in the path lets it rewrite the request line.
+/// It refuses rather than strips, so a guest learns its request was malformed
+/// instead of having it silently rewritten.
+///
+/// Also refuses the headers the client owns (`Host`, which it derives from the
+/// URL, and `Transfer-Encoding`, since the body is always sent with a fixed
+/// length) and a `Content-Length` that disagrees with the body, the pairings
+/// request smuggling relies on.
+pub fn check_outbound_request(
+    host: &str,
+    path: &str,
+    headers: &[(String, String)],
+    body_len: Option<usize>,
+) -> Result<(), String> {
+    if host.is_empty()
+        || host
+            .chars()
+            .any(|c| c.is_control() || c.is_whitespace() || "/?#@\\".contains(c))
+    {
+        return Err("invalid host in URL".into());
+    }
+    if !path.starts_with('/') || path.chars().any(|c| c.is_control() || c == ' ') {
+        return Err("invalid path in URL: must start with '/' and contain no spaces or control characters".into());
+    }
+    for (name, value) in headers {
+        let is_token = |c: char| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c);
+        if name.is_empty() || !name.chars().all(is_token) {
+            return Err(format!("invalid header name {name:?}"));
+        }
+        if value.contains(['\r', '\n', '\0']) {
+            return Err(format!("invalid value for header {name:?}: contains CR, LF or NUL"));
+        }
+        if name.eq_ignore_ascii_case("host") || name.eq_ignore_ascii_case("transfer-encoding") {
+            return Err(format!("header {name:?} is set by the client and cannot be supplied"));
+        }
+        if name.eq_ignore_ascii_case("content-length") {
+            let declared = value.trim().parse::<usize>().ok();
+            if declared != Some(body_len.unwrap_or(0)) {
+                return Err("Content-Length does not match the request body".into());
+            }
+        }
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 //  Tests
 // ---------------------------------------------------------------------------
@@ -763,5 +814,57 @@ mod tests {
         let raw = b"POST /x HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nhello";
         let (req, _) = parse_http_request(raw).expect("ordinary request");
         assert_eq!(req.body, b"hello".to_vec());
+    }
+}
+
+#[cfg(test)]
+mod outbound_tests {
+    use super::check_outbound_request;
+
+    fn h(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+    }
+
+    #[test]
+    fn accepts_an_ordinary_request() {
+        let hdrs = h(&[("Authorization", "Bearer x.y.z"), ("Content-Type", "application/json")]);
+        assert!(check_outbound_request("api.example.com", "/v1/items?q=a%20b", &hdrs, Some(2)).is_ok());
+        assert!(check_outbound_request("api.example.com", "/", &[], None).is_ok());
+        // A matching Content-Length is fine, and so is a tab inside a value.
+        let hdrs = h(&[("Content-Length", "2"), ("X-Note", "a\tb")]);
+        assert!(check_outbound_request("h", "/", &hdrs, Some(2)).is_ok());
+    }
+
+    #[test]
+    fn refuses_line_breaks_anywhere_a_guest_supplies() {
+        assert!(check_outbound_request("h", "/", &h(&[("X-A", "1\r\nX-Injected: 2")]), None).is_err());
+        assert!(check_outbound_request("h", "/", &h(&[("X-A", "1\nX-Injected: 2")]), None).is_err());
+        assert!(check_outbound_request("h", "/", &h(&[("X-A\r\nX-B", "1")]), None).is_err());
+        assert!(check_outbound_request("h", "/a\r\nX-Injected: 1", &[], None).is_err());
+        assert!(check_outbound_request("h\r\nX-Injected: 1", "/", &[], None).is_err());
+    }
+
+    #[test]
+    fn refuses_a_path_that_would_rewrite_the_request_line() {
+        assert!(check_outbound_request("h", "/a HTTP/1.0", &[], None).is_err());
+        assert!(check_outbound_request("h", "no-leading-slash", &[], None).is_err());
+    }
+
+    #[test]
+    fn refuses_bad_header_names_and_hosts() {
+        assert!(check_outbound_request("h", "/", &h(&[("", "1")]), None).is_err());
+        assert!(check_outbound_request("h", "/", &h(&[("Bad Name", "1")]), None).is_err());
+        assert!(check_outbound_request("h", "/", &h(&[("Bad:Name", "1")]), None).is_err());
+        assert!(check_outbound_request("", "/", &[], None).is_err());
+        assert!(check_outbound_request("user@h", "/", &[], None).is_err());
+    }
+
+    #[test]
+    fn refuses_the_smuggling_pairings() {
+        assert!(check_outbound_request("h", "/", &h(&[("Host", "other")]), None).is_err());
+        assert!(check_outbound_request("h", "/", &h(&[("transfer-encoding", "chunked")]), Some(3)).is_err());
+        assert!(check_outbound_request("h", "/", &h(&[("Content-Length", "10")]), Some(3)).is_err());
+        assert!(check_outbound_request("h", "/", &h(&[("Content-Length", "0")]), Some(3)).is_err());
+        assert!(check_outbound_request("h", "/", &h(&[("Content-Length", "abc")]), None).is_err());
     }
 }

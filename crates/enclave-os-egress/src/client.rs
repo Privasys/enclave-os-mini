@@ -342,6 +342,15 @@ pub fn https_fetch(
 ) -> Result<HttpResponse, String> {
     let (host, port, path) = parse_url(url)?;
 
+    // The URL and headers can come from a WASM guest and are interpolated
+    // below; refuse anything that would break out of its line.
+    enclave_os_common::protocol::check_outbound_request(
+        &host,
+        &path,
+        headers,
+        body.map(|b| b.len()),
+    )?;
+
     // Build HTTP/1.1 request.
     let mut request = format!(
         "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
