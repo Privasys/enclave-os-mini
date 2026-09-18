@@ -125,6 +125,64 @@ pub fn boot() {
 }
 
 // ---------------------------------------------------------------------------
+//  Core routes: clock config (management-service) and floor poll (monitor)
+// ---------------------------------------------------------------------------
+
+/// `PUT /clock/config`: the monitor key, incident URL and this enclave's
+/// id, sealed with the floor. The caller checks the manager role. Returns
+/// `(status, JSON body)`: 200 with `{enclave_id, monitor_key_id,
+/// config_version, applied}` (`applied` false for the version already in
+/// place), 400 for an invalid config, 409 for a lower `config_version`.
+pub fn handle_config(body: &[u8]) -> (u16, Vec<u8>) {
+    use enclave_os_clock::state::ConfigError;
+    match with_clock(|clock, env| clock.set_config(env, body)) {
+        Some(Ok(ack)) => (200, serde_json::to_vec(&ack).unwrap_or_default()),
+        Some(Err(ConfigError::Wire(e))) => json_error(400, &e.to_string()),
+        Some(Err(ConfigError::Stale { current })) => (
+            409,
+            serde_json::to_vec(&serde_json::json!({
+                "error": "config_version is lower than the current one",
+                "config_version": current,
+            }))
+            .unwrap_or_default(),
+        ),
+        None => json_error(503, "clock busy"),
+    }
+}
+
+/// `POST /clock/poll`: the monitor's signed floor. No bearer: the Ed25519
+/// signature with the configured monitor key is the authentication.
+/// Returns `(status, JSON body)`: 200 with the poll reply, 400 for a
+/// malformed body, 401 for a poll not signed by the configured key or not
+/// for this enclave, 409 while no monitor is configured, 503 when host and
+/// monitor disagree and there is no NTS quorum to settle it.
+pub fn handle_poll(body: &[u8]) -> (u16, Vec<u8>) {
+    use enclave_os_clock::state::PollError;
+    use enclave_os_clock::wire::WireError;
+    match with_clock(|clock, env| clock.poll(env, body, "mini")) {
+        Some(Ok(reply)) => (200, serde_json::to_vec(&reply).unwrap_or_default()),
+        Some(Err(PollError::Wire(WireError::BadRequest(m)))) => json_error(400, &m),
+        Some(Err(PollError::Wire(WireError::Unauthorized(m)))) => json_error(401, m),
+        Some(Err(PollError::NotConfigured)) => json_error(409, "clock not configured"),
+        Some(Err(PollError::Unavailable { reason, host_time_ms, floor_ms, detail })) => (
+            503,
+            serde_json::to_vec(&serde_json::json!({
+                "error": reason,
+                "detail": detail,
+                "host_time_ms": host_time_ms,
+                "floor_ms": floor_ms,
+            }))
+            .unwrap_or_default(),
+        ),
+        None => json_error(503, "clock busy"),
+    }
+}
+
+fn json_error(status: u16, msg: &str) -> (u16, Vec<u8>) {
+    (status, serde_json::to_vec(&serde_json::json!({ "error": msg })).unwrap_or_default())
+}
+
+// ---------------------------------------------------------------------------
 //  rustls
 // ---------------------------------------------------------------------------
 

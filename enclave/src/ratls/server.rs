@@ -764,6 +764,15 @@ impl HttpHandleResult {
             extra_headers: Vec::new(),
         }
     }
+    fn json(status: u16, body: Vec<u8>) -> Self {
+        Self {
+            status,
+            body,
+            shutdown: false,
+            content_type: None,
+            extra_headers: Vec::new(),
+        }
+    }
     fn with_header(mut self, name: &str, value: &str) -> Self {
         self.extra_headers.push((name.to_string(), value.to_string()));
         self
@@ -780,6 +789,8 @@ impl HttpHandleResult {
 ///   PUT  /attestation-servers — update attestation servers (manager)
 ///   POST /data                — module dispatch (module-dependent)
 ///   POST /shutdown            — graceful shutdown (manager)
+///   PUT  /clock/config        — trusted-clock monitor config (manager)
+///   POST /clock/poll          — monitor floor poll (Ed25519-signed body, no bearer)
 ///
 /// Auth is via `Authorization: Bearer <token>` header.
 fn handle_http_request(
@@ -840,6 +851,13 @@ fn handle_http_request(
             handle_set_attestation_servers(http_req, base_ctx)
         }
 
+        // ── Trusted clock: config (manager) and floor poll (signed) ─
+        (HttpMethod::Put, "/clock/config") => handle_clock_config(http_req),
+        (HttpMethod::Post, "/clock/poll") => {
+            let (status, body) = crate::trustedtime::handle_poll(&http_req.body);
+            HttpHandleResult::json(status, body)
+        }
+
         // ── Data / module dispatch ──────────────────────────────────
         (HttpMethod::Post, "/data") => {
             handle_data_request_http(http_req, base_ctx)
@@ -893,7 +911,8 @@ fn handle_http_request(
 
         // ── Method mismatch on known paths ──────────────────────────
         (_, "/healthz") | (_, "/readyz") | (_, "/status") | (_, "/metrics")
-        | (_, "/attestation-servers") | (_, "/data") | (_, "/shutdown") => {
+        | (_, "/attestation-servers") | (_, "/data") | (_, "/shutdown")
+        | (_, "/clock/config") | (_, "/clock/poll") => {
             HttpHandleResult::err(405, "method not allowed")
         }
 
@@ -996,6 +1015,8 @@ fn path_requires_sealed(path: &str) -> bool {
             | "/status"
             | "/metrics"
             | "/attestation-servers"
+            | "/clock/config"
+            | "/clock/poll"
     ) && !path.starts_with("/.well-known/")
 }
 
@@ -1212,6 +1233,31 @@ fn handle_set_attestation_servers(
         count, hash_hex
     );
     HttpHandleResult::ok(body.into_bytes())
+}
+
+// ---------------------------------------------------------------------------
+//  Trusted clock config handler (HTTP)
+// ---------------------------------------------------------------------------
+
+/// Handle `PUT /clock/config` (management-service, manager role).
+///
+/// Body: `{"enclave_id", "monitor_key", "monitor_key_id", "incident_url",
+/// "config_version"}`. Sealed with the clock floor; only a higher
+/// `config_version` replaces the config, the current one again is a
+/// successful no-op.
+fn handle_clock_config(
+    http_req: &enclave_os_common::protocol::HttpRequest,
+) -> HttpHandleResult {
+    // Require Manager role when OIDC is configured, like every other
+    // manager-only core route.
+    if crate::oidc_config().is_some() {
+        match verify_auth_header(http_req) {
+            Some(claims) if claims.has_manager() => {}
+            _ => return HttpHandleResult::err(403, "manager role required"),
+        }
+    }
+    let (status, body) = crate::trustedtime::handle_config(&http_req.body);
+    HttpHandleResult::json(status, body)
 }
 
 // ---------------------------------------------------------------------------

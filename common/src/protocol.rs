@@ -711,6 +711,28 @@ mod tests {
     }
 
     #[test]
+    fn test_parse_go_net_http_put() {
+        // The clock config push, as Go's net/http writes it.
+        let body = br#"{"enclave_id":"e","monitor_key":"k","monitor_key_id":"i","incident_url":"https://m/x","config_version":3}"#;
+        let mut raw = format!(
+            "PUT /clock/config HTTP/1.1\r\nHost: enclave-mgr.example:443\r\n\
+             User-Agent: Go-http-client/1.1\r\nContent-Length: {}\r\n\
+             Authorization: Bearer sa-token\r\nContent-Type: application/json\r\n\
+             Accept-Encoding: gzip\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        raw.extend_from_slice(body);
+        let (req, used) = parse_http_request(&raw).unwrap();
+        assert_eq!(used, raw.len());
+        assert_eq!(req.method, HttpMethod::Put);
+        assert_eq!(req.path, "/clock/config");
+        assert_eq!(req.authorization.as_deref(), Some("sa-token"));
+        assert_eq!(req.content_type.as_deref(), Some("application/json"));
+        assert_eq!(req.body, body.to_vec());
+    }
+
+    #[test]
     fn test_parse_connection_close() {
         let raw = b"GET /healthz HTTP/1.1\r\nConnection: close\r\n\r\n";
         let (req, _) = parse_http_request(raw).unwrap();
