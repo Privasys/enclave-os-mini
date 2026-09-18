@@ -59,6 +59,18 @@ pub const BACKSTEP_MS: i64 = 1_000;
 /// itself.
 pub const REFETCH_EVERY: u32 = 100;
 
+/// Unflagged reads without a confirmation (a monitor poll in sync, or NTS)
+/// before the clock checks itself against NTS. A host that blocks the
+/// monitor's polls could otherwise hold its clock just above the floor for
+/// ever; with no elapsed-time source in SGX, reads are what can be counted.
+pub const SELF_CHECK_EVERY: u32 = 1_000;
+
+/// Most a poll in sync (host and monitor agreeing, no NTS) may raise the
+/// floor by. A larger jump needs NTS to confirm the host: the monitor key
+/// and the host together must not be able to push the floor into the
+/// future.
+pub const MAX_UNCONFIRMED_RAISE_MS: i64 = 3_600_000;
+
 /// Why trusted time is not available, or why a step of the algorithm failed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ClockError {

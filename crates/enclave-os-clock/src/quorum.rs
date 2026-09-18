@@ -9,6 +9,10 @@
 //! NTP requests before reading any reply), so their timestamps are
 //! comparable without the enclave having to measure elapsed time. A server
 //! that fails is replaced by the next one in the random order.
+//!
+//! The cost is bounded: at most [`MAX_SERVERS`] distinct servers and
+//! [`MAX_ROUNDS`] rounds per quorum, so a quorum never waits on more than
+//! three key exchanges and five NTP replies.
 
 use alloc::format;
 use alloc::string::{String, ToString};
@@ -20,7 +24,10 @@ use crate::{abs_diff, ClockError};
 pub const AGREE_MS: i64 = 2_000;
 
 /// Most sampling rounds in one quorum.
-pub const MAX_ROUNDS: usize = 4;
+pub const MAX_ROUNDS: usize = 2;
+
+/// Most distinct servers contacted in one quorum.
+pub const MAX_SERVERS: usize = 3;
 
 /// A quorum result: the agreed time and the servers that agreed.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +60,7 @@ where
     let mut last_errors: Vec<String> = Vec::new();
 
     for _ in 0..MAX_ROUNDS {
-        while chosen.len() < target && next < order.len() {
+        while chosen.len() < target && next < order.len().min(MAX_SERVERS) {
             chosen.push(order[next]);
             next += 1;
         }
