@@ -134,9 +134,22 @@ pub fn kv_store_scan(
 //  Utility wrappers
 // ==========================================================================
 
-/// Get the current UNIX timestamp from the host.
+/// Trusted time, Unix seconds: the enclave's one time source, never the
+/// raw host clock. `Err` means no trusted time: fail closed.
 pub fn get_current_time() -> Result<u64, i32> {
-    rpc().get_current_time()
+    crate::trustedtime::now_secs()
+}
+
+/// Trusted time, Unix milliseconds. Same contract as [`get_current_time`].
+pub fn get_current_time_ms() -> Result<u64, i32> {
+    crate::trustedtime::now_ms()
+}
+
+/// The HOST clock, Unix milliseconds. Untrusted, and read only by
+/// `crate::trustedtime`, which checks it against the floor, the monitor
+/// and NTS.
+pub(crate) fn host_time_ms() -> Result<u64, i32> {
+    rpc().host_time_ms()
 }
 
 /// Log a message via the host.

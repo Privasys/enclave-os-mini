@@ -39,7 +39,7 @@
 //! host operating system.  See [`wasi`] for the mapping:
 //!
 //! - **Random**: RDRAND via `getrandom` (hardware RNG, no OCALL)
-//! - **Clocks**: OCALL `get_current_time()` (wall + monotonic)
+//! - **Clocks**: the enclave's trusted time (wall + monotonic)
 //! - **Environment**: Controlled env vars from enclave config
 //! - **I/O**: In-memory stdout/stderr capture, TCP sockets via OCALLs
 //! - **Filesystem**: Sealed KV store backing
@@ -2672,7 +2672,8 @@ fn verify_auth_token(
     // Try FIDO2 session token first (if enabled and token looks right).
     #[cfg(feature = "fido2")]
     if permissions.fido2 && is_fido2_session_token(token) {
-        let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
+        let now = enclave_os_common::ocall::get_current_time()
+            .map_err(|_| "cannot validate the session token: no trusted time".to_string())?;
         match enclave_os_fido2::sessions::validate_token(token, now) {
             Ok(entry) => {
                 let user_id = entry.user_handle.clone();

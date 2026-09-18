@@ -1,0 +1,12 @@
+# Copyright (c) Privasys. All rights reserved.
+# Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
+
+# Every time read in enclave code goes through the trusted-time choke point
+# (enclave_os_common::ocall::get_current_time / get_current_time_ms, backed
+# by enclave/src/trustedtime). The Teaclave sysroot answers SystemTime::now()
+# with its own untrusted host ocall, which would bypass it. The host crate
+# has its own clippy.toml: the host reads its own clock.
+disallowed-methods = [
+    { path = "std::time::SystemTime::now", reason = "read the enclave's trusted time: enclave_os_common::ocall::get_current_time_ms()" },
+    { path = "std::time::SystemTime::elapsed", reason = "read the enclave's trusted time: enclave_os_common::ocall::get_current_time_ms()" },
+]

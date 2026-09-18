@@ -32,7 +32,10 @@ pub(crate) fn append(
     decision: AuditDecision,
     reason: &str,
 ) -> Result<(), String> {
-    let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
+    // An audit entry stamped 0 would misdate the record; without trusted
+    // time the audited operation fails closed.
+    let now = enclave_os_common::ocall::get_current_time()
+        .map_err(|_| "audit: no trusted time".to_string())?;
     let entry = AuditEntry {
         seq: record.audit_next_seq,
         ts: now,

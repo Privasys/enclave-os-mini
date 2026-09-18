@@ -85,8 +85,12 @@ function(rust_build_enclave CRATE_DIR OUTPUT_NAME FEATURES)
     endif()
     get_filename_component(_ENCLAVE_SOURCE_ROOT
         "${RUST_ENCLAVE_SOURCE_ROOT}" ABSOLUTE)
+    # aes_force_soft / polyval_force_soft: the NTS AEADs (RustCrypto aes,
+    # polyval) use their portable constant-time backends, so they run no
+    # CPU feature detection inside the enclave.
     string(CONCAT _ENCLAVE_RUSTFLAGS
         "--sysroot ${SGX_SYSROOT_DIR} -C target-feature=+rdrand"
+        " --cfg aes_force_soft --cfg polyval_force_soft"
         " --remap-path-prefix ${_ENCLAVE_SOURCE_ROOT}=/workspace"
         " --remap-path-prefix ${_ENCLAVE_TARGET_DIR}=/cargo-target")
 

@@ -81,6 +81,13 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "x509-
 # Already in the graph via rcgen; default-features off keeps time-macros out.
 time = { version = "0.3", default-features = false }
 
+# Trusted time: floor state machine, NTS codecs and quorum, monitor
+# contracts (pure, host-tested crate).
+enclave-os-clock = { path = "../crates/enclave-os-clock" }
+# Mozilla roots for the NTS-KE servers (and incident reports without the
+# egress module). Same version egress already pulls in.
+webpki-roots = "0.26"
+
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

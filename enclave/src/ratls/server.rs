@@ -1,4 +1,4 @@
-// Copyright (c) Privasys. All rights reserved.
+// Copyright (c) Privasys. All rights reserve.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
 //! RA-TLS ingress server — data-channel driven.
@@ -30,7 +30,6 @@ use std::sync::Arc;
 use std::vec::Vec;
 
 use crate::modules;
-use crate::ocall;
 use crate::ratls::attestation::{self, CaContext, LeafKey};
 use crate::ratls::cert_store;
 use crate::ratls::session::RaTlsSession;
@@ -543,7 +542,9 @@ impl IngressServer {
         let app_data = sni.as_deref()
             .and_then(|h| cert_store::cert_store().resolve(h));
         let cache_key = sni.clone().unwrap_or_default();
-        let now = ocall::get_current_time().unwrap_or(0);
+        // Our own leaf: stamped with trusted time, or with the frozen floor
+        // when there is none (validity is the client's check, not ours).
+        let now = crate::trustedtime::issue_secs();
         let current_gen = cert_store::cert_store().generation();
         let key = self.leaf_key_for(&cache_key, now)?;
 
@@ -707,7 +708,10 @@ fn build_tls_config(
 
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(result.pkcs8_key));
 
-    let config = ServerConfig::builder_with_provider(Arc::new(default_provider()))
+    let config = ServerConfig::builder_with_details(
+        Arc::new(default_provider()),
+        Arc::new(crate::trustedtime::RustlsTime),
+    )
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| format!("TLS config error: {:?}", e))?
         .with_client_cert_verifier(Arc::new(PermissiveClientAuth))
@@ -932,7 +936,10 @@ fn handle_http_request_with_session(
         _ => return HttpHandleResult::err(401, "missing PrivasysSession"),
     };
 
-    let now = wall_seconds_now();
+    let now = match crate::trustedtime::now_secs() {
+        Ok(t) => t,
+        Err(_) => return HttpHandleResult::err(503, "no trusted time"),
+    };
     let method_str = http_method_str(&http_req.method);
 
     let plaintext = match crate::sessionrelay::open_request(
@@ -1001,14 +1008,6 @@ fn http_method_str(m: &enclave_os_common::protocol::HttpMethod) -> &'static str 
     }
 }
 
-fn wall_seconds_now() -> u64 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
-}
-
 /// `POST /__privasys/session-bootstrap` — returns
 /// `{"session_id":"...","enc_pub":"<base64url>","expires_at":<u64>,
 ///   "sub":"..."}` (`sub` only when an EncAuth voucher was accepted).
@@ -1033,7 +1032,10 @@ fn handle_session_bootstrap(
         Some(v) => v,
         None => return HttpHandleResult::err(400, "invalid sdk_pub base64"),
     };
-    let now = wall_seconds_now();
+    let now = match crate::trustedtime::now_secs() {
+        Ok(t) => t,
+        Err(_) => return HttpHandleResult::err(503, "no trusted time"),
+    };
 
     // Optional silent rebind. On verify failure we fall through to the
     // legacy anonymous bootstrap with a diagnostic header (mirroring
@@ -1256,7 +1258,10 @@ fn handle_fido2_request(
         // Check if it's a FIDO2 session token (hex, 64 chars)
         if auth.len() == 64 && auth.chars().all(|c| c.is_ascii_hexdigit()) {
             // This is a FIDO2 session token — validate it
-            let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
+            let now = match crate::trustedtime::now_secs() {
+                Ok(t) => t,
+                Err(_) => return HttpHandleResult::err(503, "no trusted time"),
+            };
             match enclave_os_fido2::sessions::validate_token(auth, now) {
                 Ok(_entry) => None, // Token valid — no OIDC claims needed
                 Err(_) => return HttpHandleResult::err(401, "invalid session token"),
@@ -2008,7 +2013,10 @@ impl IngressServer {
         if req.v != PROTOCOL_VERSION {
             return HttpHandleResult::err(400, "unsupported protocol version");
         }
-        let now = ocall::get_current_time().unwrap_or(0);
+        // What we stamp on our own evidence: trusted time, or the frozen
+        // floor when there is none. Checks on the peer's evidence below use
+        // trusted time only and fail closed.
+        let now = crate::trustedtime::issue_secs();
 
         match req.mode.as_str() {
             "deterministic" | "challenge" => {
@@ -2104,6 +2112,10 @@ impl IngressServer {
                 };
                 let tee = req.tee.clone().unwrap_or_else(|| "sgx".to_string());
                 let quote_time = req.quote_time.clone().unwrap_or_default();
+                let now = match crate::trustedtime::now_secs() {
+                    Ok(t) => t,
+                    Err(_) => return HttpHandleResult::err(503, "no trusted time"),
+                };
                 if at::check_quote_time(&quote_time, now as i64).is_err() {
                     return HttpHandleResult::err(400, "quote_time out of range");
                 }

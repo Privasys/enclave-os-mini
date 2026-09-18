@@ -242,9 +242,13 @@ fn load_record(handle: &str) -> Result<KeyRecord, VaultResponse> {
 //  Time
 // ---------------------------------------------------------------------------
 
-fn now_secs() -> u64 {
-    enclave_os_common::ocall::get_current_time().unwrap_or(0)
+/// Trusted time, Unix seconds. `None` when there is none: every caller
+/// fails closed (a 0 would make every expiry look far away).
+fn now_secs() -> Option<u64> {
+    enclave_os_common::ocall::get_current_time().ok()
 }
+
+const NO_TRUSTED_TIME: &str = "no trusted time: time-bound operations are refused";
 
 // ---------------------------------------------------------------------------
 //  Audit
@@ -345,7 +349,9 @@ fn handle_create(
         );
     }
 
-    let now = now_secs();
+    let Some(now) = now_secs() else {
+        return VaultResponse::Error(NO_TRUSTED_TIME.into());
+    };
     let grant = match crate::grant::verify_grant(grant_jwt, ctx, now) {
         Ok(g) => g,
         Err(e) => return VaultResponse::Error(e),
@@ -951,7 +957,9 @@ fn handle_issue_approval(
     } else {
         ttl_seconds
     };
-    let now = now_secs();
+    let Some(now) = now_secs() else {
+        return VaultResponse::Error(NO_TRUSTED_TIME.into());
+    };
 
     let token = {
         let kv = match kv() {
@@ -1218,6 +1226,9 @@ fn handle_stage_pending(
         .as_ref()
         .map(|c| c.sub.clone())
         .unwrap_or_else(|| "tee".into());
+    let Some(staged_at) = now_secs() else {
+        return VaultResponse::Error(NO_TRUSTED_TIME.into());
+    };
     let pending_id = record.next_pending_id;
     record.next_pending_id = record.next_pending_id.saturating_add(1);
     record.pending_profiles.push(PendingProfile {
@@ -1230,7 +1241,7 @@ fn handle_stage_pending(
         } else {
             source
         },
-        staged_at: now_secs(),
+        staged_at,
         staged_by_sub,
         staged_by_platform,
     });
@@ -1417,8 +1428,10 @@ fn handle_revoke_pending(handle: &str, pending_id: u32, ctx: &RequestContext) ->
 //  Helpers
 // ---------------------------------------------------------------------------
 
+/// Whether the key has expired. Without trusted time a key counts as
+/// expired: fail closed.
 fn expired(record: &KeyRecord) -> bool {
-    now_secs() > record.expires_at
+    now_secs().map_or(true, |now| now > record.expires_at)
 }
 
 fn owner_oidc_sub(owner: &Principal) -> Option<String> {

@@ -117,8 +117,11 @@ fn derive(key: &[u8; 32], label: &[u8]) -> [u8; 32] {
     out
 }
 
-fn now_secs() -> u64 {
-    enclave_os_common::ocall::get_current_time().unwrap_or(0)
+/// Trusted time, Unix milliseconds, for the leader's replay envelope.
+/// `None` without trusted time: the transaction is refused rather than
+/// committed with a 0 clock every replica would then replay.
+fn now_ms() -> Option<u64> {
+    enclave_os_common::ocall::get_current_time_ms().ok()
 }
 
 /// Adapt a raft ledger fork to the wasm `ledger` host interface.
@@ -1106,6 +1109,9 @@ impl RaftGlue {
 
         // Replay-mode apps get a committed determinism envelope.
         let replay = if wasm.txn_replay(&call.app) {
+            let Some(timestamp_ms) = now_ms() else {
+                return err_json("no trusted time for the transaction clock");
+            };
             let mut seed = [0u8; 32];
             if SystemRandom::new().fill(&mut seed).is_err() {
                 return err_json("rng (transaction seed)");
@@ -1115,7 +1121,7 @@ impl RaftGlue {
                 function: call.function.clone().into_bytes(),
                 params: serde_json::to_vec(&call.params).unwrap_or_default(),
                 seed,
-                timestamp_ms: now_secs().saturating_mul(1_000),
+                timestamp_ms,
                 fuel: wasm.app_max_fuel(&call.app).unwrap_or(0),
             })
         } else {

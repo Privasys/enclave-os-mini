@@ -157,14 +157,15 @@ impl PeerLink {
     /// challenge nonce in extension `0xFFBB`) is emitted immediately
     /// (the proxy buffers it until TCP connects). Returns the conn_id.
     pub fn dial(&mut self, addr: &str) -> Result<u32, String> {
-        let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
+        // Our own leaf: trusted time, or the frozen floor when there is none.
+        let now = crate::trustedtime::issue_secs();
         let leaf = attestation::new_leaf_key(now)?;
         let minted = attestation::generate_ratls_certificate(&self.ca, &leaf, now)?;
         let our_spki = leaf.spki_der.clone();
 
         let provider = Arc::new(default_provider());
         let verifier = FleetCaVerifier::new(self.fleet_roots.clone())?;
-        let mut cfg = ClientConfig::builder_with_provider(provider.clone())
+        let mut cfg = ClientConfig::builder_with_details(provider.clone(), Arc::new(crate::trustedtime::RustlsTime))
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|e| format!("peer client config: {e:?}"))?
             .dangerous()
@@ -271,7 +272,8 @@ impl PeerLink {
             Err(e) => return Err(format!("peer hello accept: {e:?}")),
         };
 
-        let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
+        // Our own leaf: trusted time, or the frozen floor when there is none.
+        let now = crate::trustedtime::issue_secs();
         let leaf = attestation::new_leaf_key(now)?;
         let minted = attestation::generate_ratls_certificate(&self.ca, &leaf, now)?;
         let our_spki = leaf.spki_der.clone();
@@ -289,7 +291,10 @@ impl PeerLink {
         )
         .build()
         .map_err(|e| format!("peer client verifier: {e:?}"))?;
-        let cfg = ServerConfig::builder_with_provider(Arc::new(default_provider()))
+        let cfg = ServerConfig::builder_with_details(
+            Arc::new(default_provider()),
+            Arc::new(crate::trustedtime::RustlsTime),
+        )
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|e| format!("peer server config: {e:?}"))?
             .with_client_cert_verifier(client_verifier)
@@ -460,7 +465,7 @@ impl PeerLink {
                 return Ok(());
             }
             let label = if session.is_client { at::EXPORTER_LABEL_PEER_CLIENT } else { at::EXPORTER_LABEL_PEER_SERVER };
-            let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
+            let now = crate::trustedtime::issue_secs();
             (label, session.our_spki.clone(), at::format_quote_time(now as i64))
         };
         let hctx = self.exporter(conn_id, label)?;
@@ -499,7 +504,8 @@ impl PeerLink {
             return Err("peer evidence frame: bad version or mode".into());
         }
         let quote = at::b64_decode(msg.quote.as_deref().unwrap_or(""))?;
-        let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
+        let now = crate::trustedtime::now_secs()
+            .map_err(|_| "peer evidence: no trusted time to check quote_time against".to_string())?;
         at::check_quote_time(msg.quote_time.as_deref().unwrap_or(""), now as i64)?;
         let (peer_label, cert) = {
             let session = self.sessions.get(&conn_id).ok_or_else(|| "session gone".to_string())?;

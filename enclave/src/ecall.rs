@@ -335,6 +335,10 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
     }
     enclave_log_info!("RA-TLS ingress server initialised (data channel mode)");
 
+    // Trusted time: restore the sealed floor and run the boot NTS fetch
+    // now, before the first connection needs a time-sensitive decision.
+    crate::trustedtime::boot();
+
     // Signal the host TCP proxy that the data channel consumer is ready.
     // The proxy blocks new connections until it receives this message.
     {
@@ -460,6 +464,7 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
         kv_store_multi_get: crate::ocall::kv_store_multi_get,
         kv_store_scan:     crate::ocall::kv_store_scan,
         get_current_time:  crate::ocall::get_current_time,
+        get_current_time_ms: crate::ocall::get_current_time_ms,
         log:               |level, msg| {
             let ll = match level {
                 0 => enclave_os_common::types::LogLevel::Trace,

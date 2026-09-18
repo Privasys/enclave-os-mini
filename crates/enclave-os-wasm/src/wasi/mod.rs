@@ -10,8 +10,8 @@
 //! | WASI interface              | Enclave OS backing                       |
 //! |-----------------------------|------------------------------------------|
 //! | `wasi:random/random`        | RDRAND via `getrandom` (sgx_read_rand)   |
-//! | `wasi:clocks/wall-clock`    | OCALL `get_current_time()`               |
-//! | `wasi:clocks/monotonic`     | OCALL `get_current_time()` (best-effort) |
+//! | `wasi:clocks/wall-clock`    | Trusted time (traps when there is none)  |
+//! | `wasi:clocks/monotonic`     | Trusted time (never goes back)           |
 //! | `wasi:cli/environment`      | Controlled env vars from AppContext      |
 //! | `wasi:cli/stdout` / `stderr`| Streamed to enclave log via OCALL        |
 //! | `wasi:cli/stdin`            | In-memory buffer via input-stream        |

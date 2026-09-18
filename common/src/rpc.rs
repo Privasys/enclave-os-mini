@@ -59,6 +59,7 @@ pub enum RpcMethod {
     // -- Utility --
     GetCurrentTime   = 0x0300,
     Log              = 0x0301,
+    GetCurrentTimeMs = 0x0302,
 
     // -- Attestation (DCAP quoting) --
     QeGetTargetInfo  = 0x0400,
@@ -90,6 +91,7 @@ impl RpcMethod {
             0x0206 => Some(Self::KvScan),
             0x0300 => Some(Self::GetCurrentTime),
             0x0301 => Some(Self::Log),
+            0x0302 => Some(Self::GetCurrentTimeMs),
             0x0400 => Some(Self::QeGetTargetInfo),
             0x0401 => Some(Self::QeGetQuote),
             0xFF00 => Some(Self::Shutdown),
@@ -652,9 +654,11 @@ pub fn decode_kv_scan_resp(p: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
     Some(entries)
 }
 
-// -- GetCurrentTime --
+// -- GetCurrentTime / GetCurrentTimeMs --
 /// Request: no payload
-/// Response: [u64 timestamp LE]
+/// Response: [u64 timestamp LE], Unix seconds / Unix milliseconds.
+/// This is the HOST clock, which the enclave does not trust: the enclave
+/// reads it only through its trusted-time choke point.
 pub fn encode_u64(v: u64) -> Vec<u8> { v.to_le_bytes().to_vec() }
 pub fn decode_u64(p: &[u8]) -> Option<u64> {
     if p.len() < 8 { return None; }
@@ -823,6 +827,7 @@ mod tests {
             RpcMethod::KvMultiGet,
             RpcMethod::KvScan,
             RpcMethod::GetCurrentTime,
+            RpcMethod::GetCurrentTimeMs,
             RpcMethod::Log,
             RpcMethod::Shutdown,
         ];
@@ -1239,6 +1244,7 @@ mod tests {
         assert_eq!(RpcMethod::from_u16(0x0205), Some(RpcMethod::KvMultiGet));
         assert_eq!(RpcMethod::from_u16(0x0206), Some(RpcMethod::KvScan));
         assert_eq!(RpcMethod::from_u16(0x0300), Some(RpcMethod::GetCurrentTime));
+        assert_eq!(RpcMethod::from_u16(0x0302), Some(RpcMethod::GetCurrentTimeMs));
         assert_eq!(RpcMethod::from_u16(0x0301), Some(RpcMethod::Log));
         assert_eq!(RpcMethod::from_u16(0x0400), Some(RpcMethod::QeGetTargetInfo));
         assert_eq!(RpcMethod::from_u16(0x0401), Some(RpcMethod::QeGetQuote));

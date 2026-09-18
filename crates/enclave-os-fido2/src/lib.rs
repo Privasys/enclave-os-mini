@@ -165,7 +165,10 @@ impl Fido2Module {
         user_handle: &str,
         session_id: Option<String>,
     ) -> Fido2Response {
-        let now = current_time_secs();
+        let now = match current_time_secs() {
+            Ok(t) => t,
+            Err(e) => return Fido2Response::Error { error: e },
+        };
 
         let challenge = match challenge::create_challenge(
             now,
@@ -214,7 +217,10 @@ impl Fido2Module {
         push_token: Option<String>,
         _ctx: &RequestContext,
     ) -> Fido2Response {
-        let now = current_time_secs();
+        let now = match current_time_secs() {
+            Ok(t) => t,
+            Err(e) => return Fido2Response::Error { error: e },
+        };
 
         // 1. Consume the challenge (one-time use)
         let consumed =
@@ -344,7 +350,10 @@ impl Fido2Module {
         credential_id_b64: Option<&str>,
         session_id: Option<String>,
     ) -> Fido2Response {
-        let now = current_time_secs();
+        let now = match current_time_secs() {
+            Ok(t) => t,
+            Err(e) => return Fido2Response::Error { error: e },
+        };
 
         let challenge = match challenge::create_challenge(
             now,
@@ -384,7 +393,10 @@ impl Fido2Module {
         client_data_json_b64: &str,
         _ctx: &RequestContext,
     ) -> Fido2Response {
-        let now = current_time_secs();
+        let now = match current_time_secs() {
+            Ok(t) => t,
+            Err(e) => return Fido2Response::Error { error: e },
+        };
 
         // 1. Consume the challenge
         let consumed =
@@ -505,7 +517,8 @@ impl Fido2Module {
 //  Time helper
 // ---------------------------------------------------------------------------
 
-/// Get the current UNIX timestamp (seconds) via OCall.
-fn current_time_secs() -> u64 {
-    enclave_os_common::ocall::get_current_time().unwrap_or(0)
+/// Trusted time, Unix seconds. Without it the ceremony is refused: a 0
+/// would keep every challenge and session unexpired.
+fn current_time_secs() -> Result<u64, String> {
+    enclave_os_common::ocall::get_current_time().map_err(|_| "no trusted time".to_string())
 }

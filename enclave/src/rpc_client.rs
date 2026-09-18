@@ -298,11 +298,13 @@ impl RpcClient {
     //  Utility calls
     // ====================================================================
 
-    /// Get current UNIX timestamp from the host.
-    pub fn get_current_time(&self) -> Result<u64, i32> {
-        let (status, resp) = self.call(RpcMethod::GetCurrentTime, &[]);
+    /// The HOST clock, Unix milliseconds. Untrusted: only the trusted-time
+    /// choke point (`crate::trustedtime`) may read it.
+    pub fn host_time_ms(&self) -> Result<u64, i32> {
+        let (status, resp) = self.call(RpcMethod::GetCurrentTimeMs, &[]);
         if status == 0 {
-            Ok(rpc::decode_u64(&resp).unwrap_or(0))
+            // A missing payload is an error, never a zero time.
+            rpc::decode_u64(&resp).ok_or(-1)
         } else {
             Err(status)
         }

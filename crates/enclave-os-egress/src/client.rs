@@ -599,7 +599,7 @@ impl ResolvesClientCert for IdentityClientAuth {
         _sigschemes: &[SignatureScheme],
     ) -> Option<Arc<CertifiedKey>> {
         let signer = *CLIENT_CERT_SIGNER.get()?;
-        let (chain_der, pkcs8) = signer.identity(&self.identity, now_unix())?;
+        let (chain_der, pkcs8) = signer.identity(&self.identity, now_unix().ok()?)?;
         if let Ok(mut g) = self.presented.lock() {
             *g = chain_der.first().cloned();
         }
@@ -612,6 +612,20 @@ impl ResolvesClientCert for IdentityClientAuth {
 
     fn has_certs(&self) -> bool {
         true
+    }
+}
+
+/// The enclave's trusted time for rustls: certificate validity is checked
+/// against it, never against the host clock the TLS stack would otherwise
+/// read. No trusted time makes the handshake fail.
+#[derive(Debug)]
+struct TrustedTime;
+
+impl rustls::time_provider::TimeProvider for TrustedTime {
+    fn current_time(&self) -> Option<UnixTime> {
+        ocall::get_current_time_ms()
+            .ok()
+            .map(|ms| UnixTime::since_unix_epoch(core::time::Duration::from_millis(ms)))
     }
 }
 
@@ -647,7 +661,7 @@ fn build_client_config(
             policy: policy.clone(),
         };
 
-        let wants_client_cert = ClientConfig::builder_with_provider(provider.clone())
+        let wants_client_cert = ClientConfig::builder_with_details(provider.clone(), Arc::new(TrustedTime))
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|_| "TLS config error")?
             .dangerous()
@@ -668,7 +682,7 @@ fn build_client_config(
         cfg
     } else {
         // Standard TLS — no RA-TLS verification.
-        ClientConfig::builder_with_provider(provider)
+        ClientConfig::builder_with_details(provider, Arc::new(TrustedTime))
             .with_protocol_versions(&[&rustls::version::TLS13])
             .map_err(|_| "TLS config error")?
             .with_root_certificates(root_store.clone())
@@ -958,8 +972,11 @@ fn verify_ratls_leaf(der: &[u8], policy: &RaTlsPolicy) -> Result<(), String> {
     verify_expected_oids(&cert, &policy.expected_oids)
 }
 
-fn now_unix() -> u64 {
-    enclave_os_common::ocall::get_current_time().unwrap_or(0)
+/// Trusted time, Unix seconds. No trusted time fails the RA-TLS exchange
+/// closed (a 0 would make any quote_time look fresh or any leaf current).
+fn now_unix() -> Result<u64, String> {
+    enclave_os_common::ocall::get_current_time()
+        .map_err(|_| "RA-TLS: no trusted time".to_string())
 }
 
 /// The RA-TLS v2 evidence exchange on an established connection, before any
@@ -1025,7 +1042,7 @@ fn attest_exchange(
         ));
     }
     let (ev, client_context) =
-        attest::parse_response(&resp_body, mode, context, hctx, now_unix() as i64)?;
+        attest::parse_response(&resp_body, mode, context, hctx, now_unix()? as i64)?;
     verify_evidence(&cert, &spki_der, &ev, policy)?;
 
     if let Some(cc) = client_context {
@@ -1138,7 +1155,7 @@ fn present_client_evidence(
         tee: Some("sgx".to_string()),
         quote: Some(attest::b64_encode(&quote)),
         gpu_evidence: None,
-        quote_time: Some(attest::format_quote_time(now_unix() as i64)),
+        quote_time: Some(attest::format_quote_time(now_unix()? as i64)),
     };
     let body = serde_json::to_vec(&msg).map_err(|e| format!("RA-TLS: present: {e}"))?;
     let (status, resp_body) = http_round_trip(fd, tls_conn, attest::ATTEST_PATH, &body)?;

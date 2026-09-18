@@ -41,7 +41,10 @@ pub struct OcallVtable {
     pub kv_store_scan: fn(&[u8], &[u8], &[u8], u32) -> Result<Vec<(Vec<u8>, Vec<u8>)>, i32>,
 
     // ── Utility ──────────────────────────────────────────────────────
+    /// Trusted time, Unix seconds. See [`get_current_time`].
     pub get_current_time: fn() -> Result<u64, i32>,
+    /// Trusted time, Unix milliseconds. See [`get_current_time_ms`].
+    pub get_current_time_ms: fn() -> Result<u64, i32>,
     pub log: fn(u8, &str),
 
     // ── Cert store (enclave-internal, for dynamic app identities) ────
@@ -151,8 +154,25 @@ pub fn kv_store_scan(
     (vt().kv_store_scan)(table, start, end, limit)
 }
 
+/// Error code of a time read when no trusted time is available.
+pub const NO_TRUSTED_TIME: i32 = -62;
+
+/// The enclave's trusted time, Unix seconds.
+///
+/// Every time read in the enclave goes through this (or
+/// [`get_current_time_ms`]): it is never simply the host clock, never goes
+/// back, and never goes below a verified floor. An `Err` (normally
+/// [`NO_TRUSTED_TIME`]) means there is no trusted time right now: the
+/// caller must fail closed, never substitute 0 (a 0 makes every expiry
+/// look far away).
 pub fn get_current_time() -> Result<u64, i32> {
     (vt().get_current_time)()
+}
+
+/// The enclave's trusted time, Unix milliseconds. Same contract as
+/// [`get_current_time`].
+pub fn get_current_time_ms() -> Result<u64, i32> {
+    (vt().get_current_time_ms)()
 }
 
 pub fn log(level: u8, message: &str) {

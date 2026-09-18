@@ -1,0 +1,5 @@
+# Copyright (c) Privasys. All rights reserved.
+# Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
+
+# The host answers the enclave's time RPCs from its own clock, so the
+# repository-wide ban on SystemTime::now (enclave code only) does not apply.

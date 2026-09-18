@@ -54,6 +54,17 @@ jobs:
       - name: Test workspace (default features)
         run: cargo test --workspace --exclude enclave-os-host
 
+      # Enclave code reads the time only through the trusted-time choke
+      # point. clippy.toml bans SystemTime::now, but the enclave crates
+      # only build in the SGX container, so check the source here too.
+      - name: No direct SystemTime::now in enclave code
+        run: |
+          if grep -rnE 'SystemTime::now|SystemTime::elapsed|UNIX_EPOCH\.elapsed' \
+              --include='*.rs' common/src enclave/src crates/*/src; then
+            echo "enclave code must read enclave_os_common::ocall::get_current_time[_ms]" >&2
+            exit 1
+          fi
+
   crates:
     name: crate ${{ matrix.crate }}
     runs-on: ubuntu-24.04

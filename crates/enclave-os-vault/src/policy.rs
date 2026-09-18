@@ -368,13 +368,19 @@ fn evaluate_conditions(
     ctx: &RequestContext,
     op_binding: Option<&OpBinding>,
 ) -> Result<(), String> {
-    let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
+    // Trusted time, read only by the conditions that need it. Without it
+    // they cannot be checked and deny.
+    let now = || {
+        enclave_os_common::ocall::get_current_time()
+            .map_err(|_| "no trusted time to evaluate a time-bound condition".to_string())
+    };
     for cond in conditions {
         match cond {
             Condition::TimeWindow {
                 not_before,
                 not_after,
             } => {
+                let now = now()?;
                 if *not_before != 0 && now < *not_before {
                     return Err(format!(
                         "TimeWindow: now={} before not_before={}",
@@ -438,6 +444,7 @@ fn evaluate_conditions(
                 } else {
                     None
                 };
+                let now = now()?;
                 let mut accepted = false;
                 let mut last_err: Option<String> = None;
                 for token in approvals {
@@ -485,6 +492,7 @@ fn evaluate_conditions(
                             "OidcStepUp: token has no iat; cannot prove freshness".to_string()
                         );
                     }
+                    let now = now()?;
                     if now.saturating_sub(claims.iat) > *fresh_for_seconds {
                         return Err(format!(
                             "OidcStepUp: token age {}s exceeds fresh_for_seconds={}",

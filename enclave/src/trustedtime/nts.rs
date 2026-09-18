@@ -1,0 +1,504 @@
+// Copyright (c) Privasys. All rights reserved.
+// Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
+
+//! NTS client (RFC 8915): NTS-KE over TLS 1.3 inside the enclave, then
+//! authenticated NTPv4 over the host's UDP sockets.
+//!
+//! Every byte crosses the host. NTS-KE is TLS terminated here, with the
+//! server certificate checked against the Mozilla roots (webpki-roots) at
+//! the enclave's floor time, never at the host's time (that time is what is
+//! in question). The NTP packets are authenticated with keys exported from
+//! that TLS session, so the host can drop or delay them but cannot forge
+//! or alter them.
+//!
+//! The host's delay is the one thing SGX cannot measure: the enclave has no
+//! clock to time a round trip with. A host can hold a reply for X seconds
+//! and roll its clock back by X to match; the unseen lag is bounded by the
+//! tolerance plus the receive timeout.
+
+use std::collections::BTreeMap;
+use std::io::{Read, Write};
+use std::string::{String, ToString};
+use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::{Arc, OnceLock};
+use std::time::Duration;
+use std::vec::Vec;
+
+use ring::rand::{SecureRandom, SystemRandom};
+use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
+use rustls::client::WebPkiServerVerifier;
+use rustls::crypto::ring::default_provider;
+use rustls::pki_types::{CertificateDer, ServerName, UnixTime};
+use rustls::time_provider::TimeProvider;
+use rustls::{ClientConfig, ClientConnection, DigitallySignedStruct, Error, RootCertStore, SignatureScheme};
+
+use enclave_os_clock::aead::{NtsAead, MAX_NONCE_LEN};
+use enclave_os_clock::ntske::{self, EXPORTER_LABEL, KE_PORT, NTP_PORT};
+use enclave_os_clock::quorum::{self, NtsSample};
+use enclave_os_clock::{ntp, servers, ClockError, TOLERANCE_MS};
+
+use crate::ocall;
+
+/// How long one NTP reply is waited for.
+const RECV_TIMEOUT_MS: u32 = 3_000;
+
+/// Datagrams read per request before giving up on a valid reply (anything
+/// that fails authentication is dropped: it may be the host's).
+const MAX_DATAGRAMS_PER_REPLY: usize = 4;
+
+/// One NTS-KE result: the negotiated AEAD, its two keys and the cookies
+/// to spend.
+struct Session {
+    aead: NtsAead,
+    c2s: Vec<u8>,
+    s2c: Vec<u8>,
+    cookies: Vec<Vec<u8>>,
+    ntp_host: String,
+    ntp_port: u16,
+    /// The time the certificate chain was checked at. The server's time
+    /// cannot be earlier: no certificate is issued in the future.
+    checked_at_ms: i64,
+}
+
+/// An NTP request waiting for its reply.
+struct InFlight {
+    fd: i32,
+    uid: [u8; ntp::UID_LEN],
+    xmt: [u8; 8],
+    aead: NtsAead,
+    s2c: Vec<u8>,
+    checked_at_ms: i64,
+}
+
+/// An NTS quorum over the pinned servers, checking certificates at
+/// `floor_ms`.
+pub fn quorum(floor_ms: i64) -> Result<NtsSample, ClockError> {
+    let hosts = servers::hosts();
+    let rng = SystemRandom::new();
+    let mut sessions: BTreeMap<String, Session> = BTreeMap::new();
+    quorum::run(
+        &hosts,
+        || {
+            let mut b = [0u8; 4];
+            let _ = rng.fill(&mut b);
+            u32::from_le_bytes(b)
+        },
+        |set| sample_round(set, &mut sessions, floor_ms, &rng),
+    )
+}
+
+/// Sample every host of `set` in one round: key exchanges first (only for
+/// hosts without an unspent cookie), then every NTP request, then every
+/// reply, so the samples are close together in time.
+fn sample_round(
+    set: &[&str],
+    sessions: &mut BTreeMap<String, Session>,
+    floor_ms: i64,
+    rng: &SystemRandom,
+) -> Vec<Result<i64, String>> {
+    let mut out: Vec<Result<i64, String>> = set.iter().map(|_| Err(String::new())).collect();
+
+    for (i, host) in set.iter().enumerate() {
+        if sessions.get(*host).map_or(false, |s| !s.cookies.is_empty()) {
+            continue;
+        }
+        match key_exchange(host, floor_ms) {
+            Ok(s) => {
+                sessions.insert(host.to_string(), s);
+            }
+            Err(e) => {
+                sessions.remove(*host);
+                out[i] = Err(format!("nts-ke: {e}"));
+            }
+        }
+    }
+
+    let mut inflight: Vec<Option<InFlight>> = Vec::with_capacity(set.len());
+    for (i, host) in set.iter().enumerate() {
+        let f = match sessions.get_mut(*host) {
+            Some(s) if !s.cookies.is_empty() => match send_request(s, rng) {
+                Ok(f) => Some(f),
+                Err(e) => {
+                    out[i] = Err(format!("ntp send: {e}"));
+                    None
+                }
+            },
+            _ => None,
+        };
+        inflight.push(f);
+    }
+
+    for (i, f) in inflight.into_iter().enumerate() {
+        if let Some(f) = f {
+            out[i] = receive(&f);
+            ocall::net_udp_close(f.fd);
+        }
+    }
+    out
+}
+
+fn random<const N: usize>(rng: &SystemRandom) -> Result<[u8; N], String> {
+    let mut b = [0u8; N];
+    rng.fill(&mut b).map_err(|_| "rng failure".to_string())?;
+    Ok(b)
+}
+
+fn send_request(s: &mut Session, rng: &SystemRandom) -> Result<InFlight, String> {
+    let cookie = s.cookies.pop().ok_or("no cookie left")?;
+    let uid: [u8; ntp::UID_LEN] = random(rng)?;
+    let xmt: [u8; 8] = random(rng)?;
+    let nonce: [u8; MAX_NONCE_LEN] = random(rng)?;
+    let pkt = ntp::build_request(s.aead, &s.c2s, &cookie, &uid, &xmt, &nonce[..s.aead.nonce_len()])
+        .ok_or("request encryption failed")?;
+    let fd = ocall::net_udp_bind("", 0).map_err(|e| format!("udp bind: {e}"))?;
+    if let Err(e) = ocall::net_udp_send_to(fd, &s.ntp_host, s.ntp_port, &pkt) {
+        ocall::net_udp_close(fd);
+        return Err(format!("udp send to {}:{}: {e}", s.ntp_host, s.ntp_port));
+    }
+    Ok(InFlight { fd, uid, xmt, aead: s.aead, s2c: s.s2c.clone(), checked_at_ms: s.checked_at_ms })
+}
+
+fn receive(f: &InFlight) -> Result<i64, String> {
+    let mut last = String::from("no reply");
+    for _ in 0..MAX_DATAGRAMS_PER_REPLY {
+        match ocall::net_udp_recv_from(f.fd, 2048, RECV_TIMEOUT_MS) {
+            Ok((d, _peer)) => match ntp::parse_response(&d, f.aead, &f.s2c, &f.uid, &f.xmt) {
+                Ok(t) if t < f.checked_at_ms.saturating_sub(TOLERANCE_MS) => {
+                    return Err("server time is before its own certificate".to_string());
+                }
+                Ok(t) => return Ok(t),
+                Err(e) => last = e.to_string(),
+            },
+            Err(-11) => return Err(format!("no valid reply ({last})")),
+            Err(e) => return Err(format!("udp recv: {e}")),
+        }
+    }
+    Err(format!("no valid reply ({last})"))
+}
+
+// ---------------------------------------------------------------------------
+//  NTS-KE
+// ---------------------------------------------------------------------------
+
+fn key_exchange(host: &str, floor_ms: i64) -> Result<Session, String> {
+    let fd = ocall::net_tcp_connect(host, KE_PORT).map_err(|e| format!("connect {host}:{KE_PORT}: {e}"))?;
+    let r = key_exchange_on(fd, host, floor_ms);
+    ocall::net_close(fd);
+    r
+}
+
+fn key_exchange_on(fd: i32, host: &str, floor_ms: i64) -> Result<Session, String> {
+    let checked_at = Arc::new(AtomicI64::new(floor_ms));
+    let config = client_config(floor_ms, Some(ntske::ALPN), checked_at.clone())?;
+    let name = ServerName::try_from(host.to_string()).map_err(|_| "invalid server name".to_string())?;
+    let mut conn = ClientConnection::new(Arc::new(config), name).map_err(|e| format!("tls init: {e}"))?;
+    handshake(fd, &mut conn)?;
+    if conn.alpn_protocol() != Some(ntske::ALPN) {
+        return Err("server did not negotiate ntske/1".to_string());
+    }
+
+    conn.writer()
+        .write_all(&ntske::build_request())
+        .map_err(|e| format!("write: {e}"))?;
+    flush(fd, &mut conn)?;
+
+    let mut buf = Vec::new();
+    let resp = loop {
+        if let Some(r) = ntske::parse_response(&buf).map_err(|e| e.to_string())? {
+            break r;
+        }
+        if read_plaintext(fd, &mut conn, &mut buf, ntske::MAX_RESPONSE)? == 0 {
+            return Err("connection closed before end of message".to_string());
+        }
+    };
+
+    let aead = resp.aead;
+    let c2s = conn
+        .export_keying_material(vec![0u8; aead.key_len()], EXPORTER_LABEL, Some(&ntske::exporter_context(aead, false)))
+        .map_err(|e| format!("exporter: {e}"))?;
+    let s2c = conn
+        .export_keying_material(vec![0u8; aead.key_len()], EXPORTER_LABEL, Some(&ntske::exporter_context(aead, true)))
+        .map_err(|e| format!("exporter: {e}"))?;
+    conn.send_close_notify();
+    let _ = flush(fd, &mut conn);
+
+    Ok(Session {
+        aead,
+        c2s,
+        s2c,
+        cookies: resp.cookies,
+        ntp_host: resp.server.unwrap_or_else(|| host.to_string()),
+        ntp_port: resp.port.unwrap_or(NTP_PORT),
+        checked_at_ms: checked_at.load(Ordering::Relaxed),
+    })
+}
+
+// ---------------------------------------------------------------------------
+//  TLS at the floor time
+// ---------------------------------------------------------------------------
+
+fn mozilla_roots() -> Arc<RootCertStore> {
+    static ROOTS: OnceLock<Arc<RootCertStore>> = OnceLock::new();
+    ROOTS
+        .get_or_init(|| {
+            let mut store = RootCertStore::empty();
+            store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+            Arc::new(store)
+        })
+        .clone()
+}
+
+/// A TLS 1.3 client config whose clock is `at_ms` and whose certificate
+/// check runs at the floor (see [`FloorVerifier`]).
+fn client_config(at_ms: i64, alpn: Option<&[u8]>, checked_at: Arc<AtomicI64>) -> Result<ClientConfig, String> {
+    let provider = Arc::new(default_provider());
+    let inner = WebPkiServerVerifier::builder_with_provider(mozilla_roots(), provider.clone())
+        .build()
+        .map_err(|e| format!("verifier: {e}"))?;
+    let mut config = ClientConfig::builder_with_details(provider, Arc::new(FixedTime(at_ms)))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| format!("tls config: {e}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(FloorVerifier { inner, floor_ms: at_ms, checked_at }))
+        .with_no_client_auth();
+    if let Some(p) = alpn {
+        config.alpn_protocols = vec![p.to_vec()];
+    }
+    Ok(config)
+}
+
+/// A fixed clock for rustls, so nothing in the TLS stack reads the host's.
+#[derive(Debug)]
+struct FixedTime(i64);
+
+impl TimeProvider for FixedTime {
+    fn current_time(&self) -> Option<UnixTime> {
+        Some(UnixTime::since_unix_epoch(Duration::from_millis(self.0.max(0) as u64)))
+    }
+}
+
+/// WebPKI chain validation against the Mozilla roots, at the floor.
+///
+/// The floor is a verified time, but it can be old (a fresh enclave starts
+/// at its build date; one that was down for weeks restores an old floor),
+/// and a certificate issued after it would look "not yet valid". So the
+/// chain is checked at the later of the floor and the newest `notBefore`
+/// in the chain: a certificate that expired before the floor is still
+/// refused, and the time the server then reports must not be earlier than
+/// the time the chain was checked at (no certificate is issued in the
+/// future).
+#[derive(Debug)]
+struct FloorVerifier {
+    inner: Arc<WebPkiServerVerifier>,
+    floor_ms: i64,
+    checked_at: Arc<AtomicI64>,
+}
+
+impl ServerCertVerifier for FloorVerifier {
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, Error> {
+        let mut at_ms = self.floor_ms;
+        for der in core::iter::once(end_entity).chain(intermediates.iter()) {
+            if let Ok((_, cert)) = x509_parser::parse_x509_certificate(der.as_ref()) {
+                at_ms = at_ms.max(cert.validity().not_before.timestamp().saturating_mul(1_000));
+            }
+        }
+        self.checked_at.store(at_ms, Ordering::Relaxed);
+        let at = UnixTime::since_unix_epoch(Duration::from_millis(at_ms.max(0) as u64));
+        self.inner.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, at)
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        self.inner.verify_tls12_signature(message, cert, dss)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        self.inner.verify_tls13_signature(message, cert, dss)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.inner.supported_verify_schemes()
+    }
+}
+
+// ---------------------------------------------------------------------------
+//  TLS pump over the host's TCP socket
+// ---------------------------------------------------------------------------
+
+fn flush(fd: i32, conn: &mut ClientConnection) -> Result<(), String> {
+    while conn.wants_write() {
+        let mut out = Vec::new();
+        conn.write_tls(&mut out).map_err(|e| format!("write_tls: {e}"))?;
+        let mut off = 0;
+        while off < out.len() {
+            let n = ocall::net_send(fd, &out[off..]).map_err(|e| format!("send: {e}"))?;
+            if n == 0 {
+                return Err("send: connection closed".to_string());
+            }
+            off += n;
+        }
+    }
+    Ok(())
+}
+
+/// Read one chunk from the network into the TLS session. Returns the number
+/// of network bytes read (0 at end of stream).
+fn pump_in(fd: i32, conn: &mut ClientConnection) -> Result<usize, String> {
+    let mut net = vec![0u8; 16 * 1024];
+    let n = ocall::net_recv(fd, &mut net).map_err(|e| format!("recv: {e}"))?;
+    let mut cursor = std::io::Cursor::new(&net[..n]);
+    while (cursor.position() as usize) < n {
+        conn.read_tls(&mut cursor).map_err(|e| format!("read_tls: {e}"))?;
+        conn.process_new_packets().map_err(|e| format!("tls: {e}"))?;
+    }
+    Ok(n)
+}
+
+fn handshake(fd: i32, conn: &mut ClientConnection) -> Result<(), String> {
+    loop {
+        flush(fd, conn)?;
+        if !conn.is_handshaking() {
+            return Ok(());
+        }
+        if pump_in(fd, conn)? == 0 {
+            return Err("connection closed during the handshake".to_string());
+        }
+    }
+}
+
+/// Read network data and append the decrypted bytes to `out`. Returns the
+/// number of network bytes read (0 at end of stream).
+fn read_plaintext(fd: i32, conn: &mut ClientConnection, out: &mut Vec<u8>, cap: usize) -> Result<usize, String> {
+    let n = pump_in(fd, conn)?;
+    let mut tmp = [0u8; 4096];
+    loop {
+        match conn.reader().read(&mut tmp) {
+            Ok(0) => break,
+            Ok(m) => {
+                out.extend_from_slice(&tmp[..m]);
+                if out.len() > cap {
+                    return Err("response too large".to_string());
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
+            Err(e) => return Err(format!("read: {e}")),
+        }
+    }
+    Ok(n)
+}
+
+// ---------------------------------------------------------------------------
+//  Incident POST without the egress module
+// ---------------------------------------------------------------------------
+
+/// POST `body` as JSON to an `https://` URL and return the body of a 2xx
+/// reply. Used for incident reports in builds without the egress module;
+/// the certificate is checked like the NTS-KE one.
+#[cfg(not(feature = "egress"))]
+pub fn https_post(url: &str, body: &[u8], at_ms: i64) -> Result<Vec<u8>, String> {
+    const MAX_REPLY: usize = 64 * 1024;
+    let rest = url.strip_prefix("https://").ok_or("incident_url is not https")?;
+    let (authority, path) = match rest.find('/') {
+        Some(i) => (&rest[..i], &rest[i..]),
+        None => (rest, "/"),
+    };
+    let (host, port) = match authority.rsplit_once(':') {
+        Some((h, p)) => (h, p.parse::<u16>().map_err(|_| "bad port in incident_url".to_string())?),
+        None => (authority, 443),
+    };
+
+    let fd = ocall::net_tcp_connect(host, port).map_err(|e| format!("connect {host}:{port}: {e}"))?;
+    let r = (|| {
+        let config = client_config(at_ms, None, Arc::new(AtomicI64::new(at_ms)))?;
+        let name = ServerName::try_from(host.to_string()).map_err(|_| "invalid server name".to_string())?;
+        let mut conn = ClientConnection::new(Arc::new(config), name).map_err(|e| format!("tls init: {e}"))?;
+        handshake(fd, &mut conn)?;
+        let mut req = format!(
+            "POST {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\n\
+             Content-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        )
+        .into_bytes();
+        req.extend_from_slice(body);
+        conn.writer().write_all(&req).map_err(|e| format!("write: {e}"))?;
+        flush(fd, &mut conn)?;
+        let mut raw = Vec::new();
+        while read_plaintext(fd, &mut conn, &mut raw, MAX_REPLY)? > 0 {}
+        parse_http_reply(&raw)
+    })();
+    ocall::net_close(fd);
+    r
+}
+
+#[cfg(not(feature = "egress"))]
+fn parse_http_reply(raw: &[u8]) -> Result<Vec<u8>, String> {
+    let split = raw
+        .windows(4)
+        .position(|w| w == b"\r\n\r\n")
+        .ok_or("incomplete HTTP reply")?;
+    let head = core::str::from_utf8(&raw[..split]).map_err(|_| "non-UTF-8 HTTP head".to_string())?;
+    let mut lines = head.split("\r\n");
+    let status: u16 = lines
+        .next()
+        .and_then(|l| l.split(' ').nth(1))
+        .and_then(|s| s.parse().ok())
+        .ok_or("bad HTTP status line")?;
+    let mut chunked = false;
+    let mut length: Option<usize> = None;
+    for l in lines {
+        if let Some((k, v)) = l.split_once(':') {
+            if k.trim().eq_ignore_ascii_case("transfer-encoding") && v.to_ascii_lowercase().contains("chunked") {
+                chunked = true;
+            } else if k.trim().eq_ignore_ascii_case("content-length") {
+                length = v.trim().parse().ok();
+            }
+        }
+    }
+    let rest = &raw[split + 4..];
+    let body = if chunked {
+        let mut out = Vec::new();
+        let mut p = rest;
+        loop {
+            let eol = p.windows(2).position(|w| w == b"\r\n").ok_or("bad chunk")?;
+            let size_str = core::str::from_utf8(&p[..eol]).map_err(|_| "bad chunk size".to_string())?;
+            let size = usize::from_str_radix(size_str.split(';').next().unwrap_or("").trim(), 16)
+                .map_err(|_| "bad chunk size".to_string())?;
+            p = &p[eol + 2..];
+            if size == 0 {
+                break;
+            }
+            if p.len() < size + 2 {
+                return Err("truncated chunk".to_string());
+            }
+            out.extend_from_slice(&p[..size]);
+            p = &p[size + 2..];
+        }
+        out
+    } else {
+        match length {
+            Some(n) if n <= rest.len() => rest[..n].to_vec(),
+            Some(_) => return Err("truncated HTTP body".to_string()),
+            None => rest.to_vec(),
+        }
+    };
+    if !(200..300).contains(&status) {
+        return Err(format!("monitor answered HTTP {status}"));
+    }
+    Ok(body)
+}

@@ -116,6 +116,7 @@ impl RpcDispatcher {
 
             // ---- Utility ----
             RpcMethod::GetCurrentTime => self.handle_get_current_time(),
+            RpcMethod::GetCurrentTimeMs => self.handle_get_current_time_ms(),
             RpcMethod::Log => self.handle_log(payload),
 
             // ---- Attestation (DCAP quoting) ----
@@ -407,6 +408,14 @@ impl RpcDispatcher {
         use std::time::{SystemTime, UNIX_EPOCH};
         match SystemTime::now().duration_since(UNIX_EPOCH) {
             Ok(d) => (0, rpc::encode_u64(d.as_secs())),
+            Err(_) => (-1, Vec::new()),
+        }
+    }
+
+    fn handle_get_current_time_ms(&self) -> (i32, Vec<u8>) {
+        use std::time::{SystemTime, UNIX_EPOCH};
+        match SystemTime::now().duration_since(UNIX_EPOCH) {
+            Ok(d) => (0, rpc::encode_u64(d.as_millis() as u64)),
             Err(_) => (-1, Vec::new()),
         }
     }

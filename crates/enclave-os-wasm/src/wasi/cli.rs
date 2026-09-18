@@ -9,7 +9,7 @@
 //! ## Implementations
 //!
 //! - **random**: RDRAND hardware RNG (no OCALL)
-//! - **clocks**: OCALL `get_current_time()` returning UNIX seconds
+//! - **clocks**: the enclave's trusted time (milliseconds); traps when there is none
 //! - **environment**: controlled env vars / args from [`AppContext`]
 //! - **stdin/stdout/stderr**: return input/output-stream resources
 //! - **exit**: trap (abort)
@@ -145,10 +145,11 @@ fn add_wall_clock(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error
             // Replay-mode transactions run against the FROZEN clock
             // committed in the entry, so replicas re-execute
             // identically.
-            let (secs, nanos) = match crate::enclave_sdk::ledger::det_timestamp_ms() {
-                Some(ms) => (ms / 1_000, ((ms % 1_000) as u32) * 1_000_000),
-                None => (get_time_secs(), 0),
+            let ms = match crate::enclave_sdk::ledger::det_timestamp_ms() {
+                Some(ms) => ms,
+                None => trusted_time_ms()?,
             };
+            let (secs, nanos) = (ms / 1_000, ((ms % 1_000) as u32) * 1_000_000);
             // Return a record { seconds, nanoseconds } — flattened as two vals.
             results[0] = Val::Record(
                 vec![
@@ -171,8 +172,8 @@ fn add_wall_clock(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error
             use wasmtime::component::Val;
             results[0] = Val::Record(
                 vec![
-                    ("seconds".into(), Val::U64(1)),
-                    ("nanoseconds".into(), Val::U32(0)),
+                    ("seconds".into(), Val::U64(0)),
+                    ("nanoseconds".into(), Val::U32(1_000_000)),
                 ]
                 .into(),
             );
@@ -197,7 +198,7 @@ fn add_monotonic_clock(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::
             // Frozen inside a replay transaction (see wall-clock).
             let nanos = match crate::enclave_sdk::ledger::det_timestamp_ms() {
                 Some(ms) => ms.saturating_mul(1_000_000),
-                None => get_time_secs().saturating_mul(1_000_000_000),
+                None => trusted_time_ms()?.saturating_mul(1_000_000),
             };
             Ok((nanos,))
         },
@@ -207,8 +208,8 @@ fn add_monotonic_clock(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::
     inst.func_wrap(
         "resolution",
         |_store: StoreContextMut<'_, AppContext>, _params: ()| {
-            // 1 second resolution (our OCALL returns whole seconds).
-            Ok((1_000_000_000u64,))
+            // 1 ms resolution (trusted time is kept in milliseconds).
+            Ok((1_000_000u64,))
         },
     )?;
 
@@ -384,7 +385,11 @@ pub fn add_to_linker(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Er
 //  Helpers
 // =========================================================================
 
-/// Fetch UNIX timestamp (seconds) via the host OCALL.
-fn get_time_secs() -> u64 {
-    enclave_os_common::ocall::get_current_time().unwrap_or(0)
+/// The enclave's trusted time, Unix milliseconds.
+///
+/// Without trusted time the clock call traps: the guest gets no time
+/// rather than a 0 that would make every expiry it checks look far away.
+fn trusted_time_ms() -> Result<u64, wasmtime::Error> {
+    enclave_os_common::ocall::get_current_time_ms()
+        .map_err(|_| wasmtime::Error::msg("wasi:clocks: no trusted time"))
 }

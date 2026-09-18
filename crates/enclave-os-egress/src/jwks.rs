@@ -100,7 +100,10 @@ fn resolve_jwks_uri(issuer: &str, jwks_uri: &str) -> Result<String, String> {
 /// Get or fetch a [`JwksCache`] for the given JWKS URI (TTL-based expiry).
 fn get_or_fetch_cache(jwks_uri: &str) -> Result<(), String> {
     ensure_store();
-    let now = enclave_os_common::ocall::get_current_time().unwrap_or(0);
+    // A 0 here would keep a cached key set "fresh" for ever (a rotated-out
+    // key would stay trusted); without trusted time, fail closed.
+    let now = enclave_os_common::ocall::get_current_time()
+        .map_err(|_| "JWKS cache: no trusted time".to_string())?;
 
     let needs_fetch = {
         let store = JWKS_STORE.lock().unwrap_or_else(|e| e.into_inner());

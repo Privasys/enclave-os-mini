@@ -191,7 +191,8 @@ fn fetch_directory(
     // Bind the current time (big-endian u64) into the quote's ReportData; send
     // the same value in a header so the server can check freshness and confirm
     // the quote is not a replay of an older one.
-    let ts = enclave_os_common::ocall::get_current_time().unwrap_or(0);
+    let ts = enclave_os_common::ocall::get_current_time()
+        .map_err(|_| String::from("no trusted time to bind into the directory quote"))?;
     let quote = enclave_attestation_quote(&ts.to_be_bytes())
         .ok_or("no attestation provider registered (cannot authenticate to directory)")?;
     let quote_b64 = b64url_nopad_encode(&quote);
