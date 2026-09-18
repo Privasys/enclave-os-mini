@@ -41,6 +41,7 @@ pub enum RpcMethod {
     NetSend          = 0x0103,
     NetRecv          = 0x0104,
     NetClose         = 0x0105,
+    NetTcpConnectTimeout = 0x0106,
     // UDP datagram sockets (their handles are not TCP handles)
     NetUdpBind       = 0x0110,
     NetUdpSendTo     = 0x0111,
@@ -78,6 +79,7 @@ impl RpcMethod {
             0x0103 => Some(Self::NetSend),
             0x0104 => Some(Self::NetRecv),
             0x0105 => Some(Self::NetClose),
+            0x0106 => Some(Self::NetTcpConnectTimeout),
             0x0110 => Some(Self::NetUdpBind),
             0x0111 => Some(Self::NetUdpSendTo),
             0x0112 => Some(Self::NetUdpRecvFrom),
@@ -227,6 +229,25 @@ pub fn decode_net_tcp_connect_req(p: &[u8]) -> Option<(String, u16)> {
     let port = u16::from_le_bytes(p[0..2].try_into().ok()?);
     let host = core::str::from_utf8(&p[2..]).ok()?.to_string();
     Some((host, port))
+}
+
+// -- NetTcpConnectTimeout --
+/// Payload: [u16 port] [u32 timeout_ms] [host as utf8]
+/// Like NetTcpConnect, but the connect and every later recv/send on the
+/// socket wait at most `timeout_ms` (the host caps it). Response: fd.
+pub fn encode_net_tcp_connect_timeout_req(host: &str, port: u16, timeout_ms: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(6 + host.len());
+    buf.extend_from_slice(&port.to_le_bytes());
+    buf.extend_from_slice(&timeout_ms.to_le_bytes());
+    buf.extend_from_slice(host.as_bytes());
+    buf
+}
+pub fn decode_net_tcp_connect_timeout_req(p: &[u8]) -> Option<(String, u16, u32)> {
+    if p.len() < 6 { return None; }
+    let port = u16::from_le_bytes(p[0..2].try_into().ok()?);
+    let timeout_ms = u32::from_le_bytes(p[2..6].try_into().ok()?);
+    let host = core::str::from_utf8(&p[6..]).ok()?.to_string();
+    Some((host, port, timeout_ms))
 }
 
 // -- NetSend --
@@ -815,6 +836,7 @@ mod tests {
             RpcMethod::NetSend,
             RpcMethod::NetRecv,
             RpcMethod::NetClose,
+            RpcMethod::NetTcpConnectTimeout,
             RpcMethod::NetUdpBind,
             RpcMethod::NetUdpSendTo,
             RpcMethod::NetUdpRecvFrom,
@@ -1106,6 +1128,16 @@ mod tests {
     }
 
     #[test]
+    fn test_connect_timeout_req_roundtrip() {
+        let e = encode_net_tcp_connect_timeout_req("nts.netnod.se", 4460, 2000);
+        assert_eq!(
+            decode_net_tcp_connect_timeout_req(&e).unwrap(),
+            ("nts.netnod.se".to_string(), 4460, 2000)
+        );
+        assert!(decode_net_tcp_connect_timeout_req(&e[..5]).is_none());
+    }
+
+    #[test]
     fn test_udp_payloads_roundtrip() {
         let e = encode_net_udp_bind_req("", 0);
         assert_eq!(decode_net_udp_bind_req(&e).unwrap(), (String::new(), 0));
@@ -1252,7 +1284,8 @@ mod tests {
 
         // Invalid IDs
         assert_eq!(RpcMethod::from_u16(0x0000), None);
-        assert_eq!(RpcMethod::from_u16(0x0106), None);
+        assert_eq!(RpcMethod::from_u16(0x0106), Some(RpcMethod::NetTcpConnectTimeout));
+        assert_eq!(RpcMethod::from_u16(0x0107), None);
         assert_eq!(RpcMethod::from_u16(0x0114), None);
         assert_eq!(RpcMethod::from_u16(0x0207), None);
         assert_eq!(RpcMethod::from_u16(0xFFFF), None);

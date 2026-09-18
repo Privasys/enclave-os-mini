@@ -40,7 +40,20 @@ use enclave_os_clock::{ntp, servers, ClockError, TOLERANCE_MS};
 use crate::ocall;
 
 /// How long one NTP reply is waited for.
-const RECV_TIMEOUT_MS: u32 = 3_000;
+const RECV_TIMEOUT_MS: u32 = 2_000;
+
+/// How long an NTS-KE connect, and each read or write on it, may wait.
+/// With at most three servers per quorum this keeps a quorum against
+/// unreachable or silent servers well under 20 s.
+const KE_TIMEOUT_MS: u32 = 2_000;
+
+/// How long the incident POST, and each read or write on it, may wait:
+/// the bound on waiting for the monitor's receipt.
+const INCIDENT_TIMEOUT_MS: u32 = 5_000;
+
+/// ALPN that makes the platform gateway splice the connection through to
+/// the monitor enclave rather than terminate TLS itself.
+const RATLS_ALPN: &[u8] = b"privasys-ratls/1";
 
 /// Datagrams read per request before giving up on a valid reply (anything
 /// that fails authentication is dropped: it may be the host's).
@@ -181,7 +194,7 @@ fn receive(f: &InFlight) -> Result<i64, String> {
 // ---------------------------------------------------------------------------
 
 fn key_exchange(host: &str, floor_ms: i64) -> Result<Session, String> {
-    let fd = ocall::net_tcp_connect(host, KE_PORT).map_err(|e| format!("connect {host}:{KE_PORT}: {e}"))?;
+    let fd = ocall::net_tcp_connect_timeout(host, KE_PORT, KE_TIMEOUT_MS).map_err(|e| format!("connect {host}:{KE_PORT}: {e}"))?;
     let r = key_exchange_on(fd, host, floor_ms);
     ocall::net_close(fd);
     r
@@ -404,14 +417,26 @@ fn read_plaintext(fd: i32, conn: &mut ClientConnection, out: &mut Vec<u8>, cap: 
 }
 
 // ---------------------------------------------------------------------------
-//  Incident POST without the egress module
+//  Incident POST to the monitor
 // ---------------------------------------------------------------------------
 
-/// POST `body` as JSON to an `https://` URL and return the body of a 2xx
-/// reply. Used for incident reports in builds without the egress module;
-/// the certificate is checked like the NTS-KE one.
-#[cfg(not(feature = "egress"))]
-pub fn https_post(url: &str, body: &[u8], at_ms: i64) -> Result<Vec<u8>, String> {
+/// POST an incident (JSON) to the monitor and return the body of its 2xx
+/// reply.
+///
+/// The monitor is an enclave behind the platform gateway, and its runtime
+/// refuses plaintext API calls on the gateway's terminating leg. ALPN
+/// `privasys-ratls/1` makes the gateway splice the connection through to
+/// the monitor enclave instead, so the enclave talks TLS to the monitor
+/// itself.
+///
+/// The monitor's certificate is an RA-TLS certificate, not a web PKI one,
+/// and it is not checked here: the report carries nothing secret, and what
+/// the enclave needs back is the receipt, which only the pinned monitor
+/// key can sign (the caller verifies it). Whoever sits in the middle can
+/// only withhold the receipt, which the host can do anyway. Each connect,
+/// read and write waits at most [`INCIDENT_TIMEOUT_MS`], which bounds the
+/// wait for the receipt.
+pub fn post_to_monitor(url: &str, body: &[u8], at_ms: i64) -> Result<Vec<u8>, String> {
     const MAX_REPLY: usize = 64 * 1024;
     let rest = url.strip_prefix("https://").ok_or("incident_url is not https")?;
     let (authority, path) = match rest.find('/') {
@@ -423,9 +448,19 @@ pub fn https_post(url: &str, body: &[u8], at_ms: i64) -> Result<Vec<u8>, String>
         None => (authority, 443),
     };
 
-    let fd = ocall::net_tcp_connect(host, port).map_err(|e| format!("connect {host}:{port}: {e}"))?;
+    let fd = ocall::net_tcp_connect_timeout(host, port, INCIDENT_TIMEOUT_MS)
+        .map_err(|e| format!("connect {host}:{port}: {e}"))?;
     let r = (|| {
-        let config = client_config(at_ms, None, Arc::new(AtomicI64::new(at_ms)))?;
+        let provider = Arc::new(default_provider());
+        // The TLS stack gets the frozen floor as its clock, never the host's.
+        let mut config = ClientConfig::builder_with_details(provider.clone(), Arc::new(FixedTime(at_ms)))
+            .with_protocol_versions(&[&rustls::version::TLS13])
+            .map_err(|e| format!("tls config: {e}"))?
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(ReceiptAuthenticates(provider)))
+            .with_no_client_auth();
+        config.alpn_protocols = vec![RATLS_ALPN.to_vec()];
+        config.resumption = rustls::client::Resumption::disabled();
         let name = ServerName::try_from(host.to_string()).map_err(|_| "invalid server name".to_string())?;
         let mut conn = ClientConnection::new(Arc::new(config), name).map_err(|e| format!("tls init: {e}"))?;
         handshake(fd, &mut conn)?;
@@ -439,19 +474,67 @@ pub fn https_post(url: &str, body: &[u8], at_ms: i64) -> Result<Vec<u8>, String>
         conn.writer().write_all(&req).map_err(|e| format!("write: {e}"))?;
         flush(fd, &mut conn)?;
         let mut raw = Vec::new();
-        while read_plaintext(fd, &mut conn, &mut raw, MAX_REPLY)? > 0 {}
-        parse_http_reply(&raw)
+        loop {
+            if let Some(body) = parse_http_reply(&raw, false)? {
+                return Ok(body);
+            }
+            if read_plaintext(fd, &mut conn, &mut raw, MAX_REPLY)? == 0 {
+                return parse_http_reply(&raw, true)?.ok_or_else(|| "incomplete HTTP reply".to_string());
+            }
+        }
     })();
     ocall::net_close(fd);
     r
 }
 
-#[cfg(not(feature = "egress"))]
-fn parse_http_reply(raw: &[u8]) -> Result<Vec<u8>, String> {
-    let split = raw
-        .windows(4)
-        .position(|w| w == b"\r\n\r\n")
-        .ok_or("incomplete HTTP reply")?;
+/// Accepts the monitor's certificate without a trust decision: the signed
+/// receipt is the authentication (see [`post_to_monitor`]). The handshake
+/// signature is still checked against the presented key, so the TLS
+/// session itself is sound.
+#[derive(Debug)]
+struct ReceiptAuthenticates(Arc<rustls::crypto::CryptoProvider>);
+
+impl ServerCertVerifier for ReceiptAuthenticates {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.0.signature_verification_algorithms)
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.0.signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Parse an HTTP/1.1 reply. `Ok(None)` while it is incomplete; `eof` says
+/// the peer closed, which completes a body without a length.
+fn parse_http_reply(raw: &[u8], eof: bool) -> Result<Option<Vec<u8>>, String> {
+    let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") else {
+        return Ok(None);
+    };
     let head = core::str::from_utf8(&raw[..split]).map_err(|_| "non-UTF-8 HTTP head".to_string())?;
     let mut lines = head.split("\r\n");
     let status: u16 = lines
@@ -475,7 +558,9 @@ fn parse_http_reply(raw: &[u8]) -> Result<Vec<u8>, String> {
         let mut out = Vec::new();
         let mut p = rest;
         loop {
-            let eol = p.windows(2).position(|w| w == b"\r\n").ok_or("bad chunk")?;
+            let Some(eol) = p.windows(2).position(|w| w == b"\r\n") else {
+                return Ok(None);
+            };
             let size_str = core::str::from_utf8(&p[..eol]).map_err(|_| "bad chunk size".to_string())?;
             let size = usize::from_str_radix(size_str.split(';').next().unwrap_or("").trim(), 16)
                 .map_err(|_| "bad chunk size".to_string())?;
@@ -484,7 +569,7 @@ fn parse_http_reply(raw: &[u8]) -> Result<Vec<u8>, String> {
                 break;
             }
             if p.len() < size + 2 {
-                return Err("truncated chunk".to_string());
+                return Ok(None);
             }
             out.extend_from_slice(&p[..size]);
             p = &p[size + 2..];
@@ -493,12 +578,13 @@ fn parse_http_reply(raw: &[u8]) -> Result<Vec<u8>, String> {
     } else {
         match length {
             Some(n) if n <= rest.len() => rest[..n].to_vec(),
-            Some(_) => return Err("truncated HTTP body".to_string()),
-            None => rest.to_vec(),
+            Some(_) => return Ok(None),
+            None if eof => rest.to_vec(),
+            None => return Ok(None),
         }
     };
     if !(200..300).contains(&status) {
         return Err(format!("monitor answered HTTP {status}"));
     }
-    Ok(body)
+    Ok(Some(body))
 }

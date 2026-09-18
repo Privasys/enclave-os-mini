@@ -43,6 +43,12 @@ pub fn net_tcp_connect(host: &str, port: u16) -> Result<i32, i32> {
     rpc().net_tcp_connect(host, port)
 }
 
+/// Connect to a remote TCP endpoint with a bounded wait (connect, then each
+/// recv/send). Returns a socket handle.
+pub fn net_tcp_connect_timeout(host: &str, port: u16, timeout_ms: u32) -> Result<i32, i32> {
+    rpc().net_tcp_connect_timeout(host, port, timeout_ms)
+}
+
 /// Send data on a socket. Returns the number of bytes sent.
 pub fn net_send(fd: i32, data: &[u8]) -> Result<usize, i32> {
     rpc().net_send(fd, data)

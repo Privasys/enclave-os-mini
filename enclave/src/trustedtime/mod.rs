@@ -26,14 +26,15 @@
 //!
 //! Reading `std::time::SystemTime` directly would bypass all of this (the
 //! Teaclave sysroot answers it with its own untrusted ocall); it is a
-//! disallowed method for clippy in every enclave crate. The TLS stacks get
-//! the same time through [`RustlsTime`].
+//! disallowed method for clippy in every enclave crate. The TLS stacks that
+//! verify a peer get the same time through [`RustlsTime`]; the RA-TLS
+//! server serves with [`ServingTime`], which never fails.
 
 pub mod nts;
 
 use std::cell::Cell;
 use std::string::String;
-use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use std::vec::Vec;
@@ -58,6 +59,11 @@ static CLOCK: OnceLock<Mutex<Clock>> = OnceLock::new();
 /// [`with_clock`]): the frozen time, never below the floor or a previous
 /// read.
 static FROZEN_MS: AtomicI64 = AtomicI64::new(MIN_TRUSTED_TIME_MS);
+
+/// Whether trusted time is failing closed, as of the last clock operation.
+/// Lets the times the enclave issues itself skip a read that would only
+/// fail (or start an NTS retry in the middle of a TLS handshake).
+static FAILING_CLOSED: AtomicBool = AtomicBool::new(false);
 
 std::thread_local! {
     static IN_CLOCK: Cell<bool> = Cell::new(false);
@@ -87,6 +93,7 @@ fn with_clock<T>(f: impl FnOnce(&mut Clock, &mut CoreEnv) -> T) -> Option<T> {
     let _guard = InClockGuard;
     let r = f(&mut clock, &mut CoreEnv);
     FROZEN_MS.store(clock.frozen_ms(), Ordering::Relaxed);
+    FAILING_CLOSED.store(clock.is_failing_closed(), Ordering::Relaxed);
     Some(r)
 }
 
@@ -113,7 +120,17 @@ pub fn now_secs() -> Result<u64, i32> {
 /// when there is one, otherwise the frozen floor. Never use it for a check
 /// on something presented to the enclave; use [`now_secs`] and fail closed.
 pub fn issue_secs() -> u64 {
-    now_secs().unwrap_or_else(|_| FROZEN_MS.load(Ordering::Relaxed).max(0) as u64 / 1_000)
+    issue_ms() / 1_000
+}
+
+/// [`issue_secs`] in milliseconds. Never fails and never waits on NTS:
+/// while trusted time is failing closed it is the frozen floor.
+pub fn issue_ms() -> u64 {
+    let frozen = FROZEN_MS.load(Ordering::Relaxed).max(0) as u64;
+    if FAILING_CLOSED.load(Ordering::Relaxed) {
+        return frozen;
+    }
+    now_ms().unwrap_or(frozen)
 }
 
 /// Run the boot NTS fetch now rather than on the first request.
@@ -191,6 +208,21 @@ fn json_error(status: u16, msg: &str) -> (u16, Vec<u8>) {
 #[derive(Debug)]
 pub struct RustlsTime;
 
+/// The clock of the RA-TLS server config. Serving TLS is not a decision
+/// the enclave makes on trusted time (its client-certificate check does
+/// not look at dates; ticket lifetimes are bookkeeping), so it gets
+/// [`issue_ms`] and never fails: while trusted time is failing closed the
+/// enclave must stay reachable, above all for the monitor's poll.
+/// Verification decisions keep [`RustlsTime`] and fail closed.
+#[derive(Debug)]
+pub struct ServingTime;
+
+impl rustls::time_provider::TimeProvider for ServingTime {
+    fn current_time(&self) -> Option<rustls::pki_types::UnixTime> {
+        Some(rustls::pki_types::UnixTime::since_unix_epoch(Duration::from_millis(issue_ms())))
+    }
+}
+
 impl rustls::time_provider::TimeProvider for RustlsTime {
     fn current_time(&self) -> Option<rustls::pki_types::UnixTime> {
         now_ms()
@@ -246,30 +278,12 @@ impl Env for CoreEnv {
 
 /// POST an incident to the monitor and return the body of its 2xx reply.
 ///
-/// The enclave cannot time the wait itself (it has no clock): the host's
-/// socket timeout bounds it, and anything but a reply carrying a valid
+/// The enclave cannot time the wait itself (it has no clock): the host
+/// socket timeouts of the connection bound it (see
+/// [`nts::post_to_monitor`]), and anything but a reply carrying a valid
 /// signed receipt counts as no receipt.
 fn post_incident(url: &str, body: &[u8]) -> Result<Vec<u8>, String> {
-    #[cfg(feature = "egress")]
-    {
-        let headers = [(String::from("Content-Type"), String::from("application/json"))];
-        let resp = enclave_os_egress::client::https_fetch(
-            "POST",
-            url,
-            &headers,
-            Some(body),
-            enclave_os_egress::client::mozilla_root_store(),
-            None,
-        )?;
-        if !(200..300).contains(&resp.status) {
-            return Err(format!("monitor answered HTTP {}", resp.status));
-        }
-        Ok(resp.body)
-    }
-    #[cfg(not(feature = "egress"))]
-    {
-        nts::https_post(url, body, FROZEN_MS.load(Ordering::Relaxed))
-    }
+    nts::post_to_monitor(url, body, FROZEN_MS.load(Ordering::Relaxed))
 }
 
 // ---------------------------------------------------------------------------

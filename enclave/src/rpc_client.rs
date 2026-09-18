@@ -143,6 +143,18 @@ impl RpcClient {
         }
     }
 
+    /// Connect to `host:port`, waiting at most `timeout_ms` for the connect
+    /// and for each later recv/send on the socket. Returns fd.
+    pub fn net_tcp_connect_timeout(&self, host: &str, port: u16, timeout_ms: u32) -> Result<i32, i32> {
+        let payload = rpc::encode_net_tcp_connect_timeout_req(host, port, timeout_ms);
+        let (status, resp) = self.call(RpcMethod::NetTcpConnectTimeout, &payload);
+        if status == 0 {
+            rpc::decode_fd(&resp).ok_or(-1)
+        } else {
+            Err(status)
+        }
+    }
+
     /// Send `data` on `fd`. Returns bytes sent.
     pub fn net_send(&self, fd: i32, data: &[u8]) -> Result<usize, i32> {
         let payload = rpc::encode_net_send_req(fd, data);

@@ -94,6 +94,38 @@ pub fn tcp_connect(host: &str, port: u16) -> Result<i32> {
     Ok(fd)
 }
 
+/// Longest wait a bounded connect may ask for.
+pub const MAX_CONNECT_TIMEOUT_MS: u32 = 30_000;
+
+/// Connect to a remote TCP endpoint, waiting at most `timeout_ms` for the
+/// connect and for each later recv or send on the socket.
+pub fn tcp_connect_timeout(host: &str, port: u16, timeout_ms: u32) -> Result<i32> {
+    use std::net::ToSocketAddrs;
+    let wait = Duration::from_millis(timeout_ms.clamp(1, MAX_CONNECT_TIMEOUT_MS) as u64);
+    let mut last_err = anyhow::anyhow!("No address for {}:{}", host, port);
+    let mut connected = None;
+    for addr in (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("Failed to resolve {}:{}", host, port))?
+    {
+        match TcpStream::connect_timeout(&addr, wait) {
+            Ok(s) => {
+                connected = Some(s);
+                break;
+            }
+            Err(e) => last_err = anyhow::anyhow!("Failed to connect to {}: {}", addr, e),
+        }
+    }
+    let stream = connected.ok_or(last_err)?;
+    let _ = stream.set_read_timeout(Some(wait));
+    let _ = stream.set_write_timeout(Some(wait));
+
+    let mut table = SOCKET_TABLE.lock().unwrap();
+    let fd = table.alloc_fd();
+    table.streams.insert(fd, stream);
+    Ok(fd)
+}
+
 /// Send data on a connected socket.
 pub fn tcp_send(fd: i32, data: &[u8]) -> Result<usize> {
     let mut table = SOCKET_TABLE.lock().unwrap();

@@ -100,6 +100,7 @@ impl RpcDispatcher {
             RpcMethod::NetSend => self.handle_net_send(payload),
             RpcMethod::NetRecv => self.handle_net_recv(payload),
             RpcMethod::NetClose => self.handle_net_close(payload),
+            RpcMethod::NetTcpConnectTimeout => self.handle_net_tcp_connect_timeout(payload),
             RpcMethod::NetUdpBind => self.handle_net_udp_bind(payload),
             RpcMethod::NetUdpSendTo => self.handle_net_udp_send_to(payload),
             RpcMethod::NetUdpRecvFrom => self.handle_net_udp_recv_from(payload),
@@ -182,6 +183,21 @@ impl RpcDispatcher {
             Ok(fd) => (0, rpc::encode_fd(fd)),
             Err(e) => {
                 error!("NetTcpConnect failed: {}", e);
+                (-1, Vec::new())
+            }
+        }
+    }
+
+    fn handle_net_tcp_connect_timeout(&self, payload: &[u8]) -> (i32, Vec<u8>) {
+        let (host, port, timeout_ms) = match rpc::decode_net_tcp_connect_timeout_req(payload) {
+            Some(r) => r,
+            None => return (-1, Vec::new()),
+        };
+        debug!("RPC: NetTcpConnectTimeout(host={}, port={}, timeout_ms={})", host, port, timeout_ms);
+        match net::tcp_connect_timeout(&host, port, timeout_ms) {
+            Ok(fd) => (0, rpc::encode_fd(fd)),
+            Err(e) => {
+                error!("NetTcpConnectTimeout failed: {}", e);
                 (-1, Vec::new())
             }
         }

@@ -708,9 +708,12 @@ fn build_tls_config(
 
     let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(result.pkcs8_key));
 
+    // Serving TLS never waits on trusted time (see ServingTime): the
+    // enclave, and the clock poll route above all, stays reachable while
+    // trusted time is failing closed.
     let config = ServerConfig::builder_with_details(
         Arc::new(default_provider()),
-        Arc::new(crate::trustedtime::RustlsTime),
+        Arc::new(crate::trustedtime::ServingTime),
     )
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| format!("TLS config error: {:?}", e))?
@@ -1248,13 +1251,15 @@ fn handle_set_attestation_servers(
 fn handle_clock_config(
     http_req: &enclave_os_common::protocol::HttpRequest,
 ) -> HttpHandleResult {
-    // Require Manager role when OIDC is configured, like every other
-    // manager-only core route.
-    if crate::oidc_config().is_some() {
-        match verify_auth_header(http_req) {
-            Some(claims) if claims.has_manager() => {}
-            _ => return HttpHandleResult::err(403, "manager role required"),
-        }
+    // Always the manager role. Unlike the other manager-only core routes
+    // this one is refused, not open, when no OIDC is configured: it sets
+    // the key every monitor poll and receipt is checked against.
+    if crate::oidc_config().is_none() {
+        return HttpHandleResult::err(403, "manager role required (no OIDC configured)");
+    }
+    match verify_auth_header(http_req) {
+        Some(claims) if claims.has_manager() => {}
+        _ => return HttpHandleResult::err(403, "manager role required"),
     }
     let (status, body) = crate::trustedtime::handle_config(&http_req.body);
     HttpHandleResult::json(status, body)
