@@ -31,7 +31,7 @@ See [vault.md](vault.md) for vault-specific details and
 | `Metrics` | Bearer | Monitoring+ | Enclave counters + WASM fuel metrics |
 | `SetAttestationServers` | Bearer | Manager | Update attestation servers (URLs + tokens) |
 | `Shutdown` | — | — | Graceful shutdown (internal) |
-| `PUT /clock/config` | Bearer | Manager | Trusted-clock monitor config (key, incident URL, version) |
+| `PUT /clock/config` | Bearer (OIDC required) | Manager | Trusted-clock monitor config (key, incident URL, version) |
 | `POST /clock/poll` | Ed25519 signature | — | Monitor floor poll; replies with the clock state |
 
 ### WASM
@@ -322,7 +322,7 @@ enclave's time honest. They are core routes (not module operations) and
 are served on the gateway's terminate path without sealed transport,
 since each carries its own authentication.
 
-- `PUT /clock/config` (Manager role when OIDC is configured): the monitor
+- `PUT /clock/config` (always the Manager role; refused when no OIDC is configured): the monitor
   key, incident URL and enclave id from management-service, sealed with
   the clock floor. Only a higher `config_version` replaces the config; the
   same version again is a successful no-op; a lower one answers 409.

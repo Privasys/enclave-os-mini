@@ -242,7 +242,7 @@ Compact binary format over the SPSC queues:
 | Payload length | u32 | u32 |
 | Payload | variable | variable |
 
-Method families: TCP (`0x0100`-`0x0105`), UDP datagrams (`0x0110`-`0x0113`:
+Method families: TCP (`0x0100`-`0x0106`, `0x0106` a connect with a bounded wait), UDP datagrams (`0x0110`-`0x0113`:
 bind, send_to, recv_from with a timeout, close), the sealed KV store
 (`0x0200`-`0x0206`), utility (`0x0300` host time in seconds, `0x0301` log,
 `0x0302` host time in milliseconds), DCAP quoting (`0x0400`-`0x0401`) and

@@ -35,12 +35,16 @@ expiry look far away):
 - the WASI `wall-clock` and `monotonic-clock`: the call **traps** (1 ms
   resolution; the monotonic clock is the same time in nanoseconds and
   never goes back);
-- every rustls config (egress, RA-TLS server, peer links) takes its clock
-  from the choke point, never from the sysroot.
+- every rustls config that verifies a peer (egress, peer links) takes its
+  clock from the choke point, never from the sysroot.
 
 What the enclave issues itself (its own leaf certificates, the
 `quote_time` it stamps) uses trusted time, or the frozen floor when there
-is none: their validity is the peer's check.
+is none: their validity is the peer's check. The RA-TLS server's own TLS
+clock (session tickets, resumption) is the same issue time: serving TLS
+is not a decision on trusted time, and while trusted time is failing
+closed the enclave stays reachable, above all for the monitor's poll.
+Only verification decisions fail closed.
 
 `std::time::SystemTime::now()` would bypass all of this: the Teaclave
 sysroot answers it with its own untrusted ocall. It is banned in enclave
@@ -73,19 +77,33 @@ monitor config. `last_returned` stays in memory.
   how stale the frozen time gets on reads the host drives). The flag
   clears when NTS confirms the host. A failed refetch fails closed.
 - **No NTS quorum when one is needed** fails closed. The fetch is retried
-  every 100 reads and on every monitor poll.
+  every 100 reads and on every signed monitor poll (after its signature
+  is checked), so an idle enclave recovers as soon as NTS is back.
+- **Self-check:** after 1000 unflagged reads without a confirmation (a
+  poll in sync, or NTS), the clock checks the host against NTS. A host
+  that blocks the monitor's polls could otherwise hold its clock just
+  above the floor for ever; SGX has no elapsed-time source, so reads are
+  what is counted. A disagreement flags the clock; no quorum fails
+  closed.
+- **Bounded raises:** a poll in sync (host and monitor agreeing, no NTS)
+  raises the floor by at most one hour. A larger jump needs an NTS quorum
+  confirming the host, so the monitor key and the host together cannot
+  push the floor into the future.
 - **No monitor configured:** incidents are only logged. NTS still decides.
 
-Incidents found by a poll or the boot fetch (`host_clock_wrong`,
-`monitor_clock_wrong`, `nts_unreachable`) are reported after the poll
-reply, on the next read: the monitor may poll again on receiving a
-report, and the single-threaded enclave could not answer while waiting
-for the receipt. The poll reply already carries the verdict, so a lost
-report of this kind is logged, not a reason to fail closed.
+What a poll finds (`host_clock_wrong`, `monitor_clock_wrong`, no NTS
+quorum) is in the poll reply and is never sent as an incident: the
+monitor polls again after every incident, which would loop. Incidents are
+for what is found outside a poll: the host behind the floor, the boot
+fetch (`nts_unreachable`, `host_clock_wrong`), a failed refetch, the
+self-check. Only `host_behind_floor` waits for the receipt (and fails
+closed without it); the others are sent on the next read, never inside a
+poll, and a lost one is logged. Each condition is reported once, until
+the host time is confirmed again.
 
 Known limit: the enclave cannot measure how long it waited for an NTS
 reply. A host can hold a reply for X seconds and roll its clock back by X
-to match; the unseen lag is the tolerance plus the receive timeout (3 s).
+to match; the unseen lag is the tolerance plus the receive timeout (2 s).
 
 The pure parts (state machine, NTS codecs, quorum, wire contracts) live in
 `crates/enclave-os-clock`, which builds and tests on any host:
@@ -124,6 +142,11 @@ round are sampled together (all requests sent before any reply is read).
 A failing server is replaced by the next one in the random order. No
 agreeing pair: no quorum.
 
+**Bounded cost:** at most three servers and two rounds per quorum. Each
+NTS-KE connect, and each read or write on it, waits at most 2 s; each NTP
+reply at most 2 s. Unreachable or silent servers cost a quorum about 2 s
+each, well under 20 s in all.
+
 **Pinned servers**, one per operator, compiled in (a change is a runtime
 roll, never configuration):
 
@@ -149,8 +172,10 @@ characters (lowercase) of `sha256(public key)`.
 
 ### `PUT /clock/config`
 
-From management-service. Manager role when OIDC is configured (like the
-other manager-only core routes). Sealed with the floor.
+From management-service. Always the manager role: unlike the other
+manager-only core routes, it is refused (403) when no OIDC is configured,
+since it sets the key every poll and receipt is checked against. Sealed
+with the floor.
 
 ```json
 { "enclave_id": "<mgmt enclave uuid>",
@@ -165,7 +190,7 @@ other manager-only core routes). Sealed with the floor.
 | 200 | `{"enclave_id", "monitor_key_id", "config_version", "applied": true}` | Higher `config_version`: applied |
 | 200 | same, `"applied": false` | Same `config_version` as the sealed one: no-op, config kept |
 | 400 | `{"error": "..."}` | Invalid body, key, key id or URL |
-| 403 | `{"error": "manager role required"}` | Bearer missing or not manager |
+| 403 | `{"error": "manager role required"}` | Bearer missing or not manager, or no OIDC configured |
 | 409 | `{"error": "...", "config_version": <current>}` | Lower `config_version` |
 
 The request needs a `Content-Length` (Go's `net/http` sets it for a byte
@@ -212,7 +237,15 @@ Reply (authentic through the RA-TLS channel):
 
 ### Incident
 
-`POST {incident_url}`, plain HTTPS (Mozilla roots):
+`POST {incident_url}` over TLS 1.3 with ALPN `privasys-ratls/1`, so the
+platform gateway splices the connection through to the monitor enclave
+(its runtime refuses plaintext API calls on the gateway's terminating
+leg). The monitor's certificate is an RA-TLS certificate, not a web PKI
+one, and is not checked: the report carries nothing secret, and the
+receipt, which only the pinned monitor key can sign, is the
+authentication. A party in the middle can only withhold the receipt,
+which the host can do anyway. The connect, and each read or write, waits
+at most 5 s.
 
 ```json
 { "enclave_id": "...", "reason": "host_behind_floor|host_clock_wrong|monitor_clock_wrong|nts_unreachable",
@@ -239,3 +272,8 @@ channel has generic datagram ops (handles are distinct from TCP ones):
 The host resolves hostnames to the socket's address family and caps a
 receive at 10 s. In the enclave they are `ocall::net_udp_*`, also on the
 OCall vtable for module crates.
+
+Alongside, `NetTcpConnectTimeout` (`0x0106`, payload
+`[u16 port][u32 timeout_ms][host]`, response fd) is a TCP connect whose
+connect, and every later recv or send, waits at most `timeout_ms` (capped
+at 30 s): it bounds the NTS-KE legs and the incident POST.
