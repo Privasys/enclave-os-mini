@@ -172,7 +172,7 @@ otherwise the frozen time (time pauses, never goes back); another clock
 route waits its turn. A time read never suspends (it may come from under
 any lock, and a request suspended while holding a lock would block the
 next one that takes it, on the enclave's one thread), so an NTS fetch a
-read starts (boot, refetch, self-check, incidents) still blocks, as do
+read starts (boot, refetch, incidents) still blocks, as do
 all of them in builds without WASM.
 
 ## Monitor contracts
