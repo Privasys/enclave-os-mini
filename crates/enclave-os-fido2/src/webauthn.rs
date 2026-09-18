@@ -5,8 +5,11 @@
 //! and verify ECDSA P-256 signatures.
 //!
 //! Only the subset needed for FIDO2 registration and authentication is
-//! implemented — no support for attestation statement verification (we
-//! trust our own authenticator via AAGUID enforcement).
+//! implemented. The attestation statement is not verified, and our own
+//! clients send `fmt: "none"`, so nothing authenticates the AAGUID: it sits in
+//! authenticator data that any software authenticator can write. The AAGUID
+//! allowlist therefore only filters honest authenticators by make. No
+//! authorization decision may depend on it.
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -35,10 +38,14 @@ pub struct ClientData {
 ///
 /// Returns the parsed structure and the raw JSON bytes (needed for
 /// signature verification — the signature is over `SHA-256(clientDataJSON)`).
+///
+/// Checks the type, the challenge and the origin (WebAuthn §7.1 step 9,
+/// §7.2 step 11); see [`origin_matches_rp_id`] for which origins are accepted.
 pub fn parse_client_data(
     client_data_json_b64: &str,
     expected_type: &str,
     expected_challenge_b64: &str,
+    rp_id: &str,
 ) -> Result<(ClientData, Vec<u8>), String> {
     let raw = URL_SAFE_NO_PAD
         .decode(client_data_json_b64)
@@ -58,7 +65,42 @@ pub fn parse_client_data(
         return Err("clientDataJSON challenge mismatch".into());
     }
 
+    if !origin_matches_rp_id(&cd.origin, rp_id) {
+        return Err(format!(
+            "clientDataJSON origin {:?} is not an https origin for {rp_id}",
+            cd.origin
+        ));
+    }
+
     Ok((cd, raw))
+}
+
+/// Whether a ceremony origin belongs to this relying party.
+///
+/// Accepts `https://` origins whose host is the RP ID or a subdomain of it, on
+/// any port. That is the rule a browser already applies before it lets a page
+/// use an RP ID, so every ceremony a browser completes passes. What it refuses
+/// is an origin for some other site, or a non-https one, which only a
+/// non-browser client or a relayed ceremony produces.
+///
+/// Android app origins (`android:apk-key-hash:...`) are refused: no client of
+/// this module sends them today, and accepting one safely needs a list of the
+/// app signing keys this RP trusts.
+pub fn origin_matches_rp_id(origin: &str, rp_id: &str) -> bool {
+    let Some(authority) = origin.strip_prefix("https://") else {
+        return false;
+    };
+    let host = match authority.rsplit_once(':') {
+        Some((h, port)) if !port.is_empty() && port.bytes().all(|b| b.is_ascii_digit()) => h,
+        Some(_) => return false,
+        None => authority,
+    };
+    if host.is_empty() || rp_id.is_empty() || host.contains(['/', '?', '#', '@']) {
+        return false;
+    }
+    let host = host.to_ascii_lowercase();
+    let rp_id = rp_id.to_ascii_lowercase();
+    host == rp_id || host.ends_with(&format!(".{rp_id}"))
 }
 
 // ---------------------------------------------------------------------------
@@ -303,4 +345,41 @@ pub fn verify_signature(
 pub fn sha256(data: &[u8]) -> Vec<u8> {
     use ring::digest;
     digest::digest(&digest::SHA256, data).as_ref().to_vec()
+}
+
+#[cfg(test)]
+mod origin_tests {
+    use super::origin_matches_rp_id as ok;
+
+    const RP: &str = "myapp.apps.privasys.org";
+
+    #[test]
+    fn accepts_what_a_browser_would_allow() {
+        assert!(ok("https://myapp.apps.privasys.org", RP));
+        assert!(ok("https://myapp.apps.privasys.org:8445", RP));
+        assert!(ok("https://www.myapp.apps.privasys.org", RP));
+        assert!(ok("https://MyApp.Apps.Privasys.org", RP));
+    }
+
+    #[test]
+    fn refuses_other_sites() {
+        assert!(!ok("https://evil.example", RP));
+        assert!(!ok("https://other.apps.privasys.org", RP));
+        assert!(!ok("https://apps.privasys.org", RP));
+        // A suffix match on the string, not on a label boundary.
+        assert!(!ok("https://notmyapp.apps.privasys.org", RP));
+        assert!(!ok("https://myapp.apps.privasys.org.evil.example", RP));
+    }
+
+    #[test]
+    fn refuses_non_https_and_malformed() {
+        assert!(!ok("http://myapp.apps.privasys.org", RP));
+        assert!(!ok("android:apk-key-hash:abc", RP));
+        assert!(!ok("https://myapp.apps.privasys.org:", RP));
+        assert!(!ok("https://myapp.apps.privasys.org:x", RP));
+        assert!(!ok("https://myapp.apps.privasys.org/path", RP));
+        assert!(!ok("https://user@myapp.apps.privasys.org", RP));
+        assert!(!ok("", RP));
+        assert!(!ok("https://myapp.apps.privasys.org", ""));
+    }
 }

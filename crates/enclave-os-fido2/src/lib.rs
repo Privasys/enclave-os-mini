@@ -233,6 +233,7 @@ impl Fido2Module {
             client_data_json_b64,
             "webauthn.create",
             challenge_b64,
+            &self.rp_id,
         ) {
             Ok(cd) => cd,
             Err(e) => return Fido2Response::Error { error: e },
@@ -399,6 +400,7 @@ impl Fido2Module {
             client_data_json_b64,
             "webauthn.get",
             challenge_b64,
+            &self.rp_id,
         ) {
             Ok(cd) => cd,
             Err(e) => return Fido2Response::Error { error: e },
