@@ -116,6 +116,14 @@ use crate::registry::AppMeta;
 /// KV key storing the JSON array of all persisted app names.
 const KV_MANIFEST: &[u8] = b"wasm:manifest";
 
+/// Per-call fuel budget of an app loaded without `max_fuel`: about a second
+/// or two of guest compute. The previous 10 000 000 (~10-20 ms) could not
+/// even decode a typical web page after `https.fetch` (24-43 M measured).
+/// Guest calls yield to the event loop every `FUEL_YIELD_INTERVAL`, so a
+/// long call no longer blocks other requests, and billing counts the fuel
+/// consumed, not the budget.
+const DEFAULT_MAX_FUEL: u64 = 1_000_000_000;
+
 /// Build the KV key for an app's serialised metadata.
 fn kv_meta_key(name: &str) -> Vec<u8> {
     let mut k = b"wasm:meta:".to_vec();
@@ -1760,7 +1768,7 @@ impl EnclaveModule for WasmModule {
                 None => None,
             };
 
-            let max_fuel = load.max_fuel.unwrap_or(10_000_000);
+            let max_fuel = load.max_fuel.unwrap_or(DEFAULT_MAX_FUEL);
             let mcp_enabled = load.mcp_enabled.unwrap_or(true);
 
             let app_id = parse_app_id(load.app_id.as_deref());

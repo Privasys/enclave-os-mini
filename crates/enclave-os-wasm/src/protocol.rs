@@ -315,7 +315,8 @@ pub struct WasmLoad {
     ///
     /// Each `wasm_call` invocation starts with this many fuel units.
     /// When the budget is exhausted, the WASM instance traps.
-    /// Defaults to 10 000 000 (~a few hundred ms of compute) when absent.
+    /// Defaults to `DEFAULT_MAX_FUEL` (1 000 000 000, about a second or two of
+    /// compute) when absent.
     #[serde(default)]
     pub max_fuel: Option<u64>,
     /// Whether to expose this app as an MCP tool server.
