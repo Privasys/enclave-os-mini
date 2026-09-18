@@ -1669,9 +1669,14 @@ impl EnclaveModule for WasmModule {
         };
 
         // ── Platform OIDC role gate (load/unload/list) ──────────────
+        // Every host-pushed control operation belongs here. `wasm_funded_rps`
+        // was documented as manager-only but missing from this list, so an
+        // unauthenticated POST /data could install a funded-sponsor set and
+        // refuse every sponsored call on the enclave.
         let needs_manager = envelope.wasm_load.is_some()
             || envelope.wasm_unload.is_some()
             || envelope.wasm_freeze.is_some()
+            || envelope.wasm_funded_rps.is_some()
             || envelope.wasm_rotate_key.is_some()
             || envelope.wasm_set_dependencies.is_some();
         let needs_monitoring = envelope.wasm_list.is_some();
