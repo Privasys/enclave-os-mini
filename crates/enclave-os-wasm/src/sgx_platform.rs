@@ -11,28 +11,49 @@
 //! SGX enclaves have two memory constraints:
 //!
 //! 1. **Heap pages** (EADD'd during ECREATE) have RW permissions.
-//!    These CANNOT be made executable — EMODPE only extends EAUG'd pages.
+//!    These CANNOT be made executable: EMODPE only extends EAUG'd pages.
 //!
 //! 2. **Dynamic pages** (EAUG'd via EDMM) can have flexible permissions,
 //!    but EDMM operations hang on some server configurations.
 //!
 //! Our solution: pre-allocate an **RWX section** in the enclave ELF binary
 //! using `global_asm!`. The `sgx_sign` tool creates EADD entries with RWX
-//! permissions for these pages. Wasmtime gets code memory from this pool
-//! (bump allocator), and data memory from the heap (standard allocator).
+//! permissions for these pages. Wasmtime gets code memory from this pool and
+//! data memory from the heap.
+//!
+//! ## Which allocations are code
+//!
+//! `wasmtime_mmap_new` is not told what a mapping is for, but with the
+//! features we build (no pooling allocator, no copy-on-write images, no
+//! compiler) wasmtime asks for memory in exactly two ways:
+//!
+//! - `Mmap::new` (`prot = READ | WRITE`), reached only through `MmapVec`,
+//!   which holds a code image: `Component::deserialize` copies the whole
+//!   `.cwasm` into one and later makes its `.text` executable. These go to
+//!   the pool, whatever their size.
+//! - `Mmap::reserve` (`prot = NONE`), for linear memories and GC heaps, which
+//!   are never executed. These go to the heap.
+//!
+//! Pool pages are tracked by [`PagePool`] and reclaimed when wasmtime unmaps
+//! them, so loads, unloads, LRU evictions and redeploys reuse the same pages.
+//! When the pool cannot hold a code image the allocation fails and wasmtime
+//! fails that one load. Code never falls back to the heap: the enclave would
+//! crash the first time it ran it. As a second line of defence,
+//! `wasmtime_mprotect` refuses to make anything outside a pool allocation
+//! executable, which also fails the load instead of the enclave.
 //!
 //! ## C API symbols provided
 //!
-//! | C API function               | SGX implementation                        |
-//! |------------------------------|-------------------------------------------|
-//! | `wasmtime_mmap_new`          | RWX code pool (≤1MB) or heap alloc (>1MB) |
-//! | `wasmtime_mprotect`          | no-op (pool=RWX, heap=RW)                 |
-//! | `wasmtime_munmap`            | heap dealloc (pool: retained)             |
-//! | `wasmtime_mmap_remap`        | zero memory                               |
-//! | `wasmtime_page_size`         | 4096                                      |
-//! | `wasmtime_init_traps`        | `sgx_register_exception_handler` (VEH)    |
-//! | `wasmtime_tls_get/set`       | `AtomicPtr` (single-threaded per TCS)     |
-//! | `wasmtime_memory_image_*`    | disabled (no CoW / memfd in SGX)          |
+//! | C API function               | SGX implementation                         |
+//! |------------------------------|--------------------------------------------|
+//! | `wasmtime_mmap_new`          | code image: RWX pool; reservation: heap    |
+//! | `wasmtime_mprotect`          | no-op; EXEC outside the pool is refused    |
+//! | `wasmtime_munmap`            | pool: pages reclaimed; heap: dealloc       |
+//! | `wasmtime_mmap_remap`        | zero the range                             |
+//! | `wasmtime_page_size`         | 4096                                       |
+//! | `wasmtime_init_traps`        | `sgx_register_exception_handler` (VEH)     |
+//! | `wasmtime_tls_get/set`       | `AtomicPtr` (single-threaded per TCS)      |
+//! | `wasmtime_memory_image_*`    | disabled (no CoW / memfd in SGX)           |
 
 #![allow(unused_unsafe)]
 
@@ -41,15 +62,22 @@ extern crate alloc;
 use core::ffi::c_void;
 use core::ptr;
 use core::sync::atomic::{AtomicPtr, AtomicUsize, Ordering};
+use std::sync::{Mutex, MutexGuard, PoisonError};
+
+use crate::code_pool::{FreeError, PagePool};
 
 // =========================================================================
-//  RWX Code Pool — pre-allocated executable memory
+//  RWX Code Pool: pre-allocated executable memory
 // =========================================================================
+
+/// Page size (x86-64 SGX).
+const PAGE_SIZE: usize = 4096;
 
 /// Size of the RWX code pool (16 MiB).
 ///
-/// This is the maximum total size of pre-compiled WASM code that can be
-/// loaded into the enclave. Adjust based on your needs.
+/// Bounds the code images of all apps held at once (loaded apps, plus one
+/// being loaded). Pages are reclaimed on unload, so this is a limit on what
+/// is resident, not on how many loads the enclave serves.
 const CODE_POOL_SIZE: usize = 16 * 1024 * 1024;
 
 // Define an RWX section in the enclave ELF binary.
@@ -72,39 +100,111 @@ extern "C" {
     static _wasm_code_pool_end: u8;
 }
 
-/// Bump pointer for the RWX code pool.
-static CODE_POOL_OFFSET: AtomicUsize = AtomicUsize::new(0);
+/// Which pool pages are in use.
+static CODE_POOL: Mutex<PagePool> = Mutex::new(PagePool::new(CODE_POOL_SIZE / PAGE_SIZE));
 
-/// Allocate `size` bytes from the RWX code pool (page-aligned).
-/// Returns null on exhaustion.
+/// Lock the pool bookkeeping. A panic while it was held cannot leave it
+/// inconsistent (every update is a single `Vec` edit), so poisoning is
+/// ignored rather than unwinding through an `extern "C"` function.
+fn code_pool() -> MutexGuard<'static, PagePool> {
+    CODE_POOL.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+fn code_pool_base() -> usize {
+    unsafe { &_wasm_code_pool_start as *const u8 as usize }
+}
+
+/// Allocate `size` bytes (page-aligned) of zeroed memory from the RWX code
+/// pool. Returns null, having logged why, if no free run is long enough.
 unsafe fn code_pool_alloc(size: usize) -> *mut u8 {
-    let aligned = page_align(size);
-    let pool_start = &_wasm_code_pool_start as *const u8 as usize;
+    let pages = size / PAGE_SIZE;
+    let mut pool = code_pool();
+    let Some(first) = pool.alloc(pages) else {
+        enclave_os_common::enclave_log_info!(
+            "[sgx_platform] code pool: no room for a {} KiB code image ({} of {} KiB in use \
+             by {} images, largest free run {} KiB); refusing the load",
+            size / 1024,
+            pool.in_use() * PAGE_SIZE / 1024,
+            pool.total() * PAGE_SIZE / 1024,
+            pool.allocation_count(),
+            pool.largest_free_run() * PAGE_SIZE / 1024
+        );
+        return ptr::null_mut();
+    };
+    let addr = (code_pool_base() + first * PAGE_SIZE) as *mut u8;
+    ptr::write_bytes(addr, 0, size);
+    enclave_os_common::enclave_log_info!(
+        "[sgx_platform] code pool: +{} KiB at {:p} ({} of {} KiB in use, peak {} KiB)",
+        size / 1024,
+        addr,
+        pool.in_use() * PAGE_SIZE / 1024,
+        pool.total() * PAGE_SIZE / 1024,
+        pool.peak() * PAGE_SIZE / 1024
+    );
+    addr
+}
 
-    loop {
-        let current = CODE_POOL_OFFSET.load(Ordering::Relaxed);
-        let new_offset = current + aligned;
-        if new_offset > CODE_POOL_SIZE {
-            return ptr::null_mut(); // Pool exhausted
+/// Return a code pool allocation. Freed code is overwritten with `int3` so a
+/// stale jump into it traps instead of running old code.
+unsafe fn code_pool_free(addr: *mut u8, size: usize) {
+    let offset = addr as usize - code_pool_base();
+    let mut pool = code_pool();
+    if offset % PAGE_SIZE != 0 {
+        enclave_os_common::enclave_log_info!(
+            "[sgx_platform] code pool: unmap of unaligned {:p} ignored; pages kept",
+            addr
+        );
+        return;
+    }
+    match pool.free(offset / PAGE_SIZE, size / PAGE_SIZE) {
+        Ok(()) => {
+            ptr::write_bytes(addr, 0xCC, size);
+            enclave_os_common::enclave_log_info!(
+                "[sgx_platform] code pool: -{} KiB at {:p} ({} of {} KiB in use)",
+                size / 1024,
+                addr,
+                pool.in_use() * PAGE_SIZE / 1024,
+                pool.total() * PAGE_SIZE / 1024
+            );
         }
-        if CODE_POOL_OFFSET
-            .compare_exchange_weak(current, new_offset, Ordering::AcqRel, Ordering::Relaxed)
-            .is_ok()
-        {
-            let addr = (pool_start + current) as *mut u8;
-            // Zero the memory
-            ptr::write_bytes(addr, 0, aligned);
-            return addr;
+        // Freeing pages other than exactly one allocation could hand out
+        // code still in use; keep them (a leak, never a corruption).
+        Err(FreeError::NotAllocated) => {
+            enclave_os_common::enclave_log_info!(
+                "[sgx_platform] code pool: unmap of {:p} ({} KiB) matches no allocation; ignored",
+                addr,
+                size / 1024
+            );
+        }
+        Err(FreeError::SizeMismatch { allocated }) => {
+            enclave_os_common::enclave_log_info!(
+                "[sgx_platform] code pool: unmap of {:p} for {} KiB, allocation is {} KiB; \
+                 pages kept",
+                addr,
+                size / 1024,
+                allocated * PAGE_SIZE / 1024
+            );
         }
     }
 }
 
-/// Check if an address is within the RWX code pool.
-unsafe fn is_code_pool(addr: *const u8) -> bool {
-    let pool_start = &_wasm_code_pool_start as *const u8 as usize;
-    let pool_end = pool_start + CODE_POOL_SIZE;
+/// Whether an address lies within the RWX code pool section. Used by the VEH,
+/// so it takes no lock.
+fn is_code_pool(addr: *const u8) -> bool {
+    let start = code_pool_base();
     let a = addr as usize;
-    a >= pool_start && a < pool_end
+    a >= start && a < start + CODE_POOL_SIZE
+}
+
+/// Whether `[addr, addr + size)` lies inside one live code pool allocation.
+fn is_code_pool_allocation(addr: *const u8, size: usize) -> bool {
+    if !is_code_pool(addr) || size == 0 {
+        return false;
+    }
+    let offset = addr as usize - code_pool_base();
+    let first = offset / PAGE_SIZE;
+    let last = (offset + size - 1) / PAGE_SIZE;
+    code_pool().is_allocated(first, last - first + 1)
 }
 
 // =========================================================================
@@ -112,18 +212,18 @@ unsafe fn is_code_pool(addr: *const u8) -> bool {
 // =========================================================================
 
 fn page_align(size: usize) -> usize {
-    (size + 4095) & !4095
+    (size + PAGE_SIZE - 1) & !(PAGE_SIZE - 1)
 }
 
 /// Allocate page-aligned memory from the enclave heap.
 unsafe fn heap_alloc_pages(size: usize) -> *mut u8 {
-    let layout = alloc::alloc::Layout::from_size_align_unchecked(size, 4096);
+    let layout = alloc::alloc::Layout::from_size_align_unchecked(size, PAGE_SIZE);
     alloc::alloc::alloc_zeroed(layout)
 }
 
 /// Deallocate page-aligned memory from the enclave heap.
 unsafe fn heap_dealloc_pages(ptr: *mut u8, size: usize) {
-    let layout = alloc::alloc::Layout::from_size_align_unchecked(size, 4096);
+    let layout = alloc::alloc::Layout::from_size_align_unchecked(size, PAGE_SIZE);
     alloc::alloc::dealloc(ptr, layout);
 }
 
@@ -177,52 +277,38 @@ extern "C" {
 //  Wasmtime platform API (C-ABI)
 // =========================================================================
 
+/// Protection flag of the `sys::custom` C API (`WASMTIME_PROT_EXEC`).
+const PROT_EXEC: u32 = 1 << 2;
+
 /// Allocate memory for wasmtime.
 ///
-/// Uses the RWX code pool for small allocations (likely code segments)
-/// and the heap allocator for large allocations (likely linear memory).
-///
-/// The heuristic: allocations that will later be mprotect'd to RX are code.
-/// Since we can't predict this at allocation time, we use a size heuristic:
-/// - Allocations ≤ 1 MiB go to the code pool (WASM code segments)
-/// - Larger allocations go to the heap (linear memory, which is RW only)
-///
-/// prot_flags: 0=NONE, 1=READ, 2=WRITE, 3=RW, 4=EXEC, 5=RX, 7=RWX
+/// A mapping created accessible (`prot_flags != 0`, i.e. `Mmap::new`) is a
+/// code image and comes from the RWX pool; a reservation (`prot_flags == 0`,
+/// i.e. `Mmap::reserve`) is a linear memory or GC heap and comes from the
+/// heap. See the module documentation for why this is exact for the features
+/// we build. A code image that does not fit in the pool fails here (wasmtime
+/// fails the load); it is never placed on the non-executable heap.
 #[no_mangle]
 pub unsafe extern "C" fn wasmtime_mmap_new(
     size: usize,
-    _prot_flags: u32,
+    prot_flags: u32,
     ret_addr: *mut *mut u8,
 ) -> i32 {
     let aligned = page_align(size);
+    if aligned == 0 {
+        return -1;
+    }
 
-    // Strategy: code segments are typically < 1MB, linear memory is >= 4MB.
-    let use_code_pool = aligned <= 1024 * 1024;
-
-    let addr = if use_code_pool {
-        let ptr = code_pool_alloc(aligned);
-        if ptr.is_null() {
-            // Code pool exhausted, fall back to heap
-            enclave_os_common::enclave_log_info!(
-                "[sgx_platform] mmap: code pool exhausted, falling back to heap for {} bytes",
-                aligned
-            );
-            heap_alloc_pages(aligned)
-        } else {
-            enclave_os_common::enclave_log_info!(
-                "[sgx_platform] mmap: code pool alloc {} bytes at {:p}",
-                aligned,
-                ptr
-            );
-            ptr
-        }
+    let addr = if prot_flags != 0 {
+        code_pool_alloc(aligned)
     } else {
         let ptr = heap_alloc_pages(aligned);
-        enclave_os_common::enclave_log_info!(
-            "[sgx_platform] mmap: heap alloc {} bytes at {:p}",
-            aligned,
-            ptr
-        );
+        if ptr.is_null() {
+            enclave_os_common::enclave_log_info!(
+                "[sgx_platform] mmap: heap allocation of {} KiB failed",
+                aligned / 1024
+            );
+        }
         ptr
     };
 
@@ -233,63 +319,26 @@ pub unsafe extern "C" fn wasmtime_mmap_new(
     0
 }
 
-/// Remap memory (resize). Zero the region and report whether it worked.
+/// Replace `size` bytes at `addr` with a fresh blank mapping: zero them.
 ///
-/// Neither backing allocator can grow a region in place: the code pool is a
-/// bump allocator with no resize, and a heap block is fixed at its address.
-/// A growing remap is therefore refused rather than reported as successful.
-///
-/// This previously ignored `old_size`, always returned 0, and zeroed
-/// `page_align(new_size)` bytes at `addr`. When `new_size` exceeded the
-/// original allocation from `wasmtime_mmap_new` that write ran past the end of
-/// the allocation, and wasmtime was told a larger region existed when it did
-/// not.
+/// The C API is `wasmtime_mmap_remap(addr, size, prot_flags)` and never
+/// resizes. This shim used to take `(addr, old_size, new_size, prot)`, so it
+/// read the protection flags as the size and zeroed 0 or 4096 bytes instead
+/// of the range. Only the copy-on-write and pooling paths call it, and
+/// neither is built, so it is not reached today.
 #[no_mangle]
-pub unsafe extern "C" fn wasmtime_mmap_remap(
-    addr: *mut u8,
-    old_size: usize,
-    new_size: usize,
-    _prot_flags: u32,
-) -> i32 {
-    let old_aligned = page_align(old_size);
-    let new_aligned = page_align(new_size);
-
-    if new_aligned > old_aligned {
-        enclave_os_common::enclave_log_info!(
-            "[sgx_platform] mmap: remap {:p} {} -> {} bytes refused (no in-place grow)",
-            addr,
-            old_aligned,
-            new_aligned
-        );
-        return -1;
-    }
-
-    // Shrink or no-op: the write stays inside the existing allocation.
-    ptr::write_bytes(addr, 0, new_aligned);
+pub unsafe extern "C" fn wasmtime_mmap_remap(addr: *mut u8, size: usize, _prot_flags: u32) -> i32 {
+    ptr::write_bytes(addr, 0, page_align(size));
     0
 }
 
-/// Unmap memory.
-///
-/// Code pool memory is NOT freed (bump allocator doesn't support individual frees).
-/// Heap memory is properly deallocated.
+/// Unmap memory: pool pages go back to the pool, heap memory is freed.
 #[no_mangle]
 pub unsafe extern "C" fn wasmtime_munmap(ptr: *mut u8, size: usize) -> i32 {
     let aligned = page_align(size);
     if is_code_pool(ptr) {
-        // Code pool: can't free individual allocations from bump allocator.
-        // The memory stays allocated until enclave teardown.
-        enclave_os_common::enclave_log_info!(
-            "[sgx_platform] munmap: code pool page {:p} ({} bytes) — retained",
-            ptr,
-            aligned
-        );
+        code_pool_free(ptr, aligned);
     } else {
-        enclave_os_common::enclave_log_info!(
-            "[sgx_platform] munmap: heap dealloc {:p} ({} bytes)",
-            ptr,
-            aligned
-        );
         heap_dealloc_pages(ptr, aligned);
     }
     0
@@ -297,20 +346,22 @@ pub unsafe extern "C" fn wasmtime_munmap(ptr: *mut u8, size: usize) -> i32 {
 
 /// Change memory protection.
 ///
-/// No-op: code pool pages are already RWX, heap pages are RW.
-/// Wasmtime calls this to set code pages to RX after writing code,
-/// but since our pool is already RWX, no action is needed.
+/// Nothing to change: pool pages are always RWX and heap pages always RW.
+/// But making a range executable is only honoured inside a live pool
+/// allocation; anywhere else the code could not run, so the call fails and
+/// wasmtime fails the load ("unable to make memory executable") instead of
+/// the enclave crashing on the first call.
 #[no_mangle]
 pub unsafe extern "C" fn wasmtime_mprotect(ptr: *mut u8, size: usize, prot_flags: u32) -> i32 {
-    let aligned = page_align(size);
-    let in_pool = is_code_pool(ptr);
-    enclave_os_common::enclave_log_info!(
-        "[sgx_platform] mprotect: addr={:p} size={} prot={} pool={} (no-op)",
-        ptr,
-        aligned,
-        prot_flags,
-        in_pool
-    );
+    if prot_flags & PROT_EXEC != 0 && !is_code_pool_allocation(ptr, size) {
+        enclave_os_common::enclave_log_info!(
+            "[sgx_platform] mprotect: refusing to make {:p} ({} KiB) executable: \
+             it is not in the code pool",
+            ptr,
+            page_align(size) / 1024
+        );
+        return -1;
+    }
     0
 }
 

@@ -69,9 +69,9 @@ the C-ABI symbols Wasmtime needs:
 
 | Capability | SGX Implementation |
 |------------|-------------------|
-| Code memory | 16 MiB RWX pool (`.wasm_code` ELF section, bump allocator) |
+| Code memory | 16 MiB RWX pool (`.wasm_code` ELF section); pages are reclaimed when an app is unloaded or evicted, and a load that does not fit is refused |
 | Data memory | Standard heap allocation |
-| Memory protection | No-op (code pool = RWX, heap = RW) |
+| Memory protection | No-op (code pool = RWX, heap = RW); making memory outside the pool executable is refused |
 | Trap handling | `sgx_register_exception_handler` (vectored exception) |
 | Thread-local storage | `AtomicPtr` (single-threaded per TCS) |
 | Stack unwinding | Stub (no-op) |

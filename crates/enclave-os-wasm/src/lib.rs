@@ -66,6 +66,7 @@
 //! - Thread-local storage via `sgx_tstd::thread_local!`
 //! - Stub unwind registration
 
+pub mod code_pool;
 pub mod enclave_sdk;
 pub mod engine;
 pub mod executor;

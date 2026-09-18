@@ -15,8 +15,8 @@
 //!
 //! | Capability        | SGX backend                                  |
 //! |-------------------|----------------------------------------------|
-//! | Memory allocation | RWX code pool (`.wasm_code` section, bump)   |
-//! | Memory protection | No-op (pool=RWX, heap=RW)                    |
+//! | Memory allocation | code: RWX pool (`.wasm_code`), data: heap    |
+//! | Memory protection | No-op; EXEC refused outside the pool         |
 //! | Trap handling     | `sgx_register_exception_handler` (VEH)       |
 //! | Thread-local      | `std::thread_local!` (→ `sgx_tstd`)         |
 //! | Unwind            | Stub (no-op)                                 |

@@ -8,6 +8,7 @@ members = [
     "tests/integration",
     "tests/sovereign-seal-unit",
     "tests/wasm-docs-unit",
+    "tests/code-pool-unit",
     "tests/feature-wiring-unit",
 ]
 exclude = [
