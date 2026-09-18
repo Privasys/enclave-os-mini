@@ -129,6 +129,17 @@ impl WasmEngine {
         // and no reliance on SGX guard-page semantics.
         config.signals_based_traps(false);
 
+        // ── Fibers ─────────────────────────────────────────────────
+        // Every call runs on a fiber (see `executor`), so an async host
+        // function can suspend the guest. A fiber stack holds the guest's
+        // frames (at most `max_wasm_stack`) and the host code the guest calls
+        // into, e.g. a TLS handshake for `https.fetch`. The fiber stack has
+        // no guard page, so the headroom must cover the deepest host path:
+        // measured at 86 KiB for a fetch; 512 KiB leaves ample margin.
+        config.max_wasm_stack(512 * 1024);
+        config.async_stack_size(1024 * 1024);
+        config.with_host_stack(std::sync::Arc::new(crate::executor::FiberStacks));
+
         let engine =
             Engine::new(&config).map_err(|e| format!("wasmtime engine init failed: {:#}", e))?;
 
@@ -210,10 +221,9 @@ impl WasmEngine {
         component: &Component,
     ) -> Result<(Store<AppContext>, wasmtime::component::Instance), String> {
         let mut store = self.new_store(app_name, master_key, fuel)?;
-        let instance = self
-            .linker
-            .instantiate(&mut store, component)
-            .map_err(|e| format!("WASM instantiation failed: {:#}", e))?;
+        let instance =
+            crate::executor::block_on(self.linker.instantiate_async(&mut store, component))
+                .map_err(|e| format!("WASM instantiation failed: {:#}", e))?;
         Ok((store, instance))
     }
 

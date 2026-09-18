@@ -724,10 +724,10 @@ impl AppRegistry {
             let mut probe_store = self
                 .engine
                 .new_store(name, [0u8; AEAD_KEY_SIZE], max_fuel)?;
-            self.engine
-                .linker()
-                .instantiate(&mut probe_store, &component)
-                .map_err(|e| {
+            crate::executor::block_on(
+                self.engine.linker().instantiate_async(&mut probe_store, &component),
+            )
+            .map_err(|e| {
                     format!("component failed trial instantiation (linker error): {:#}", e)
                 })?;
         }

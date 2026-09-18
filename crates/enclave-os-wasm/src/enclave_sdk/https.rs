@@ -91,6 +91,10 @@ wasmtime::component::bindgen!({
         }
     "#,
     world: "https-host",
+    // A Rust-level async host function: the guest still sees a blocking
+    // call, but the host can suspend it (wasmtime parks the guest's fiber on
+    // `Poll::Pending`) while the request waits on the network.
+    imports: { default: async },
 });
 
 use privasys::enclave_os::https as wit;
@@ -176,7 +180,7 @@ fn build_custom_root_store(
 // =========================================================================
 
 impl wit::Host for AppContext {
-    fn fetch(&mut self, req: wit::Request) -> Result<wit::Response, String> {
+    async fn fetch(&mut self, req: wit::Request) -> Result<wit::Response, String> {
         let method_str = match req.method {
             wit::Method::Get => "GET",
             wit::Method::Post => "POST",

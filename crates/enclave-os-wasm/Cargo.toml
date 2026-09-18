@@ -43,17 +43,20 @@ enclave-os-app-auth = { path = "../enclave-os-app-auth", optional = true }
 # Reference: https://github.com/bytecodealliance/wasmtime/commit/fbbcd2ac
 #
 # Features:
+#   async            — guest calls run on fibers so an async host function
+#                      (e.g. https.fetch) can suspend the guest; the fork
+#                      routes fibers to the heap-backed `nostd` backend
 #   component-model  — Component Model / WIT support for typed interfaces
 #   runtime          — the core execution engine
 #   sgx              — routes to sys::custom + enables EDMM/VEH C API
 #
 # Excluded features:
 #   cranelift        — not needed; AOT-only (pre-compiled components)
-#   async            — not needed; synchronous dispatch only
 #   pooling-allocator— complex SGX memory constraints
 #   cache            — no filesystem in SGX
 #   wat              — text format parsing not needed at runtime
-wasmtime = { git = "https://github.com/Privasys/wasmtime", tag = "privasys-v0.2.0", default-features = false, features = [
+wasmtime = { path = "../../../../libraries/wasmtime/crates/wasmtime", default-features = false, features = [
+    "async",
     "component-model",
     "runtime",
     "std",

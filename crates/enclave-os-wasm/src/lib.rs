@@ -68,6 +68,7 @@
 
 pub mod enclave_sdk;
 pub mod engine;
+pub mod executor;
 pub mod jwks_fetcher;
 pub mod metrics;
 pub mod protocol;
@@ -528,14 +529,15 @@ impl WasmModule {
 
         // Execute the wasm function WITHOUT the registry mutex held.
         let mut results = vec![wasmtime::component::Val::Bool(false); prep.result_count];
-        let call_err = prep
-            .func
-            .call(&mut prep.store, &prep.val_params, &mut results)
-            .err();
+        let call_err = crate::executor::block_on(prep.func.call_async(
+            &mut prep.store,
+            &prep.val_params,
+            &mut results,
+        ))
+        .err();
         prep.store.data_mut().flush_logs();
         let fuel_after = prep.store.get_fuel().unwrap_or(0) as i64;
         let fuel_consumed = prep.fuel_before - fuel_after;
-
         // Snapshot this call's billable SDK resource usage (crypto / https /
         // sealed-KV). The AppContext is per-call, so this is the delta.
         let sdk_usage = prep.store.data().usage.clone();
