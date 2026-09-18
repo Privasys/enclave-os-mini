@@ -18,11 +18,17 @@
 //!   reads; the flag clears when NTS confirms the host.
 //! - A host that goes back more than [`BACKSTEP_MS`] below the floor is an
 //!   incident: report it to the monitor and wait for its signed receipt,
-//!   then fetch NTS and freeze. Without a configured monitor the incident
-//!   is only logged; NTS still decides.
-//! - Anything that cannot be completed (no receipt, no NTS quorum) fails
-//!   closed: reads return an error, and the step is retried every
-//!   [`REFETCH_EVERY`] reads and on every monitor poll.
+//!   then fetch NTS and freeze. No receipt: fail closed.
+//! - The other incidents (`host_clock_wrong`, `monitor_clock_wrong`,
+//!   `nts_unreachable` found by a poll or the boot fetch) are reported
+//!   after the fact, on the next read rather than inside the poll: the
+//!   monitor may poll again on receiving one, and a single-threaded
+//!   enclave busy waiting for its receipt could not answer. A lost report
+//!   of this kind is logged; the poll reply already carries the verdict.
+//! - Without a configured monitor, incidents are only logged; NTS still
+//!   decides.
+//! - No NTS quorum fails closed: reads return an error, and the fetch is
+//!   retried every [`REFETCH_EVERY`] reads and on every monitor poll.
 //! - Boot: restore the sealed floor, then one NTS fetch before the first
 //!   read is answered. A host that rolls the sealed state back only
 //!   restores an older floor, which this fetch corrects.
@@ -51,7 +57,7 @@ pub trait Env {
     /// reply. The caller bounds the wait.
     fn post_incident(&mut self, url: &str, body: &[u8]) -> Result<Vec<u8>, String>;
     /// 32 random bytes for an incident nonce.
-    fn random_nonce(&mut self) -> [u8; 32];
+    fn random_nonce(&mut self) -> Result<[u8; 32], ClockError>;
     /// Seal and store the state. Best effort: a failure is logged by the
     /// implementation, and the boot NTS fetch covers a lost seal.
     fn persist(&mut self, sealed: &[u8]);
@@ -116,12 +122,12 @@ impl Verdict {
 /// A refused or failed poll.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum PollError {
-    /// Malformed (400) or not authentic (403).
+    /// Malformed (400) or not authentic (401).
     Wire(WireError),
     /// No clock config yet, so no key to check the signature with (409).
     NotConfigured,
-    /// Trusted time is failing closed (503). `reason` names the unresolved
-    /// problem.
+    /// Host and monitor disagree and there is no NTS quorum to settle it
+    /// (503). `reason` names the unresolved problem.
     Unavailable { reason: String, host_time_ms: i64, floor_ms: i64, detail: String },
 }
 
@@ -130,7 +136,7 @@ pub enum PollError {
 pub enum ConfigError {
     /// Malformed or invalid (400).
     Wire(WireError),
-    /// Not higher than the current `config_version` (409).
+    /// Lower than the current `config_version` (409).
     Stale { current: u64 },
 }
 
@@ -140,41 +146,50 @@ pub struct ConfigAck {
     pub enclave_id: String,
     pub monitor_key_id: String,
     pub config_version: u64,
-    /// `false` when the same config was already in place.
+    /// `false` when this `config_version` was already in place (no-op).
     pub applied: bool,
 }
 
+/// A clock problem not resolved yet. While one exists, reads fail closed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PendingKind {
+    /// The boot NTS fetch has not succeeded yet.
     Boot,
-    Incident(Reason),
+    /// The host went back below the floor: receipt, then NTS.
+    HostBehindFloor,
+    /// No NTS quorum when one was needed.
+    NtsUnreachable,
 }
 
-/// A clock problem not resolved yet. While one exists, reads fail closed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct Pending {
     kind: PendingKind,
+    /// The incident report has been made (or is not owed).
     reported: bool,
-    needs_nts: bool,
+    /// Host time when the problem was found.
     host_ms: i64,
-    nts_ms: i64,
 }
 
 impl Pending {
-    fn boot() -> Self {
-        Self { kind: PendingKind::Boot, reported: true, needs_nts: true, host_ms: 0, nts_ms: 0 }
-    }
-
-    fn incident(reason: Reason, needs_nts: bool, host_ms: i64, nts_ms: i64) -> Self {
-        Self { kind: PendingKind::Incident(reason), reported: false, needs_nts, host_ms, nts_ms }
+    fn new(kind: PendingKind, reported: bool, host_ms: i64) -> Self {
+        Self { kind, reported, host_ms }
     }
 
     fn reason_str(&self) -> &'static str {
         match self.kind {
-            PendingKind::Boot => "boot",
-            PendingKind::Incident(r) => r.as_str(),
+            // A boot fetch that is still pending is one that failed.
+            PendingKind::Boot | PendingKind::NtsUnreachable => Reason::NtsUnreachable.as_str(),
+            PendingKind::HostBehindFloor => Reason::HostBehindFloor.as_str(),
         }
     }
+}
+
+/// An incident to report after the fact (see the module docs).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Deferred {
+    reason: Reason,
+    host_ms: i64,
+    nts_ms: i64,
 }
 
 const SEALED_VERSION: u32 = 1;
@@ -198,6 +213,7 @@ pub struct Clock {
     flagged_reads: u32,
     retry_skip: u32,
     pending: Option<Pending>,
+    deferred: Option<Deferred>,
     config: Option<MonitorConfig>,
 }
 
@@ -217,7 +233,8 @@ impl Clock {
             last_returned: MIN_TRUSTED_TIME_MS,
             flagged_reads: 0,
             retry_skip: 0,
-            pending: Some(Pending::boot()),
+            pending: Some(Pending::new(PendingKind::Boot, true, 0)),
+            deferred: None,
             config: None,
         }
     }
@@ -282,6 +299,7 @@ impl Clock {
 
     /// One trusted-time read, Unix ms.
     pub fn read(&mut self, env: &mut dyn Env) -> Result<i64, ClockError> {
+        self.flush_deferred(env);
         if self.pending.is_some() {
             if self.retry_skip > 0 {
                 self.retry_skip -= 1;
@@ -291,6 +309,7 @@ impl Clock {
                 self.retry_skip = REFETCH_EVERY - 1;
                 return Err(e);
             }
+            self.flush_deferred(env);
         }
         let h = env.host_time_ms()?;
         if self.flagged {
@@ -312,7 +331,7 @@ impl Clock {
                     }
                     Err(e) => {
                         env.log(true, &format!("trusted time: refetch while flagged failed, failing closed: {e}"));
-                        self.pending = Some(Pending::incident(Reason::NtsUnreachable, true, h, 0));
+                        self.pending = Some(Pending::new(PendingKind::NtsUnreachable, false, h));
                         self.retry_skip = 0;
                         return Err(e);
                     }
@@ -325,11 +344,12 @@ impl Clock {
                 true,
                 &format!("trusted time: host clock {h} went back below the floor {}", self.floor),
             );
-            self.pending = Some(Pending::incident(Reason::HostBehindFloor, true, h, 0));
+            self.pending = Some(Pending::new(PendingKind::HostBehindFloor, false, h));
             if let Err(e) = self.resolve(env) {
                 self.retry_skip = REFETCH_EVERY - 1;
                 return Err(e);
             }
+            self.flush_deferred(env);
             return Ok(self.ret_frozen());
         }
         Ok(self.ret(h))
@@ -378,58 +398,68 @@ impl Clock {
     }
 
     // ------------------------------------------------------------------
-    //  Resolution of a pending problem (boot fetch, incidents)
+    //  Incidents
     // ------------------------------------------------------------------
 
+    fn defer(&mut self, reason: Reason, host_ms: i64, nts_ms: i64) {
+        self.deferred = Some(Deferred { reason, host_ms, nts_ms });
+    }
+
+    /// Send a deferred report, once; a lost one is logged.
+    fn flush_deferred(&mut self, env: &mut dyn Env) {
+        if let Some(d) = self.deferred.take() {
+            if let Err(e) = self.report(env, d.reason, d.host_ms, d.nts_ms) {
+                env.log(true, &format!("clock incident {} not acknowledged: {e}", d.reason.as_str()));
+            }
+        }
+    }
+
+    /// Resolve a pending problem: the owed report, then an NTS fetch.
     fn resolve(&mut self, env: &mut dyn Env) -> Result<(), ClockError> {
         let Some(mut p) = self.pending.clone() else { return Ok(()) };
         let h = env.host_time_ms()?;
 
         if !p.reported {
-            if let PendingKind::Incident(reason) = p.kind {
-                let host_ms = if p.host_ms != 0 { p.host_ms } else { h };
-                self.report(env, reason, host_ms, p.nts_ms)?;
+            let reason = match p.kind {
+                PendingKind::HostBehindFloor => Reason::HostBehindFloor,
+                PendingKind::Boot | PendingKind::NtsUnreachable => Reason::NtsUnreachable,
+            };
+            let host_ms = if p.host_ms != 0 { p.host_ms } else { h };
+            match self.report(env, reason, host_ms, 0) {
+                Ok(()) => {}
+                // The one incident that waits for its receipt.
+                Err(e) if p.kind == PendingKind::HostBehindFloor => return Err(e),
+                Err(e) => env.log(true, &format!("clock incident {} not acknowledged: {e}", reason.as_str())),
             }
             p.reported = true;
             self.pending = Some(p.clone());
         }
 
-        if p.needs_nts {
-            let n = match env.nts_quorum(self.floor) {
-                Ok(n) => n,
-                Err(e) => {
-                    env.log(true, &format!("trusted time: no NTS quorum, failing closed: {e}"));
-                    if p.kind != PendingKind::Incident(Reason::NtsUnreachable) {
-                        self.pending = Some(Pending::incident(Reason::NtsUnreachable, true, h, 0));
-                    }
-                    return Err(e);
+        let n = match env.nts_quorum(self.floor) {
+            Ok(n) => n,
+            Err(e) => {
+                env.log(true, &format!("trusted time: no NTS quorum, failing closed: {e}"));
+                if p.kind != PendingKind::NtsUnreachable {
+                    self.pending = Some(Pending::new(PendingKind::NtsUnreachable, false, h));
                 }
-            };
-            self.raise_floor(n.time_ms);
-            let host_ok = abs_diff(h, n.time_ms) <= TOLERANCE_MS;
-            match p.kind {
-                PendingKind::Incident(Reason::HostBehindFloor) => self.flag(Reason::HostBehindFloor),
-                PendingKind::Incident(Reason::HostClockWrong) => self.flag(Reason::HostClockWrong),
-                PendingKind::Boot | PendingKind::Incident(_) => {
-                    if host_ok {
-                        self.unflag();
-                        self.raise_floor(h);
-                    } else if self.flagged && p.kind != PendingKind::Boot {
-                        // Already flagged and reported; stay frozen.
-                    } else {
-                        env.log(
-                            true,
-                            &format!("trusted time: host clock {h} is wrong, NTS says {}", n.time_ms),
-                        );
-                        self.flag(Reason::HostClockWrong);
-                        self.pending = Some(Pending::incident(Reason::HostClockWrong, false, h, n.time_ms));
-                        self.persist(env);
-                        return self.resolve(env);
-                    }
+                return Err(e);
+            }
+        };
+        self.raise_floor(n.time_ms);
+        match p.kind {
+            PendingKind::HostBehindFloor => self.flag(Reason::HostBehindFloor),
+            PendingKind::Boot | PendingKind::NtsUnreachable => {
+                if abs_diff(h, n.time_ms) <= TOLERANCE_MS {
+                    self.unflag();
+                    self.raise_floor(h);
+                } else if !(self.flagged && p.kind == PendingKind::NtsUnreachable) {
+                    env.log(true, &format!("trusted time: host clock {h} is wrong, NTS says {}", n.time_ms));
+                    self.flag(Reason::HostClockWrong);
+                    self.defer(Reason::HostClockWrong, h, n.time_ms);
                 }
+                // Otherwise already flagged and reported: stay frozen.
             }
         }
-
         if p.kind == PendingKind::Boot {
             env.log(false, &format!("trusted time: boot NTS fetch done, floor {}", self.floor));
         }
@@ -455,7 +485,7 @@ impl Clock {
             return Ok(());
         };
         env.log(true, &format!("CRITICAL {line}, reporting to the monitor"));
-        let nonce = wire::b64url_encode(&env.random_nonce());
+        let nonce = wire::b64url_encode(&env.random_nonce().map_err(|e| ClockError::NoReceipt(format!("nonce: {e}")))?);
         let body = serde_json::to_vec(&Incident {
             enclave_id: cfg.wire.enclave_id.clone(),
             reason: reason.as_str().to_string(),
@@ -476,17 +506,18 @@ impl Clock {
     // ------------------------------------------------------------------
 
     /// Handle a `POST /clock/poll` body. `runtime` is `mini` or `virtual`.
+    ///
+    /// While trusted time is failing closed, the reply still comes (the
+    /// monitor keeps its fleet view) with `reason` naming the problem and
+    /// `trusted_time_ms` 0.
     pub fn poll(&mut self, env: &mut dyn Env, body: &[u8], runtime: &str) -> Result<PollReply, PollError> {
         let req = PollRequest::parse(body).map_err(PollError::Wire)?;
         let cfg = self.config.as_ref().ok_or(PollError::NotConfigured)?;
         req.verify(cfg).map_err(PollError::Wire)?;
 
         // An unresolved problem is retried now: a poll is a natural trigger.
-        if self.pending.is_some() {
-            if let Err(e) = self.resolve(env) {
-                self.retry_skip = REFETCH_EVERY - 1;
-                return Err(self.unavailable(env, e));
-            }
+        if self.pending.is_some() && self.resolve(env).is_err() {
+            self.retry_skip = REFETCH_EVERY - 1;
         }
 
         let h = env.host_time_ms().map_err(|e| self.unavailable(env, e))?;
@@ -496,41 +527,42 @@ impl Clock {
             Verdict::IgnoredStale
         } else if abs_diff(h, req.t_ms) <= TOLERANCE_MS {
             self.raise_floor(h);
-            self.unflag();
+            if self.pending.is_none() {
+                self.unflag();
+            }
             Verdict::InSync
         } else {
             match env.nts_quorum(self.floor) {
                 Err(e) => {
                     env.log(true, &format!("trusted time: poll disagrees and NTS is unreachable: {e}"));
-                    self.pending = Some(Pending::incident(Reason::NtsUnreachable, true, h, 0));
-                    // Report now; the NTS retry comes with later reads and polls.
-                    if let Some(mut p) = self.pending.clone() {
-                        if self.report(env, Reason::NtsUnreachable, h, 0).is_ok() {
-                            p.reported = true;
-                            self.pending = Some(p);
-                        }
+                    if self.pending.as_ref().map(|p| p.kind) != Some(PendingKind::HostBehindFloor) {
+                        self.pending = Some(Pending::new(PendingKind::NtsUnreachable, true, h));
+                        self.defer(Reason::NtsUnreachable, h, 0);
                     }
                     self.retry_skip = REFETCH_EVERY - 1;
+                    self.persist(env);
                     return Err(self.unavailable(env, e));
                 }
                 Ok(n) => {
                     nts = NtsReply { time_ms: n.time_ms, servers: n.servers.clone() };
+                    // NTS answers again: that settles a failed boot fetch or
+                    // an NTS outage.
+                    if matches!(self.pending.as_ref().map(|p| p.kind), Some(PendingKind::Boot | PendingKind::NtsUnreachable)) {
+                        self.pending = None;
+                        self.retry_skip = 0;
+                    }
                     if abs_diff(h, n.time_ms) <= TOLERANCE_MS {
                         self.raise_floor(h);
-                        self.unflag();
-                        if let Err(e) = self.report(env, Reason::MonitorClockWrong, h, n.time_ms) {
-                            // The host is fine: a lost report is not a reason to fail closed.
-                            env.log(true, &format!("monitor_clock_wrong report not acknowledged: {e}"));
+                        if self.pending.is_none() {
+                            self.unflag();
                         }
+                        self.defer(Reason::MonitorClockWrong, h, n.time_ms);
                         Verdict::MonitorClockWrong
                     } else {
+                        env.log(true, &format!("trusted time: host clock {h} is wrong, NTS says {}", n.time_ms));
                         self.raise_floor(n.time_ms);
                         self.flag(Reason::HostClockWrong);
-                        if let Err(e) = self.report(env, Reason::HostClockWrong, h, n.time_ms) {
-                            env.log(true, &format!("host_clock_wrong report not acknowledged, failing closed: {e}"));
-                            self.pending = Some(Pending::incident(Reason::HostClockWrong, false, h, n.time_ms));
-                            self.retry_skip = 0;
-                        }
+                        self.defer(Reason::HostClockWrong, h, n.time_ms);
                         Verdict::HostClockWrong
                     }
                 }
@@ -539,14 +571,18 @@ impl Clock {
         self.persist(env);
 
         let cfg = self.config.as_ref().ok_or(PollError::NotConfigured)?;
+        let (trusted, reason) = match self.pending.as_ref() {
+            Some(p) => (0, p.reason_str().to_string()),
+            None => (self.peek(h), self.flag_reason.map(|r| r.as_str().to_string()).unwrap_or_default()),
+        };
         Ok(PollReply {
             enclave_id: cfg.wire.enclave_id.clone(),
             runtime: runtime.to_string(),
             host_time_ms: h,
-            trusted_time_ms: self.peek(h),
+            trusted_time_ms: trusted,
             floor_ms: self.floor,
             flagged: self.flagged,
-            reason: self.flag_reason.map(|r| r.as_str().to_string()).unwrap_or_default(),
+            reason,
             verdict: verdict.as_str().to_string(),
             nts,
             config_key_id: cfg.key_id(),
@@ -555,7 +591,12 @@ impl Clock {
 
     fn unavailable(&self, env: &mut dyn Env, e: ClockError) -> PollError {
         PollError::Unavailable {
-            reason: self.pending.as_ref().map(|p| p.reason_str()).unwrap_or("unavailable").to_string(),
+            reason: self
+                .pending
+                .as_ref()
+                .map(|p| p.reason_str())
+                .unwrap_or(Reason::NtsUnreachable.as_str())
+                .to_string(),
             host_time_ms: env.host_time_ms().unwrap_or(0),
             floor_ms: self.floor,
             detail: e.to_string(),
@@ -637,6 +678,10 @@ mod tests {
                 seen_floor: Vec::new(),
             }
         }
+
+        fn reasons(&self) -> Vec<&str> {
+            self.incidents.iter().map(|i| i.reason.as_str()).collect()
+        }
     }
 
     impl Env for Fake {
@@ -661,8 +706,8 @@ mod tests {
                 Err("timeout".to_string())
             }
         }
-        fn random_nonce(&mut self) -> [u8; 32] {
-            [9; 32]
+        fn random_nonce(&mut self) -> Result<[u8; 32], ClockError> {
+            Ok([9; 32])
         }
         fn persist(&mut self, sealed: &[u8]) {
             self.sealed = sealed.to_vec();
@@ -741,8 +786,7 @@ mod tests {
         env.nts = Ok(T0 + 10_000);
         assert_eq!(c.read(&mut env), Ok(T0 + 10_000));
         assert!(c.is_flagged());
-        assert_eq!(env.incidents.len(), 1);
-        assert_eq!(env.incidents[0].reason, "host_behind_floor");
+        assert_eq!(env.reasons(), vec!["host_behind_floor"]);
         assert_eq!(env.incidents[0].host_time_ms, T0 - 3_600_000);
         // Frozen while the host stays wrong, until the refetch.
         for _ in 0..REFETCH_EVERY - 1 {
@@ -762,7 +806,7 @@ mod tests {
     }
 
     #[test]
-    fn no_receipt_fails_closed() {
+    fn no_receipt_for_host_behind_floor_fails_closed() {
         let mut env = Fake::new(T0);
         let mut c = configured(&mut env);
         c.read(&mut env).unwrap();
@@ -796,8 +840,8 @@ mod tests {
                 // Signed for another nonce.
                 Ok(signed_receipt(&inc.enclave_id, "replayed", "inc-1"))
             }
-            fn random_nonce(&mut self) -> [u8; 32] {
-                [1; 32]
+            fn random_nonce(&mut self) -> Result<[u8; 32], ClockError> {
+                Ok([1; 32])
             }
             fn persist(&mut self, s: &[u8]) {
                 self.0.persist(s)
@@ -878,6 +922,7 @@ mod tests {
         assert_eq!(r.host_time_ms, T0 + 300_000);
         assert_eq!(r.trusted_time_ms, T0 + 300_000);
         assert_eq!(r.runtime, "mini");
+        assert_eq!(r.reason, "");
         assert_eq!(r.nts, NtsReply::default());
         assert_eq!(r.config_key_id, config(1).key_id());
         assert_eq!(env.nts_calls, 1);
@@ -898,7 +943,7 @@ mod tests {
     }
 
     #[test]
-    fn poll_with_a_wrong_monitor_reports_it_and_keeps_the_host() {
+    fn poll_with_a_wrong_monitor_reports_it_after_the_reply() {
         let mut env = Fake::new(T0);
         let mut c = configured(&mut env);
         c.read(&mut env).unwrap();
@@ -907,17 +952,20 @@ mod tests {
         assert!(!r.flagged);
         assert_eq!(r.nts.time_ms, T0);
         assert_eq!(r.nts.servers.len(), 2);
-        assert_eq!(env.incidents.last().unwrap().reason, "monitor_clock_wrong");
+        // Not reported inside the poll; on the next read.
+        assert!(env.incidents.is_empty());
+        assert_eq!(c.read(&mut env), Ok(T0));
+        assert_eq!(env.reasons(), vec!["monitor_clock_wrong"]);
         // The monitor's time never became the floor.
         assert_eq!(c.floor_ms(), T0);
-        // A lost report of a wrong monitor does not fail closed.
+        // A lost report of this kind does not fail closed.
         env.receipts = false;
         poll(&mut c, &mut env, T0 + 3_600_000).unwrap();
         assert_eq!(c.read(&mut env), Ok(T0));
     }
 
     #[test]
-    fn poll_with_a_wrong_host_freezes_and_a_lost_report_fails_closed() {
+    fn poll_with_a_wrong_host_freezes_without_failing_closed() {
         let mut env = Fake::new(T0);
         let mut c = configured(&mut env);
         c.read(&mut env).unwrap();
@@ -929,31 +977,45 @@ mod tests {
         assert_eq!(r.reason, "host_clock_wrong");
         assert!(r.flagged);
         assert_eq!(r.trusted_time_ms, T0 + 5_000);
-        assert!(c.is_failing_closed());
-        // The next read retries the report at once; still no receipt.
-        assert!(matches!(c.read(&mut env), Err(ClockError::NoReceipt(_))));
-        env.receipts = true;
-        for _ in 0..REFETCH_EVERY - 1 {
-            assert_eq!(c.read(&mut env), Err(ClockError::Unavailable));
-        }
+        assert!(!c.is_failing_closed());
+        // Reported on the next read; the lost receipt is only logged.
         assert_eq!(c.read(&mut env), Ok(T0 + 5_000));
+        assert_eq!(env.reasons(), vec!["host_clock_wrong"]);
+        assert!(env.logs.iter().any(|(crit, l)| *crit && l.contains("not acknowledged")));
     }
 
     #[test]
-    fn poll_without_nts_is_unavailable() {
+    fn poll_without_nts_is_unavailable_and_fails_closed() {
         let mut env = Fake::new(T0);
         let mut c = configured(&mut env);
         c.read(&mut env).unwrap();
         env.nts = Err(());
         match poll(&mut c, &mut env, T0 + 3_600_000) {
-            Err(PollError::Unavailable { reason, floor_ms, .. }) => {
+            Err(PollError::Unavailable { reason, floor_ms, host_time_ms, .. }) => {
                 assert_eq!(reason, "nts_unreachable");
                 assert_eq!(floor_ms, T0);
+                assert_eq!(host_time_ms, T0);
             }
             other => panic!("{other:?}"),
         }
-        assert_eq!(env.incidents.last().unwrap().reason, "nts_unreachable");
         assert!(c.is_failing_closed());
+        assert_eq!(c.read(&mut env), Err(ClockError::Unavailable));
+        assert_eq!(env.reasons(), vec!["nts_unreachable"]);
+
+        // A poll in sync while failing closed still gets a reply.
+        let r = poll(&mut c, &mut env, T0).unwrap();
+        assert_eq!(r.verdict, "in_sync");
+        assert_eq!(r.reason, "nts_unreachable");
+        assert_eq!(r.trusted_time_ms, 0);
+        assert_eq!(r.nts, NtsReply::default());
+
+        // NTS back: the next poll that needs it settles the outage.
+        env.nts = Ok(T0);
+        let r = poll(&mut c, &mut env, T0 + 3_600_000).unwrap();
+        assert_eq!(r.verdict, "monitor_clock_wrong");
+        assert_eq!(r.reason, "");
+        assert_eq!(r.trusted_time_ms, T0);
+        assert!(!c.is_failing_closed());
     }
 
     #[test]
@@ -966,7 +1028,7 @@ mod tests {
         let mut p = signed_poll("enc-1", T0, 1);
         p.t_ms += 1;
         let body = serde_json::to_vec(&p).unwrap();
-        assert!(matches!(c.poll(&mut env, &body, "mini"), Err(PollError::Wire(WireError::Forbidden(_)))));
+        assert!(matches!(c.poll(&mut env, &body, "mini"), Err(PollError::Wire(WireError::Unauthorized(_)))));
         assert!(matches!(c.poll(&mut env, b"{", "mini"), Err(PollError::Wire(WireError::BadRequest(_)))));
         // Nothing was fetched for a refused poll.
         assert_eq!(env.nts_calls, 0);
@@ -1025,9 +1087,14 @@ mod tests {
         let mut c = configured(&mut env);
         assert_eq!(c.read(&mut env), Ok(T0));
         assert!(c.is_flagged());
-        assert_eq!(env.incidents.len(), 1);
-        assert_eq!(env.incidents[0].reason, "host_clock_wrong");
+        assert_eq!(env.reasons(), vec!["host_clock_wrong"]);
         assert_eq!(env.incidents[0].nts_time_ms, T0);
+        // A lost receipt does not fail closed here.
+        let mut env = Fake::new(T0 - 7_200_000);
+        env.nts = Ok(T0);
+        env.receipts = false;
+        let mut c = configured(&mut env);
+        assert_eq!(c.read(&mut env), Ok(T0));
     }
 
     #[test]

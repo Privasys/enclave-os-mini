@@ -34,15 +34,15 @@ pub enum WireError {
     /// Malformed body or field (HTTP 400).
     BadRequest(String),
     /// Well formed, but not signed by the configured monitor, or for
-    /// another enclave (HTTP 403).
-    Forbidden(&'static str),
+    /// another enclave (HTTP 401).
+    Unauthorized(&'static str),
 }
 
 impl core::fmt::Display for WireError {
     fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
         match self {
             WireError::BadRequest(m) => write!(f, "{m}"),
-            WireError::Forbidden(m) => write!(f, "{m}"),
+            WireError::Unauthorized(m) => write!(f, "{m}"),
         }
     }
 }
@@ -175,14 +175,14 @@ impl PollRequest {
     /// Check the poll is for this enclave and signed by the configured key.
     pub fn verify(&self, cfg: &MonitorConfig) -> Result<(), WireError> {
         if self.enclave_id != cfg.wire.enclave_id {
-            return Err(WireError::Forbidden("enclave_id does not match this enclave"));
+            return Err(WireError::Unauthorized("enclave_id does not match this enclave"));
         }
         if !self.key_id.eq_ignore_ascii_case(&cfg.key_id()) {
-            return Err(WireError::Forbidden("key_id is not the configured monitor key"));
+            return Err(WireError::Unauthorized("key_id is not the configured monitor key"));
         }
-        let sig = b64url_decode(&self.sig).ok_or(WireError::Forbidden("bad signature"))?;
+        let sig = b64url_decode(&self.sig).ok_or(WireError::Unauthorized("bad signature"))?;
         if !verify_ed25519(&cfg.key, &floor_signed_bytes(&self.enclave_id, self.t_ms, self.seq), &sig) {
-            return Err(WireError::Forbidden("bad signature"));
+            return Err(WireError::Unauthorized("bad signature"));
         }
         Ok(())
     }
@@ -250,17 +250,17 @@ pub fn verify_receipt(cfg: &MonitorConfig, nonce: &str, body: &[u8]) -> Result<S
     let r: Receipt =
         serde_json::from_slice(body).map_err(|e| WireError::BadRequest(format!("invalid receipt: {e}")))?;
     if r.nonce != nonce {
-        return Err(WireError::Forbidden("receipt nonce does not match"));
+        return Err(WireError::Unauthorized("receipt nonce does not match"));
     }
     if !r.key_id.eq_ignore_ascii_case(&cfg.key_id()) {
-        return Err(WireError::Forbidden("receipt key_id is not the configured monitor key"));
+        return Err(WireError::Unauthorized("receipt key_id is not the configured monitor key"));
     }
     if r.incident_id.is_empty() {
         return Err(WireError::BadRequest("receipt has no incident_id".to_string()));
     }
-    let sig = b64url_decode(&r.sig).ok_or(WireError::Forbidden("bad receipt signature"))?;
+    let sig = b64url_decode(&r.sig).ok_or(WireError::Unauthorized("bad receipt signature"))?;
     if !verify_ed25519(&cfg.key, &receipt_signed_bytes(&cfg.wire.enclave_id, nonce, &r.incident_id), &sig) {
-        return Err(WireError::Forbidden("bad receipt signature"));
+        return Err(WireError::Unauthorized("bad receipt signature"));
     }
     Ok(r.incident_id)
 }
@@ -357,15 +357,15 @@ pub(crate) mod tests {
 
         let mut bad = p.clone();
         bad.t_ms += 1;
-        assert_eq!(bad.verify(&cfg), Err(WireError::Forbidden("bad signature")));
+        assert_eq!(bad.verify(&cfg), Err(WireError::Unauthorized("bad signature")));
         let mut bad = p.clone();
         bad.seq += 1;
-        assert_eq!(bad.verify(&cfg), Err(WireError::Forbidden("bad signature")));
+        assert_eq!(bad.verify(&cfg), Err(WireError::Unauthorized("bad signature")));
         let other = signed_poll("enc-2", 1_789_700_000_000, 5);
-        assert!(matches!(other.verify(&cfg), Err(WireError::Forbidden(_))));
+        assert!(matches!(other.verify(&cfg), Err(WireError::Unauthorized(_))));
         let mut bad = p;
         bad.key_id = "ffffffffffffffff".to_string();
-        assert!(matches!(bad.verify(&cfg), Err(WireError::Forbidden(_))));
+        assert!(matches!(bad.verify(&cfg), Err(WireError::Unauthorized(_))));
     }
 
     #[test]
@@ -375,7 +375,7 @@ pub(crate) mod tests {
         assert_eq!(verify_receipt(&cfg, "n0nce", &body), Ok("inc-1".to_string()));
         assert!(verify_receipt(&cfg, "other", &body).is_err());
         let body = signed_receipt("enc-2", "n0nce", "inc-1");
-        assert_eq!(verify_receipt(&cfg, "n0nce", &body), Err(WireError::Forbidden("bad receipt signature")));
+        assert_eq!(verify_receipt(&cfg, "n0nce", &body), Err(WireError::Unauthorized("bad receipt signature")));
     }
 
     #[test]

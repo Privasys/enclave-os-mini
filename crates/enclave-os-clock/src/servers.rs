@@ -8,7 +8,8 @@
 //! universities and companies, all in Europe. Each completed an NTS-KE
 //! handshake (TLS 1.3, ALPN `ntske/1`, eight cookies) when the list was
 //! compiled. Some of them refuse plain NTP, so a plain NTP probe is not a
-//! valid health check.
+//! valid health check. TimeNL is reached through `nts.time.nl`: the NTP leg
+//! of its `ntppool1.time.nl` does not answer.
 //!
 //! The list is compiled in, and therefore measured, and never taken from
 //! configuration: whoever can change it can point the enclave at servers
@@ -16,14 +17,14 @@
 //! get. Changing it is a runtime roll.
 //!
 //! Backups that also passed the handshake, for a future roll:
-//! `nts.time.nl`, `1.nts.nothingtohide.nl`, `ntp.miuku.net`,
-//! `time.cincura.net`, `ntp01.maillink.ch`.
+//! `1.nts.nothingtohide.nl`, `ntp.miuku.net`, `time.cincura.net`,
+//! `ntp01.maillink.ch`.
 
 /// `(host, operator)`; NTS-KE on TCP 4460 unless the server redirects.
 pub const NTS_SERVERS: [(&str, &str); 10] = [
     ("nts.netnod.se", "Netnod, Sweden"),
     ("ptbtime1.ptb.de", "PTB, Germany"),
-    ("ntppool1.time.nl", "TimeNL (SIDN), Netherlands"),
+    ("nts.time.nl", "TimeNL (SIDN), Netherlands"),
     ("time.cloudflare.com", "Cloudflare, Europe"),
     ("ntp3.fau.de", "FAU Erlangen-Nuernberg, Germany"),
     ("ntp1.cam.ac.uk", "University of Cambridge, UK"),
