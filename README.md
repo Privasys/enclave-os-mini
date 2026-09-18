@@ -16,6 +16,7 @@ single SGX enclave.
 | **OIDC-Authenticated Vault** | Store and retrieve secrets gated by OIDC RBAC with dual-path GetSecret (OIDC owner + RA-TLS TEE) |
 | **Sealed Config** | All persistent state stored as a single MRENCLAVE-bound blob |
 | **Config Attestation** | Merkle root + per-module OIDs over all config inputs in every RA-TLS certificate |
+| **Trusted Time** | The host's clock is never taken on trust: every time read is checked against a sealed floor, the platform clock monitor's signed polls and NTS servers (RFC 8915), and verification decisions fail closed without it. See [docs/trusted-time.md](docs/trusted-time.md) |
 
 ## Architecture
 

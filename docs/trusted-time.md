@@ -10,6 +10,14 @@ enclave-os-mini therefore reads the time in exactly one place, checks the
 host's answer against a sealed floor, a platform monitor and NTS servers
 on the internet, and fails closed when it cannot.
 
+The platform monitor is the `platform-monitoring` app, an instance of
+[container-app-service-monitoring](https://github.com/Privasys/container-app-service-monitoring/blob/main/docs/platform-clock.md)
+running its platform clock. It polls every enclave's core every 5
+minutes and has the platform quarantine, at the gateways, an enclave
+whose host clock is wrong, that has no trusted time, or that misses two
+polls in a row. The enclave keeps running and its manager route stays
+up, so the monitor can keep checking it; a clean poll releases it.
+
 ## The choke point
 
 Every time read goes through `enclave/src/trustedtime`, reached through the
@@ -92,9 +100,10 @@ What a poll finds (`host_clock_wrong`, `monitor_clock_wrong`, no NTS
 quorum) is in the poll reply and is never sent as an incident: the
 monitor polls again after every incident, which would loop. Incidents are
 for what is found outside a poll: the host behind the floor, the boot
-fetch (`nts_unreachable`, `host_clock_wrong`) and a failed refetch. Only `host_behind_floor` waits for the receipt (and fails
-closed without it); the others are sent on the next read, never inside a
-poll, and a lost one is logged. Each condition is reported once, until
+fetch (`nts_unreachable`, `host_clock_wrong`) and a failed refetch.
+Only `host_behind_floor` waits for the receipt (and fails closed without
+it); the others are sent on the next read, never inside a poll, and a
+lost one is logged. Each condition is reported once, until
 the host time is confirmed again.
 
 Known limit: the enclave cannot measure how long it waited for an NTS
