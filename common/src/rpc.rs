@@ -583,12 +583,41 @@ pub fn decode_u64(p: &[u8]) -> Option<u64> {
 }
 
 // -- Log --
-/// Payload: [i32 level] [message utf8]
+/// Payload: [i32 level] [message utf8], the message escaped to one line.
+///
+/// Every enclave log line reaches the host through here, and many carry text
+/// an outsider chose: WASM guest stdout and stderr, request paths, error
+/// messages echoing input. Control characters (other than tab) and Unicode
+/// bidirectional overrides are written as escapes, so that text cannot start a
+/// new log record, move the cursor or recolour an operator's terminal, or
+/// visually reorder a line to forge another app's prefix.
 pub fn encode_log_req(level: i32, message: &str) -> Vec<u8> {
+    let message = escape_log_text(message);
     let mut buf = Vec::with_capacity(4 + message.len());
     buf.extend_from_slice(&level.to_le_bytes());
     buf.extend_from_slice(message.as_bytes());
     buf
+}
+
+/// Escape the characters that let log text act on the log instead of
+/// appearing in it. See [`encode_log_req`].
+pub fn escape_log_text(s: &str) -> String {
+    let unsafe_char = |c: char| {
+        (c.is_control() && c != '\t')
+            || matches!(c, '\u{200E}' | '\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2066}'..='\u{2069}')
+    };
+    if !s.chars().any(unsafe_char) {
+        return String::from(s);
+    }
+    let mut out = String::with_capacity(s.len() + 8);
+    for c in s.chars() {
+        if unsafe_char(c) {
+            out.extend(c.escape_default());
+        } else {
+            out.push(c);
+        }
+    }
+    out
 }
 pub fn decode_log_req(p: &[u8]) -> Option<(i32, &str)> {
     if p.len() < 4 { return None; }
@@ -1103,5 +1132,37 @@ mod tests {
         assert_eq!(RpcMethod::from_u16(0x0106), None);
         assert_eq!(RpcMethod::from_u16(0x0207), None);
         assert_eq!(RpcMethod::from_u16(0xFFFF), None);
+    }
+}
+
+#[cfg(test)]
+mod log_escape_tests {
+    use super::{decode_log_req, encode_log_req, escape_log_text};
+
+    #[test]
+    fn ordinary_text_is_unchanged() {
+        assert_eq!(escape_log_text("GET /v1/items 200"), "GET /v1/items 200");
+        assert_eq!(escape_log_text("tab\tstays"), "tab\tstays");
+        assert_eq!(escape_log_text("Ünïcödë 日本語 🔒"), "Ünïcödë 日本語 🔒");
+    }
+
+    #[test]
+    fn a_line_break_cannot_start_a_new_record() {
+        let out = escape_log_text("ok\n[wasm:other-app] forged\r\n");
+        assert!(!out.contains('\n') && !out.contains('\r'));
+        assert_eq!(out, r"ok\n[wasm:other-app] forged\r\n");
+    }
+
+    #[test]
+    fn terminal_and_bidi_controls_are_escaped() {
+        assert_eq!(escape_log_text("\x1b[31mred"), r"\u{1b}[31mred");
+        assert_eq!(escape_log_text("a\u{202E}b"), r"a\u{202e}b");
+        assert_eq!(escape_log_text("nul\0"), r"nul\u{0}");
+    }
+
+    #[test]
+    fn the_encoder_applies_it() {
+        let enc = encode_log_req(2, "x\ny");
+        assert_eq!(decode_log_req(&enc), Some((2, r"x\ny")));
     }
 }

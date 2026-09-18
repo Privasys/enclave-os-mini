@@ -274,9 +274,8 @@ impl AppContext {
     /// Flush any remaining partial line in stdout to the enclave log.
     pub fn flush_stdout(&mut self) {
         if !self.stdout_buf.is_empty() {
-            if let Ok(s) = core::str::from_utf8(&self.stdout_buf) {
-                enclave_os_common::enclave_log_info!("[wasm:{}] {}", self.app_name, s);
-            }
+            let s = String::from_utf8_lossy(&self.stdout_buf);
+            enclave_os_common::enclave_log_info!("[wasm:{}] {}", self.app_name, s);
             self.stdout_buf.clear();
         }
     }
@@ -284,9 +283,8 @@ impl AppContext {
     /// Flush any remaining partial line in stderr to the enclave log.
     pub fn flush_stderr(&mut self) {
         if !self.stderr_buf.is_empty() {
-            if let Ok(s) = core::str::from_utf8(&self.stderr_buf) {
-                enclave_os_common::enclave_log_error!("[wasm:{}] {}", self.app_name, s);
-            }
+            let s = String::from_utf8_lossy(&self.stderr_buf);
+            enclave_os_common::enclave_log_error!("[wasm:{}] {}", self.app_name, s);
             self.stderr_buf.clear();
         }
     }
@@ -305,13 +303,15 @@ impl AppContext {
     fn forward_to_log(buf: &mut Vec<u8>, app_name: &str, data: &[u8], is_stderr: bool) {
         buf.extend_from_slice(data);
         // Emit every complete line.
+        // Guest output is untrusted: the log encoder escapes control
+        // characters, and invalid UTF-8 is shown lossily rather than dropped,
+        // so a guest cannot hide a line by corrupting it.
         while let Some(pos) = buf.iter().position(|&b| b == b'\n') {
-            if let Ok(line) = core::str::from_utf8(&buf[..pos]) {
-                if is_stderr {
-                    enclave_os_common::enclave_log_error!("[wasm:{}] {}", app_name, line);
-                } else {
-                    enclave_os_common::enclave_log_info!("[wasm:{}] {}", app_name, line);
-                }
+            let line = String::from_utf8_lossy(&buf[..pos]);
+            if is_stderr {
+                enclave_os_common::enclave_log_error!("[wasm:{}] {}", app_name, line);
+            } else {
+                enclave_os_common::enclave_log_info!("[wasm:{}] {}", app_name, line);
             }
             buf.drain(..=pos);
         }
