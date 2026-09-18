@@ -25,7 +25,7 @@
 
 pub mod helloworld;
 
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::vec::Vec;
 
 use enclave_os_common::modules::{
@@ -38,11 +38,11 @@ use enclave_os_common::protocol::{Request, Response};
 // ---------------------------------------------------------------------------
 
 /// Global registry of modules.
-static MODULES: Mutex<Vec<Box<dyn EnclaveModule>>> = Mutex::new(Vec::new());
+static MODULES: Mutex<Vec<Arc<dyn EnclaveModule>>> = Mutex::new(Vec::new());
 
 /// Register a module. Call during enclave startup.
 pub fn register_module(module: Box<dyn EnclaveModule>) {
-    MODULES.lock().unwrap().push(module);
+    MODULES.lock().unwrap().push(Arc::from(module));
 }
 
 /// Collect config leaves from all registered modules.
@@ -74,7 +74,11 @@ pub fn collect_app_identities() -> Vec<AppIdentity> {
 
 /// Dispatch a request to the first module that handles it.
 pub fn dispatch(req: &Request, ctx: &RequestContext) -> Option<Response> {
-    for module in MODULES.lock().unwrap().iter() {
+    // Snapshot the list and release the lock before any module runs: a
+    // module can suspend the request mid-call (a guest waiting on egress)
+    // while other requests are dispatched.
+    let modules: Vec<Arc<dyn EnclaveModule>> = MODULES.lock().unwrap().clone();
+    for module in modules.iter() {
         if let Some(resp) = module.handle(req, ctx) {
             return Some(resp);
         }

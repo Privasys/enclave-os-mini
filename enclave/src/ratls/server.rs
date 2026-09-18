@@ -104,7 +104,26 @@ pub struct IngressServer {
     leaf_by_spki: BTreeMap<[u8; 32], LeafKey>,
     /// Deterministic quotes, one per leaf key, cached for the key's lifetime.
     det_quotes: BTreeMap<[u8; 32], DetQuote>,
+    /// Requests suspended mid-handling (e.g. a guest waiting on egress),
+    /// keyed by conn_id. A connection has at most one: HTTP/1.1 answers in
+    /// order, so its next requests stay buffered in the session meanwhile.
+    #[cfg(feature = "wasm")]
+    pending: BTreeMap<u32, PendingRequest>,
 }
+
+/// A request whose handler suspended; answered when its task finishes.
+#[cfg(feature = "wasm")]
+struct PendingRequest {
+    task: enclave_os_wasm::executor::Task<HttpHandleResult>,
+    /// The request asked to close the connection after the response.
+    close: bool,
+}
+
+/// Most requests suspended at once. Each holds a task stack, a guest fiber
+/// stack and the guest's memory in the enclave heap; past this, requests run
+/// to completion inline, blocking the event loop as they always did.
+#[cfg(feature = "wasm")]
+const MAX_PENDING_REQUESTS: usize = 8;
 
 /// A cached ServerConfig for deterministic (non-challenge) connections.
 struct CachedConfig {
@@ -141,6 +160,8 @@ impl IngressServer {
             leaf_keys: BTreeMap::new(),
             leaf_by_spki: BTreeMap::new(),
             det_quotes: BTreeMap::new(),
+            #[cfg(feature = "wasm")]
+            pending: BTreeMap::new(),
         }
     }
 
@@ -370,6 +391,12 @@ impl IngressServer {
         // because different requests in the same session may carry
         // different tokens (or none — e.g. GET /healthz).
         loop {
+            // HTTP/1.1 answers in order: while a request of this connection
+            // is suspended, the next ones stay buffered in the session.
+            #[cfg(feature = "wasm")]
+            if self.pending.contains_key(&conn_id) {
+                return;
+            }
             match session.recv_http_request() {
                 Ok(Some(http_req)) => {
                     let close = http_req.connection_close;
@@ -386,46 +413,14 @@ impl IngressServer {
                             attestation: session.attestation().to_string(),
                             oidc_claims: None,
                         };
-                        handle_http_request_with_session(&http_req, &base_ctx)
+                        match self.run_request(conn_id, http_req, base_ctx, close) {
+                            Some(result) => result,
+                            // Suspended: `poll_tasks` answers it later.
+                            None => return,
+                        }
                     };
 
-                    // Send HTTP response
-                    let send_close = close || result.shutdown;
-                    let ct = result.content_type.as_deref()
-                        .unwrap_or("application/json");
-                    match session.send_http_response_with_headers(
-                        result.status,
-                        ct,
-                        &result.extra_headers,
-                        &result.body,
-                        send_close,
-                    ) {
-                        Ok(tls_bytes) => {
-                            if !tls_bytes.is_empty() {
-                                self.send_to_proxy(conn_id, &tls_bytes);
-                            }
-                        }
-                        Err(e) => {
-                            enclave_log_error!(
-                                "send_http_response failed conn_id={}: {}",
-                                conn_id, e
-                            );
-                            self.send_close(conn_id);
-                            return;
-                        }
-                    }
-
-                    if result.shutdown {
-                        enclave_log_info!(
-                            "Shutdown requested by conn_id={}", conn_id
-                        );
-                        self.shutdown = true;
-                        self.send_close(conn_id);
-                        return;
-                    }
-
-                    if close {
-                        self.send_close(conn_id);
+                    if !self.send_result(conn_id, session, result, close) {
                         return;
                     }
                 }
@@ -447,6 +442,142 @@ impl IngressServer {
                     return;
                 }
             }
+        }
+    }
+
+    /// Send a handled request's response. Returns `false` when the
+    /// connection is finished (closed, or the enclave is shutting down).
+    fn send_result(
+        &mut self,
+        conn_id: u32,
+        session: &mut RaTlsSession,
+        result: HttpHandleResult,
+        close: bool,
+    ) -> bool {
+        let send_close = close || result.shutdown;
+        let ct = result.content_type.as_deref().unwrap_or("application/json");
+        match session.send_http_response_with_headers(
+            result.status,
+            ct,
+            &result.extra_headers,
+            &result.body,
+            send_close,
+        ) {
+            Ok(tls_bytes) => {
+                if !tls_bytes.is_empty() {
+                    self.send_to_proxy(conn_id, &tls_bytes);
+                }
+            }
+            Err(e) => {
+                enclave_log_error!(
+                    "send_http_response failed conn_id={}: {}",
+                    conn_id, e
+                );
+                self.send_close(conn_id);
+                return false;
+            }
+        }
+
+        if result.shutdown {
+            enclave_log_info!("Shutdown requested by conn_id={}", conn_id);
+            self.shutdown = true;
+            self.send_close(conn_id);
+            return false;
+        }
+
+        if close {
+            self.send_close(conn_id);
+            return false;
+        }
+        true
+    }
+
+    /// Handle a request as a task, so that it can suspend while it waits
+    /// (a guest call waiting on egress) and let other connections be served.
+    /// Returns the result if the request finished without suspending.
+    #[cfg(feature = "wasm")]
+    fn run_request(
+        &mut self,
+        conn_id: u32,
+        http_req: enclave_os_common::protocol::HttpRequest,
+        base_ctx: enclave_os_common::modules::RequestContext,
+        close: bool,
+    ) -> Option<HttpHandleResult> {
+        use enclave_os_wasm::executor::Task;
+
+        if self.pending.len() >= MAX_PENDING_REQUESTS {
+            return Some(handle_http_request_with_session(&http_req, &base_ctx));
+        }
+        let mut task =
+            match Task::spawn(move || handle_http_request_with_session(&http_req, &base_ctx)) {
+                Ok(task) => task,
+                Err(e) => {
+                    enclave_log_error!("request task for conn_id={}: {}", conn_id, e);
+                    return Some(HttpHandleResult::err(503, "enclave busy"));
+                }
+            };
+        match task.resume() {
+            Some(result) => Some(result),
+            None => {
+                self.pending.insert(conn_id, PendingRequest { task, close });
+                None
+            }
+        }
+    }
+
+    #[cfg(not(feature = "wasm"))]
+    fn run_request(
+        &mut self,
+        _conn_id: u32,
+        http_req: enclave_os_common::protocol::HttpRequest,
+        base_ctx: enclave_os_common::modules::RequestContext,
+        _close: bool,
+    ) -> Option<HttpHandleResult> {
+        Some(handle_http_request_with_session(&http_req, &base_ctx))
+    }
+
+    /// Resume the suspended requests that were woken, and answer those that
+    /// finish. Called from the enclave event loop.
+    #[cfg(feature = "wasm")]
+    pub fn poll_tasks(&mut self) {
+        if !enclave_os_wasm::executor::take_runnable() || self.pending.is_empty() {
+            return;
+        }
+        let woken: Vec<u32> = self
+            .pending
+            .iter()
+            .filter(|(_, p)| p.task.is_woken())
+            .map(|(conn_id, _)| *conn_id)
+            .collect();
+        for conn_id in woken {
+            let Some(mut pending) = self.pending.remove(&conn_id) else {
+                continue;
+            };
+            match pending.task.resume() {
+                None => {
+                    self.pending.insert(conn_id, pending);
+                }
+                Some(result) => self.finish_request(conn_id, result, pending.close),
+            }
+        }
+    }
+
+    /// Answer a request that finished after suspending, then carry on with
+    /// the requests its connection buffered meanwhile.
+    #[cfg(feature = "wasm")]
+    fn finish_request(&mut self, conn_id: u32, result: HttpHandleResult, close: bool) {
+        match self.sessions.remove(&conn_id) {
+            Some(SessionState::Established(mut session)) => {
+                if self.send_result(conn_id, &mut session, result, close) {
+                    self.dispatch_requests(conn_id, &mut session);
+                }
+                self.sessions.insert(conn_id, SessionState::Established(session));
+            }
+            Some(other) => {
+                self.sessions.insert(conn_id, other);
+            }
+            // The connection went away while the request ran.
+            None => {}
         }
     }
 

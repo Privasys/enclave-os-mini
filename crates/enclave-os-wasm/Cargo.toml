@@ -68,6 +68,11 @@ wasmtime = { path = "../../../../libraries/wasmtime/crates/wasmtime", default-fe
     "gc-drc",
 ] }
 
+# The fibers wasmtime itself uses (same fork, same crate instance): request
+# tasks run the synchronous request handler on one, so a request waiting on
+# a suspended guest call yields back to the enclave event loop.
+wasmtime-internal-fiber = { path = "../../../../libraries/wasmtime/crates/fiber", features = ["std"] }
+
 # Crypto (SHA-256 for WASM code hashing, RNG for WASI random)
 ring = "0.17"
 # RFC 6979 deterministic ECDSA for replay-mode transactions (same

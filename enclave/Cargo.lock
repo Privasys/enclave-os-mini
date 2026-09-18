@@ -590,6 +590,7 @@ dependencies = [
  "serde",
  "serde_json",
  "wasmtime",
+ "wasmtime-internal-fiber",
 ]
 
 [[package]]

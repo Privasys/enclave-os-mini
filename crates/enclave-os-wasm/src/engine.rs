@@ -35,6 +35,10 @@ use wasmtime::{Config, Engine, Store};
 use crate::wasi::AppContext;
 use enclave_os_common::types::AEAD_KEY_SIZE;
 
+/// Fuel a guest call consumes between two yields to the event loop: a few
+/// milliseconds of compute.
+const FUEL_YIELD_INTERVAL: u64 = 1_000_000;
+
 // ---------------------------------------------------------------------------
 //  WasmEngine
 // ---------------------------------------------------------------------------
@@ -202,10 +206,16 @@ impl WasmEngine {
         let mut store = Store::new(&self.engine, host);
 
         // ── Fuel / resource limits ─────────────────────────────
-        // Fuel limits prevent infinite loops from hanging the enclave.
+        // The budget ends a runaway call; the yield interval keeps a long
+        // one from monopolising the enclave: the guest suspends every
+        // interval, and a call running as a request task lets the event loop
+        // serve other connections before carrying on.
         store
             .set_fuel(fuel)
             .map_err(|e| format!("WASM fuel installation failed: {:#}", e))?;
+        store
+            .fuel_async_yield_interval(Some(FUEL_YIELD_INTERVAL))
+            .map_err(|e| format!("WASM fuel yield setup failed: {:#}", e))?;
 
         Ok(store)
     }

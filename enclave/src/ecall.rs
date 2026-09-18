@@ -393,6 +393,8 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
                         };
                         if let Some(ref mut srv) = st.ingress_server {
                             srv.handle_message(msg_type, conn_id, payload);
+                            #[cfg(feature = "wasm")]
+                            srv.poll_tasks();
                             if let Some(reason) = srv.shutdown_reason() {
                                 enclave_log_error!(
                                     "MINI-CONTROL-SHUTDOWN: reason=Ingress({:?})",
@@ -416,7 +418,16 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
                 }
             }
             None => {
-                // No message available — yield
+                // No message: resume suspended requests that were woken.
+                #[cfg(feature = "wasm")]
+                if enclave_os_wasm::executor::has_runnable() {
+                    if let Ok(mut st) = crate::state().lock() {
+                        if let Some(ref mut srv) = st.ingress_server {
+                            srv.poll_tasks();
+                        }
+                    }
+                    continue;
+                }
                 core::hint::spin_loop();
             }
         }
