@@ -29,6 +29,7 @@
 
 extern crate alloc;
 
+pub mod aead;
 pub mod ntp;
 pub mod ntske;
 pub mod quorum;

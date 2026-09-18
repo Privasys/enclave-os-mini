@@ -16,11 +16,9 @@
 //! enclave cannot measure (it has no clock), so the server's transmit
 //! timestamp is taken as the time.
 
-use aes_siv::aead::{Aead, KeyInit, Payload};
-use aes_siv::{Aes128SivAead, Nonce};
 use alloc::vec::Vec;
 
-use crate::ntske::KEY_LEN;
+use crate::aead::NtsAead;
 
 /// Unique Identifier extension field.
 pub const EF_UNIQUE_ID: u16 = 0x0104;
@@ -35,8 +33,6 @@ pub const EF_AUTHENTICATOR: u16 = 0x0404;
 pub const HEADER_LEN: usize = 48;
 /// Unique Identifier length used by this client.
 pub const UID_LEN: usize = 32;
-/// SIV nonce length used by this client (and the only one accepted back).
-pub const NONCE_LEN: usize = 16;
 
 /// Seconds from the NTP epoch (1900) to the Unix epoch (1970).
 const NTP_UNIX_OFFSET: i64 = 2_208_988_800;
@@ -86,39 +82,41 @@ fn push_ef(out: &mut Vec<u8>, ftype: u16, body: &[u8]) {
     out.resize(out.len() + pad4(body.len()) - body.len(), 0);
 }
 
-fn siv(key: &[u8; KEY_LEN]) -> Aes128SivAead {
-    // A 32-byte slice always fits AEAD_AES_SIV_CMAC_256.
-    Aes128SivAead::new_from_slice(key).expect("32-byte SIV key")
-}
-
 /// Append an Authenticator extension field whose tag covers `packet` as it
 /// stands, sealing `plaintext` (encrypted extension fields; empty for a
-/// client request).
-pub fn push_authenticator(packet: &mut Vec<u8>, key: &[u8; KEY_LEN], nonce: &[u8; NONCE_LEN], plaintext: &[u8]) {
-    let ct = siv(key)
-        .encrypt(Nonce::from_slice(nonce), Payload { msg: plaintext, aad: packet })
-        .expect("SIV encryption does not fail");
-    let mut body = Vec::with_capacity(4 + NONCE_LEN + pad4(ct.len()));
-    body.extend_from_slice(&(NONCE_LEN as u16).to_be_bytes());
+/// client request). `None` on a wrong key or nonce length.
+pub fn push_authenticator(
+    packet: &mut Vec<u8>,
+    aead: NtsAead,
+    key: &[u8],
+    nonce: &[u8],
+    plaintext: &[u8],
+) -> Option<()> {
+    let ct = aead.seal(key, nonce, packet, plaintext)?;
+    let mut body = Vec::with_capacity(4 + pad4(nonce.len()) + pad4(ct.len()));
+    body.extend_from_slice(&(nonce.len() as u16).to_be_bytes());
     body.extend_from_slice(&(ct.len() as u16).to_be_bytes());
     body.extend_from_slice(nonce);
+    body.resize(4 + pad4(nonce.len()), 0);
     body.extend_from_slice(&ct);
-    body.resize(4 + NONCE_LEN + pad4(ct.len()), 0);
+    body.resize(4 + pad4(nonce.len()) + pad4(ct.len()), 0);
     push_ef(packet, EF_AUTHENTICATOR, &body);
+    Some(())
 }
 
-/// Build the client request.
+/// Build the client request. `None` on a wrong key or nonce length.
 ///
 /// `xmt` goes into the transmit timestamp: pass random bytes, not a time,
 /// so the request carries no clock reading and the server's origin echo
 /// works as a second nonce.
 pub fn build_request(
-    c2s: &[u8; KEY_LEN],
+    aead: NtsAead,
+    c2s: &[u8],
     cookie: &[u8],
     uid: &[u8; UID_LEN],
     xmt: &[u8; 8],
-    nonce: &[u8; NONCE_LEN],
-) -> Vec<u8> {
+    nonce: &[u8],
+) -> Option<Vec<u8>> {
     let mut p = Vec::with_capacity(HEADER_LEN + 36 + 4 + pad4(cookie.len()) + 40);
     p.resize(HEADER_LEN, 0);
     // LI = 0, VN = 4, mode = 3 (client).
@@ -126,8 +124,8 @@ pub fn build_request(
     p[40..48].copy_from_slice(xmt);
     push_ef(&mut p, EF_UNIQUE_ID, uid);
     push_ef(&mut p, EF_COOKIE, cookie);
-    push_authenticator(&mut p, c2s, nonce, &[]);
-    p
+    push_authenticator(&mut p, aead, c2s, nonce, &[])?;
+    Some(p)
 }
 
 /// Convert an NTP 64-bit timestamp to Unix milliseconds. Era 0 covers
@@ -155,7 +153,8 @@ pub fn unix_ms_to_ntp(ms: i64) -> [u8; 8] {
 /// Verify a server reply and return the server's transmit time in Unix ms.
 pub fn parse_response(
     pkt: &[u8],
-    s2c: &[u8; KEY_LEN],
+    aead: NtsAead,
+    s2c: &[u8],
     uid: &[u8; UID_LEN],
     xmt: &[u8; 8],
 ) -> Result<i64, NtpError> {
@@ -205,15 +204,13 @@ pub fn parse_response(
                 }
                 let nonce_len = u16::from_be_bytes([body[0], body[1]]) as usize;
                 let ct_len = u16::from_be_bytes([body[2], body[3]]) as usize;
-                if nonce_len != NONCE_LEN || 4 + pad4(nonce_len) + pad4(ct_len) > body.len() {
+                if nonce_len != aead.nonce_len() || 4 + pad4(nonce_len) + pad4(ct_len) > body.len() {
                     return Err(NtpError::Malformed("authenticator lengths"));
                 }
                 let nonce = &body[4..4 + nonce_len];
                 let ct_start = 4 + pad4(nonce_len);
                 let ct = &body[ct_start..ct_start + ct_len];
-                siv(s2c)
-                    .decrypt(Nonce::from_slice(nonce), Payload { msg: ct, aad: &pkt[..off] })
-                    .map_err(|_| NtpError::NotAuthenticated)?;
+                aead.open(s2c, nonce, &pkt[..off], ct).ok_or(NtpError::NotAuthenticated)?;
                 authenticated = true;
                 break;
             }
@@ -238,16 +235,18 @@ pub fn parse_response(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use aes_siv::siv::Aes128Siv;
+    use crate::aead::OFFERED;
     use alloc::vec;
 
-    const C2S: [u8; 32] = [1; 32];
-    const S2C: [u8; 32] = [2; 32];
     const UID: [u8; 32] = [7; 32];
     const XMT: [u8; 8] = [9, 8, 7, 6, 5, 4, 3, 2];
 
+    fn keys(a: NtsAead) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+        (vec![1; a.key_len()], vec![2; a.key_len()], vec![3; a.nonce_len()])
+    }
+
     /// A server reply the way an NTS server builds one.
-    fn server_reply(uid: &[u8; 32], origin: &[u8; 8], time_ms: i64, key: &[u8; 32]) -> Vec<u8> {
+    fn server_reply(a: NtsAead, uid: &[u8; 32], origin: &[u8; 8], time_ms: i64, key: &[u8]) -> Vec<u8> {
         let mut p = vec![0u8; HEADER_LEN];
         p[0] = (4 << 3) | 4;
         p[1] = 1;
@@ -257,104 +256,98 @@ mod tests {
         // One fresh cookie, encrypted, as servers do.
         let mut enc = Vec::new();
         push_ef(&mut enc, EF_COOKIE, &[0xAB; 100]);
-        push_authenticator(&mut p, key, &[3; 16], &enc);
+        push_authenticator(&mut p, a, key, &vec![3; a.nonce_len()], &enc).unwrap();
         p
     }
 
     #[test]
-    fn rfc5297_deterministic_vector_confirms_tag_first() {
-        // RFC 5297 appendix A.1.
-        let key = hex("fffefdfcfbfaf9f8f7f6f5f4f3f2f1f0f0f1f2f3f4f5f6f7f8f9fafbfcfdfeff");
-        let ad = hex("101112131415161718191a1b1c1d1e1f2021222324252627");
-        let pt = hex("112233445566778899aabbccddee");
-        let mut siv = Aes128Siv::new_from_slice(&key).unwrap();
-        let out = siv.encrypt(&[&ad], &pt).unwrap();
-        assert_eq!(out, hex("85632d07c6e8f37f950acd320a2ecc9340c02b9690c4dc04daef7f6afe5c"));
-    }
-
-    #[test]
-    fn aead_is_s2v_over_ad_then_nonce() {
-        let aad = b"header bytes";
-        let nonce = [5u8; 16];
-        let a = siv(&C2S).encrypt(Nonce::from_slice(&nonce), Payload { msg: b"pt", aad }).unwrap();
-        let b = Aes128Siv::new_from_slice(&C2S).unwrap().encrypt(&[&aad[..], &nonce[..]], b"pt").unwrap();
-        assert_eq!(a, b);
-    }
-
-    #[test]
     fn request_layout() {
-        let cookie = [0x55u8; 99];
-        let p = build_request(&C2S, &cookie, &UID, &XMT, &[4; 16]);
-        assert_eq!(p[0], 0x23);
-        assert_eq!(&p[40..48], &XMT);
-        // Unique Identifier: 4 + 32.
-        assert_eq!(&p[48..52], &[0x01, 0x04, 0x00, 36]);
-        // Cookie padded to 100.
-        assert_eq!(&p[84..88], &[0x02, 0x04, 0x00, 104]);
-        // Authenticator: 4 + 4 + 16 nonce + 16 tag.
-        let a = 84 + 104;
-        assert_eq!(&p[a..a + 8], &[0x04, 0x04, 0x00, 40, 0x00, 16, 0x00, 16]);
-        assert_eq!(p.len(), a + 40);
-        // The tag covers everything before the authenticator.
-        let ct = &p[a + 24..a + 40];
-        siv(&C2S)
-            .decrypt(Nonce::from_slice(&[4; 16]), Payload { msg: ct, aad: &p[..a] })
-            .unwrap();
+        for a in OFFERED {
+            let (c2s, _, nonce) = keys(a);
+            let cookie = [0x55u8; 99];
+            let p = build_request(a, &c2s, &cookie, &UID, &XMT, &nonce).unwrap();
+            assert_eq!(p[0], 0x23);
+            assert_eq!(&p[40..48], &XMT);
+            // Unique Identifier: 4 + 32.
+            assert_eq!(&p[48..52], &[0x01, 0x04, 0x00, 36]);
+            // Cookie padded to 100.
+            assert_eq!(&p[84..88], &[0x02, 0x04, 0x00, 104]);
+            // Authenticator: 4 + 4 + nonce + 16-byte tag (empty plaintext).
+            let at = 84 + 104;
+            let n = a.nonce_len() as u8;
+            assert_eq!(&p[at..at + 8], &[0x04, 0x04, 0x00, 4 + 4 + n + 16, 0x00, n, 0x00, 16]);
+            assert_eq!(p.len(), at + 8 + a.nonce_len() + 16);
+            // The tag covers everything before the authenticator.
+            let ct = &p[at + 8 + a.nonce_len()..];
+            assert!(a.open(&c2s, &nonce, &p[..at], ct).is_some());
+        }
     }
 
     #[test]
     fn accepts_authentic_reply() {
-        let t = 1_789_700_000_123;
-        let r = server_reply(&UID, &XMT, t, &S2C);
-        assert_eq!(parse_response(&r, &S2C, &UID, &XMT), Ok(t));
+        for a in OFFERED {
+            let (_, s2c, _) = keys(a);
+            let t = 1_789_700_000_123;
+            let r = server_reply(a, &UID, &XMT, t, &s2c);
+            assert_eq!(parse_response(&r, a, &s2c, &UID, &XMT), Ok(t));
+            // Parsed with the other algorithm: refused.
+            let other = if a == NtsAead::AesSivCmac256 { NtsAead::Aes128GcmSiv } else { NtsAead::AesSivCmac256 };
+            assert!(parse_response(&r, other, &vec![2; other.key_len()], &UID, &XMT).is_err());
+        }
     }
 
     #[test]
     fn refuses_forged_or_replayed_replies() {
-        let t = 1_789_700_000_000;
-        // Wrong key: forged.
-        let r = server_reply(&UID, &XMT, t, &C2S);
-        assert_eq!(parse_response(&r, &S2C, &UID, &XMT), Err(NtpError::NotAuthenticated));
-        // Another request's uid: replay.
-        let r = server_reply(&[8; 32], &XMT, t, &S2C);
-        assert_eq!(parse_response(&r, &S2C, &UID, &XMT), Err(NtpError::UniqueIdMismatch));
-        // Another request's origin.
-        let r = server_reply(&UID, &[0; 8], t, &S2C);
-        assert_eq!(parse_response(&r, &S2C, &UID, &XMT), Err(NtpError::OriginMismatch));
-        // Host rewrites the time: the tag covers the header.
-        let mut r = server_reply(&UID, &XMT, t, &S2C);
-        r[41] ^= 1;
-        assert_eq!(parse_response(&r, &S2C, &UID, &XMT), Err(NtpError::NotAuthenticated));
-        // Authenticator stripped.
-        let mut r = vec![0u8; HEADER_LEN];
-        r[0] = 0x24;
-        r[1] = 1;
-        r[24..32].copy_from_slice(&XMT);
-        push_ef(&mut r, EF_UNIQUE_ID, &UID);
-        assert_eq!(parse_response(&r, &S2C, &UID, &XMT), Err(NtpError::NotAuthenticated));
+        for a in OFFERED {
+            let (c2s, s2c, _) = keys(a);
+            let t = 1_789_700_000_000;
+            // Wrong key: forged.
+            let r = server_reply(a, &UID, &XMT, t, &c2s);
+            assert_eq!(parse_response(&r, a, &s2c, &UID, &XMT), Err(NtpError::NotAuthenticated));
+            // Another request's uid: replay.
+            let r = server_reply(a, &[8; 32], &XMT, t, &s2c);
+            assert_eq!(parse_response(&r, a, &s2c, &UID, &XMT), Err(NtpError::UniqueIdMismatch));
+            // Another request's origin.
+            let r = server_reply(a, &UID, &[0; 8], t, &s2c);
+            assert_eq!(parse_response(&r, a, &s2c, &UID, &XMT), Err(NtpError::OriginMismatch));
+            // Host rewrites the time: the tag covers the header.
+            let mut r = server_reply(a, &UID, &XMT, t, &s2c);
+            r[41] ^= 1;
+            assert_eq!(parse_response(&r, a, &s2c, &UID, &XMT), Err(NtpError::NotAuthenticated));
+            // Authenticator stripped.
+            let mut r = vec![0u8; HEADER_LEN];
+            r[0] = 0x24;
+            r[1] = 1;
+            r[24..32].copy_from_slice(&XMT);
+            push_ef(&mut r, EF_UNIQUE_ID, &UID);
+            assert_eq!(parse_response(&r, a, &s2c, &UID, &XMT), Err(NtpError::NotAuthenticated));
+        }
     }
 
     #[test]
     fn unauthenticated_uid_after_authenticator_is_ignored() {
-        let t = 1_789_700_000_000;
+        let a = NtsAead::AesSivCmac256;
+        let (_, s2c, _) = keys(a);
         // Reply for another uid, with ours appended after the tag.
-        let mut r = server_reply(&[8; 32], &XMT, t, &S2C);
+        let mut r = server_reply(a, &[8; 32], &XMT, 1_789_700_000_000, &s2c);
         push_ef(&mut r, EF_UNIQUE_ID, &UID);
-        assert_eq!(parse_response(&r, &S2C, &UID, &XMT), Err(NtpError::UniqueIdMismatch));
+        assert_eq!(parse_response(&r, a, &s2c, &UID, &XMT), Err(NtpError::UniqueIdMismatch));
     }
 
     #[test]
     fn kiss_and_unsynchronised() {
-        let mut r = server_reply(&UID, &XMT, 1, &S2C);
+        let a = NtsAead::AesSivCmac256;
+        let (_, s2c, _) = keys(a);
+        let mut r = server_reply(a, &UID, &XMT, 1, &s2c);
         r[1] = 0;
         r[12..16].copy_from_slice(b"NTSN");
-        assert_eq!(parse_response(&r, &S2C, &UID, &XMT), Err(NtpError::Kiss(*b"NTSN")));
-        let mut r = server_reply(&UID, &XMT, 1, &S2C);
+        assert_eq!(parse_response(&r, a, &s2c, &UID, &XMT), Err(NtpError::Kiss(*b"NTSN")));
+        let mut r = server_reply(a, &UID, &XMT, 1, &s2c);
         r[0] |= 0xC0;
-        assert_eq!(parse_response(&r, &S2C, &UID, &XMT), Err(NtpError::Unsynchronised));
-        let mut r = server_reply(&UID, &XMT, 1, &S2C);
+        assert_eq!(parse_response(&r, a, &s2c, &UID, &XMT), Err(NtpError::Unsynchronised));
+        let mut r = server_reply(a, &UID, &XMT, 1, &s2c);
         r[0] = (4 << 3) | 3;
-        assert_eq!(parse_response(&r, &S2C, &UID, &XMT), Err(NtpError::NotServerReply));
+        assert_eq!(parse_response(&r, a, &s2c, &UID, &XMT), Err(NtpError::NotServerReply));
     }
 
     #[test]
@@ -364,9 +357,5 @@ mod tests {
         }
         // 2036-02-07T06:28:16Z is NTP era 1, second 0.
         assert_eq!(ntp_to_unix_ms(&[0, 0, 0, 0, 0, 0, 0, 0]), 2_085_978_496_000);
-    }
-
-    fn hex(s: &str) -> Vec<u8> {
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
     }
 }

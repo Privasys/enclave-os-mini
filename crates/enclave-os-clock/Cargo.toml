@@ -12,8 +12,9 @@ description = "Trusted time for enclave-os: the floor state machine, the NTS (RF
 name = "enclave_os_clock"
 
 [dependencies]
-# AEAD_AES_SIV_CMAC_256, the one NTS algorithm we negotiate (RFC 8915 §5.1).
+# The NTS AEADs offered: AEAD_AES_SIV_CMAC_256 (15) and AEAD_AES_128_GCM_SIV (30).
 aes-siv = { version = "0.7", default-features = false, features = ["alloc"] }
+aes-gcm-siv = { version = "0.11", default-features = false, features = ["aes", "alloc"] }
 
 # Ed25519 verification of the monitor's floor and receipt signatures, and
 # SHA-256 for the monitor key id. Already in the enclave graph.
