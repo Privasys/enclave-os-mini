@@ -863,15 +863,17 @@ pub struct AppPermissions {
     /// string) in `app_auth` instead of an OIDC JWT.  The token is
     /// validated against the enclave's in-memory session store.
     ///
-    /// FIDO2 tokens satisfy `Authenticated` policy but carry no roles,
-    /// so `Role` policy requires an OIDC JWT.
+    /// FIDO2 tokens satisfy `Authenticated` policy. They carry the roles held
+    /// for the user in the app's sealed role store (built with `app-auth`),
+    /// which never include `admin`: admin comes only from an OIDC JWT.
     #[serde(default)]
     pub fido2: bool,
     /// Default policy for functions not listed in `functions`.
     ///
     /// - `"public"` — no authentication required
     /// - `"authenticated"` — valid token required (OIDC JWT or FIDO2 session)
-    /// - `"role"` — requires `default_roles` (OIDC only)
+    /// - `"role"` — requires `default_roles` (OIDC roles, or FIDO2 roles from
+    ///   the app's role store; `admin` only ever from OIDC)
     #[serde(default = "default_policy")]
     pub default_policy: FunctionPolicy,
     /// Roles required when `default_policy` is `Role`.

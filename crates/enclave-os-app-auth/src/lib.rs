@@ -5,16 +5,15 @@
 //!
 //! Stores user roles in the app's own sealed KV space (same table as the
 //! app's WASI filesystem, differentiated by the `roles:` key prefix).
-//! The first authenticated user is automatically assigned the `admin`
-//! role (bootstrap).
+//! The store never confers `admin`: that comes only from the identity
+//! provider's `roles` claim.
 
 pub mod roles;
 
 pub use roles::{
     get_default_roles,
+    get_or_enroll_user_roles,
     get_user_roles,
-    get_user_roles_with_bootstrap,
-    is_first_user,
     list_users,
     remove_user_roles,
     set_default_roles,

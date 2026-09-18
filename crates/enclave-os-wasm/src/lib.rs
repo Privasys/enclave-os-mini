@@ -2658,7 +2658,7 @@ fn build_app_role_store(
 ///
 /// Returns an [`AuthResult`] with the caller's roles and identity.
 /// When `role_store` is provided, FIDO2 users get roles from the app's
-/// sealed KV space (with first-user bootstrap).
+/// sealed KV space. That store never confers `admin`; see enclave-os-app-auth.
 fn verify_auth_token(
     token: &str,
     permissions: &crate::protocol::AppPermissions,
@@ -2676,7 +2676,7 @@ fn verify_auth_token(
                     {
                         match role_store {
                             Some(store) => {
-                                enclave_os_app_auth::get_user_roles_with_bootstrap(store, &user_id)
+                                enclave_os_app_auth::get_or_enroll_user_roles(store, &user_id)
                                     .unwrap_or_default()
                             }
                             None => Vec::new(),
