@@ -459,7 +459,10 @@ pub fn post_to_monitor(url: &str, body: &[u8], at_ms: i64) -> Result<Vec<u8>, St
             .dangerous()
             .with_custom_certificate_verifier(Arc::new(ReceiptAuthenticates(provider)))
             .with_no_client_auth();
-        config.alpn_protocols = vec![RATLS_ALPN.to_vec()];
+        // The marker only steers the gateway; the monitor's own TLS server
+        // does not list it, and TLS 1.3 aborts a handshake with no protocol
+        // in common. `http/1.1` is what the two actually agree on.
+        config.alpn_protocols = vec![RATLS_ALPN.to_vec(), b"http/1.1".to_vec()];
         config.resumption = rustls::client::Resumption::disabled();
         let name = ServerName::try_from(host.to_string()).map_err(|_| "invalid server name".to_string())?;
         let mut conn = ClientConnection::new(Arc::new(config), name).map_err(|e| format!("tls init: {e}"))?;
