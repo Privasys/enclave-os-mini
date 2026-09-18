@@ -21,8 +21,9 @@ mock = []
 # Shared types, module trait, and OCall vtable
 enclave-os-common = { path = "../../common", features = ["crypto"] }
 
-# TLS (Privasys fork with RA-TLS 0xFFBB challenge extension)
-rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# TLS: upstream rustls. `tls12` is for plain HTTPS egress only; every RA-TLS,
+# ingress and peer-link config pins TLS 1.3 explicitly.
+rustls = { version = "0.23", default-features = false, features = ["ring", "tls12", "std"] }
 
 # Mozilla root CAs for general-purpose HTTPS egress (WASM SDK, etc.)
 webpki-roots = "0.26"

@@ -681,9 +681,11 @@ fn build_client_config(
 
         cfg
     } else {
-        // Standard TLS — no RA-TLS verification.
+        // Standard TLS — no RA-TLS verification. TLS 1.2 stays on offer:
+        // public servers still exist that speak nothing newer (e.g. some
+        // CDN edges). RA-TLS above needs the TLS 1.3 exporter.
         ClientConfig::builder_with_details(provider, Arc::new(TrustedTime))
-            .with_protocol_versions(&[&rustls::version::TLS13])
+            .with_protocol_versions(&[&rustls::version::TLS13, &rustls::version::TLS12])
             .map_err(|_| "TLS config error")?
             .with_root_certificates(root_store.clone())
             .with_no_client_auth()
