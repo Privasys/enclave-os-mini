@@ -567,20 +567,20 @@ impl Clock {
     // ------------------------------------------------------------------
 
     /// Handle a `PUT /clock/config` body. Only a higher `config_version`
-    /// replaces the current config; the same config again is a no-op.
+    /// replaces the current config. The current version again is a no-op
+    /// that succeeds (management-service re-pushes it on retries), and
+    /// keeps the config already in place; a lower one is refused.
     pub fn set_config(&mut self, env: &mut dyn Env, body: &[u8]) -> Result<ConfigAck, ConfigError> {
         let cfg = MonitorConfig::parse(body).map_err(ConfigError::Wire)?;
         if let Some(cur) = self.config.as_ref() {
             let current = cur.wire.config_version;
-            if cfg.wire.config_version < current
-                || (cfg.wire.config_version == current && cfg.wire != cur.wire)
-            {
+            if cfg.wire.config_version < current {
                 return Err(ConfigError::Stale { current });
             }
-            if cfg.wire == cur.wire {
+            if cfg.wire.config_version == current {
                 return Ok(ConfigAck {
-                    enclave_id: cfg.wire.enclave_id.clone(),
-                    monitor_key_id: cfg.key_id(),
+                    enclave_id: cur.wire.enclave_id.clone(),
+                    monitor_key_id: cur.key_id(),
                     config_version: current,
                     applied: false,
                 });
@@ -982,15 +982,16 @@ mod tests {
         let ack = c.set_config(&mut env, &v3).unwrap();
         assert!(!ack.applied);
         assert_eq!(ack.config_version, 3);
-        // Lower, or same version with other content: refused.
+        // Lower: refused.
         let v2 = serde_json::to_vec(&config(2).wire).unwrap();
         assert_eq!(c.set_config(&mut env, &v2), Err(ConfigError::Stale { current: 3 }));
+        // Same version with other content: succeeds as a no-op, keeps the
+        // config in place.
         let mut w = config(3).wire;
         w.incident_url = "https://other.example/x".to_string();
-        assert_eq!(
-            c.set_config(&mut env, &serde_json::to_vec(&w).unwrap()),
-            Err(ConfigError::Stale { current: 3 })
-        );
+        let ack = c.set_config(&mut env, &serde_json::to_vec(&w).unwrap()).unwrap();
+        assert!(!ack.applied);
+        assert_eq!(c.config().unwrap().wire.incident_url, config(3).wire.incident_url);
         let v4 = serde_json::to_vec(&config(4).wire).unwrap();
         assert!(c.set_config(&mut env, &v4).unwrap().applied);
         assert!(matches!(c.set_config(&mut env, b"{}"), Err(ConfigError::Wire(_))));
