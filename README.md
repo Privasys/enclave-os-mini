@@ -125,6 +125,7 @@ Clients verify: **MRENCLAVE** (code identity) + **Config Merkle Root** (config i
 |----------|-------------|
 | [Architecture](docs/architecture.md) | Rust + SGX rationale, Teaclave fork, composable module design, SPSC queues, RPC protocol, sealed config |
 | [RA-TLS and Attestation](docs/ra-tls.md) | Certificate trust chain, X.509 OID extensions, Config Merkle tree, verification strategies, per-app certificates |
+| [Trusted Time](docs/trusted-time.md) | The one time source: sealed floor, NTS (RFC 8915), platform monitor contracts, UDP host ops |
 | [WASM Runtime](docs/wasm-runtime.md) | Wasmtime fork for SGX, WASI + Enclave OS SDK interfaces, per-app isolation, building WASM apps |
 | [Building and Usage](docs/building.md) | Prerequisites, build commands, running the enclave, WASM builds, client libraries, production deployment |
 | [Layer 4 Proxy](docs/layer4-proxy.md) | Caddy (caddy-l4) and HAProxy configuration for TCP passthrough |

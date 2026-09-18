@@ -90,7 +90,15 @@ cargo build --manifest-path host/Cargo.toml
 
 ```bash
 cargo test --workspace
+# Crates outside the root workspace are tested one by one, e.g. the
+# trusted-time state machine and NTS codecs:
+cargo test --manifest-path crates/enclave-os-clock/Cargo.toml
 ```
+
+Enclave code must read the time through
+`enclave_os_common::ocall::get_current_time[_ms]` (see
+[Trusted Time](trusted-time.md)); `clippy.toml` bans `SystemTime::now`
+outside the host crate.
 
 ---
 

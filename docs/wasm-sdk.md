@@ -16,7 +16,7 @@ WASM apps are sandboxed guests — they can **only** call the host functions def
 │    ├── import privasys:enclave-os/keystore   ─── sealed keys    │
 │    ├── import privasys:enclave-os/https      ─── rustls egress  │
 │    ├── import wasi:random/*                  ─── RDRAND         │
-│    ├── import wasi:clocks/*                  ─── OCALL time     │
+│    ├── import wasi:clocks/*                  ─── trusted time   │
 │    ├── import wasi:filesystem/*              ─── sealed KV      │
 │    ├── import wasi:io/*                      ─── in-memory      │
 │    ├── import wasi:cli/*                     ─── controlled env │
@@ -109,8 +109,8 @@ All random bytes come from Intel RDRAND (hardware RNG inside SGX). There is no d
 
 | Interface | Functions | Notes |
 |-----------|-----------|-------|
-| `wall-clock` | `now()`, `resolution()` | UNIX timestamp via OCALL. 1-second resolution |
-| `monotonic-clock` | `now()`, `resolution()`, `subscribe-instant()`, `subscribe-duration()` | Derived from wall clock. 1-second resolution |
+| `wall-clock` | `now()`, `resolution()` | The enclave's trusted UNIX time (never simply the host clock). 1 ms resolution; traps when there is no trusted time |
+| `monotonic-clock` | `now()`, `resolution()`, `subscribe-instant()`, `subscribe-duration()` | The same trusted time in nanoseconds; never goes back. 1 ms resolution |
 
 ### Filesystem (`wasi:filesystem@0.2.0`)
 

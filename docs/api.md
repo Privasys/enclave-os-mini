@@ -31,6 +31,8 @@ See [vault.md](vault.md) for vault-specific details and
 | `Metrics` | Bearer | Monitoring+ | Enclave counters + WASM fuel metrics |
 | `SetAttestationServers` | Bearer | Manager | Update attestation servers (URLs + tokens) |
 | `Shutdown` | — | — | Graceful shutdown (internal) |
+| `PUT /clock/config` | Bearer | Manager | Trusted-clock monitor config (key, incident URL, version) |
+| `POST /clock/poll` | Ed25519 signature | — | Monitor floor poll; replies with the clock state |
 
 ### WASM
 
@@ -312,6 +314,25 @@ Attestation servers can also be configured at startup via CLI flags:
 | `--attestation-servers` | Comma-separated list of attestation server URLs |
 | `--oidc-issuer` | OIDC issuer URL |
 | `--oidc-audience` | OIDC audience claim |
+
+### Trusted clock
+
+Two core HTTP routes on the RA-TLS server let the platform keep the
+enclave's time honest. They are core routes (not module operations) and
+are served on the gateway's terminate path without sealed transport,
+since each carries its own authentication.
+
+- `PUT /clock/config` (Manager role when OIDC is configured): the monitor
+  key, incident URL and enclave id from management-service, sealed with
+  the clock floor. Only a higher `config_version` replaces the config; the
+  same version again is a successful no-op; a lower one answers 409.
+- `POST /clock/poll` (no bearer): the monitor's signed floor. The Ed25519
+  signature with the configured key is the authentication (401 otherwise,
+  409 while no monitor is configured). The reply carries the host time,
+  trusted time, floor, flag and verdict.
+
+Bodies, status codes and signed payloads are in
+[trusted-time.md](trusted-time.md#monitor-contracts).
 
 ---
 

@@ -101,8 +101,8 @@ The WASM runtime implements a subset of the [WASI](https://wasi.dev/)
 | `wasi:random/random@0.2.0` | RDRAND hardware RNG (no OCALL) |
 | `wasi:random/insecure@0.2.0` | Same (RDRAND) — stub for compatibility |
 | `wasi:random/insecure-seed@0.2.0` | Same (RDRAND) |
-| `wasi:clocks/wall-clock@0.2.0` | OCALL to host for current UNIX time |
-| `wasi:clocks/monotonic-clock@0.2.0` | OCALL to host (best-effort) |
+| `wasi:clocks/wall-clock@0.2.0` | The enclave's trusted time (see [Trusted Time](trusted-time.md)); traps when there is none |
+| `wasi:clocks/monotonic-clock@0.2.0` | The same trusted time in nanoseconds; never goes back |
 | `wasi:cli/environment@0.2.0` | Enclave-controlled environment variables |
 | `wasi:cli/stdout@0.2.0` | Line-buffered → enclave log |
 | `wasi:cli/stderr@0.2.0` | Line-buffered → enclave error log |
@@ -350,7 +350,7 @@ is a complete reference implementation that exercises all WASM capabilities:
 |----------|---------------|---------------------|
 | `hello` | *(none)* | Pure guest code, no host imports |
 | `get-random` | `wasi:random` | RDRAND hardware RNG |
-| `get-time` | `wasi:clocks/wall-clock` | Wall clock via OCALL |
+| `get-time` | `wasi:clocks/wall-clock` | Trusted wall clock |
 | `kv-store` | `wasi:filesystem` | Write to sealed KV store |
 | `kv-read` | `wasi:filesystem` | Read from sealed KV store |
 | `fetch-headlines` | `privasys:enclave-os/https` | HTTPS egress from inside SGX |
