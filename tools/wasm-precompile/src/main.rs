@@ -52,6 +52,9 @@ fn enclave_compatible_config() -> Config {
     // explicit trap opcode the SGX VEH can forward to wasmtime.
     config.native_unwind_info(false);
     config.signals_based_traps(false);
+    // Fuel metering is compiled into the generated code; the enclave
+    // rejects a cwasm built without it.
+    config.consume_fuel(true);
 
     config
 }
