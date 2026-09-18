@@ -61,6 +61,27 @@ pub fn net_close(fd: i32) {
     rpc().net_close(fd);
 }
 
+/// Bind a UDP socket. Returns a UDP socket handle.
+pub fn net_udp_bind(bind_addr: &str, port: u16) -> Result<i32, i32> {
+    rpc().net_udp_bind(bind_addr, port)
+}
+
+/// Send one datagram to `host:port`. Returns the number of bytes sent.
+pub fn net_udp_send_to(fd: i32, host: &str, port: u16, data: &[u8]) -> Result<usize, i32> {
+    rpc().net_udp_send_to(fd, host, port, data)
+}
+
+/// Receive one datagram, waiting up to `timeout_ms`. Returns the datagram
+/// and the peer address; `Err(-11)` when nothing arrived in time.
+pub fn net_udp_recv_from(fd: i32, max_len: u32, timeout_ms: u32) -> Result<(Vec<u8>, String), i32> {
+    rpc().net_udp_recv_from(fd, max_len, timeout_ms)
+}
+
+/// Close a UDP socket.
+pub fn net_udp_close(fd: i32) {
+    rpc().net_udp_close(fd);
+}
+
 // ==========================================================================
 //  KV store wrappers
 // ==========================================================================

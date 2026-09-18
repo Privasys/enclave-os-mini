@@ -100,6 +100,10 @@ impl RpcDispatcher {
             RpcMethod::NetSend => self.handle_net_send(payload),
             RpcMethod::NetRecv => self.handle_net_recv(payload),
             RpcMethod::NetClose => self.handle_net_close(payload),
+            RpcMethod::NetUdpBind => self.handle_net_udp_bind(payload),
+            RpcMethod::NetUdpSendTo => self.handle_net_udp_send_to(payload),
+            RpcMethod::NetUdpRecvFrom => self.handle_net_udp_recv_from(payload),
+            RpcMethod::NetUdpClose => self.handle_net_udp_close(payload),
 
             // ---- KV Store ----
             RpcMethod::KvPut => self.handle_kv_put(payload),
@@ -218,6 +222,58 @@ impl RpcDispatcher {
         if let Some(fd) = rpc::decode_net_close_req(payload) {
             debug!("RPC: NetClose(fd={})", fd);
             net::tcp_close(fd);
+        }
+        (0, Vec::new())
+    }
+
+    fn handle_net_udp_bind(&self, payload: &[u8]) -> (i32, Vec<u8>) {
+        let (bind_addr, port) = match rpc::decode_net_udp_bind_req(payload) {
+            Some(r) => r,
+            None => return (-1, Vec::new()),
+        };
+        debug!("RPC: NetUdpBind(addr={:?}, port={})", bind_addr, port);
+        match net::udp_bind(&bind_addr, port) {
+            Ok(fd) => (0, rpc::encode_fd(fd)),
+            Err(e) => {
+                error!("NetUdpBind failed: {}", e);
+                (-1, Vec::new())
+            }
+        }
+    }
+
+    fn handle_net_udp_send_to(&self, payload: &[u8]) -> (i32, Vec<u8>) {
+        let (fd, host, port, data) = match rpc::decode_net_udp_send_to_req(payload) {
+            Some(r) => r,
+            None => return (-1, Vec::new()),
+        };
+        match net::udp_send_to(fd, &host, port, data) {
+            Ok(n) => (0, rpc::encode_i32(n as i32)),
+            Err(e) => {
+                error!("NetUdpSendTo({}:{}) failed: {}", host, port, e);
+                (-1, Vec::new())
+            }
+        }
+    }
+
+    fn handle_net_udp_recv_from(&self, payload: &[u8]) -> (i32, Vec<u8>) {
+        let (fd, max_len, timeout_ms) = match rpc::decode_net_udp_recv_from_req(payload) {
+            Some(r) => r,
+            None => return (-1, Vec::new()),
+        };
+        match net::udp_recv_from(fd, max_len, timeout_ms) {
+            Ok(Some((data, peer))) => (0, rpc::encode_net_udp_recv_from_resp(&peer.to_string(), &data)),
+            Ok(None) => (-11, Vec::new()), // EAGAIN: timed out
+            Err(e) => {
+                error!("NetUdpRecvFrom failed: {}", e);
+                (-1, Vec::new())
+            }
+        }
+    }
+
+    fn handle_net_udp_close(&self, payload: &[u8]) -> (i32, Vec<u8>) {
+        if let Some(fd) = rpc::decode_net_udp_close_req(payload) {
+            debug!("RPC: NetUdpClose(fd={})", fd);
+            net::udp_close(fd);
         }
         (0, Vec::new())
     }

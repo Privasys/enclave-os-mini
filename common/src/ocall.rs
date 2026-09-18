@@ -26,6 +26,10 @@ pub struct OcallVtable {
     pub net_send: fn(i32, &[u8]) -> Result<usize, i32>,
     pub net_recv: fn(i32, &mut [u8]) -> Result<usize, i32>,
     pub net_close: fn(i32),
+    pub net_udp_bind: fn(&str, u16) -> Result<i32, i32>,
+    pub net_udp_send_to: fn(i32, &str, u16, &[u8]) -> Result<usize, i32>,
+    pub net_udp_recv_from: fn(i32, u32, u32) -> Result<(Vec<u8>, String), i32>,
+    pub net_udp_close: fn(i32),
 
     // ── KV store ─────────────────────────────────────────────────────
     pub kv_store_put: fn(&[u8], &[u8], &[u8]) -> Result<(), i32>,
@@ -89,6 +93,25 @@ pub fn net_recv(fd: i32, buf: &mut [u8]) -> Result<usize, i32> {
 
 pub fn net_close(fd: i32) {
     (vt().net_close)(fd)
+}
+
+/// Bind a UDP socket (`bind_addr` empty = `0.0.0.0`, port 0 = ephemeral).
+pub fn net_udp_bind(bind_addr: &str, port: u16) -> Result<i32, i32> {
+    (vt().net_udp_bind)(bind_addr, port)
+}
+
+/// Send one datagram to `host:port` (resolved by the host).
+pub fn net_udp_send_to(fd: i32, host: &str, port: u16, data: &[u8]) -> Result<usize, i32> {
+    (vt().net_udp_send_to)(fd, host, port, data)
+}
+
+/// Receive one datagram, waiting up to `timeout_ms`. `Err(-11)` on timeout.
+pub fn net_udp_recv_from(fd: i32, max_len: u32, timeout_ms: u32) -> Result<(Vec<u8>, String), i32> {
+    (vt().net_udp_recv_from)(fd, max_len, timeout_ms)
+}
+
+pub fn net_udp_close(fd: i32) {
+    (vt().net_udp_close)(fd)
 }
 
 pub fn kv_store_put(table: &[u8], enc_key: &[u8], enc_val: &[u8]) -> Result<(), i32> {

@@ -41,6 +41,11 @@ pub enum RpcMethod {
     NetSend          = 0x0103,
     NetRecv          = 0x0104,
     NetClose         = 0x0105,
+    // UDP datagram sockets (their handles are not TCP handles)
+    NetUdpBind       = 0x0110,
+    NetUdpSendTo     = 0x0111,
+    NetUdpRecvFrom   = 0x0112,
+    NetUdpClose      = 0x0113,
 
     // -- KV Store --
     KvPut            = 0x0200,
@@ -72,6 +77,10 @@ impl RpcMethod {
             0x0103 => Some(Self::NetSend),
             0x0104 => Some(Self::NetRecv),
             0x0105 => Some(Self::NetClose),
+            0x0110 => Some(Self::NetUdpBind),
+            0x0111 => Some(Self::NetUdpSendTo),
+            0x0112 => Some(Self::NetUdpRecvFrom),
+            0x0113 => Some(Self::NetUdpClose),
             0x0200 => Some(Self::KvPut),
             0x0201 => Some(Self::KvGet),
             0x0202 => Some(Self::KvDelete),
@@ -258,6 +267,76 @@ pub fn decode_net_recv_req(p: &[u8]) -> Option<(i32, u32)> {
 /// Payload: just fd
 pub fn encode_net_close_req(fd: i32) -> Vec<u8> { fd.to_le_bytes().to_vec() }
 pub fn decode_net_close_req(p: &[u8]) -> Option<i32> { decode_fd(p) }
+
+// -- NetUdpBind --
+/// Payload: [u16 port] [bind address as utf8; empty = "0.0.0.0"]
+/// Response: fd (status 0), or status != 0 on error. Port 0 = ephemeral.
+pub fn encode_net_udp_bind_req(bind_addr: &str, port: u16) -> Vec<u8> {
+    encode_net_tcp_connect_req(bind_addr, port) // same wire format
+}
+pub fn decode_net_udp_bind_req(p: &[u8]) -> Option<(String, u16)> {
+    decode_net_tcp_connect_req(p)
+}
+
+// -- NetUdpSendTo --
+/// Payload: [i32 fd] [u16 port] [u16 host_len] [host utf8] [datagram]
+/// Response: number of bytes sent (i32). The host resolves `host`.
+pub fn encode_net_udp_send_to_req(fd: i32, host: &str, port: u16, data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(8 + host.len() + data.len());
+    buf.extend_from_slice(&fd.to_le_bytes());
+    buf.extend_from_slice(&port.to_le_bytes());
+    buf.extend_from_slice(&(host.len() as u16).to_le_bytes());
+    buf.extend_from_slice(host.as_bytes());
+    buf.extend_from_slice(data);
+    buf
+}
+pub fn decode_net_udp_send_to_req(p: &[u8]) -> Option<(i32, String, u16, &[u8])> {
+    if p.len() < 8 { return None; }
+    let fd = i32::from_le_bytes(p[0..4].try_into().ok()?);
+    let port = u16::from_le_bytes(p[4..6].try_into().ok()?);
+    let host_len = u16::from_le_bytes(p[6..8].try_into().ok()?) as usize;
+    if p.len() < 8 + host_len { return None; }
+    let host = core::str::from_utf8(&p[8..8 + host_len]).ok()?.to_string();
+    Some((fd, host, port, &p[8 + host_len..]))
+}
+
+// -- NetUdpRecvFrom --
+/// Payload: [i32 fd] [u32 max_len] [u32 timeout_ms]
+/// Response (status 0): [u16 addr_len] [peer "ip:port" utf8] [datagram].
+/// Status -11 (EAGAIN) when nothing arrived within the timeout.
+pub fn encode_net_udp_recv_from_req(fd: i32, max_len: u32, timeout_ms: u32) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(12);
+    buf.extend_from_slice(&fd.to_le_bytes());
+    buf.extend_from_slice(&max_len.to_le_bytes());
+    buf.extend_from_slice(&timeout_ms.to_le_bytes());
+    buf
+}
+pub fn decode_net_udp_recv_from_req(p: &[u8]) -> Option<(i32, u32, u32)> {
+    if p.len() < 12 { return None; }
+    let fd = i32::from_le_bytes(p[0..4].try_into().ok()?);
+    let max_len = u32::from_le_bytes(p[4..8].try_into().ok()?);
+    let timeout_ms = u32::from_le_bytes(p[8..12].try_into().ok()?);
+    Some((fd, max_len, timeout_ms))
+}
+pub fn encode_net_udp_recv_from_resp(peer: &str, data: &[u8]) -> Vec<u8> {
+    let mut buf = Vec::with_capacity(2 + peer.len() + data.len());
+    buf.extend_from_slice(&(peer.len() as u16).to_le_bytes());
+    buf.extend_from_slice(peer.as_bytes());
+    buf.extend_from_slice(data);
+    buf
+}
+pub fn decode_net_udp_recv_from_resp(p: &[u8]) -> Option<(String, Vec<u8>)> {
+    if p.len() < 2 { return None; }
+    let addr_len = u16::from_le_bytes(p[0..2].try_into().ok()?) as usize;
+    if p.len() < 2 + addr_len { return None; }
+    let peer = core::str::from_utf8(&p[2..2 + addr_len]).ok()?.to_string();
+    Some((peer, p[2 + addr_len..].to_vec()))
+}
+
+// -- NetUdpClose --
+/// Payload: just fd
+pub fn encode_net_udp_close_req(fd: i32) -> Vec<u8> { fd.to_le_bytes().to_vec() }
+pub fn decode_net_udp_close_req(p: &[u8]) -> Option<i32> { decode_fd(p) }
 
 // -- KvPut --
 /// Payload: [u16 table_len] [table] [u32 key_len] [key] [value]
@@ -732,6 +811,10 @@ mod tests {
             RpcMethod::NetSend,
             RpcMethod::NetRecv,
             RpcMethod::NetClose,
+            RpcMethod::NetUdpBind,
+            RpcMethod::NetUdpSendTo,
+            RpcMethod::NetUdpRecvFrom,
+            RpcMethod::NetUdpClose,
             RpcMethod::KvPut,
             RpcMethod::KvGet,
             RpcMethod::KvDelete,
@@ -1018,6 +1101,36 @@ mod tests {
     }
 
     #[test]
+    fn test_udp_payloads_roundtrip() {
+        let e = encode_net_udp_bind_req("", 0);
+        assert_eq!(decode_net_udp_bind_req(&e).unwrap(), (String::new(), 0));
+        let e = encode_net_udp_bind_req("::", 5123);
+        assert_eq!(decode_net_udp_bind_req(&e).unwrap(), ("::".to_string(), 5123));
+
+        let e = encode_net_udp_send_to_req(7, "nts.netnod.se", 123, b"\x23datagram");
+        let (fd, host, port, data) = decode_net_udp_send_to_req(&e).unwrap();
+        assert_eq!((fd, host.as_str(), port, data), (7, "nts.netnod.se", 123, &b"\x23datagram"[..]));
+        // Empty datagram.
+        let e = encode_net_udp_send_to_req(7, "h", 1, b"");
+        assert!(decode_net_udp_send_to_req(&e).unwrap().3.is_empty());
+        // Host length overruns the payload.
+        assert!(decode_net_udp_send_to_req(&e[..8]).is_none());
+
+        let e = encode_net_udp_recv_from_req(7, 2048, 3000);
+        assert_eq!(decode_net_udp_recv_from_req(&e).unwrap(), (7, 2048, 3000));
+        assert!(decode_net_udp_recv_from_req(&e[..11]).is_none());
+
+        let e = encode_net_udp_recv_from_resp("194.58.200.20:123", b"reply");
+        assert_eq!(
+            decode_net_udp_recv_from_resp(&e).unwrap(),
+            ("194.58.200.20:123".to_string(), b"reply".to_vec())
+        );
+        assert!(decode_net_udp_recv_from_resp(&e[..5]).is_none());
+
+        assert_eq!(decode_net_udp_close_req(&encode_net_udp_close_req(9)).unwrap(), 9);
+    }
+
+    #[test]
     fn test_i32_roundtrip() {
         assert_eq!(decode_i32(&encode_i32(0)).unwrap(), 0);
         assert_eq!(decode_i32(&encode_i32(-1)).unwrap(), -1);
@@ -1114,6 +1227,10 @@ mod tests {
         assert_eq!(RpcMethod::from_u16(0x0103), Some(RpcMethod::NetSend));
         assert_eq!(RpcMethod::from_u16(0x0104), Some(RpcMethod::NetRecv));
         assert_eq!(RpcMethod::from_u16(0x0105), Some(RpcMethod::NetClose));
+        assert_eq!(RpcMethod::from_u16(0x0110), Some(RpcMethod::NetUdpBind));
+        assert_eq!(RpcMethod::from_u16(0x0111), Some(RpcMethod::NetUdpSendTo));
+        assert_eq!(RpcMethod::from_u16(0x0112), Some(RpcMethod::NetUdpRecvFrom));
+        assert_eq!(RpcMethod::from_u16(0x0113), Some(RpcMethod::NetUdpClose));
         assert_eq!(RpcMethod::from_u16(0x0200), Some(RpcMethod::KvPut));
         assert_eq!(RpcMethod::from_u16(0x0201), Some(RpcMethod::KvGet));
         assert_eq!(RpcMethod::from_u16(0x0202), Some(RpcMethod::KvDelete));
@@ -1130,6 +1247,7 @@ mod tests {
         // Invalid IDs
         assert_eq!(RpcMethod::from_u16(0x0000), None);
         assert_eq!(RpcMethod::from_u16(0x0106), None);
+        assert_eq!(RpcMethod::from_u16(0x0114), None);
         assert_eq!(RpcMethod::from_u16(0x0207), None);
         assert_eq!(RpcMethod::from_u16(0xFFFF), None);
     }

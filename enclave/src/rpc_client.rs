@@ -171,6 +171,50 @@ impl RpcClient {
         let _ = self.call(RpcMethod::NetClose, &payload);
     }
 
+    /// Bind a UDP socket (`bind_addr` empty = `0.0.0.0`, port 0 =
+    /// ephemeral). Returns fd.
+    pub fn net_udp_bind(&self, bind_addr: &str, port: u16) -> Result<i32, i32> {
+        let payload = rpc::encode_net_udp_bind_req(bind_addr, port);
+        let (status, resp) = self.call(RpcMethod::NetUdpBind, &payload);
+        if status == 0 {
+            rpc::decode_fd(&resp).ok_or(-1)
+        } else {
+            Err(status)
+        }
+    }
+
+    /// Send one datagram on UDP `fd` to `host:port`. Returns bytes sent.
+    pub fn net_udp_send_to(&self, fd: i32, host: &str, port: u16, data: &[u8]) -> Result<usize, i32> {
+        let payload = rpc::encode_net_udp_send_to_req(fd, host, port, data);
+        let (status, resp) = self.call(RpcMethod::NetUdpSendTo, &payload);
+        if status == 0 {
+            rpc::decode_i32(&resp).map(|n| n as usize).ok_or(-1)
+        } else {
+            Err(status)
+        }
+    }
+
+    /// Receive one datagram on UDP `fd`, waiting up to `timeout_ms` (the
+    /// host caps it). Returns `(datagram, peer "ip:port")`; `Err(-11)` on
+    /// timeout.
+    pub fn net_udp_recv_from(&self, fd: i32, max_len: u32, timeout_ms: u32) -> Result<(Vec<u8>, String), i32> {
+        let payload = rpc::encode_net_udp_recv_from_req(fd, max_len, timeout_ms);
+        let (status, resp) = self.call(RpcMethod::NetUdpRecvFrom, &payload);
+        if status == 0 {
+            rpc::decode_net_udp_recv_from_resp(&resp)
+                .map(|(peer, data)| (data, peer))
+                .ok_or(-1)
+        } else {
+            Err(status)
+        }
+    }
+
+    /// Close UDP socket `fd`.
+    pub fn net_udp_close(&self, fd: i32) {
+        let payload = rpc::encode_net_udp_close_req(fd);
+        let _ = self.call(RpcMethod::NetUdpClose, &payload);
+    }
+
     // ====================================================================
     //  KV store calls
     // ====================================================================
