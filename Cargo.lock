@@ -943,12 +943,12 @@ dependencies = [
 [[package]]
 name = "sgx_types"
 version = "2.0.0"
-source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.4.0#2330b2a5aa8404d3c0a38e9d3a760144549f4943"
+source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.5.0#9c2b604331154fc45ff6f2bf08a4e4e7a0e0a3cb"
 
 [[package]]
 name = "sgx_uprotected_fs"
 version = "2.0.0"
-source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.4.0#2330b2a5aa8404d3c0a38e9d3a760144549f4943"
+source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.5.0#9c2b604331154fc45ff6f2bf08a4e4e7a0e0a3cb"
 dependencies = [
  "libc",
  "sgx_types",
@@ -957,7 +957,7 @@ dependencies = [
 [[package]]
 name = "sgx_urts"
 version = "2.0.0"
-source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.4.0#2330b2a5aa8404d3c0a38e9d3a760144549f4943"
+source = "git+https://github.com/Privasys/teaclave-sgx-sdk?tag=privasys-v0.5.0#9c2b604331154fc45ff6f2bf08a4e4e7a0e0a3cb"
 dependencies = [
  "libc",
  "sgx_types",

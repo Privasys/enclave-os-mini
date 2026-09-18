@@ -55,7 +55,7 @@ enclave-os-app-auth = { path = "../enclave-os-app-auth", optional = true }
 #   pooling-allocator— complex SGX memory constraints
 #   cache            — no filesystem in SGX
 #   wat              — text format parsing not needed at runtime
-wasmtime = { path = "../../../../libraries/wasmtime/crates/wasmtime", default-features = false, features = [
+wasmtime = { git = "https://github.com/Privasys/wasmtime", tag = "privasys-v0.3.0", default-features = false, features = [
     "async",
     "component-model",
     "runtime",
@@ -71,7 +71,7 @@ wasmtime = { path = "../../../../libraries/wasmtime/crates/wasmtime", default-fe
 # The fibers wasmtime itself uses (same fork, same crate instance): request
 # tasks run the synchronous request handler on one, so a request waiting on
 # a suspended guest call yields back to the enclave event loop.
-wasmtime-internal-fiber = { path = "../../../../libraries/wasmtime/crates/fiber", features = ["std"] }
+wasmtime-internal-fiber = { git = "https://github.com/Privasys/wasmtime", tag = "privasys-v0.3.0", features = ["std"] }
 
 # Crypto (SHA-256 for WASM code hashing, RNG for WASI random)
 ring = "0.17"
