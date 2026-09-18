@@ -542,7 +542,7 @@ impl WasmModule {
 
         let mut result = if let Some(e) = call_err {
             WasmResult::Error {
-                message: format!("call failed: {}", e),
+                message: format!("call failed: {:#}", e),
             }
         } else {
             let returns: Vec<protocol::WasmValue> = results

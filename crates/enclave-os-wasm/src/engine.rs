@@ -130,16 +130,16 @@ impl WasmEngine {
         config.signals_based_traps(false);
 
         let engine =
-            Engine::new(&config).map_err(|e| format!("wasmtime engine init failed: {}", e))?;
+            Engine::new(&config).map_err(|e| format!("wasmtime engine init failed: {:#}", e))?;
 
         // ── Build Linker with WASI host functions ──────────────────
         let mut linker = Linker::<AppContext>::new(&engine);
         crate::wasi::add_wasi_to_linker(&mut linker)
-            .map_err(|e| format!("WASI linker setup failed: {}", e))?;
+            .map_err(|e| format!("WASI linker setup failed: {:#}", e))?;
 
         // ── Register Enclave OS SDK interfaces ─────────────────────
         crate::enclave_sdk::add_to_linker(&mut linker)
-            .map_err(|e| format!("Enclave SDK linker setup failed: {}", e))?;
+            .map_err(|e| format!("Enclave SDK linker setup failed: {:#}", e))?;
 
         Ok(Self { engine, linker })
     }
@@ -171,7 +171,7 @@ impl WasmEngine {
         // The enclave verifies the code hash before loading.
         unsafe {
             Component::deserialize(&self.engine, precompiled_bytes)
-                .map_err(|e| format!("WASM deserialization failed: {}", e))
+                .map_err(|e| format!("WASM deserialization failed: {:#}", e))
         }
     }
 
@@ -194,7 +194,7 @@ impl WasmEngine {
         // Fuel limits prevent infinite loops from hanging the enclave.
         store
             .set_fuel(fuel)
-            .map_err(|e| format!("WASM fuel installation failed: {}", e))?;
+            .map_err(|e| format!("WASM fuel installation failed: {:#}", e))?;
 
         Ok(store)
     }
@@ -213,7 +213,7 @@ impl WasmEngine {
         let instance = self
             .linker
             .instantiate(&mut store, component)
-            .map_err(|e| format!("WASM instantiation failed: {}", e))?;
+            .map_err(|e| format!("WASM instantiation failed: {:#}", e))?;
         Ok((store, instance))
     }
 

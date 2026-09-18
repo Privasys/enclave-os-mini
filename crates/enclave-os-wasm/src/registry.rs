@@ -728,7 +728,7 @@ impl AppRegistry {
                 .linker()
                 .instantiate(&mut probe_store, &component)
                 .map_err(|e| {
-                    format!("component failed trial instantiation (linker error): {}", e)
+                    format!("component failed trial instantiation (linker error): {:#}", e)
                 })?;
         }
 
@@ -1441,7 +1441,7 @@ impl AppRegistry {
             Ok(pair) => pair,
             Err(e) => {
                 return Err(WasmResult::Error {
-                    message: format!("instantiation failed: {}", e),
+                    message: format!("instantiation failed: {:#}", e),
                 });
             }
         };
