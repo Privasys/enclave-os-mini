@@ -67,6 +67,7 @@ jobs:
           - enclave-os-fido2
           - enclave-os-merkle
           - enclave-os-raft
+          - enclave-os-clock
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable

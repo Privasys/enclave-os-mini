@@ -1,0 +1,32 @@
+# Copyright (c) Privasys. All rights reserved.
+# Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
+
+[package]
+name = "enclave-os-clock"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+description = "Trusted time for enclave-os: the floor state machine, the NTS (RFC 8915) codecs and quorum, and the monitor wire contracts. Pure code, no I/O."
+
+[lib]
+name = "enclave_os_clock"
+
+[dependencies]
+# AEAD_AES_SIV_CMAC_256, the one NTS algorithm we negotiate (RFC 8915 §5.1).
+aes-siv = { version = "0.7", default-features = false, features = ["alloc"] }
+
+# Ed25519 verification of the monitor's floor and receipt signatures, and
+# SHA-256 for the monitor key id. Already in the enclave graph.
+ring = { version = "0.17", default-features = false }
+
+# Wire contracts (JSON) and the sealed state.
+serde = { version = "1", default-features = false, features = ["derive", "alloc"] }
+serde_json = { version = "1", default-features = false, features = ["alloc"] }
+base64 = { version = "0.21", default-features = false, features = ["alloc"] }
+
+[dev-dependencies]
+ring = { version = "0.17", features = ["alloc"] }
+
+# Standalone (not a member of the root workspace): built as a path dependency
+# of the enclave crate, and testable directly with `cargo test`.
+[workspace]
