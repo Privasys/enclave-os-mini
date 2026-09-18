@@ -26,8 +26,17 @@ use serde::{Deserialize, Serialize};
 /// Maximum HTTP request body: 16 MiB.
 pub const MAX_BODY_SIZE: usize = 16 * 1024 * 1024;
 
-/// Maximum HTTP header section: 8 KiB (enforced via header count).
+/// Maximum number of HTTP headers in a request.
 pub const MAX_HEADERS: usize = 32;
+
+/// Maximum size of an HTTP request's header section, in bytes.
+///
+/// A header count does not bound bytes: one header, or the request line,
+/// can grow without end. The session buffers decrypted plaintext until the
+/// header section is complete, so without this cap a peer that never sends
+/// the blank line grows the enclave heap until allocation fails. 64 KiB
+/// leaves room for several bearer tokens.
+pub const MAX_HEADER_BYTES: usize = 64 * 1024;
 
 /// A simple request type for the RA-TLS ingress server.
 ///
@@ -332,6 +341,8 @@ pub enum HttpParseError {
     Incomplete,
     /// Too many headers.
     TooManyHeaders,
+    /// Header section exceeds [`MAX_HEADER_BYTES`] without completing.
+    HeadersTooLarge,
     /// Body exceeds [`MAX_BODY_SIZE`].
     BodyTooLarge,
     /// HTTP method is not GET, POST, or PUT.
@@ -353,6 +364,10 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
 
     let header_len = match req.parse(buf) {
         Ok(httparse::Status::Complete(len)) => len,
+        // Everything buffered so far is header bytes: see MAX_HEADER_BYTES.
+        Ok(httparse::Status::Partial) if buf.len() > MAX_HEADER_BYTES => {
+            return Err(HttpParseError::HeadersTooLarge)
+        }
         Ok(httparse::Status::Partial) => return Err(HttpParseError::Incomplete),
         Err(_) => return Err(HttpParseError::Malformed),
     };
@@ -866,5 +881,26 @@ mod outbound_tests {
         assert!(check_outbound_request("h", "/", &h(&[("Content-Length", "10")]), Some(3)).is_err());
         assert!(check_outbound_request("h", "/", &h(&[("Content-Length", "0")]), Some(3)).is_err());
         assert!(check_outbound_request("h", "/", &h(&[("Content-Length", "abc")]), None).is_err());
+    }
+}
+
+#[cfg(test)]
+mod header_bound_tests {
+    use super::{parse_http_request, HttpParseError, MAX_HEADER_BYTES};
+
+    #[test]
+    fn a_header_section_that_never_ends_is_refused_once_over_the_cap() {
+        let mut buf = b"GET / HTTP/1.1\r\nX-Endless: ".to_vec();
+        buf.resize(MAX_HEADER_BYTES, b'a');
+        assert!(matches!(parse_http_request(&buf), Err(HttpParseError::Incomplete)));
+        buf.push(b'a');
+        assert!(matches!(parse_http_request(&buf), Err(HttpParseError::HeadersTooLarge)));
+    }
+
+    #[test]
+    fn a_large_body_after_complete_headers_is_not_mistaken_for_headers() {
+        let mut buf = b"POST / HTTP/1.1\r\nContent-Length: 100000\r\n\r\n".to_vec();
+        buf.resize(buf.len() + 90_000, b'b');
+        assert!(matches!(parse_http_request(&buf), Err(HttpParseError::Incomplete)));
     }
 }

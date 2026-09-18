@@ -183,6 +183,9 @@ impl RaTlsSession {
                 Ok(Some(request))
             }
             Err(protocol::HttpParseError::Incomplete) => Ok(None),
+            Err(protocol::HttpParseError::HeadersTooLarge) => {
+                Err("HTTP header section too large")
+            }
             Err(protocol::HttpParseError::TooManyHeaders) => {
                 Err("HTTP: too many headers")
             }
