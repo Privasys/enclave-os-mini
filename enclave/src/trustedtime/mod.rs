@@ -30,6 +30,7 @@
 //! verify a peer get the same time through [`RustlsTime`]; the RA-TLS
 //! server serves with [`ServingTime`], which never fails.
 
+mod io;
 pub mod nts;
 
 use std::cell::Cell;
@@ -66,44 +67,96 @@ static FROZEN_MS: AtomicI64 = AtomicI64::new(MIN_TRUSTED_TIME_MS);
 static FAILING_CLOSED: AtomicBool = AtomicBool::new(false);
 
 std::thread_local! {
-    static IN_CLOCK: Cell<bool> = Cell::new(false);
+    /// Who runs the current clock operation: a request task's id, or 0 for
+    /// code outside tasks (start-up, the event loop). `None`: the clock is
+    /// free.
+    ///
+    /// An operation can be suspended halfway (its NTS fetch or incident POST
+    /// waits on the network, see [`nts`]), and the enclave serves other
+    /// requests meanwhile, on this same thread. So ownership is per task,
+    /// not per thread.
+    static OWNER: Cell<Option<usize>> = Cell::new(None);
 }
 
-struct InClockGuard;
+/// Tasks waiting for the clock to be free.
+static WAITERS: Mutex<Vec<core::task::Waker>> = Mutex::new(Vec::new());
 
-impl Drop for InClockGuard {
+struct OwnerGuard;
+
+impl Drop for OwnerGuard {
     fn drop(&mut self) {
-        IN_CLOCK.with(|c| c.set(false));
+        OWNER.with(|o| o.set(None));
+        let waiters = core::mem::take(&mut *WAITERS.lock().unwrap_or_else(|e| e.into_inner()));
+        for w in waiters {
+            w.wake();
+        }
     }
+}
+
+/// What [`with_clock`] could do.
+enum Access<T> {
+    Done(T),
+    /// Called from inside the operation this caller is running: an incident
+    /// report or NTS fetch goes through TLS stacks that read the time
+    /// themselves. Those nested reads get the frozen time instead of waiting
+    /// for themselves.
+    Nested,
+    /// Another task's operation is suspended and this caller cannot wait
+    /// for it: a time read (it may hold a lock), code outside a task, or a
+    /// guest call.
+    Busy,
 }
 
 /// Run `f` on the clock, one operation at a time.
 ///
-/// Returns `None` for a call made from inside another clock operation on
-/// this thread: an incident report or NTS fetch goes through TLS stacks
-/// that read the time themselves. Those nested reads get the frozen time
-/// instead of waiting for themselves.
-fn with_clock<T>(f: impl FnOnce(&mut Clock, &mut CoreEnv) -> T) -> Option<T> {
-    if IN_CLOCK.with(|c| c.get()) {
-        return None;
+/// `lock_free` declares that the caller holds no lock another request may
+/// take: only then may the operation suspend its task (its network waits,
+/// or waiting for another task's operation). A task suspended while holding
+/// a mutex would block the next request that takes it, on the enclave's one
+/// thread, for ever. Time reads come from everywhere, under any lock, so
+/// they pass `false` and block instead; the clock's own routes, at the top
+/// of their request, pass `true`.
+fn with_clock<T>(lock_free: bool, f: impl FnOnce(&mut Clock, &mut CoreEnv) -> T) -> Access<T> {
+    let me = io::caller_id();
+    loop {
+        match OWNER.with(|o| o.get()) {
+            None => break,
+            Some(owner) if owner == me => return Access::Nested,
+            Some(_) if lock_free && io::can_wait() => io::wait_until(|cx| {
+                if OWNER.with(|o| o.get()).is_none() {
+                    return true;
+                }
+                WAITERS.lock().unwrap_or_else(|e| e.into_inner()).push(cx.waker().clone());
+                false
+            }),
+            Some(_) => return Access::Busy,
+        }
     }
+    // Uncontended: while an operation runs, OWNER keeps everyone else out.
     let cell = CLOCK.get_or_init(|| Mutex::new(load()));
     let mut clock = cell.lock().unwrap_or_else(|e| e.into_inner());
-    IN_CLOCK.with(|c| c.set(true));
-    let _guard = InClockGuard;
+    OWNER.with(|o| o.set(Some(me)));
+    let _guard = OwnerGuard;
+    let _suspendable = io::SuspendScope::enter(lock_free);
     let r = f(&mut clock, &mut CoreEnv);
     FROZEN_MS.store(clock.frozen_ms(), Ordering::Relaxed);
     FAILING_CLOSED.store(clock.is_failing_closed(), Ordering::Relaxed);
-    Some(r)
+    Access::Done(r)
 }
 
 /// Trusted time, Unix milliseconds. `Err(NO_TRUSTED_TIME)`: fail closed.
 pub fn now_ms() -> Result<u64, i32> {
-    match with_clock(|clock, env| clock.read(env)) {
-        None => Ok(FROZEN_MS.load(Ordering::Relaxed).max(0) as u64),
-        Some(Ok(t)) => Ok(t.max(0) as u64),
-        Some(Err(ClockError::Unavailable)) => Err(NO_TRUSTED_TIME),
-        Some(Err(e)) => {
+    match with_clock(false, |clock, env| clock.read(env)) {
+        Access::Nested => Ok(FROZEN_MS.load(Ordering::Relaxed).max(0) as u64),
+        // Another task's operation is under way: the state as of the last
+        // operation. Failing closed stays failing closed; otherwise the
+        // frozen time (the last read or the floor: time pauses, never goes
+        // back) until the operation settles.
+        Access::Busy if FAILING_CLOSED.load(Ordering::Relaxed) => Err(NO_TRUSTED_TIME),
+        Access::Busy => Ok(FROZEN_MS.load(Ordering::Relaxed).max(0) as u64),
+        Access::Done(Ok(t)) => Ok(t.max(0) as u64),
+        Access::Done(Err(ClockError::Unavailable)) => Err(NO_TRUSTED_TIME),
+        Access::Done(Err(e)) => {
             enclave_log_error!("trusted time unavailable: {}", e);
             Err(NO_TRUSTED_TIME)
         }
@@ -152,10 +205,10 @@ pub fn boot() {
 /// place), 400 for an invalid config, 409 for a lower `config_version`.
 pub fn handle_config(body: &[u8]) -> (u16, Vec<u8>) {
     use enclave_os_clock::state::ConfigError;
-    match with_clock(|clock, env| clock.set_config(env, body)) {
-        Some(Ok(ack)) => (200, serde_json::to_vec(&ack).unwrap_or_default()),
-        Some(Err(ConfigError::Wire(e))) => json_error(400, &e.to_string()),
-        Some(Err(ConfigError::Stale { current })) => (
+    match with_clock(true, |clock, env| clock.set_config(env, body)) {
+        Access::Done(Ok(ack)) => (200, serde_json::to_vec(&ack).unwrap_or_default()),
+        Access::Done(Err(ConfigError::Wire(e))) => json_error(400, &e.to_string()),
+        Access::Done(Err(ConfigError::Stale { current })) => (
             409,
             serde_json::to_vec(&serde_json::json!({
                 "error": "config_version is lower than the current one",
@@ -163,7 +216,7 @@ pub fn handle_config(body: &[u8]) -> (u16, Vec<u8>) {
             }))
             .unwrap_or_default(),
         ),
-        None => json_error(503, "clock busy"),
+        Access::Nested | Access::Busy => json_error(503, "clock busy"),
     }
 }
 
@@ -176,12 +229,12 @@ pub fn handle_config(body: &[u8]) -> (u16, Vec<u8>) {
 pub fn handle_poll(body: &[u8]) -> (u16, Vec<u8>) {
     use enclave_os_clock::state::PollError;
     use enclave_os_clock::wire::WireError;
-    match with_clock(|clock, env| clock.poll(env, body, "mini")) {
-        Some(Ok(reply)) => (200, serde_json::to_vec(&reply).unwrap_or_default()),
-        Some(Err(PollError::Wire(WireError::BadRequest(m)))) => json_error(400, &m),
-        Some(Err(PollError::Wire(WireError::Unauthorized(m)))) => json_error(401, m),
-        Some(Err(PollError::NotConfigured)) => json_error(409, "clock not configured"),
-        Some(Err(PollError::Unavailable { reason, host_time_ms, floor_ms, detail })) => (
+    match with_clock(true, |clock, env| clock.poll(env, body, "mini")) {
+        Access::Done(Ok(reply)) => (200, serde_json::to_vec(&reply).unwrap_or_default()),
+        Access::Done(Err(PollError::Wire(WireError::BadRequest(m)))) => json_error(400, &m),
+        Access::Done(Err(PollError::Wire(WireError::Unauthorized(m)))) => json_error(401, m),
+        Access::Done(Err(PollError::NotConfigured)) => json_error(409, "clock not configured"),
+        Access::Done(Err(PollError::Unavailable { reason, host_time_ms, floor_ms, detail })) => (
             503,
             serde_json::to_vec(&serde_json::json!({
                 "error": reason,
@@ -191,7 +244,7 @@ pub fn handle_poll(body: &[u8]) -> (u16, Vec<u8>) {
             }))
             .unwrap_or_default(),
         ),
-        None => json_error(503, "clock busy"),
+        Access::Nested | Access::Busy => json_error(503, "clock busy"),
     }
 }
 

@@ -48,14 +48,18 @@ const TASK_STACK_POOL: usize = 8;
 // ---------------------------------------------------------------------------
 
 /// Poll `fut` to completion. Inside a task, the task suspends while `fut` is
-/// pending; elsewhere this polls in a loop.
+/// pending (see [`can_suspend`]); elsewhere this polls in a loop.
+///
+/// The caller must not hold a lock another request may take: every task
+/// runs on the enclave's one thread, so a request blocking on a lock held
+/// by a suspended task would never let that task resume.
 pub fn block_on<F: Future>(fut: F) -> F::Output {
     let mut fut = pin!(fut);
     let ctx = CURRENT.with(|c| c.get());
-    if ctx.is_null() {
+    if ctx.is_null() || POLL_DEPTH.with(|d| d.get()) > 0 {
         let mut cx = Context::from_waker(Waker::noop());
         loop {
-            if let Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
+            if let Poll::Ready(out) = poll_nested(fut.as_mut(), &mut cx) {
                 return out;
             }
         }
@@ -65,7 +69,7 @@ pub fn block_on<F: Future>(fut: F) -> F::Output {
     let ctx = unsafe { &*ctx };
     let mut cx = Context::from_waker(&ctx.waker);
     loop {
-        if let Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
+        if let Poll::Ready(out) = poll_nested(fut.as_mut(), &mut cx) {
             return out;
         }
         // SAFETY: `suspend` was set when the task's fiber started and stays
@@ -74,9 +78,39 @@ pub fn block_on<F: Future>(fut: F) -> F::Output {
     }
 }
 
+/// Poll with [`POLL_DEPTH`] raised, so a `block_on` reached from inside this
+/// poll (e.g. a synchronous host function inside a guest call) does not
+/// suspend the task with the outer future's frames on the stack.
+fn poll_nested<F: Future>(fut: core::pin::Pin<&mut F>, cx: &mut Context<'_>) -> Poll<F::Output> {
+    struct Depth;
+    impl Drop for Depth {
+        fn drop(&mut self) {
+            POLL_DEPTH.with(|d| d.set(d.get() - 1));
+        }
+    }
+    POLL_DEPTH.with(|d| d.set(d.get() + 1));
+    let _depth = Depth;
+    fut.poll(cx)
+}
+
 /// Whether the caller runs inside a [`Task`].
 pub fn in_task() -> bool {
     CURRENT.with(|c| !c.get().is_null())
+}
+
+/// Whether a synchronous [`block_on`] here would suspend the task rather
+/// than poll in place: inside a task, and not inside another `block_on`'s
+/// poll. Inside a guest call it would suspend with wasmtime's frames on the
+/// stack, which must not be interleaved with other guest calls; there it
+/// polls in place, so the future must not wait on the event loop (use the
+/// blocking sockets).
+pub fn can_suspend() -> bool {
+    in_task() && POLL_DEPTH.with(|d| d.get()) == 0
+}
+
+/// An id for the running task, 0 outside a task.
+pub fn current_task_id() -> usize {
+    CURRENT.with(|c| c.get() as usize)
 }
 
 // ---------------------------------------------------------------------------
@@ -86,6 +120,8 @@ pub fn in_task() -> bool {
 std::thread_local! {
     /// Context of the task currently running on this thread, or null.
     static CURRENT: Cell<*const TaskCtx> = Cell::new(ptr::null());
+    /// How many `block_on` polls are on the stack.
+    static POLL_DEPTH: Cell<usize> = Cell::new(0);
 }
 
 /// Set when any task is woken; cleared by [`take_runnable`].

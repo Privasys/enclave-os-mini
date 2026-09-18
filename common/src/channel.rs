@@ -35,7 +35,8 @@
 //! | `TcpData`    | 0x02 | raw bytes | TLS bytes to send to client            |
 //! | `TcpClose`   | 0x03 | (empty)   | Enclave closing connection             |
 //! | `DataReady`  | 0x04 | (empty)   | Data channel consumer ready — start accepting |
-//! | `TcpConnect` | 0x05 | UTF-8 `host:port` | Open an outbound TCP connection owned by the proxy |
+//! | `TcpConnect` | 0x05 | UTF-8 `host:port[\n<ms>]` | Open an outbound TCP connection owned by the proxy |
+//! | `UdpOpen`    | 0x08 | UTF-8 `host:port[\n<ms>]` | Open a UDP socket to one peer; `TcpData` carries one datagram |
 //!
 //! # Connection-id ranges
 //!
@@ -64,6 +65,8 @@
 //! - **Data channel**: host TCP proxy ↔ enclave TLS engine, inbound and
 //!   proxy-owned outbound connections.
 
+#[cfg(feature = "sgx")]
+use alloc::format;
 #[cfg(feature = "sgx")]
 use alloc::string::String;
 #[cfg(feature = "sgx")]
@@ -106,8 +109,11 @@ pub enum ChannelMsgType {
     DataReady = 0x04,
 
     /// Open an outbound TCP connection (enclave → host).
-    /// Payload: UTF-8 `host:port`. The conn_id MUST come from the
-    /// enclave-assigned outbound range (`CONN_ID_OUTBOUND_BASE..`).
+    /// Payload: UTF-8 `host:port`, optionally followed by `\n<ms>`: a
+    /// timeout the proxy enforces on the connect and on every quiet period
+    /// after it (no byte either way), closing the connection when it runs
+    /// out. The conn_id MUST come from the enclave-assigned outbound range
+    /// (`CONN_ID_OUTBOUND_BASE..`).
     TcpConnect = 0x05,
 
     /// An enclave-requested outbound connect succeeded (host → enclave).
@@ -119,6 +125,13 @@ pub enum ChannelMsgType {
     /// drives raft election/heartbeat timers. Untrusted like all host
     /// input: only liveness depends on it, never safety.
     Tick = 0x07,
+
+    /// Open a UDP socket to one peer (enclave → host).
+    /// Payload: UTF-8 `host:port`, optionally followed by `\n<ms>` (the
+    /// quiet-period timeout, as for `TcpConnect`). Each `TcpData` on the
+    /// conn_id is one datagram, both ways; `TcpClose` closes the socket
+    /// (sent by the proxy on a timeout or an error). Outbound range only.
+    UdpOpen = 0x08,
 }
 
 impl ChannelMsgType {
@@ -132,6 +145,7 @@ impl ChannelMsgType {
             0x05 => Some(Self::TcpConnect),
             0x06 => Some(Self::TcpConnected),
             0x07 => Some(Self::Tick),
+            0x08 => Some(Self::UdpOpen),
             _ => None,
         }
     }
@@ -241,6 +255,33 @@ pub fn encode_tcp_connected(conn_id: u32) -> Vec<u8> {
     encode_channel_msg(ChannelMsgType::TcpConnected, conn_id, &[])
 }
 
+/// Encode a TcpConnect with a quiet-period timeout (enclave → host).
+pub fn encode_tcp_connect_timeout(conn_id: u32, addr: &str, timeout_ms: u32) -> Vec<u8> {
+    encode_channel_msg(
+        ChannelMsgType::TcpConnect,
+        conn_id,
+        format!("{addr}\n{timeout_ms}").as_bytes(),
+    )
+}
+
+/// Encode a UdpOpen with a quiet-period timeout (enclave → host).
+pub fn encode_udp_open(conn_id: u32, addr: &str, timeout_ms: u32) -> Vec<u8> {
+    encode_channel_msg(
+        ChannelMsgType::UdpOpen,
+        conn_id,
+        format!("{addr}\n{timeout_ms}").as_bytes(),
+    )
+}
+
+/// Split a `TcpConnect` / `UdpOpen` payload into the address and the
+/// optional timeout in milliseconds.
+pub fn decode_connect_payload(payload: &str) -> (&str, Option<u32>) {
+    match payload.split_once('\n') {
+        Some((addr, ms)) => (addr, ms.trim().parse().ok()),
+        None => (payload, None),
+    }
+}
+
 // ========================================================================
 //  Tests
 // ========================================================================
@@ -284,6 +325,25 @@ mod tests {
         assert_eq!(typ, ChannelMsgType::TcpConnect);
         assert_eq!(id, 0x8000_0001);
         assert_eq!(core::str::from_utf8(payload).unwrap(), "10.0.0.7:7400");
+    }
+
+    #[test]
+    fn test_connect_and_udp_open_timeouts() {
+        let msg = encode_tcp_connect_timeout(0xC000_0001, "time.example:4460", 2000);
+        let (typ, id, payload) = decode_channel_msg(&msg).unwrap();
+        assert_eq!(typ, ChannelMsgType::TcpConnect);
+        assert_eq!(id, 0xC000_0001);
+        let payload = core::str::from_utf8(payload).unwrap();
+        assert_eq!(decode_connect_payload(payload), ("time.example:4460", Some(2000)));
+
+        let msg = encode_udp_open(0xC000_0002, "10.0.0.7:123", 500);
+        let (typ, _, payload) = decode_channel_msg(&msg).unwrap();
+        assert_eq!(typ, ChannelMsgType::UdpOpen);
+        let payload = core::str::from_utf8(payload).unwrap();
+        assert_eq!(decode_connect_payload(payload), ("10.0.0.7:123", Some(500)));
+
+        // A plain TcpConnect has no timeout.
+        assert_eq!(decode_connect_payload("10.0.0.7:7400"), ("10.0.0.7:7400", None));
     }
 
     #[test]

@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, Read, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{TcpListener, TcpStream, UdpSocket};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
@@ -71,8 +71,8 @@ const IDLE_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 /// fails instead of holding its slot forever.
 const EGRESS_MAX_LIFETIME: Duration = Duration::from_secs(60);
 
-/// How often the proxy loop checks egress lifetimes.
-const EGRESS_SCAN_INTERVAL: Duration = Duration::from_secs(1);
+/// How often the proxy loop checks egress lifetimes and requested timeouts.
+const DEADLINE_SCAN_INTERVAL: Duration = Duration::from_millis(250);
 
 /// TCP keepalive parameters applied to every accepted socket. The kernel
 /// sends the first probe after `KEEPALIVE_IDLE`, then `KEEPALIVE_RETRIES`
@@ -88,6 +88,8 @@ struct ConnState {
     last_activity: Instant,
     /// When the connection was accepted, or its outbound connect started.
     opened: Instant,
+    /// Quiet-period timeout the enclave asked for (see `TcpConnect`).
+    timeout: Option<Duration>,
 }
 
 /// An enclave-requested outbound connection whose non-blocking connect
@@ -98,6 +100,16 @@ struct PendingConn {
     buffered: Vec<Vec<u8>>,
     buffered_len: usize,
     started: Instant,
+    /// Quiet-period timeout the enclave asked for; also bounds the connect.
+    timeout: Option<Duration>,
+}
+
+/// An enclave-requested UDP socket, connected to its one peer.
+struct UdpConn {
+    socket: UdpSocket,
+    last_activity: Instant,
+    opened: Instant,
+    timeout: Option<Duration>,
 }
 
 /// TCP proxy for enclave inbound and proxy-owned outbound connections.
@@ -111,6 +123,8 @@ pub struct TcpProxy {
     connections: HashMap<u32, ConnState>,
     /// Outbound connects in progress: conn_id → pending state.
     pending_connects: HashMap<u32, PendingConn>,
+    /// Enclave-requested UDP sockets: conn_id → socket.
+    udp: HashMap<u32, UdpConn>,
     /// Next ingress connection ID to assign.
     next_conn_id: u32,
     /// Next peer-port connection ID to assign.
@@ -125,8 +139,8 @@ pub struct TcpProxy {
     ready: bool,
     /// Last time we ran the idle-connection sweep.
     last_idle_scan: Instant,
-    /// Last time we checked egress connection lifetimes.
-    last_egress_scan: Instant,
+    /// Last time we checked egress lifetimes and requested timeouts.
+    last_deadline_scan: Instant,
     /// Last raft tick sent (peer-port mode only).
     last_tick: Instant,
 }
@@ -163,6 +177,7 @@ impl TcpProxy {
             peer_listener,
             connections: HashMap::new(),
             pending_connects: HashMap::new(),
+            udp: HashMap::new(),
             next_conn_id: 1,
             next_peer_conn_id: CONN_ID_PEER_IN_BASE,
             data_tx,
@@ -170,7 +185,7 @@ impl TcpProxy {
             shutdown,
             ready: false,
             last_idle_scan: Instant::now(),
-            last_egress_scan: Instant::now(),
+            last_deadline_scan: Instant::now(),
             last_tick: Instant::now(),
         })
     }
@@ -202,6 +217,7 @@ impl TcpProxy {
 
             // 2. Read from TCP sockets → send to enclave
             did_work |= self.read_sockets(&mut read_buf);
+            did_work |= self.read_udp_sockets(&mut read_buf);
 
             // 4. Periodically reap idle connections (catches half-dead peers
             //    that never trigger TCP keepalive — e.g. stalled TLS handshakes).
@@ -209,9 +225,9 @@ impl TcpProxy {
                 self.reap_idle_connections();
                 self.last_idle_scan = Instant::now();
             }
-            if self.last_egress_scan.elapsed() >= EGRESS_SCAN_INTERVAL {
-                self.reap_expired_egress();
-                self.last_egress_scan = Instant::now();
+            if self.last_deadline_scan.elapsed() >= DEADLINE_SCAN_INTERVAL {
+                self.reap_expired();
+                self.last_deadline_scan = Instant::now();
             }
 
             // 5. Raft timer ticks (only when a peer port is configured).
@@ -275,7 +291,7 @@ impl TcpProxy {
             // Drop the freshly-accepted socket immediately if we're
             // already tracking too many connections — better to refuse
             // a single connection than to leak FDs and DoS ourselves.
-            if self.connections.len() + self.pending_connects.len() >= MAX_CONNS {
+            if self.connections.len() + self.pending_connects.len() + self.udp.len() >= MAX_CONNS {
                 warn!(
                     "Connection cap reached ({}), dropping new connection from {}",
                     MAX_CONNS, addr
@@ -329,7 +345,12 @@ impl TcpProxy {
 
             self.connections.insert(
                 conn_id,
-                ConnState { stream, last_activity: Instant::now(), opened: Instant::now() },
+                ConnState {
+                    stream,
+                    last_activity: Instant::now(),
+                    opened: Instant::now(),
+                    timeout: None,
+                },
             );
             accepted = true;
         }
@@ -341,7 +362,7 @@ impl TcpProxy {
     /// The connect is non-blocking; completion is polled in
     /// [`Self::poll_pending_connects`]. Failures are reported to the
     /// enclave as `TcpClose` for the conn_id.
-    fn start_outbound_connect(&mut self, conn_id: u32, addr_str: &str) {
+    fn start_outbound_connect(&mut self, conn_id: u32, addr_str: &str, timeout: Option<Duration>) {
         use std::net::ToSocketAddrs;
 
         if !channel::conn_id_is_outbound(conn_id) {
@@ -356,7 +377,7 @@ impl TcpProxy {
             self.data_tx.send(&channel::encode_tcp_close(conn_id));
             return;
         }
-        if self.connections.len() + self.pending_connects.len() >= MAX_CONNS {
+        if self.connections.len() + self.pending_connects.len() + self.udp.len() >= MAX_CONNS {
             warn!("Connection cap reached, rejecting outbound conn_id={}", conn_id);
             self.data_tx.send(&channel::encode_tcp_close(conn_id));
             return;
@@ -413,8 +434,79 @@ impl TcpProxy {
                 buffered: Vec::new(),
                 buffered_len: 0,
                 started: Instant::now(),
+                timeout,
             },
         );
+    }
+
+    /// Open an enclave-requested UDP socket (`UdpOpen`), connected to its
+    /// one peer so only that peer's datagrams are read. Failures are
+    /// reported as `TcpClose`.
+    fn open_udp(&mut self, conn_id: u32, addr_str: &str, timeout: Option<Duration>) {
+        use std::net::ToSocketAddrs;
+
+        let fail = |proxy: &mut Self, why: &str| {
+            warn!("UdpOpen conn_id={} to '{}': {}", conn_id, addr_str, why);
+            proxy.data_tx.send(&channel::encode_tcp_close(conn_id));
+        };
+        if !channel::conn_id_is_outbound(conn_id) {
+            return fail(self, "not an outbound conn_id");
+        }
+        if self.udp.contains_key(&conn_id)
+            || self.connections.contains_key(&conn_id)
+            || self.pending_connects.contains_key(&conn_id)
+        {
+            return fail(self, "duplicate conn_id");
+        }
+        if self.connections.len() + self.pending_connects.len() + self.udp.len() >= MAX_CONNS {
+            return fail(self, "connection cap reached");
+        }
+        // Same caveat as for TCP: resolving a DNS name can block briefly.
+        let Some(addr) = addr_str.to_socket_addrs().ok().and_then(|mut a| a.next()) else {
+            return fail(self, "cannot resolve");
+        };
+        let local = if addr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
+        let socket = match UdpSocket::bind(local)
+            .and_then(|s| s.connect(addr).map(|_| s))
+            .and_then(|s| s.set_nonblocking(true).map(|_| s))
+        {
+            Ok(s) => s,
+            Err(e) => return fail(self, &e.to_string()),
+        };
+        debug!("UDP socket opened conn_id={} to {}", conn_id, addr);
+        let now = Instant::now();
+        self.udp.insert(conn_id, UdpConn { socket, last_activity: now, opened: now, timeout });
+    }
+
+    /// Read datagrams from the UDP sockets and forward each to the enclave
+    /// as one `TcpData`. Returns true if any datagram was read.
+    fn read_udp_sockets(&mut self, buf: &mut [u8]) -> bool {
+        let mut did_work = false;
+        let mut to_close = Vec::new();
+        for (&conn_id, conn) in self.udp.iter_mut() {
+            loop {
+                match conn.socket.recv(buf) {
+                    Ok(n) => {
+                        self.data_tx.send(&channel::encode_tcp_data(conn_id, &buf[..n]));
+                        conn.last_activity = Instant::now();
+                        did_work = true;
+                    }
+                    Err(ref e) if e.kind() == io::ErrorKind::WouldBlock => break,
+                    Err(e) => {
+                        // e.g. ICMP port unreachable on a connected socket.
+                        debug!("UDP recv error on conn_id={}: {}", conn_id, e);
+                        to_close.push(conn_id);
+                        break;
+                    }
+                }
+            }
+        }
+        for conn_id in to_close {
+            self.udp.remove(&conn_id);
+            self.data_tx.send(&channel::encode_tcp_close(conn_id));
+            did_work = true;
+        }
+        did_work
     }
 
     /// Poll outbound connects for completion, failure, or timeout.
@@ -443,7 +535,7 @@ impl TcpProxy {
             match pending.stream.peer_addr() {
                 Ok(_) => done.push((conn_id, true)),
                 Err(_) => {
-                    if pending.started.elapsed() >= CONNECT_TIMEOUT {
+                    if pending.started.elapsed() >= pending.timeout.map_or(CONNECT_TIMEOUT, |t| t.min(CONNECT_TIMEOUT)) {
                         warn!("Outbound connect timeout conn_id={}", conn_id);
                         done.push((conn_id, false));
                     }
@@ -477,6 +569,7 @@ impl TcpProxy {
                     stream: pending.stream,
                     last_activity: Instant::now(),
                     opened: pending.started,
+                    timeout: pending.timeout,
                 },
             );
             self.data_tx.send(&channel::encode_tcp_connected(conn_id));
@@ -560,26 +653,34 @@ impl TcpProxy {
         }
     }
 
-    /// Close egress connections older than `EGRESS_MAX_LIFETIME`, and tell
-    /// the enclave.
-    fn reap_expired_egress(&mut self) {
+    /// Close egress connections older than `EGRESS_MAX_LIFETIME`, and outbound
+    /// connections and UDP sockets quiet past the timeout the enclave asked
+    /// for; tell the enclave.
+    fn reap_expired(&mut self) {
         let now = Instant::now();
-        let expired: Vec<u32> = self
+        let expired = |id: u32, opened: Instant, last: Instant, timeout: Option<Duration>| {
+            if channel::conn_id_is_egress(id) && now.duration_since(opened) >= EGRESS_MAX_LIFETIME {
+                return Some("open too long");
+            }
+            match timeout {
+                Some(t) if now.duration_since(last) >= t => Some("quiet past its timeout"),
+                _ => None,
+            }
+        };
+        let tcp: Vec<(u32, &str)> = self
             .connections
             .iter()
-            .filter(|(&id, c)| {
-                channel::conn_id_is_egress(id)
-                    && now.duration_since(c.opened) >= EGRESS_MAX_LIFETIME
-            })
-            .map(|(&id, _)| id)
+            .filter_map(|(&id, c)| expired(id, c.opened, c.last_activity, c.timeout).map(|why| (id, why)))
             .collect();
-        for conn_id in expired {
-            warn!(
-                "Closing egress conn_id={}: open for more than {}s",
-                conn_id,
-                EGRESS_MAX_LIFETIME.as_secs()
-            );
+        let udp: Vec<(u32, &str)> = self
+            .udp
+            .iter()
+            .filter_map(|(&id, c)| expired(id, c.opened, c.last_activity, c.timeout).map(|why| (id, why)))
+            .collect();
+        for (conn_id, why) in tcp.into_iter().chain(udp) {
+            warn!("Closing outbound conn_id={}: {}", conn_id, why);
             self.connections.remove(&conn_id);
+            self.udp.remove(&conn_id);
             self.data_tx.send(&channel::encode_tcp_close(conn_id));
         }
     }
@@ -606,14 +707,23 @@ impl TcpProxy {
                             self.connections.remove(&conn_id);
                             // Also cancels a connect still in progress.
                             self.pending_connects.remove(&conn_id);
+                            self.udp.remove(&conn_id);
                         }
-                        Some((ChannelMsgType::TcpConnect, conn_id, payload)) => {
+                        Some((msg_type @ (ChannelMsgType::TcpConnect | ChannelMsgType::UdpOpen), conn_id, payload)) => {
                             match core::str::from_utf8(payload) {
-                                Ok(addr) => self.start_outbound_connect(conn_id, addr),
+                                Ok(payload) => {
+                                    let (addr, ms) = channel::decode_connect_payload(payload);
+                                    let timeout = ms.map(|ms| Duration::from_millis(ms as u64));
+                                    if msg_type == ChannelMsgType::UdpOpen {
+                                        self.open_udp(conn_id, addr, timeout);
+                                    } else {
+                                        self.start_outbound_connect(conn_id, addr, timeout);
+                                    }
+                                }
                                 Err(_) => {
                                     warn!(
-                                        "TcpConnect conn_id={} with non-UTF-8 address",
-                                        conn_id
+                                        "{:?} conn_id={} with non-UTF-8 address",
+                                        msg_type, conn_id
                                     );
                                     self.data_tx.send(&channel::encode_tcp_close(conn_id));
                                 }
@@ -646,6 +756,18 @@ impl TcpProxy {
     /// Write data to a TCP socket. If the write fails, close the connection.
     /// Data for an outbound connection still connecting is buffered.
     fn write_to_socket(&mut self, conn_id: u32, data: &[u8]) {
+        if let Some(udp) = self.udp.get_mut(&conn_id) {
+            // One message is one datagram.
+            match udp.socket.send(data) {
+                Ok(_) => udp.last_activity = Instant::now(),
+                Err(e) => {
+                    warn!("UDP send error on conn_id={}: {}", conn_id, e);
+                    self.udp.remove(&conn_id);
+                    self.data_tx.send(&channel::encode_tcp_close(conn_id));
+                }
+            }
+            return;
+        }
         if let Some(pending) = self.pending_connects.get_mut(&conn_id) {
             if pending.buffered_len + data.len() > MAX_PENDING_WRITE {
                 warn!(

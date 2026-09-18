@@ -159,6 +159,22 @@ roll, never configuration):
 | `ntp1.rdem-systems.com` | RDEM Systems, France |
 | `nts.teambelgium.net` | Team Belgium, Belgium |
 
+**Waiting without blocking the enclave.** In WASM builds, requests run as
+tasks on the enclave's event loop (see `enclave_os_wasm::executor`). A
+clock operation started by the clock's own routes (`POST /clock/poll`,
+`PUT /clock/config`), at the top of their request where no lock is held,
+does its NTS quorum and incident POST over sockets the host proxy drives
+(`TcpConnect` / `UdpOpen` with the same timeouts, enforced by the proxy),
+and each network wait suspends only that request: the enclave keeps
+serving the others. Meanwhile another request's time read gets the state
+as of the last operation: `NO_TRUSTED_TIME` if that was failing closed,
+otherwise the frozen time (time pauses, never goes back); another clock
+route waits its turn. A time read never suspends (it may come from under
+any lock, and a request suspended while holding a lock would block the
+next one that takes it, on the enclave's one thread), so an NTS fetch a
+read starts (boot, refetch, self-check, incidents) still blocks, as do
+all of them in builds without WASM.
+
 ## Monitor contracts
 
 Keys are Ed25519, times are Unix milliseconds, base64 is base64url
@@ -273,3 +289,11 @@ Alongside, `NetTcpConnectTimeout` (`0x0106`, payload
 `[u16 port][u32 timeout_ms][host]`, response fd) is a TCP connect whose
 connect, and every later recv or send, waits at most `timeout_ms` (capped
 at 30 s): it bounds the NTS-KE legs and the incident POST.
+
+The suspending path uses the data channel instead (`common::channel`):
+`TcpConnect` with a `\n<ms>` suffix is a proxy-owned TCP connection
+whose connect and every quiet period (no byte either way) the proxy bounds
+at that many milliseconds; `UdpOpen` (`0x08`, same payload) is a UDP socket
+connected to its one peer, each `TcpData` on it one datagram, closed by the
+proxy after the same quiet period, which the enclave reads as the
+receive timeout.

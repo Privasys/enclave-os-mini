@@ -4,6 +4,12 @@
 //! NTS client (RFC 8915): NTS-KE over TLS 1.3 inside the enclave, then
 //! authenticated NTPv4 over the host's UDP sockets.
 //!
+//! In a request task the sockets are ones the host proxy drives, and every
+//! network wait suspends the task instead of the enclave (see [`io`]); the
+//! proxy enforces the same timeouts the host RPC sockets take. Elsewhere
+//! (start-up, the event loop, inside a guest call) the host's RPC sockets
+//! block, as before.
+//!
 //! Every byte crosses the host. NTS-KE is TLS terminated here, with the
 //! server certificate checked against the Mozilla roots (webpki-roots) at
 //! the enclave's floor time, never at the host's time (that time is what is
@@ -37,6 +43,7 @@ use enclave_os_clock::ntske::{self, EXPORTER_LABEL, KE_PORT, NTP_PORT};
 use enclave_os_clock::quorum::{self, NtsSample};
 use enclave_os_clock::{ntp, servers, ClockError, TOLERANCE_MS};
 
+use super::io;
 use crate::ocall;
 
 /// How long one NTP reply is waited for.
@@ -75,7 +82,7 @@ struct Session {
 
 /// An NTP request waiting for its reply.
 struct InFlight {
-    fd: i32,
+    sock: Udp,
     uid: [u8; ntp::UID_LEN],
     xmt: [u8; 8],
     aead: NtsAead,
@@ -84,10 +91,12 @@ struct InFlight {
 }
 
 /// An NTS quorum over the pinned servers, checking certificates at
-/// `floor_ms`.
+/// `floor_ms`. In a request task its network waits suspend the task (see
+/// [`io`]); elsewhere they block.
 pub fn quorum(floor_ms: i64) -> Result<NtsSample, ClockError> {
     let hosts = servers::hosts();
     let rng = SystemRandom::new();
+    let suspend = io::can_suspend();
     let mut sessions: BTreeMap<String, Session> = BTreeMap::new();
     quorum::run(
         &hosts,
@@ -96,18 +105,19 @@ pub fn quorum(floor_ms: i64) -> Result<NtsSample, ClockError> {
             let _ = rng.fill(&mut b);
             u32::from_le_bytes(b)
         },
-        |set| sample_round(set, &mut sessions, floor_ms, &rng),
+        |set| io::run(suspend, sample_round(set, &mut sessions, floor_ms, &rng, suspend)),
     )
 }
 
 /// Sample every host of `set` in one round: key exchanges first (only for
 /// hosts without an unspent cookie), then every NTP request, then every
 /// reply, so the samples are close together in time.
-fn sample_round(
+async fn sample_round(
     set: &[&str],
     sessions: &mut BTreeMap<String, Session>,
     floor_ms: i64,
     rng: &SystemRandom,
+    suspend: bool,
 ) -> Vec<Result<i64, String>> {
     let mut out: Vec<Result<i64, String>> = set.iter().map(|_| Err(String::new())).collect();
 
@@ -115,7 +125,7 @@ fn sample_round(
         if sessions.get(*host).map_or(false, |s| !s.cookies.is_empty()) {
             continue;
         }
-        match key_exchange(host, floor_ms) {
+        match key_exchange(host, floor_ms, suspend).await {
             Ok(s) => {
                 sessions.insert(host.to_string(), s);
             }
@@ -129,7 +139,7 @@ fn sample_round(
     let mut inflight: Vec<Option<InFlight>> = Vec::with_capacity(set.len());
     for (i, host) in set.iter().enumerate() {
         let f = match sessions.get_mut(*host) {
-            Some(s) if !s.cookies.is_empty() => match send_request(s, rng) {
+            Some(s) if !s.cookies.is_empty() => match send_request(s, rng, suspend) {
                 Ok(f) => Some(f),
                 Err(e) => {
                     out[i] = Err(format!("ntp send: {e}"));
@@ -143,8 +153,8 @@ fn sample_round(
 
     for (i, f) in inflight.into_iter().enumerate() {
         if let Some(f) = f {
-            out[i] = receive(&f);
-            ocall::net_udp_close(f.fd);
+            out[i] = receive(&f).await;
+            f.sock.close();
         }
     }
     out
@@ -156,34 +166,33 @@ fn random<const N: usize>(rng: &SystemRandom) -> Result<[u8; N], String> {
     Ok(b)
 }
 
-fn send_request(s: &mut Session, rng: &SystemRandom) -> Result<InFlight, String> {
+fn send_request(s: &mut Session, rng: &SystemRandom, suspend: bool) -> Result<InFlight, String> {
     let cookie = s.cookies.pop().ok_or("no cookie left")?;
     let uid: [u8; ntp::UID_LEN] = random(rng)?;
     let xmt: [u8; 8] = random(rng)?;
     let nonce: [u8; MAX_NONCE_LEN] = random(rng)?;
     let pkt = ntp::build_request(s.aead, &s.c2s, &cookie, &uid, &xmt, &nonce[..s.aead.nonce_len()])
         .ok_or("request encryption failed")?;
-    let fd = ocall::net_udp_bind("", 0).map_err(|e| format!("udp bind: {e}"))?;
-    if let Err(e) = ocall::net_udp_send_to(fd, &s.ntp_host, s.ntp_port, &pkt) {
-        ocall::net_udp_close(fd);
-        return Err(format!("udp send to {}:{}: {e}", s.ntp_host, s.ntp_port));
+    let sock = Udp::open(&s.ntp_host, s.ntp_port, suspend)?;
+    if let Err(e) = sock.send(&pkt) {
+        sock.close();
+        return Err(e);
     }
-    Ok(InFlight { fd, uid, xmt, aead: s.aead, s2c: s.s2c.clone(), checked_at_ms: s.checked_at_ms })
+    Ok(InFlight { sock, uid, xmt, aead: s.aead, s2c: s.s2c.clone(), checked_at_ms: s.checked_at_ms })
 }
 
-fn receive(f: &InFlight) -> Result<i64, String> {
+async fn receive(f: &InFlight) -> Result<i64, String> {
     let mut last = String::from("no reply");
     for _ in 0..MAX_DATAGRAMS_PER_REPLY {
-        match ocall::net_udp_recv_from(f.fd, 2048, RECV_TIMEOUT_MS) {
-            Ok((d, _peer)) => match ntp::parse_response(&d, f.aead, &f.s2c, &f.uid, &f.xmt) {
+        match f.sock.recv().await? {
+            Some(d) => match ntp::parse_response(&d, f.aead, &f.s2c, &f.uid, &f.xmt) {
                 Ok(t) if t < f.checked_at_ms.saturating_sub(TOLERANCE_MS) => {
                     return Err("server time is before its own certificate".to_string());
                 }
                 Ok(t) => return Ok(t),
                 Err(e) => last = e.to_string(),
             },
-            Err(-11) => return Err(format!("no valid reply ({last})")),
-            Err(e) => return Err(format!("udp recv: {e}")),
+            None => return Err(format!("no valid reply ({last})")),
         }
     }
     Err(format!("no valid reply ({last})"))
@@ -193,19 +202,19 @@ fn receive(f: &InFlight) -> Result<i64, String> {
 //  NTS-KE
 // ---------------------------------------------------------------------------
 
-fn key_exchange(host: &str, floor_ms: i64) -> Result<Session, String> {
-    let fd = ocall::net_tcp_connect_timeout(host, KE_PORT, KE_TIMEOUT_MS).map_err(|e| format!("connect {host}:{KE_PORT}: {e}"))?;
-    let r = key_exchange_on(fd, host, floor_ms);
-    ocall::net_close(fd);
+async fn key_exchange(host: &str, floor_ms: i64, suspend: bool) -> Result<Session, String> {
+    let mut tcp = Tcp::connect(host, KE_PORT, KE_TIMEOUT_MS, suspend)?;
+    let r = key_exchange_on(&mut tcp, host, floor_ms).await;
+    tcp.close();
     r
 }
 
-fn key_exchange_on(fd: i32, host: &str, floor_ms: i64) -> Result<Session, String> {
+async fn key_exchange_on(tcp: &mut Tcp, host: &str, floor_ms: i64) -> Result<Session, String> {
     let checked_at = Arc::new(AtomicI64::new(floor_ms));
     let config = client_config(floor_ms, Some(ntske::ALPN), checked_at.clone())?;
     let name = ServerName::try_from(host.to_string()).map_err(|_| "invalid server name".to_string())?;
     let mut conn = ClientConnection::new(Arc::new(config), name).map_err(|e| format!("tls init: {e}"))?;
-    handshake(fd, &mut conn)?;
+    handshake(tcp, &mut conn).await?;
     if conn.alpn_protocol() != Some(ntske::ALPN) {
         return Err("server did not negotiate ntske/1".to_string());
     }
@@ -213,14 +222,14 @@ fn key_exchange_on(fd: i32, host: &str, floor_ms: i64) -> Result<Session, String
     conn.writer()
         .write_all(&ntske::build_request())
         .map_err(|e| format!("write: {e}"))?;
-    flush(fd, &mut conn)?;
+    flush(tcp, &mut conn)?;
 
     let mut buf = Vec::new();
     let resp = loop {
         if let Some(r) = ntske::parse_response(&buf).map_err(|e| e.to_string())? {
             break r;
         }
-        if read_plaintext(fd, &mut conn, &mut buf, ntske::MAX_RESPONSE)? == 0 {
+        if read_plaintext(tcp, &mut conn, &mut buf, ntske::MAX_RESPONSE).await? == 0 {
             return Err("connection closed before end of message".to_string());
         }
     };
@@ -233,7 +242,7 @@ fn key_exchange_on(fd: i32, host: &str, floor_ms: i64) -> Result<Session, String
         .export_keying_material(vec![0u8; aead.key_len()], EXPORTER_LABEL, Some(&ntske::exporter_context(aead, true)))
         .map_err(|e| format!("exporter: {e}"))?;
     conn.send_close_notify();
-    let _ = flush(fd, &mut conn);
+    let _ = flush(tcp, &mut conn);
 
     Ok(Session {
         aead,
@@ -351,30 +360,23 @@ impl ServerCertVerifier for FloorVerifier {
 }
 
 // ---------------------------------------------------------------------------
-//  TLS pump over the host's TCP socket
+//  TLS pump over a TCP socket
 // ---------------------------------------------------------------------------
 
-fn flush(fd: i32, conn: &mut ClientConnection) -> Result<(), String> {
+fn flush(tcp: &mut Tcp, conn: &mut ClientConnection) -> Result<(), String> {
     while conn.wants_write() {
         let mut out = Vec::new();
         conn.write_tls(&mut out).map_err(|e| format!("write_tls: {e}"))?;
-        let mut off = 0;
-        while off < out.len() {
-            let n = ocall::net_send(fd, &out[off..]).map_err(|e| format!("send: {e}"))?;
-            if n == 0 {
-                return Err("send: connection closed".to_string());
-            }
-            off += n;
-        }
+        tcp.send_all(&out)?;
     }
     Ok(())
 }
 
 /// Read one chunk from the network into the TLS session. Returns the number
 /// of network bytes read (0 at end of stream).
-fn pump_in(fd: i32, conn: &mut ClientConnection) -> Result<usize, String> {
+async fn pump_in(tcp: &mut Tcp, conn: &mut ClientConnection) -> Result<usize, String> {
     let mut net = vec![0u8; 16 * 1024];
-    let n = ocall::net_recv(fd, &mut net).map_err(|e| format!("recv: {e}"))?;
+    let n = tcp.recv(&mut net).await?;
     let mut cursor = std::io::Cursor::new(&net[..n]);
     while (cursor.position() as usize) < n {
         conn.read_tls(&mut cursor).map_err(|e| format!("read_tls: {e}"))?;
@@ -383,13 +385,13 @@ fn pump_in(fd: i32, conn: &mut ClientConnection) -> Result<usize, String> {
     Ok(n)
 }
 
-fn handshake(fd: i32, conn: &mut ClientConnection) -> Result<(), String> {
+async fn handshake(tcp: &mut Tcp, conn: &mut ClientConnection) -> Result<(), String> {
     loop {
-        flush(fd, conn)?;
+        flush(tcp, conn)?;
         if !conn.is_handshaking() {
             return Ok(());
         }
-        if pump_in(fd, conn)? == 0 {
+        if pump_in(tcp, conn).await? == 0 {
             return Err("connection closed during the handshake".to_string());
         }
     }
@@ -397,8 +399,8 @@ fn handshake(fd: i32, conn: &mut ClientConnection) -> Result<(), String> {
 
 /// Read network data and append the decrypted bytes to `out`. Returns the
 /// number of network bytes read (0 at end of stream).
-fn read_plaintext(fd: i32, conn: &mut ClientConnection, out: &mut Vec<u8>, cap: usize) -> Result<usize, String> {
-    let n = pump_in(fd, conn)?;
+async fn read_plaintext(tcp: &mut Tcp, conn: &mut ClientConnection, out: &mut Vec<u8>, cap: usize) -> Result<usize, String> {
+    let n = pump_in(tcp, conn).await?;
     let mut tmp = [0u8; 4096];
     loop {
         match conn.reader().read(&mut tmp) {
@@ -437,7 +439,11 @@ fn read_plaintext(fd: i32, conn: &mut ClientConnection, out: &mut Vec<u8>, cap: 
 /// read and write waits at most [`INCIDENT_TIMEOUT_MS`], which bounds the
 /// wait for the receipt.
 pub fn post_to_monitor(url: &str, body: &[u8], at_ms: i64) -> Result<Vec<u8>, String> {
-    const MAX_REPLY: usize = 64 * 1024;
+    let suspend = io::can_suspend();
+    io::run(suspend, post_to_monitor_on(url, body, at_ms, suspend))
+}
+
+async fn post_to_monitor_on(url: &str, body: &[u8], at_ms: i64, suspend: bool) -> Result<Vec<u8>, String> {
     let rest = url.strip_prefix("https://").ok_or("incident_url is not https")?;
     let (authority, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
@@ -448,46 +454,53 @@ pub fn post_to_monitor(url: &str, body: &[u8], at_ms: i64) -> Result<Vec<u8>, St
         None => (authority, 443),
     };
 
-    let fd = ocall::net_tcp_connect_timeout(host, port, INCIDENT_TIMEOUT_MS)
-        .map_err(|e| format!("connect {host}:{port}: {e}"))?;
-    let r = (|| {
-        let provider = Arc::new(default_provider());
-        // The TLS stack gets the frozen floor as its clock, never the host's.
-        let mut config = ClientConfig::builder_with_details(provider.clone(), Arc::new(FixedTime(at_ms)))
-            .with_protocol_versions(&[&rustls::version::TLS13])
-            .map_err(|e| format!("tls config: {e}"))?
-            .dangerous()
-            .with_custom_certificate_verifier(Arc::new(ReceiptAuthenticates(provider)))
-            .with_no_client_auth();
-        // The marker only steers the gateway; the monitor's own TLS server
-        // does not list it, and TLS 1.3 aborts a handshake with no protocol
-        // in common. `http/1.1` is what the two actually agree on.
-        config.alpn_protocols = vec![RATLS_ALPN.to_vec(), b"http/1.1".to_vec()];
-        config.resumption = rustls::client::Resumption::disabled();
-        let name = ServerName::try_from(host.to_string()).map_err(|_| "invalid server name".to_string())?;
-        let mut conn = ClientConnection::new(Arc::new(config), name).map_err(|e| format!("tls init: {e}"))?;
-        handshake(fd, &mut conn)?;
-        let mut req = format!(
-            "POST {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\n\
-             Content-Length: {}\r\nConnection: close\r\n\r\n",
-            body.len()
-        )
-        .into_bytes();
-        req.extend_from_slice(body);
-        conn.writer().write_all(&req).map_err(|e| format!("write: {e}"))?;
-        flush(fd, &mut conn)?;
-        let mut raw = Vec::new();
-        loop {
-            if let Some(body) = parse_http_reply(&raw, false)? {
-                return Ok(body);
-            }
-            if read_plaintext(fd, &mut conn, &mut raw, MAX_REPLY)? == 0 {
-                return parse_http_reply(&raw, true)?.ok_or_else(|| "incomplete HTTP reply".to_string());
-            }
-        }
-    })();
-    ocall::net_close(fd);
+    let mut tcp = Tcp::connect(host, port, INCIDENT_TIMEOUT_MS, suspend)?;
+    let r = incident_exchange(&mut tcp, host, authority, path, body, at_ms).await;
+    tcp.close();
     r
+}
+
+/// The TLS session and HTTP exchange of [`post_to_monitor`].
+async fn incident_exchange(
+    tcp: &mut Tcp,
+    host: &str,
+    authority: &str,
+    path: &str,
+    body: &[u8],
+    at_ms: i64,
+) -> Result<Vec<u8>, String> {
+    const MAX_REPLY: usize = 64 * 1024;
+    let provider = Arc::new(default_provider());
+    // The TLS stack gets the frozen floor as its clock, never the host's.
+    let mut config = ClientConfig::builder_with_details(provider.clone(), Arc::new(FixedTime(at_ms)))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| format!("tls config: {e}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(ReceiptAuthenticates(provider)))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![RATLS_ALPN.to_vec()];
+    config.resumption = rustls::client::Resumption::disabled();
+    let name = ServerName::try_from(host.to_string()).map_err(|_| "invalid server name".to_string())?;
+    let mut conn = ClientConnection::new(Arc::new(config), name).map_err(|e| format!("tls init: {e}"))?;
+    handshake(tcp, &mut conn).await?;
+    let mut req = format!(
+        "POST {path} HTTP/1.1\r\nHost: {authority}\r\nContent-Type: application/json\r\n\
+         Content-Length: {}\r\nConnection: close\r\n\r\n",
+        body.len()
+    )
+    .into_bytes();
+    req.extend_from_slice(body);
+    conn.writer().write_all(&req).map_err(|e| format!("write: {e}"))?;
+    flush(tcp, &mut conn)?;
+    let mut raw = Vec::new();
+    loop {
+        if let Some(body) = parse_http_reply(&raw, false)? {
+            return Ok(body);
+        }
+        if read_plaintext(tcp, &mut conn, &mut raw, MAX_REPLY).await? == 0 {
+            return parse_http_reply(&raw, true)?.ok_or_else(|| "incomplete HTTP reply".to_string());
+        }
+    }
 }
 
 /// Accepts the monitor's certificate without a trust decision: the signed
@@ -590,4 +603,123 @@ fn parse_http_reply(raw: &[u8], eof: bool) -> Result<Option<Vec<u8>>, String> {
         return Err(format!("monitor answered HTTP {status}"));
     }
     Ok(Some(body))
+}
+
+// ---------------------------------------------------------------------------
+//  Sockets
+// ---------------------------------------------------------------------------
+
+/// A TCP socket: the host's (blocking RPC) or one the host proxy drives
+/// (its reads suspend the request task, see [`io`]).
+enum Tcp {
+    Rpc(i32),
+    #[cfg(feature = "wasm")]
+    Chan(enclave_os_egress::netchan::NetConn),
+}
+
+impl Tcp {
+    /// Connect, with `timeout_ms` bounding the connect and each wait after.
+    fn connect(host: &str, port: u16, timeout_ms: u32, suspend: bool) -> Result<Self, String> {
+        #[cfg(feature = "wasm")]
+        if suspend {
+            return enclave_os_egress::netchan::NetConn::connect_timeout(host, port, timeout_ms)
+                .map(Tcp::Chan)
+                .map_err(|e| format!("connect {host}:{port}: {e}"));
+        }
+        let _ = suspend;
+        ocall::net_tcp_connect_timeout(host, port, timeout_ms)
+            .map(Tcp::Rpc)
+            .map_err(|e| format!("connect {host}:{port}: {e}"))
+    }
+
+    fn send_all(&mut self, data: &[u8]) -> Result<(), String> {
+        match self {
+            Tcp::Rpc(fd) => {
+                let mut off = 0;
+                while off < data.len() {
+                    let n = ocall::net_send(*fd, &data[off..]).map_err(|e| format!("send: {e}"))?;
+                    if n == 0 {
+                        return Err("send: connection closed".to_string());
+                    }
+                    off += n;
+                }
+                Ok(())
+            }
+            #[cfg(feature = "wasm")]
+            Tcp::Chan(c) => c.send(data).map_err(|e| format!("send: {e}")),
+        }
+    }
+
+    /// Read some bytes; 0 at the end of the stream (or the timeout, for a
+    /// proxy socket).
+    async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, String> {
+        match self {
+            Tcp::Rpc(fd) => ocall::net_recv(*fd, buf).map_err(|e| format!("recv: {e}")),
+            #[cfg(feature = "wasm")]
+            Tcp::Chan(c) => c.recv(buf).await.map_err(|e| format!("recv: {e}")),
+        }
+    }
+
+    fn close(self) {
+        match self {
+            Tcp::Rpc(fd) => ocall::net_close(fd),
+            #[cfg(feature = "wasm")]
+            Tcp::Chan(c) => drop(c),
+        }
+    }
+}
+
+/// A UDP socket to one NTP server: the host's (blocking RPC) or one the
+/// host proxy drives.
+enum Udp {
+    Rpc { fd: i32, host: String, port: u16 },
+    #[cfg(feature = "wasm")]
+    Chan(enclave_os_egress::netchan::UdpConn),
+}
+
+impl Udp {
+    fn open(host: &str, port: u16, suspend: bool) -> Result<Self, String> {
+        #[cfg(feature = "wasm")]
+        if suspend {
+            // The proxy closes the socket after RECV_TIMEOUT_MS without a
+            // datagram, which `recv` reports as a timeout.
+            return enclave_os_egress::netchan::UdpConn::open(host, port, RECV_TIMEOUT_MS)
+                .map(Udp::Chan)
+                .map_err(|e| format!("udp open: {e}"));
+        }
+        let _ = suspend;
+        let fd = ocall::net_udp_bind("", 0).map_err(|e| format!("udp bind: {e}"))?;
+        Ok(Udp::Rpc { fd, host: host.to_string(), port })
+    }
+
+    fn send(&self, pkt: &[u8]) -> Result<(), String> {
+        match self {
+            Udp::Rpc { fd, host, port } => ocall::net_udp_send_to(*fd, host, *port, pkt)
+                .map(|_| ())
+                .map_err(|e| format!("udp send to {host}:{port}: {e}")),
+            #[cfg(feature = "wasm")]
+            Udp::Chan(c) => c.send(pkt).map_err(|e| format!("udp send: {e}")),
+        }
+    }
+
+    /// The next datagram, `None` after [`RECV_TIMEOUT_MS`] without one.
+    async fn recv(&self) -> Result<Option<Vec<u8>>, String> {
+        match self {
+            Udp::Rpc { fd, .. } => match ocall::net_udp_recv_from(*fd, 2048, RECV_TIMEOUT_MS) {
+                Ok((d, _peer)) => Ok(Some(d)),
+                Err(-11) => Ok(None),
+                Err(e) => Err(format!("udp recv: {e}")),
+            },
+            #[cfg(feature = "wasm")]
+            Udp::Chan(c) => Ok(c.recv().await.ok()),
+        }
+    }
+
+    fn close(self) {
+        match self {
+            Udp::Rpc { fd, .. } => ocall::net_udp_close(fd),
+            #[cfg(feature = "wasm")]
+            Udp::Chan(c) => drop(c),
+        }
+    }
 }

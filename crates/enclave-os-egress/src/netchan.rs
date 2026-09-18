@@ -1,7 +1,7 @@
 // Copyright (c) Privasys. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
-//! Outbound TCP over the data channel, for code that can suspend.
+//! Outbound TCP and UDP over the data channel, for code that can suspend.
 //!
 //! The host TCP proxy owns the socket and does its I/O without blocking the
 //! enclave. The enclave sends `TcpConnect` and `TcpData`; the proxy answers
@@ -19,7 +19,7 @@ use core::future::poll_fn;
 use core::sync::atomic::{AtomicU32, Ordering};
 use core::task::{Poll, Waker};
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::string::{String, ToString};
 use std::sync::{Mutex, OnceLock};
 use std::vec::Vec;
@@ -37,8 +37,12 @@ static NEXT_ID: AtomicU32 = AtomicU32::new(CONN_ID_EGRESS_BASE);
 
 #[derive(Default)]
 struct Conn {
-    /// Bytes received and not yet read.
+    /// A UDP socket: data arrives as datagrams, not as a byte stream.
+    udp: bool,
+    /// Bytes received and not yet read (TCP).
     rx: Vec<u8>,
+    /// Datagrams received and not yet read (UDP).
+    datagrams: VecDeque<Vec<u8>>,
     /// The proxy reported the connect succeeded (or sent data).
     connected: bool,
     /// The proxy closed the connection (or the connect failed).
@@ -77,7 +81,11 @@ pub fn handle_message(msg_type: ChannelMsgType, conn_id: u32, payload: &[u8]) {
         ChannelMsgType::TcpConnected => conn.connected = true,
         ChannelMsgType::TcpData => {
             conn.connected = true;
-            conn.rx.extend_from_slice(payload);
+            if conn.udp {
+                conn.datagrams.push_back(payload.to_vec());
+            } else {
+                conn.rx.extend_from_slice(payload);
+            }
         }
         ChannelMsgType::TcpClose => conn.closed = true,
         _ => return,
@@ -117,16 +125,18 @@ impl NetConn {
     /// [`NetConn::recv`] reports a failed connect. Data sent before the
     /// connect completes is buffered by the proxy.
     pub fn connect(host: &str, port: u16) -> Result<Self, String> {
-        if !is_available() {
-            return Err("egress data channel not initialised".to_string());
-        }
-        let id = {
-            let mut conns = CONNS.lock().map_err(|_| "egress connections lock poisoned")?;
-            let id = alloc_id(&conns);
-            conns.insert(id, Conn::default());
-            id
-        };
+        let id = register(false)?;
         send(&channel::encode_tcp_connect(id, &format!("{host}:{port}")));
+        Ok(Self { id })
+    }
+
+    /// [`NetConn::connect`] with a timeout the proxy enforces on the connect
+    /// and on every quiet period after it (no byte either way): the
+    /// connection is closed when it runs out, which a reader sees as the end
+    /// of the stream (or a failed connect).
+    pub fn connect_timeout(host: &str, port: u16, timeout_ms: u32) -> Result<Self, String> {
+        let id = register(false)?;
+        send(&channel::encode_tcp_connect_timeout(id, &format!("{host}:{port}"), timeout_ms));
         Ok(Self { id })
     }
 
@@ -179,14 +189,93 @@ impl NetConn {
 
 impl Drop for NetConn {
     fn drop(&mut self) {
+        release(self.id);
+    }
+}
+
+/// A UDP socket the host proxy owns, connected to one peer. Closed when
+/// dropped.
+pub struct UdpConn {
+    id: u32,
+}
+
+impl UdpConn {
+    /// Open a UDP socket to `host:port`. The proxy closes it once it has
+    /// been quiet (no datagram either way) for `timeout_ms`, which a reader
+    /// sees as [`UdpConn::recv`] failing.
+    pub fn open(host: &str, port: u16, timeout_ms: u32) -> Result<Self, String> {
+        let id = register(true)?;
+        send(&channel::encode_udp_open(id, &format!("{host}:{port}"), timeout_ms));
+        Ok(Self { id })
+    }
+
+    /// Send one datagram.
+    pub fn send(&self, datagram: &[u8]) -> Result<(), String> {
+        if datagram.len() > channel::MAX_CHANNEL_PAYLOAD {
+            return Err("datagram too large".to_string());
+        }
         let closed = CONNS
             .lock()
             .ok()
-            .and_then(|mut conns| conns.remove(&self.id))
-            .map(|c| c.closed)
+            .and_then(|conns| conns.get(&self.id).map(|c| c.closed))
             .unwrap_or(true);
-        if !closed {
-            send(&channel::encode_tcp_close(self.id));
+        if closed {
+            return Err("socket closed".to_string());
         }
+        send(&channel::encode_tcp_data(self.id, datagram));
+        Ok(())
+    }
+
+    /// Wait for the next datagram. Fails once the socket is closed (the
+    /// proxy's timeout, or an error such as an ICMP unreachable).
+    pub async fn recv(&self) -> Result<Vec<u8>, String> {
+        poll_fn(|cx| {
+            let mut conns = match CONNS.lock() {
+                Ok(c) => c,
+                Err(_) => return Poll::Ready(Err("egress connections lock poisoned".to_string())),
+            };
+            let Some(conn) = conns.get_mut(&self.id) else {
+                return Poll::Ready(Err("socket gone".to_string()));
+            };
+            if let Some(d) = conn.datagrams.pop_front() {
+                return Poll::Ready(Ok(d));
+            }
+            if conn.closed {
+                return Poll::Ready(Err("timed out".to_string()));
+            }
+            conn.waker = Some(cx.waker().clone());
+            Poll::Pending
+        })
+        .await
+    }
+}
+
+impl Drop for UdpConn {
+    fn drop(&mut self) {
+        release(self.id);
+    }
+}
+
+/// Allocate an id and its state for a new connection.
+fn register(udp: bool) -> Result<u32, String> {
+    if !is_available() {
+        return Err("egress data channel not initialised".to_string());
+    }
+    let mut conns = CONNS.lock().map_err(|_| "egress connections lock poisoned")?;
+    let id = alloc_id(&conns);
+    conns.insert(id, Conn { udp, ..Conn::default() });
+    Ok(id)
+}
+
+/// Forget a connection, and close it at the proxy unless the proxy did.
+fn release(id: u32) {
+    let closed = CONNS
+        .lock()
+        .ok()
+        .and_then(|mut conns| conns.remove(&id))
+        .map(|c| c.closed)
+        .unwrap_or(true);
+    if !closed {
+        send(&channel::encode_tcp_close(id));
     }
 }

@@ -213,6 +213,7 @@ impl IngressServer {
 
             ChannelMsgType::TcpConnect
             | ChannelMsgType::TcpConnected
+            | ChannelMsgType::UdpOpen
             | ChannelMsgType::Tick => {
                 // Outbound-connection lifecycle messages belong to the
                 // peer-link layer (routed by conn-id range before this
