@@ -52,6 +52,11 @@ The egress module provides outbound HTTPS from inside the enclave.  It
 has no module-level management operations — attestation server management
 is handled at the core level (see `SetAttestationServers` above).
 
+Plain HTTPS offers TLS 1.3 and 1.2; RA-TLS is TLS 1.3 only. A request made
+from a request task waits without blocking the enclave, and the host closes
+its connection 60 s after it opened (see
+[wasm-runtime.md](wasm-runtime.md#concurrency)).
+
 ### Vault
 
 | Operation | Auth | Role | Description |
@@ -379,7 +384,7 @@ Load (or replace) a WASM component.  Requires **Manager** role.
 | `bytes` | byte[] | yes | Raw WASM component bytecode |
 | `hostname` | string | no | SNI hostname for per-app TLS certificate (defaults to `name`) |
 | `encryption_key` | string | no | Hex-encoded 32-byte AES-256 key for per-app KV encryption. If omitted, a random key is generated inside the enclave via RDRAND |
-| `max_fuel` | u64 | no | Maximum fuel budget per call. Defaults to 10 000 000 (~a few hundred ms of compute) |
+| `max_fuel` | u64 | no | Maximum fuel budget per call. Defaults to 1 000 000 000 (about a second or two of compute); a call yields to other requests every 1 000 000 |
 | `permissions` | AppPermissions | no | Per-function access policy with app-developer OIDC. If omitted, all functions are public (no auth) || `mcp_enabled` | bool | no | Whether to expose this app as an MCP tool server. Defaults to `true`. Set to `false` to disable MCP tool generation |
 **Response** (success)
 

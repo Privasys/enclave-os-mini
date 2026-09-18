@@ -31,8 +31,9 @@ access enclave memory, other apps' data, or the enclave's private keys.
 ## Wasmtime
 
 Enclave OS uses [Wasmtime](https://wasmtime.dev/) as the WASM runtime,
-specifically a [Privasys fork](https://github.com/Privasys/wasmtime) on the
-`sgx` branch.
+specifically a [Privasys fork](https://github.com/Privasys/wasmtime), pinned
+by release tag (`privasys-v0.3.0` = upstream v48.0.2 plus one SGX commit, see
+[wasmtime-fork.md](wasmtime-fork.md)).
 
 ### Why Wasmtime?
 
@@ -56,7 +57,9 @@ The Wasmtime engine inside the enclave is configured for the SGX constraints:
 | Memory guard size | 64 KiB | No virtual memory overcommit in SGX |
 | Copy-on-write | disabled | No disk-backed memory images in SGX |
 | Cranelift | excluded | AOT only — no compiler in the TCB |
-| Async | excluded | Synchronous execution model |
+| Async | enabled | Every call runs on a fiber, so a host import can suspend the guest (see [Concurrency](#concurrency)) |
+| Fiber stack | 1 MiB (`max_wasm_stack` 512 KiB) | Guest frames plus the host code a guest calls into; heap-allocated, registered with the SGX runtime |
+| Fuel yield interval | 1,000,000 | A long call gives the event loop back every few milliseconds |
 | Pooling allocator | excluded | Not needed for single-threaded model |
 
 ### SGX Platform Layer
@@ -134,8 +137,13 @@ fetch(method: u32, url: string, headers: list<(string, string)>, body: option<li
 Methods: 0=GET, 1=POST, 2=PUT, 3=DELETE, 4=PATCH, 5=HEAD, 6=OPTIONS.
 
 TLS terminates **inside the enclave** using `rustls` + Mozilla root CAs.
-The host only transports encrypted TCP bytes via OCALLs — it never sees
-request URLs, headers, or response bodies in plaintext.
+The host only transports encrypted TCP bytes: it never sees request URLs,
+headers, or response bodies in plaintext. Plain HTTPS offers TLS 1.3 and
+1.2; an RA-TLS request is TLS 1.3 only.
+
+The guest sees a blocking call, but the enclave does not block: while the
+request waits on the network, the guest is suspended and the enclave serves
+other requests (see [Concurrency](#concurrency)).
 
 Only `https://` URLs are accepted; `http://` is rejected.
 
@@ -220,7 +228,7 @@ hostnames, and the complete Python loading example.
 
 2. **Call** — client sends function name + typed parameters.  The enclave:
    - Looks up the app in the registry
-   - Creates a fresh `Store` with 10M fuel and a new `Instance`
+   - Creates a fresh `Store` with the app's fuel budget and a new `Instance`
    - Sets up WASI + SDK host imports with per-app `AppContext`
    - Invokes the exported function
    - Returns typed results or error message
@@ -371,12 +379,17 @@ across calls and enclave restarts (same MRENCLAVE required to unseal).
 ### Fuel Metering
 
 Each call gets a fuel budget that limits computation.  The default is
-**10 million fuel units** (~a few hundred ms of compute).  Managers can
+**1 billion fuel units** (about a second or two of compute; decoding a
+typical web page after `https.fetch` takes 25 to 45 million).  Managers can
 set a custom `max_fuel` per app at load time.  When the budget is
-exhausted, the WASM instance traps.
+exhausted, the WASM instance traps and the call fails with
+`wasm trap: all fuel consumed by WebAssembly`.
 
-This prevents infinite loops and ensures fair resource sharing when multiple
-apps are loaded.
+The budget ends a runaway call. Fairness between calls comes from the fuel
+yield interval: every 1 million fuel units the guest gives the event loop
+back, so a long computation does not hold up other requests (see
+[Concurrency](#concurrency)). Billing counts the fuel consumed, not the
+budget.
 
 #### Fuel Metrics
 
@@ -412,6 +425,50 @@ When an app is unloaded via `wasm_unload`, its counters are removed from
 the in-memory store.  The next `Metrics` call will persist the
 remaining apps' counters (effectively garbage-collecting the old app).
 
+### Concurrency
+
+The enclave has one event loop, on one SGX thread, for every app it hosts.
+Requests still never wait for each other's network I/O or long computations:
+
+- **Requests run as tasks.** Each ingress request runs its handler on its
+  own fiber (1 MiB, pooled). When the handler has to wait, the task
+  suspends and the event loop goes on serving other connections; the task
+  resumes when its waker fires. A connection has at most one suspended
+  request at a time (HTTP/1.1 answers in order, the next requests stay
+  buffered), and at most 8 requests are suspended at once; past that, a
+  request runs to completion inline.
+- **Guest calls run on fibers.** wasmtime runs each call on a fiber of its
+  own, so an async host import suspends the guest in the middle of a call.
+  The guest cannot tell: `https.fetch` still looks like a blocking call.
+- **Egress waits suspend, not block.** Inside a request task,
+  `https.fetch` does its TLS and HTTP exchange over sockets the host TCP
+  proxy drives (`TcpConnect` / `TcpData` / `TcpClose` on the data channel,
+  connection ids from `0xC000_0000` up). A read with no data suspends the
+  guest and its task; the proxy's next message wakes them. Outside a task
+  (e.g. a raft replay) the call uses the blocking RPC sockets.
+- **Long computations yield.** Every 1 million fuel units a guest call
+  yields, and the event loop serves other requests before resuming it.
+- **Bounded waits.** The proxy closes an egress connection 60 s after it
+  opened, so a server that never answers, or trickles one byte at a time,
+  fails the request instead of holding its slot.
+
+Measured on SGX hardware: while fetches of a 1.3 MB page ran back to back,
+a concurrent `hello` answered in 15 ms median (56 ms worst) instead of
+~245 ms; during a fetch to a server that accepts the connection and never
+answers, 1,472 `hello` calls answered in 15 ms median and the fetch failed
+after 60 s.
+
+Two rules keep this sound. Code running in a task must not hold a lock
+another request may take when it waits (every task shares the one thread,
+so the second request would block the thread for good). And a wait inside
+a guest call's synchronous host function blocks rather than suspends, so
+wasmtime's frames are never switched out from under another guest call.
+
+Fiber stacks live on the enclave heap. The SGX runtime only accepts an
+exception (such as the `CPUID` the enclave emulates) raised on a stack it
+knows, so every fiber stack is registered with it
+(`sgx_register_alt_stack`, Privasys Teaclave SDK `privasys-v0.5.0`).
+
 ### Memory Limits
 
 | Resource | Limit |
@@ -419,4 +476,6 @@ remaining apps' counters (effectively garbage-collecting the old app).
 | Linear memory per instance | 4 MiB |
 | Code memory pool (shared) | 16 MiB |
 | Memory guard pages | 64 KiB |
-| Default fuel budget per call | 10,000,000 (configurable via `max_fuel`) |
+| Default fuel budget per call | 1,000,000,000 (configurable via `max_fuel`) |
+| Fiber stack per call | 1 MiB |
+| Requests suspended at once | 8 (further requests run to completion inline) |

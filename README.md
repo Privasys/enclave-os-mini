@@ -10,7 +10,7 @@ single SGX enclave.
 | Feature | Description |
 |---------|-------------|
 | **RA-TLS Ingress** | TLS 1.3 with SGX DCAP quotes and config Merkle root embedded in X.509 certificates |
-| **HTTPS Egress** | Outbound HTTPS from inside the enclave (TLS terminated in enclave, network I/O via host RPC) |
+| **HTTPS Egress** | Outbound HTTPS from inside the enclave (TLS terminated in enclave, sockets owned by the host). A request waiting on the network suspends and the enclave keeps serving the others |
 | **Sealed Key-Value Store** | Encrypted KV database — keys HMAC'd, values AES-256-GCM'd — master key sealed to MRENCLAVE |
 | **WASM Runtime** | Execute WebAssembly apps inside SGX with WASI and Enclave OS SDK interfaces |
 | **OIDC-Authenticated Vault** | Store and retrieve secrets gated by OIDC RBAC with dual-path GetSecret (OIDC owner + RA-TLS TEE) |
@@ -123,10 +123,11 @@ Clients verify: **MRENCLAVE** (code identity) + **Config Merkle Root** (config i
 
 | Document | Description |
 |----------|-------------|
-| [Architecture](docs/architecture.md) | Rust + SGX rationale, Teaclave fork, composable module design, SPSC queues, RPC protocol, sealed config |
+| [Architecture](docs/architecture.md) | Rust + SGX rationale, Teaclave fork, composable module design, SPSC queues, RPC protocol, the event loop and request tasks, sealed config |
 | [RA-TLS and Attestation](docs/ra-tls.md) | Certificate trust chain, X.509 OID extensions, Config Merkle tree, verification strategies, per-app certificates |
 | [Trusted Time](docs/trusted-time.md) | The one time source: sealed floor, NTS (RFC 8915), platform monitor contracts, UDP host ops |
-| [WASM Runtime](docs/wasm-runtime.md) | Wasmtime fork for SGX, WASI + Enclave OS SDK interfaces, per-app isolation, building WASM apps |
+| [WASM Runtime](docs/wasm-runtime.md) | Wasmtime fork for SGX, WASI + Enclave OS SDK interfaces, per-app isolation, concurrency and non-blocking egress, building WASM apps |
+| [Wasmtime Fork](docs/wasmtime-fork.md) | What the SGX port changes, fibers in SGX, updating to a new upstream release |
 | [Building and Usage](docs/building.md) | Prerequisites, build commands, running the enclave, WASM builds, client libraries, production deployment |
 | [Layer 4 Proxy](docs/layer4-proxy.md) | Caddy (caddy-l4) and HAProxy configuration for TCP passthrough |
 
@@ -136,8 +137,8 @@ Clients verify: **MRENCLAVE** (code identity) + **Config Merkle Root** (config i
 |------------|-------------|
 | [ra-tls-clients](https://github.com/Privasys/ra-tls-clients) | RA-TLS client libraries (Go, Python, Rust, TypeScript, C#) |
 | [wasm-app-example](https://github.com/Privasys/wasm-app-example) | Example WASM app + composition crate for Enclave OS |
-| [teaclave-sgx-sdk](https://github.com/Privasys/teaclave-sgx-sdk) | Privasys fork of Teaclave SGX SDK |
-| [wasmtime](https://github.com/Privasys/wasmtime) | Privasys fork of Wasmtime (branch `sgx`, AOT-only) |
+| [teaclave-sgx-sdk](https://github.com/Privasys/teaclave-sgx-sdk) | Privasys fork of Teaclave SGX SDK (tag `privasys-v0.5.0`) |
+| [wasmtime](https://github.com/Privasys/wasmtime) | Privasys fork of Wasmtime (tag `privasys-v0.3.0` = v48.0.2, AOT-only) |
 
 ## Third-Party Dependencies
 

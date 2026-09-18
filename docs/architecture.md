@@ -42,13 +42,18 @@ It supplies:
 ### Our Fork
 
 Enclave OS uses a [Privasys fork](https://github.com/privasys/teaclave-sgx-sdk)
-of the Teaclave SGX SDK, maintained on the `main` branch.  The fork tracks
-upstream with the following patches:
+of the Teaclave SGX SDK, maintained on the `main` branch and pinned by
+release tag (`privasys-v0.5.0`).  The fork tracks upstream with the
+following patches:
 
 - **Rust nightly-2026-06-21** support (updated target JSON, sysroot build)
 - **SGX SDK 2.29** compatibility
 - Fixes for `target-pointer-width` and `target-c-int-width` types in the
   `x86_64-unknown-linux-sgx.json` target specification
+- **Alternate stacks** (`sgx_register_alt_stack`): the exception path
+  accepts an exception raised on a registered stack (the enclave's fiber
+  stacks, see [wasm-runtime.md](wasm-runtime.md#concurrency)) instead of
+  crashing the enclave with `StackOverRun`
 
 We use only the minimum set of Teaclave crates:
 
@@ -152,8 +157,8 @@ There are **two independent channel pairs**:
 
 | Channel | Direction | Purpose |
 |---------|-----------|---------|
-| **Data Channel** | host ↔ enclave | Raw TCP bytes. The host TCP Proxy writes inbound socket data and reads enclave TLS output. |
-| **RPC Channel** | enclave ↔ host | Control-plane requests: KV reads/writes, HTTPS egress, etc. |
+| **Data Channel** | host ↔ enclave | Raw TCP bytes. The host TCP Proxy writes inbound socket data and reads enclave TLS output; it also owns the enclave's outbound connections (egress from request tasks, raft peer links, NTS for the clock routes) and UDP sockets, driven by `TcpConnect` / `UdpOpen`. |
+| **RPC Channel** | enclave ↔ host | Control-plane requests: KV reads/writes, time, blocking sockets for egress outside a request task, etc. |
 
 Separating data and control planes means network I/O never contends with
 KV or egress RPC.
@@ -252,6 +257,27 @@ checks them against a sealed floor, the platform monitor and NTS (see
 [Trusted Time](trusted-time.md)). The UDP ops carry the NTS client's NTP
 leg; like every host-carried byte stream, their datagrams are
 authenticated end to end inside the enclave.
+
+### The Event Loop and Request Tasks
+
+The enclave runs one event loop on one SGX thread (`ecall_run`). It reads
+the Data Channel, feeds TLS bytes to the RA-TLS sessions, and dispatches
+complete HTTP requests to the modules.
+
+In WASM builds each request runs as a **task**: its handler runs on a fiber
+of its own, and whenever it has to wait (a guest's `https.fetch`, a guest
+call yielding after its fuel slice, an NTS quorum started by the clock's own
+routes) the task suspends and the loop goes on with other connections. The
+loop resumes a task once something wakes it, typically a Data Channel
+message for its outbound connection. A connection has at most one suspended
+request (HTTP/1.1 answers in order); at most 8 are suspended at once.
+
+Waits that cannot suspend still block, as before: code outside a task
+(start-up, raft replay), a wait inside a guest call's synchronous host
+function, and a trusted-time read, which may come from under any lock. A
+task must not suspend while holding a lock another request may take: every
+task shares the one thread, so the next request to take the lock would block
+it for good.
 
 ### EDL Interface
 

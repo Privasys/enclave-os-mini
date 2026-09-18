@@ -169,7 +169,8 @@ TCP sockets tunnelled through host OCALLs.
 | Property | Value |
 |----------|-------|
 | **Isolation** | Each call creates a fresh `Store` + `Instance` (stateless) |
-| **Fuel budget** | 10,000,000 instructions per call |
+| **Fuel budget** | 1,000,000,000 per call by default (`max_fuel`), yielding to other requests every 1,000,000 |
+| **Waiting** | `https.fetch` looks blocking to the guest; the enclave serves other requests meanwhile |
 | **Persistence** | Via `wasi:filesystem` → `sync-data()` → sealed KV store |
 | **Key persistence** | Via `keystore/persist-key()` → sealed KV store |
 | **Max WASM memory** | 4 MiB static allocation |
