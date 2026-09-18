@@ -65,6 +65,15 @@ const IDLE_TIMEOUT: Duration = Duration::from_secs(300);
 /// How often the proxy loop scans for idle connections.
 const IDLE_SCAN_INTERVAL: Duration = Duration::from_secs(30);
 
+/// Total lifetime of an egress connection (an HTTPS request made by the
+/// enclave), connect included. A peer that keeps a request alive by
+/// trickling bytes is cut off here; the enclave's waiting request then
+/// fails instead of holding its slot forever.
+const EGRESS_MAX_LIFETIME: Duration = Duration::from_secs(60);
+
+/// How often the proxy loop checks egress lifetimes.
+const EGRESS_SCAN_INTERVAL: Duration = Duration::from_secs(1);
+
 /// TCP keepalive parameters applied to every accepted socket. The kernel
 /// sends the first probe after `KEEPALIVE_IDLE`, then `KEEPALIVE_RETRIES`
 /// further probes spaced by `KEEPALIVE_INTERVAL`. Dead peers are reaped
@@ -77,6 +86,8 @@ const KEEPALIVE_RETRIES: u32 = 3;
 struct ConnState {
     stream: TcpStream,
     last_activity: Instant,
+    /// When the connection was accepted, or its outbound connect started.
+    opened: Instant,
 }
 
 /// An enclave-requested outbound connection whose non-blocking connect
@@ -114,6 +125,8 @@ pub struct TcpProxy {
     ready: bool,
     /// Last time we ran the idle-connection sweep.
     last_idle_scan: Instant,
+    /// Last time we checked egress connection lifetimes.
+    last_egress_scan: Instant,
     /// Last raft tick sent (peer-port mode only).
     last_tick: Instant,
 }
@@ -157,6 +170,7 @@ impl TcpProxy {
             shutdown,
             ready: false,
             last_idle_scan: Instant::now(),
+            last_egress_scan: Instant::now(),
             last_tick: Instant::now(),
         })
     }
@@ -194,6 +208,10 @@ impl TcpProxy {
             if self.last_idle_scan.elapsed() >= IDLE_SCAN_INTERVAL {
                 self.reap_idle_connections();
                 self.last_idle_scan = Instant::now();
+            }
+            if self.last_egress_scan.elapsed() >= EGRESS_SCAN_INTERVAL {
+                self.reap_expired_egress();
+                self.last_egress_scan = Instant::now();
             }
 
             // 5. Raft timer ticks (only when a peer port is configured).
@@ -311,7 +329,7 @@ impl TcpProxy {
 
             self.connections.insert(
                 conn_id,
-                ConnState { stream, last_activity: Instant::now() },
+                ConnState { stream, last_activity: Instant::now(), opened: Instant::now() },
             );
             accepted = true;
         }
@@ -455,7 +473,11 @@ impl TcpProxy {
             );
             self.connections.insert(
                 conn_id,
-                ConnState { stream: pending.stream, last_activity: Instant::now() },
+                ConnState {
+                    stream: pending.stream,
+                    last_activity: Instant::now(),
+                    opened: pending.started,
+                },
             );
             self.data_tx.send(&channel::encode_tcp_connected(conn_id));
             // Flush any TLS bytes the enclave emitted while connecting.
@@ -535,6 +557,30 @@ impl TcpProxy {
             self.connections.remove(&conn_id);
             let msg = channel::encode_tcp_close(conn_id);
             self.data_tx.send(&msg);
+        }
+    }
+
+    /// Close egress connections older than `EGRESS_MAX_LIFETIME`, and tell
+    /// the enclave.
+    fn reap_expired_egress(&mut self) {
+        let now = Instant::now();
+        let expired: Vec<u32> = self
+            .connections
+            .iter()
+            .filter(|(&id, c)| {
+                channel::conn_id_is_egress(id)
+                    && now.duration_since(c.opened) >= EGRESS_MAX_LIFETIME
+            })
+            .map(|(&id, _)| id)
+            .collect();
+        for conn_id in expired {
+            warn!(
+                "Closing egress conn_id={}: open for more than {}s",
+                conn_id,
+                EGRESS_MAX_LIFETIME.as_secs()
+            );
+            self.connections.remove(&conn_id);
+            self.data_tx.send(&channel::encode_tcp_close(conn_id));
         }
     }
 

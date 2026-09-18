@@ -44,7 +44,9 @@
 //!
 //! - `[1, 0x3FFF_FFFF]` — proxy-assigned, inbound on the ingress port
 //! - `[0x4000_0000, 0x7FFF_FFFF]` — proxy-assigned, inbound on the peer port
-//! - `[0x8000_0000, 0xFFFF_FFFF]` — enclave-assigned, outbound (`TcpConnect`)
+//! - `[0x8000_0000, 0xFFFF_FFFF]` — enclave-assigned, outbound (`TcpConnect`):
+//!   `[0x8000_0000, 0xBFFF_FFFF]` for the raft peer link,
+//!   `[0xC000_0000, 0xFFFF_FFFF]` for egress (HTTPS from requests)
 //!
 //! Outbound flow: the enclave picks a conn_id from its range and sends
 //! `TcpConnect`. The proxy performs a non-blocking connect; `TcpData`
@@ -145,6 +147,10 @@ pub const CONN_ID_PEER_IN_BASE: u32 = 0x4000_0000;
 /// First conn_id of the enclave-assigned *outbound* range.
 pub const CONN_ID_OUTBOUND_BASE: u32 = 0x8000_0000;
 
+/// First conn_id of the outbound sub-range used by egress; the peer link
+/// allocates below it.
+pub const CONN_ID_EGRESS_BASE: u32 = 0xC000_0000;
+
 /// Is this conn_id an inbound connection on the ingress port?
 #[inline]
 pub fn conn_id_is_ingress(conn_id: u32) -> bool {
@@ -161,6 +167,12 @@ pub fn conn_id_is_peer_inbound(conn_id: u32) -> bool {
 #[inline]
 pub fn conn_id_is_outbound(conn_id: u32) -> bool {
     conn_id >= CONN_ID_OUTBOUND_BASE
+}
+
+/// Is this conn_id an outbound connection opened by egress?
+#[inline]
+pub fn conn_id_is_egress(conn_id: u32) -> bool {
+    conn_id >= CONN_ID_EGRESS_BASE
 }
 
 // ========================================================================
@@ -294,6 +306,10 @@ mod tests {
         assert!(conn_id_is_outbound(CONN_ID_OUTBOUND_BASE));
         assert!(conn_id_is_outbound(u32::MAX));
         assert!(!conn_id_is_outbound(CONN_ID_OUTBOUND_BASE - 1));
+        assert!(!conn_id_is_egress(CONN_ID_EGRESS_BASE - 1));
+        assert!(conn_id_is_egress(CONN_ID_EGRESS_BASE));
+        assert!(conn_id_is_egress(u32::MAX));
+        assert!(conn_id_is_outbound(CONN_ID_EGRESS_BASE));
     }
 
     #[test]

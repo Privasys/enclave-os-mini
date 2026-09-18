@@ -183,7 +183,11 @@ impl PeerLink {
             .map_err(|e| format!("peer client conn: {e:?}"))?;
 
         let conn_id = self.next_out;
-        self.next_out = self.next_out.checked_add(1).unwrap_or(CONN_ID_OUTBOUND_BASE);
+        // Egress owns the ids from CONN_ID_EGRESS_BASE up.
+        self.next_out = match self.next_out + 1 {
+            next if next < channel::CONN_ID_EGRESS_BASE => next,
+            _ => CONN_ID_OUTBOUND_BASE,
+        };
 
         crate::data_tx().send(&channel::encode_tcp_connect(conn_id, addr));
         self.sessions.insert(
@@ -629,7 +633,8 @@ impl PeerLink {
 
     /// Is the given conn_id one of ours (either range)?
     pub fn owns(conn_id: u32) -> bool {
-        conn_id_is_peer_inbound(conn_id) || conn_id_is_outbound(conn_id)
+        conn_id_is_peer_inbound(conn_id)
+            || (conn_id_is_outbound(conn_id) && !channel::conn_id_is_egress(conn_id))
     }
 }
 

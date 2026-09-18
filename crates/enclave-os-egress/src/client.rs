@@ -4,12 +4,15 @@
 //! HTTPS egress client – makes outbound HTTPS requests from inside the enclave.
 //!
 //! Uses rustls for TLS and a minimal HTTP/1.1 implementation. Network I/O
-//! flows through OCALLs to the host, but the TLS termination happens inside
-//! the enclave, so the host never sees plaintext.
+//! goes through the host, but the TLS termination happens inside the
+//! enclave, so the host never sees plaintext.
 //!
-//! The single public entry point is [`https_fetch`], which returns an
-//! [`HttpResponse`] (status + headers + body) and supports all HTTP methods,
-//! custom headers, and optional RA-TLS verification.
+//! [`https_fetch`] blocks on the host's sockets (RPC). [`https_fetch_async`]
+//! is for code running in a request task: it uses sockets the host proxy
+//! drives ([`crate::netchan`]), and its network waits suspend the task
+//! instead of the enclave. Both return an [`HttpResponse`] (status + headers
+//! + body) and support all HTTP methods, custom headers, and optional RA-TLS
+//! verification.
 
 use std::io::{Read, Write};
 use std::string::String;
@@ -341,17 +344,62 @@ pub fn https_fetch(
     ratls: Option<&RaTlsPolicy>,
 ) -> Result<HttpResponse, String> {
     let (host, port, path) = parse_url(url)?;
+    let request_bytes = build_request(method, &host, &path, headers, body)?;
 
+    // Blocking RPC sockets never leave the future pending.
+    poll_to_completion(https_request_inner(
+        &host,
+        port,
+        &request_bytes,
+        root_store,
+        ratls,
+        false,
+    ))
+}
+
+/// [`https_fetch`] for code running in a request task: the network waits
+/// suspend the task instead of blocking the enclave, over sockets the host
+/// proxy drives ([`crate::netchan`]). Falls back to blocking sockets when
+/// the data channel is not up.
+pub async fn https_fetch_async(
+    method: &str,
+    url: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+    root_store: &RootCertStore,
+    ratls: Option<&RaTlsPolicy>,
+) -> Result<HttpResponse, String> {
+    let (host, port, path) = parse_url(url)?;
+    let request_bytes = build_request(method, &host, &path, headers, body)?;
+    https_request_inner(
+        &host,
+        port,
+        &request_bytes,
+        root_store,
+        ratls,
+        crate::netchan::is_available(),
+    )
+    .await
+}
+
+/// The HTTP/1.1 request bytes. They can carry bearer tokens and other
+/// protected material, so the buffer wipes itself when dropped.
+fn build_request(
+    method: &str,
+    host: &str,
+    path: &str,
+    headers: &[(String, String)],
+    body: Option<&[u8]>,
+) -> Result<Zeroizing<Vec<u8>>, String> {
     // The URL and headers can come from a WASM guest and are interpolated
     // below; refuse anything that would break out of its line.
     enclave_os_common::protocol::check_outbound_request(
-        &host,
-        &path,
+        host,
+        path,
         headers,
         body.map(|b| b.len()),
     )?;
 
-    // Build HTTP/1.1 request.
     let mut request = format!(
         "{} {} HTTP/1.1\r\nHost: {}\r\nConnection: close\r\n",
         method, path, host
@@ -366,36 +414,108 @@ pub fn https_fetch(
     }
     request.push_str("\r\n");
 
-    // The assembled request can carry bearer tokens and other protected
-    // material — wipe the plaintext copy when it goes out of scope.
     let mut request_bytes = Zeroizing::new(request.into_bytes());
     if let Some(b) = body {
         request_bytes.extend_from_slice(b);
     }
+    Ok(request_bytes)
+}
 
-    https_request_inner(&host, port, &request_bytes, root_store, ratls)
+/// Poll a future that never waits (all its I/O blocks) to completion.
+fn poll_to_completion<F: core::future::Future>(fut: F) -> F::Output {
+    use core::task::{Context, Poll, Waker};
+    let mut fut = core::pin::pin!(fut);
+    let mut cx = Context::from_waker(Waker::noop());
+    loop {
+        if let Poll::Ready(out) = fut.as_mut().poll(&mut cx) {
+            return out;
+        }
+    }
+}
+
+/// Where an HTTPS request's bytes go.
+enum Transport {
+    /// A blocking socket in the host, over RPC.
+    Rpc(i32),
+    /// A socket the host proxy drives; reads suspend the caller's task.
+    Chan(crate::netchan::NetConn),
+}
+
+impl Transport {
+    fn connect(host: &str, port: u16, async_io: bool) -> Result<Self, String> {
+        if async_io {
+            crate::netchan::NetConn::connect(host, port).map(Transport::Chan)
+        } else {
+            ocall::net_tcp_connect(host, port)
+                .map(Transport::Rpc)
+                .map_err(|e| format!("TCP connect failed: {}", e))
+        }
+    }
+
+    fn send(&mut self, data: &[u8]) -> Result<(), ()> {
+        match self {
+            Transport::Rpc(fd) => {
+                let mut offset = 0;
+                while offset < data.len() {
+                    offset += ocall::net_send(*fd, &data[offset..]).map_err(|_| ())?;
+                }
+                Ok(())
+            }
+            Transport::Chan(conn) => conn.send(data).map_err(|_| ()),
+        }
+    }
+
+    async fn recv(&mut self, buf: &mut [u8]) -> Result<usize, String> {
+        match self {
+            Transport::Rpc(fd) => ocall::net_recv(*fd, buf).map_err(|e| format!("{e}")),
+            Transport::Chan(conn) => conn.recv(buf).await,
+        }
+    }
+
+    fn close(self) {
+        match self {
+            Transport::Rpc(fd) => ocall::net_close(fd),
+            Transport::Chan(conn) => drop(conn),
+        }
+    }
 }
 
 /// Internal: perform an HTTPS request and return the full parsed response.
-fn https_request_inner(
+/// `async_io` selects the data-channel transport.
+async fn https_request_inner(
     host: &str,
     port: u16,
     request: &[u8],
     root_store: &RootCertStore,
     ratls: Option<&RaTlsPolicy>,
+    async_io: bool,
 ) -> Result<HttpResponse, String> {
     let (tls_config, identity_auth) = build_client_config(root_store, ratls)
         .map_err(|e| e.to_string())?;
 
-    let fd = ocall::net_tcp_connect(host, port)
-        .map_err(|e| format!("TCP connect failed: {}", e))?;
+    let mut net = Transport::connect(host, port, async_io)?;
+    let result =
+        https_exchange(&mut net, host, request, tls_config, identity_auth, ratls).await;
+    net.close();
+    result
+}
 
+/// The TLS session and HTTP exchange on a connected transport.
+async fn https_exchange(
+    net: &mut Transport,
+    host: &str,
+    request: &[u8],
+    tls_config: Arc<ClientConfig>,
+    identity_auth: Option<Arc<IdentityClientAuth>>,
+    ratls: Option<&RaTlsPolicy>,
+) -> Result<HttpResponse, String> {
     let server_name = ServerName::try_from(host.to_string())
         .map_err(|_| "invalid server name".to_string())?;
     let mut tls_conn = ClientConnection::new(tls_config, server_name.to_owned())
         .map_err(|e| format!("TLS init failed: {}", e))?;
 
-    tls_handshake(fd, &mut tls_conn)
+    tls_handshake(net, &mut tls_conn)
+        .await
         .map_err(|e| format!("TLS handshake failed: {e}"))?;
 
     // RA-TLS v2: the evidence exchange runs after the handshake and before
@@ -404,7 +524,7 @@ fn https_request_inner(
     // challenge mode, from our context and this connection's exporter value,
     // attestation servers, dependencies). Fails closed.
     if let Some(policy) = ratls {
-        attest_exchange(fd, &mut tls_conn, policy, identity_auth.as_ref())?;
+        attest_exchange(net, &mut tls_conn, policy, identity_auth.as_ref()).await?;
     }
 
     // Send the HTTP request.
@@ -412,7 +532,7 @@ fn https_request_inner(
         let mut writer = tls_conn.writer();
         writer.write_all(request).map_err(|e| format!("write failed: {}", e))?;
     }
-    flush_tls(fd, &mut tls_conn).map_err(|_| "flush failed".to_string())?;
+    flush_tls(net, &mut tls_conn).map_err(|_| "flush failed".to_string())?;
 
     // Read the complete response with cursor-based multi-record TLS
     // reads. We MUST drain decrypted plaintext between successive
@@ -431,10 +551,10 @@ fn https_request_inner(
     tls_conn.set_buffer_limit(None);
 
     'outer: loop {
-        match ocall::net_recv(fd, &mut net_buf) {
+        match net.recv(&mut net_buf).await {
             Ok(0) => break,
             Ok(n) => {
-                // A single net_recv may contain multiple TLS records.
+                // A single recv may contain multiple TLS records.
                 // Feed them all to rustls, draining plaintext after
                 // each decryption pass.
                 let mut cursor = std::io::Cursor::new(&net_buf[..n]);
@@ -475,10 +595,9 @@ fn https_request_inner(
         }
     }
 
-    // Close.
+    // Close (the caller closes the transport).
     tls_conn.send_close_notify();
-    let _ = flush_tls(fd, &mut tls_conn);
-    ocall::net_close(fd);
+    let _ = flush_tls(net, &mut tls_conn);
 
     // Parse HTTP response.
     let (status, headers, mut body) = parse_http_response(&response_data)?;
@@ -695,10 +814,10 @@ fn build_client_config(
 }
 
 /// Perform the TLS handshake with cursor-based multi-record reads.
-fn tls_handshake(fd: i32, tls_conn: &mut ClientConnection) -> Result<(), String> {
+async fn tls_handshake(net: &mut Transport, tls_conn: &mut ClientConnection) -> Result<(), String> {
     loop {
         // Flush any pending outbound TLS data (e.g. ClientHello, Finished).
-        flush_tls(fd, tls_conn).map_err(|_| String::from("flush failed"))?;
+        flush_tls(net, tls_conn).map_err(|_| String::from("flush failed"))?;
 
         // In TLS 1.3 the handshake completes as soon as the client Finished
         // is flushed — there is nothing more to receive. Checking *after*
@@ -709,7 +828,7 @@ fn tls_handshake(fd: i32, tls_conn: &mut ClientConnection) -> Result<(), String>
 
         // Read the next chunk of TLS handshake data from the server.
         let mut buf = vec![0u8; 16384];
-        match ocall::net_recv(fd, &mut buf) {
+        match net.recv(&mut buf).await {
             Ok(n) if n > 0 => {
                 // A single recv may contain multiple TLS records; drain
                 // them all via cursor.
@@ -738,23 +857,14 @@ fn tls_handshake(fd: i32, tls_conn: &mut ClientConnection) -> Result<(), String>
     }
 }
 
-/// Flush TLS output to the network via OCALL.
-fn flush_tls(fd: i32, tls_conn: &mut ClientConnection) -> Result<(), i32> {
+/// Flush TLS output to the network.
+fn flush_tls(net: &mut Transport, tls_conn: &mut ClientConnection) -> Result<(), i32> {
     let mut buf = vec![0u8; 16384];
     loop {
         let mut cursor = std::io::Cursor::new(&mut buf[..]);
         match tls_conn.write_tls(&mut cursor) {
             Ok(0) => break,
-            Ok(n) => {
-                let data = &buf[..n];
-                let mut offset = 0;
-                while offset < data.len() {
-                    match ocall::net_send(fd, &data[offset..]) {
-                        Ok(sent) => offset += sent,
-                        Err(_) => return Err(-1),
-                    }
-                }
-            }
+            Ok(n) => net.send(&buf[..n]).map_err(|_| -1)?,
             Err(_) => return Err(-1),
         }
     }
@@ -984,8 +1094,8 @@ fn now_unix() -> Result<u64, String> {
 /// The RA-TLS v2 evidence exchange on an established connection, before any
 /// application data: request the server's evidence in the policy's mode,
 /// verify it, and present our own evidence when the server requires it.
-fn attest_exchange(
-    fd: i32,
+async fn attest_exchange(
+    net: &mut Transport,
     tls_conn: &mut ClientConnection,
     policy: &RaTlsPolicy,
     identity: Option<&Arc<IdentityClientAuth>>,
@@ -1033,7 +1143,7 @@ fn attest_exchange(
         hctx = Some(h);
     }
     let body = serde_json::to_vec(&req).map_err(|e| format!("RA-TLS: attest request: {e}"))?;
-    let (status, resp_body) = http_round_trip(fd, tls_conn, attest::ATTEST_PATH, &body)?;
+    let (status, resp_body) = http_round_trip(net, tls_conn, attest::ATTEST_PATH, &body).await?;
     if status == 404 {
         return Err("RA-TLS: server has no v2 evidence endpoint (/__privasys/attest)".into());
     }
@@ -1051,7 +1161,7 @@ fn attest_exchange(
         let identity = identity.ok_or_else(|| {
             "RA-TLS: server requires client evidence but this policy presents no identity".to_string()
         })?;
-        present_client_evidence(fd, tls_conn, identity, cc)?;
+        present_client_evidence(net, tls_conn, identity, cc).await?;
     }
     Ok(())
 }
@@ -1124,8 +1234,8 @@ fn verify_evidence(
 /// Answer a server that requires client evidence: quote our presented
 /// identity's key with the server's client context and this connection's
 /// client exporter value, through the registered signer.
-fn present_client_evidence(
-    fd: i32,
+async fn present_client_evidence(
+    net: &mut Transport,
     tls_conn: &mut ClientConnection,
     identity: &Arc<IdentityClientAuth>,
     client_context: [u8; crate::attest::CONTEXT_LEN],
@@ -1160,7 +1270,7 @@ fn present_client_evidence(
         quote_time: Some(attest::format_quote_time(now_unix()? as i64)),
     };
     let body = serde_json::to_vec(&msg).map_err(|e| format!("RA-TLS: present: {e}"))?;
-    let (status, resp_body) = http_round_trip(fd, tls_conn, attest::ATTEST_PATH, &body)?;
+    let (status, resp_body) = http_round_trip(net, tls_conn, attest::ATTEST_PATH, &body).await?;
     if status != 204 && status != 200 {
         return Err(format!(
             "RA-TLS: client evidence rejected ({status}): {}",
@@ -1172,8 +1282,8 @@ fn present_client_evidence(
 
 /// One HTTP/1.1 POST and its response on the established connection, which
 /// stays open for the application request that follows.
-fn http_round_trip(
-    fd: i32,
+async fn http_round_trip(
+    net: &mut Transport,
     tls_conn: &mut ClientConnection,
     path: &str,
     body: &[u8],
@@ -1190,7 +1300,7 @@ fn http_round_trip(
             .write_all(&request)
             .map_err(|e| format!("RA-TLS: attest write failed: {e}"))?;
     }
-    flush_tls(fd, tls_conn).map_err(|_| "RA-TLS: attest flush failed".to_string())?;
+    flush_tls(net, tls_conn).map_err(|_| "RA-TLS: attest flush failed".to_string())?;
 
     let mut data: Vec<u8> = Vec::new();
     let mut net_buf = vec![0u8; 16384];
@@ -1199,7 +1309,7 @@ fn http_round_trip(
         if response_complete(&data) {
             break;
         }
-        let n = match ocall::net_recv(fd, &mut net_buf) {
+        let n = match net.recv(&mut net_buf).await {
             Ok(0) => break,
             Ok(n) => n,
             Err(e) => return Err(format!("RA-TLS: attest read failed: {e}")),

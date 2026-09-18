@@ -351,15 +351,39 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
         enclave_log_info!("DataReady sent to host TCP proxy");
     }
 
+    // Egress sockets driven by the proxy, for requests running as tasks.
+    #[cfg(feature = "egress")]
+    enclave_os_egress::netchan::init(crate::data_tx());
+
     // Main event loop: read from data channel, dispatch to IngressServer
     let data_rx = crate::data_rx();
     while !crate::is_shutdown() {
+        // Resume suspended requests that were woken (by data for their
+        // egress connection, or a guest yielding after its fuel slice).
+        #[cfg(feature = "wasm")]
+        if enclave_os_wasm::executor::has_runnable() {
+            if let Ok(mut st) = crate::state().lock() {
+                if let Some(ref mut srv) = st.ingress_server {
+                    srv.poll_tasks();
+                }
+            }
+        }
+
         // Try to receive a data channel message
         match data_rx.try_recv() {
             Some(msg) => {
                 // Decode the channel message
                 match channel::decode_channel_msg(&msg) {
                     Some((msg_type, conn_id, payload)) => {
+                        // Egress connections belong to the request tasks
+                        // waiting on them.
+                        #[cfg(feature = "egress")]
+                        if channel::conn_id_is_egress(conn_id)
+                            && msg_type != channel::ChannelMsgType::Tick
+                        {
+                            enclave_os_egress::netchan::handle_message(msg_type, conn_id, payload);
+                            continue;
+                        }
                         // Peer-port and outbound conn-id ranges, and the
                         // proxy's timer ticks, belong to the raft layer.
                         // Without it registered, refuse inbound peer
@@ -393,8 +417,6 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
                         };
                         if let Some(ref mut srv) = st.ingress_server {
                             srv.handle_message(msg_type, conn_id, payload);
-                            #[cfg(feature = "wasm")]
-                            srv.poll_tasks();
                             if let Some(reason) = srv.shutdown_reason() {
                                 enclave_log_error!(
                                     "MINI-CONTROL-SHUTDOWN: reason=Ingress({:?})",
@@ -418,16 +440,7 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
                 }
             }
             None => {
-                // No message: resume suspended requests that were woken.
-                #[cfg(feature = "wasm")]
-                if enclave_os_wasm::executor::has_runnable() {
-                    if let Ok(mut st) = crate::state().lock() {
-                        if let Some(ref mut srv) = st.ingress_server {
-                            srv.poll_tasks();
-                        }
-                    }
-                    continue;
-                }
+                // No message available — yield
                 core::hint::spin_loop();
             }
         }

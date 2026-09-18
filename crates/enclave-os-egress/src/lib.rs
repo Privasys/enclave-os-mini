@@ -54,6 +54,7 @@ pub mod attestation;
 pub use enclave_os_common::attest;
 
 pub mod jwks;
+pub mod netchan;
 
 // Re-export RA-TLS verification types for convenience.
 pub use client::{

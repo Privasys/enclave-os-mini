@@ -209,14 +209,29 @@ impl wit::Host for AppContext {
             None => client::mozilla_root_store(),
         };
 
-        let r = client::https_fetch(
-            method_str,
-            &req.url,
-            &req.headers,
-            req.body.as_deref(),
-            root_store,
-            ratls_policy.as_ref(),
-        )?;
+        // In a request task the network waits suspend the guest and the
+        // task, and the enclave serves other requests meanwhile. Elsewhere
+        // (e.g. raft replay) nothing would drive the task, so block.
+        let r = if crate::executor::in_task() {
+            client::https_fetch_async(
+                method_str,
+                &req.url,
+                &req.headers,
+                req.body.as_deref(),
+                root_store,
+                ratls_policy.as_ref(),
+            )
+            .await
+        } else {
+            client::https_fetch(
+                method_str,
+                &req.url,
+                &req.headers,
+                req.body.as_deref(),
+                root_store,
+                ratls_policy.as_ref(),
+            )
+        }?;
 
         // Record billable HTTPS egress (request + response body bytes),
         // split by transport (plain TLS vs RA-TLS).
