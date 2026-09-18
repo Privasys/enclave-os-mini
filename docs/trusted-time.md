@@ -79,12 +79,9 @@ monitor config. `last_returned` stays in memory.
 - **No NTS quorum when one is needed** fails closed. The fetch is retried
   every 100 reads and on every signed monitor poll (after its signature
   is checked), so an idle enclave recovers as soon as NTS is back.
-- **Self-check:** after 1000 unflagged reads without a confirmation (a
-  poll in sync, or NTS), the clock checks the host against NTS. A host
-  that blocks the monitor's polls could otherwise hold its clock just
-  above the floor for ever; SGX has no elapsed-time source, so reads are
-  what is counted. A disagreement flags the clock; no quorum fails
-  closed.
+- **Blocked polls are the monitor's to catch:** a host that stops the
+  monitor's polls gets its enclave quarantined after two missed polls, so
+  reads between polls never reach NTS on their own.
 - **Bounded raises:** a poll in sync (host and monitor agreeing, no NTS)
   raises the floor by at most one hour. A larger jump needs an NTS quorum
   confirming the host, so the monitor key and the host together cannot
@@ -95,8 +92,7 @@ What a poll finds (`host_clock_wrong`, `monitor_clock_wrong`, no NTS
 quorum) is in the poll reply and is never sent as an incident: the
 monitor polls again after every incident, which would loop. Incidents are
 for what is found outside a poll: the host behind the floor, the boot
-fetch (`nts_unreachable`, `host_clock_wrong`), a failed refetch, the
-self-check. Only `host_behind_floor` waits for the receipt (and fails
+fetch (`nts_unreachable`, `host_clock_wrong`) and a failed refetch. Only `host_behind_floor` waits for the receipt (and fails
 closed without it); the others are sent on the next read, never inside a
 poll, and a lost one is logged. Each condition is reported once, until
 the host time is confirmed again.

@@ -23,7 +23,7 @@
 //!   no NTS quorum) is in the poll reply and is never sent as an incident:
 //!   the monitor polls again after every incident, which would loop.
 //! - Incidents are for what is found outside a poll: the boot fetch, a
-//!   failed refetch, the self-check below. They are sent after the fact
+//!   host behind the floor, a failed refetch. They are sent after the fact
 //!   (on the next read, never inside a poll, since a single-threaded
 //!   enclave waiting for a receipt could not answer the poll that follows)
 //!   and a lost one is logged. Each condition is reported once, until the
@@ -32,9 +32,9 @@
 //!   [`MAX_UNCONFIRMED_RAISE_MS`]; a larger jump needs NTS to confirm the
 //!   host, so the monitor key and the host together cannot push the floor
 //!   into the future.
-//! - Self-check: after [`SELF_CHECK_EVERY`] unflagged reads without a
-//!   confirmation (a host blocking the monitor's polls could otherwise hold
-//!   its clock just above the floor for ever), NTS checks the host.
+//! - A host that blocks the monitor's polls is not the clock's to detect:
+//!   the monitor quarantines an enclave that stops answering, so the clock
+//!   only acts on what a read or a poll shows it.
 //! - Without a configured monitor, incidents are only logged; NTS still
 //!   decides.
 //! - No NTS quorum fails closed: reads return an error, and the fetch is
@@ -55,7 +55,7 @@ use serde::{Deserialize, Serialize};
 use crate::quorum::NtsSample;
 use crate::wire::{self, ClockConfigWire, Incident, MonitorConfig, NtsReply, PollReply, PollRequest, WireError};
 use crate::{
-    abs_diff, ClockError, BACKSTEP_MS, MAX_UNCONFIRMED_RAISE_MS, MIN_TRUSTED_TIME_MS, REFETCH_EVERY, SELF_CHECK_EVERY,
+    abs_diff, ClockError, BACKSTEP_MS, MAX_UNCONFIRMED_RAISE_MS, MIN_TRUSTED_TIME_MS, REFETCH_EVERY,
     TOLERANCE_MS,
 };
 
@@ -227,8 +227,6 @@ pub struct Clock {
     retry_skip: u32,
     pending: Option<Pending>,
     deferred: Option<Deferred>,
-    /// Unflagged reads since the host time was last confirmed.
-    unconfirmed_reads: u32,
     /// The last incident reported, until the clock is confirmed again.
     last_reported: Option<Reason>,
     config: Option<MonitorConfig>,
@@ -252,7 +250,6 @@ impl Clock {
             retry_skip: 0,
             pending: Some(Pending::new(PendingKind::Boot, true, 0)),
             deferred: None,
-            unconfirmed_reads: 0,
             last_reported: None,
             config: None,
         }
@@ -371,38 +368,6 @@ impl Clock {
             self.flush_deferred(env);
             return Ok(self.ret_frozen());
         }
-        self.unconfirmed_reads += 1;
-        if self.unconfirmed_reads >= SELF_CHECK_EVERY {
-            // No confirmation for a long while: the monitor's polls may be
-            // blocked. Check the host against NTS.
-            self.unconfirmed_reads = 0;
-            match env.nts_quorum(self.floor) {
-                Ok(n) => {
-                    self.raise_floor(n.time_ms);
-                    if abs_diff(h, n.time_ms) <= TOLERANCE_MS {
-                        self.raise_floor(h);
-                        self.confirmed();
-                        self.persist(env);
-                    } else {
-                        env.log(
-                            true,
-                            &format!("trusted time: self-check: host clock {h} is wrong, NTS says {}", n.time_ms),
-                        );
-                        self.flag(Reason::HostClockWrong);
-                        self.persist(env);
-                        self.defer(Reason::HostClockWrong, h, n.time_ms);
-                        self.flush_deferred(env);
-                        return Ok(self.ret_frozen());
-                    }
-                }
-                Err(e) => {
-                    env.log(true, &format!("trusted time: self-check found no NTS quorum, failing closed: {e}"));
-                    self.pending = Some(Pending::new(PendingKind::NtsUnreachable, false, h));
-                    self.retry_skip = 0;
-                    return Err(e);
-                }
-            }
-        }
         Ok(self.ret(h))
     }
 
@@ -445,11 +410,9 @@ impl Clock {
     }
 
     /// The host time was just confirmed (by the monitor or NTS): clear the
-    /// flag, restart the self-check count, and let the next incident of any
-    /// kind be reported again.
+    /// flag, and let the next incident of any kind be reported again.
     fn confirmed(&mut self) {
         self.unflag();
-        self.unconfirmed_reads = 0;
         self.last_reported = None;
     }
 
@@ -602,8 +565,6 @@ impl Clock {
             self.raise_floor(h);
             if self.pending.is_none() {
                 self.confirmed();
-            } else {
-                self.unconfirmed_reads = 0;
             }
             Verdict::InSync
         } else {
@@ -1130,31 +1091,19 @@ mod tests {
     }
 
     #[test]
-    fn without_polls_the_clock_checks_itself_against_nts() {
+    fn reads_between_polls_never_reach_nts() {
         let mut env = Fake::new(T0);
         let mut c = configured(&mut env);
         c.read(&mut env).unwrap();
-        // The host holds its clock just above the floor; polls are blocked.
+        let calls = env.nts_calls;
+        // However many reads come between two polls, an unflagged clock
+        // answers them from the host and the floor alone.
         env.nts = Ok(T0 + 900_000);
-        for _ in 0..SELF_CHECK_EVERY - 2 {
+        for _ in 0..10_000 {
             assert_eq!(c.read(&mut env), Ok(T0));
         }
-        assert_eq!(env.nts_calls, 1);
-        assert_eq!(c.read(&mut env), Ok(T0 + 900_000));
-        assert_eq!(env.nts_calls, 2);
-        assert!(c.is_flagged());
-        assert_eq!(env.reasons(), vec!["host_clock_wrong"]);
-        // A confirmed poll restarts the count.
-        let mut env = Fake::new(T0);
-        let mut c = configured(&mut env);
-        for _ in 0..SELF_CHECK_EVERY / 2 {
-            c.read(&mut env).unwrap();
-        }
-        poll(&mut c, &mut env, T0).unwrap();
-        for _ in 0..SELF_CHECK_EVERY - 2 {
-            c.read(&mut env).unwrap();
-        }
-        assert_eq!(env.nts_calls, 1);
+        assert_eq!(env.nts_calls, calls);
+        assert!(!c.is_flagged());
     }
 
     #[test]
