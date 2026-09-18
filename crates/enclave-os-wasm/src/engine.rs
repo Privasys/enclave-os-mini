@@ -196,13 +196,17 @@ impl WasmEngine {
     /// wasm-visible state (memories, tables, globals, app context).
     /// The `app_name` is used to namespace all KV store operations.
     /// `fuel` sets the per-call fuel budget.
+    /// `egress` is the app's outbound allowlist; it is in place before any
+    /// guest code runs, including component initialisation.
     pub fn new_store(
         &self,
         app_name: &str,
         master_key: [u8; AEAD_KEY_SIZE],
         fuel: u64,
+        egress: Option<Vec<String>>,
     ) -> Result<Store<AppContext>, String> {
-        let host = AppContext::with_app(app_name, master_key);
+        let mut host = AppContext::with_app(app_name, master_key);
+        host.egress = egress;
         let mut store = Store::new(&self.engine, host);
 
         // ── Fuel / resource limits ─────────────────────────────
@@ -229,8 +233,9 @@ impl WasmEngine {
         master_key: [u8; AEAD_KEY_SIZE],
         fuel: u64,
         component: &Component,
+        egress: Option<Vec<String>>,
     ) -> Result<(Store<AppContext>, wasmtime::component::Instance), String> {
-        let mut store = self.new_store(app_name, master_key, fuel)?;
+        let mut store = self.new_store(app_name, master_key, fuel, egress)?;
         let instance =
             crate::executor::block_on(self.linker.instantiate_async(&mut store, component))
                 .map_err(|e| format!("WASM instantiation failed: {:#}", e))?;
@@ -351,6 +356,7 @@ impl WasmEngine {
             functions,
             interfaces,
             mcp_enabled: true,
+            egress: None,
         }
     }
 }

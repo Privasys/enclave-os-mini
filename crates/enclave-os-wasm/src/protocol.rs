@@ -897,6 +897,13 @@ pub struct AppPermissions {
     /// (from `price:__default__`). `None` = free by default.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_price: Option<PriceRule>,
+    /// Hosts the app may open outbound connections to, from the WIT
+    /// `@egress` annotation; see `enclave_os_common::egress_policy`. `None`:
+    /// anywhere. `Some(empty)`: nowhere. Being part of the permissions, it is
+    /// folded into the configuration hash (OID 5.2); skipped when `None` so
+    /// apps that declare nothing keep their existing hash.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<Vec<String>>,
 }
 
 impl AppPermissions {
@@ -1228,6 +1235,11 @@ pub struct AppSchema {
     /// Whether MCP tool generation is enabled for this app.
     #[serde(default = "default_true")]
     pub mcp_enabled: bool,
+    /// The hosts this app may connect out to (its attested `@egress`
+    /// allowlist), so a client can read it from the enclave itself. `None`:
+    /// anywhere; empty: nowhere.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub egress: Option<Vec<String>>,
 }
 
 fn default_true() -> bool {

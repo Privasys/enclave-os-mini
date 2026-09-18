@@ -365,6 +365,7 @@ fn merge_auth_from_docs(
         schema_policy: FunctionPolicy::Public,
         schema_roles: Vec::new(),
         default_price: None,
+        egress: None,
     });
 
     for (name, value) in auth_entries {
@@ -384,6 +385,48 @@ fn merge_auth_from_docs(
         }
     }
 
+    Some(perms)
+}
+
+/// Read the `egress` docs entry (the WIT `@egress` annotation: a JSON list of
+/// allowlist entries, see `enclave_os_common::egress_policy`). Absent: `None`,
+/// the app may connect anywhere. A malformed entry refuses the load rather
+/// than silently running unrestricted.
+fn egress_from_docs(
+    docs: Option<&BTreeMap<String, String>>,
+) -> Result<Option<Vec<String>>, String> {
+    match docs.and_then(|d| d.get("egress")) {
+        None => Ok(None),
+        Some(raw) => serde_json::from_str::<Vec<String>>(raw)
+            .map(Some)
+            .map_err(|e| format!("invalid @egress declaration: {e}")),
+    }
+}
+
+/// Fold the `@egress` allowlist into the permissions, so it is part of the
+/// configuration hash (OID 5.2). An app that declares one but has no
+/// permissions block gets a public one, which grants exactly what having none
+/// does.
+fn merge_egress(
+    egress: Option<Vec<String>>,
+    permissions: Option<AppPermissions>,
+) -> Option<AppPermissions> {
+    let Some(egress) = egress else {
+        return permissions;
+    };
+    let mut perms = permissions.unwrap_or(AppPermissions {
+        version: 1,
+        oidc: None,
+        fido2: false,
+        default_policy: FunctionPolicy::Public,
+        default_roles: Vec::new(),
+        functions: BTreeMap::new(),
+        schema_policy: FunctionPolicy::Public,
+        schema_roles: Vec::new(),
+        default_price: None,
+        egress: None,
+    });
+    perms.egress = Some(egress);
     Some(perms)
 }
 
@@ -716,6 +759,11 @@ impl AppRegistry {
         // a missing import (e.g. auth@0.1.0 on an old binary) would
         // only surface on the first wasm_call, after the management
         // service already reported a successful deployment.
+        // The @egress allowlist is read before the trial instantiation:
+        // component init code runs there and must already be bound by it.
+        // The WIT declaration wins over one in a supplied permissions block.
+        let egress = egress_from_docs(docs.as_ref())?
+            .or_else(|| permissions.as_ref().and_then(|p| p.egress.clone()));
         {
             // Fund the probe with the app's per-call budget: instantiation
             // runs component init code, which burns real fuel now that
@@ -723,7 +771,7 @@ impl AppRegistry {
             // "all fuel consumed").
             let mut probe_store = self
                 .engine
-                .new_store(name, [0u8; AEAD_KEY_SIZE], max_fuel)?;
+                .new_store(name, [0u8; AEAD_KEY_SIZE], max_fuel, egress.clone())?;
             crate::executor::block_on(
                 self.engine.linker().instantiate_async(&mut probe_store, &component),
             )
@@ -773,6 +821,7 @@ impl AppRegistry {
             Some(ref d) => merge_price_from_docs(d, merge_auth_from_docs(d, permissions)),
             None => permissions,
         };
+        let permissions = merge_egress(egress, permissions);
         // Extract @config-api decoration from docs. The WIT-derived
         // decoration is the source of truth; the protocol-level
         // `config_api_function` parameter (sourced from privasys.json
@@ -788,6 +837,9 @@ impl AppRegistry {
             self.engine
                 .discover_exports_typed(name, hostname, &component, Some(wasm_bytes), docs);
         schema.mcp_enabled = mcp_enabled;
+        // Publish the attested egress allowlist alongside the prices, so a
+        // client reads where this app may connect from the enclave itself.
+        schema.egress = permissions.as_ref().and_then(|p| p.egress.clone());
         // Stamp each function's ATTESTED price (from the measured permissions)
         // onto the schema, so clients that fetch the schema from the enclave
         // discover exactly the fee the runtime will charge.
@@ -1408,6 +1460,12 @@ impl AppRegistry {
         // The app's runtime-owned attested-dependency set, injected into the
         // per-call context so outbound RA-TLS enforces it fail-closed.
         let pinned_dependencies = self.known.get(app_name).and_then(|m| m.dependencies.clone());
+        // Its attested @egress allowlist, bound from store creation onward.
+        let egress = self
+            .known
+            .get(app_name)
+            .and_then(|m| m.permissions.as_ref())
+            .and_then(|p| p.egress.clone());
 
         // ── Look up app ────────────────────────────────────────────
         let app = match self.loaded.get(app_name) {
@@ -1437,6 +1495,7 @@ impl AppRegistry {
             app.encryption_key,
             app.max_fuel,
             &app.component,
+            egress,
         ) {
             Ok(pair) => pair,
             Err(e) => {

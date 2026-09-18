@@ -191,6 +191,17 @@ impl wit::Host for AppContext {
             wit::Method::Options => "OPTIONS",
         };
 
+        // The app's attested @egress allowlist. Checked against the host and
+        // port the client will actually connect to, parsed the same way.
+        if let Some(ref allow) = self.egress {
+            let (host, port, _) = client::parse_url(&req.url)?;
+            if !enclave_os_common::egress_policy::allows(allow, &host, port) {
+                return Err(format!(
+                    "egress to {host}:{port} is not in this app's @egress allowlist"
+                ));
+            }
+        }
+
         // Capture billable metering inputs before `req` is consumed.
         let is_ratls = req.ratls.is_some();
         let req_body_len = req.body.as_deref().map(|b| b.len()).unwrap_or(0) as i64;

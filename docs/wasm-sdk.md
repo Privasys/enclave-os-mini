@@ -162,6 +162,28 @@ TCP sockets tunnelled through host OCALLs.
 | `tcp-create-socket` | Creates socket via host OCALL |
 | `network` / `instance-network` | Opaque handles |
 
+### Declaring where your app connects (`@egress`)
+
+By default an app may open outbound connections anywhere. Declare an allowlist
+on the world to restrict it:
+
+```wit
+/// @egress api.search.brave.com *.googleapis.com
+/// @egress api.example.org:8443
+world my-app { ... }
+```
+
+- A host matches that host on any port; `host:port` matches that port only.
+- `*.example.org` matches any subdomain, not `example.org` itself.
+- Raw sockets connect by address, so list the IP literal (`203.0.113.7:5432`).
+- `/// @egress none` declares that the app makes no outbound connections.
+
+The list is enforced on both `https.fetch` and raw socket connects, from the
+moment the component starts. It is part of the app's configuration hash
+(OID `1.3.6.1.4.1.65230.5.2`) and published in the schema the enclave serves,
+so anyone verifying the app can read exactly where it is allowed to connect. A
+malformed entry fails the build.
+
 ---
 
 ## Execution Model

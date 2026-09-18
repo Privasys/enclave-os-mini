@@ -872,7 +872,7 @@ fn flush_tls(net: &mut Transport, tls_conn: &mut ClientConnection) -> Result<(),
 }
 
 /// Parse a URL into (host, port, path). Only `https://` is supported.
-fn parse_url(url: &str) -> Result<(String, u16, String), String> {
+pub fn parse_url(url: &str) -> Result<(String, u16, String), String> {
     let url = url.trim();
 
     let rest = url

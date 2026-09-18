@@ -14,6 +14,7 @@
 extern crate alloc;
 pub mod channel;
 pub mod dependencies;
+pub mod egress_policy;
 pub mod hex;
 pub mod modules;
 pub mod ocall;

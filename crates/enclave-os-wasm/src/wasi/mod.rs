@@ -192,6 +192,10 @@ pub struct AppContext {
     /// into every outbound RA-TLS policy so a connection to a declared dependency
     /// is verified fail-closed. `None` when the app declares no dependencies.
     pub pinned_dependencies: Option<Vec<u8>>,
+    /// Where this app may connect out to, from its attested `@egress`
+    /// allowlist (see `enclave_os_common::egress_policy`). `None`: anywhere.
+    /// Set when the store is created, so component init code is bound too.
+    pub egress: Option<Vec<String>>,
 
     // ── Billable SDK resource usage (this call only) ──────────────
     /// Accumulates billable Enclave-OS SDK resource usage for the
@@ -246,6 +250,7 @@ impl AppContext {
             caller_id: None,
             caller_roles: Vec::new(),
             pinned_dependencies: None,
+            egress: None,
             usage: SdkUsage::default(),
             output_streams: BTreeMap::new(),
             input_streams: BTreeMap::new(),

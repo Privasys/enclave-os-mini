@@ -183,6 +183,15 @@ fn add_tcp(linker: &mut Linker<AppContext>) -> Result<(), wasmtime::Error> {
             // params[1] = network
             let (host, port) = extract_host_port_from_address(&params[2]);
 
+            // The app's attested @egress allowlist. A socket connects by
+            // address, so only an IP literal listed there can match.
+            if let Some(ref allow) = store.data().egress {
+                if !enclave_os_common::egress_policy::allows(allow, &host, port) {
+                    results[0] = error_code_result("access-denied");
+                    return Ok(());
+                }
+            }
+
             let fd = match enclave_os_common::ocall::net_tcp_connect(&host, port) {
                 Ok(fd) => fd,
                 Err(_) => {
