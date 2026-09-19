@@ -23,9 +23,7 @@ use enclave_os_common::types::AEAD_KEY_SIZE;
 
 /// Domain tag for value ciphertexts, differentiating them from key
 /// ciphertexts. It is the prefix of the full AAD built by
-/// [`SealedKvStore::value_aad`], which also binds the table and the key, and
-/// on its own it is the legacy AAD accepted on read for values written before
-/// that binding existed.
+/// [`SealedKvStore::value_aad`], which also binds the table and the key.
 const AAD_VALUE: &[u8] = b"enclave_os_kv_val";
 
 /// Default KV table for the sealed KV store module.
@@ -73,31 +71,19 @@ impl SealedKvStore {
 
     /// Get a value by key.
     ///
-    /// Values written before the AAD bound the key identity are still
-    /// readable: the legacy AAD is tried second and the entry is rewritten
-    /// under the bound AAD. A vault-backed app's per-app KV survives an
-    /// MRENCLAVE roll, so such values outlive the build that wrote them.
+    /// A value authenticates only under the AAD of the slot it is read from.
+    /// Values written before that binding, under `AAD_VALUE` alone, are
+    /// refused like any other value that fails authentication: accepting them
+    /// would let the host place a kept old-format ciphertext in any slot.
     pub fn get(&self, key: &[u8]) -> Result<Option<Vec<u8>>, String> {
         let enc_key = self.encrypt_key(key)?;
 
         match ocall::kv_store_get(&self.table, &enc_key) {
-            Ok(Some(enc_val)) => {
-                if let Ok(plaintext) = self.cipher.decrypt(&enc_val, &self.value_aad(&enc_key)) {
-                    return Ok(Some(plaintext));
-                }
-                // Legacy value: authenticate under the old unbound AAD, then
-                // rewrite so the next read takes the path above. A failure
-                // here is a genuine authentication failure, not a format
-                // mismatch, so it must surface.
-                let plaintext = self.cipher
-                    .decrypt(&enc_val, AAD_VALUE)
-                    .map_err(|e| format!("Value decryption failed: {}", e))?;
-                // Best-effort: a failed rewrite must not turn a good read into
-                // an error. The value stays readable on the legacy path and
-                // the next read tries again.
-                let _ = self.put(key, &plaintext);
-                Ok(Some(plaintext))
-            }
+            Ok(Some(enc_val)) => self
+                .cipher
+                .decrypt(&enc_val, &self.value_aad(&enc_key))
+                .map(Some)
+                .map_err(|e| format!("Value decryption failed: {}", e)),
             Ok(None) => Ok(None),
             Err(e) => Err(format!("Host KV get failed: {}", e)),
         }
@@ -144,5 +130,113 @@ impl SealedKvStore {
         let hmac_key = hmac::Key::new(hmac::HMAC_SHA256, self.cipher.key_bytes());
         let tag = hmac::sign(&hmac_key, key);
         Ok(tag.as_ref().to_vec())
+    }
+}
+
+/// Behaviour against an in-memory map standing in for the host, which chooses
+/// what bytes each lookup returns.
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use enclave_os_common::modules::AppIdentity;
+    use enclave_os_common::ocall::{self, OcallVtable};
+    use enclave_os_common::rpc::KvBatchOp;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, Once};
+
+    type Host = HashMap<(Vec<u8>, Vec<u8>), Vec<u8>>;
+    static HOST: Mutex<Option<Host>> = Mutex::new(None);
+    static REGISTER: Once = Once::new();
+
+    fn put(t: &[u8], k: &[u8], v: &[u8]) -> Result<(), i32> {
+        let mut h = HOST.lock().unwrap();
+        h.get_or_insert_with(HashMap::new).insert((t.to_vec(), k.to_vec()), v.to_vec());
+        Ok(())
+    }
+    fn get(t: &[u8], k: &[u8]) -> Result<Option<Vec<u8>>, i32> {
+        let h = HOST.lock().unwrap();
+        Ok(h.as_ref().and_then(|m| m.get(&(t.to_vec(), k.to_vec())).cloned()))
+    }
+    fn unused<T>() -> Result<T, i32> {
+        Err(-1)
+    }
+
+    const KEY: [u8; 32] = [7u8; 32];
+
+    /// Each test uses its own table, so the shared map needs no reset.
+    fn store(table: &str) -> SealedKvStore {
+        REGISTER.call_once(|| {
+            ocall::register(OcallVtable {
+                net_tcp_listen: |_, _| unused(),
+                net_tcp_accept: |_| unused(),
+                net_tcp_connect: |_, _| unused(),
+                net_send: |_, _| unused(),
+                net_recv: |_, _| unused(),
+                net_close: |_| {},
+                net_udp_bind: |_, _| unused(),
+                net_udp_send_to: |_, _, _, _| unused(),
+                net_udp_recv_from: |_, _, _| unused(),
+                net_udp_close: |_| {},
+                kv_store_put: put,
+                kv_store_get: get,
+                kv_store_delete: |_, _| unused(),
+                kv_store_list_keys: |_, _| unused(),
+                kv_store_write_batch: |_, _: &[KvBatchOp]| unused(),
+                kv_store_multi_get: |_, _| unused(),
+                kv_store_scan: |_, _, _, _| unused(),
+                get_current_time: || Ok(0),
+                get_current_time_ms: || unused(),
+                log: |_, _| {},
+                cert_store_register: |_: AppIdentity| {},
+                cert_store_unregister: |_| false,
+            });
+        });
+        SealedKvStore::from_master_key_with_table(KEY, table.as_bytes())
+    }
+
+    fn host_get(s: &SealedKvStore, key: &[u8]) -> Vec<u8> {
+        get(&s.table, &s.encrypt_key(key).unwrap()).unwrap().unwrap()
+    }
+    fn host_put(s: &SealedKvStore, key: &[u8], bytes: Vec<u8>) {
+        put(&s.table, &s.encrypt_key(key).unwrap(), &bytes).unwrap();
+    }
+
+    #[test]
+    fn a_value_round_trips() {
+        let s = store("round-trip");
+        s.put(b"a", b"alpha").unwrap();
+        assert_eq!(s.get(b"a").unwrap(), Some(b"alpha".to_vec()));
+        assert_eq!(s.get(b"missing").unwrap(), None);
+    }
+
+    #[test]
+    fn a_value_moved_to_another_key_is_refused() {
+        let s = store("move-key");
+        s.put(b"a", b"alpha").unwrap();
+        s.put(b"b", b"beta").unwrap();
+        host_put(&s, b"b", host_get(&s, b"a"));
+        assert!(s.get(b"b").is_err());
+    }
+
+    #[test]
+    fn a_value_moved_to_another_table_is_refused() {
+        let s1 = store("move-table-1");
+        let s2 = store("move-table-2");
+        s1.put(b"a", b"alpha").unwrap();
+        host_put(&s2, b"a", host_get(&s1, b"a"));
+        assert!(s2.get(b"a").is_err());
+    }
+
+    /// A ciphertext under the old unbound AAD, as a host may have kept it, is
+    /// refused in any slot, including the one it was written to.
+    #[test]
+    fn an_old_format_value_is_refused() {
+        let s = store("legacy");
+        let old = s.cipher.encrypt(b"alpha", AAD_VALUE).unwrap();
+        host_put(&s, b"a", old.clone());
+        assert!(s.get(b"a").is_err());
+        s.put(b"b", b"beta").unwrap();
+        host_put(&s, b"b", old);
+        assert!(s.get(b"b").is_err());
     }
 }
