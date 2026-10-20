@@ -56,8 +56,9 @@ pub struct PeerEvidence {
 
 /// Parse the peer certificate (OID claims, public key) and pair it with the
 /// quote the peer presented. A v1 leaf (quote inside the certificate) is
-/// rejected. An empty `quote` yields the claims and key only, for callers
-/// that need no evidence (grant binding by app id).
+/// rejected. An empty `quote` yields the claims and key only, unverified: a
+/// caller reading claims that way must establish trust in the certificate
+/// separately (grant binding does, through `tee_matches`).
 pub fn dissect_peer_cert(der: &[u8], quote: &[u8]) -> Result<PeerEvidence, String> {
     use x509_parser::prelude::{FromDer, X509Certificate};
 

@@ -751,18 +751,27 @@ impl Drop for IngressServer {
 // ── Permissive client-certificate verifier ────────────────────────────────
 //
 // The server optionally accepts client certificates but does NOT require
-// them (browsers never present one). When a client *does* present a cert
-// (mutual RA-TLS for vault GetSecret), we store it verbatim and let the
-// vault module extract and verify the SGX/TDX quote at the application
-// layer — there is no X.509 chain validation here.
+// them (browsers never present one). There is no X.509 chain validation:
+// trust in a client never comes from a CA. A TEE caller proves itself after
+// the handshake with evidence bound to its leaf key and this connection
+// (`handle_attest`); a holder-of-key caller is trusted for its certificate.
+//
+// What the handshake does establish is that the client holds the private key
+// of the certificate it presented: its CertificateVerify signature is checked
+// against that certificate's key. Without that, certificate bytes, which are
+// not secret, would stand in for the key wherever a consumer binds to them.
 
-/// A [`ClientCertVerifier`] that *optionally* accepts any client cert.
+/// A [`ClientCertVerifier`] that *optionally* accepts any client cert, and
+/// requires the client to prove it holds that cert's private key.
 ///
 /// * `client_auth_mandatory()` returns `false` → browsers may skip.
-/// * `verify_client_cert()` always succeeds → the vault module does
-///   the real attestation verification from the cert's extensions.
+/// * `verify_client_cert()` always succeeds → no CA, no chain.
+/// * `verify_tls1{2,3}_signature()` check the handshake signature against the
+///   presented certificate's public key.
 #[derive(Debug)]
-struct PermissiveClientAuth;
+struct PermissiveClientAuth {
+    algs: rustls::crypto::WebPkiSupportedAlgorithms,
+}
 
 impl ClientCertVerifier for PermissiveClientAuth {
     fn offer_client_auth(&self) -> bool {
@@ -783,26 +792,26 @@ impl ClientCertVerifier for PermissiveClientAuth {
         _intermediates: &[CertificateDer<'_>],
         _now: UnixTime,
     ) -> Result<ClientCertVerified, TlsError> {
-        // Accept unconditionally — quote verification happens in the vault module.
+        // No CA and no chain: trust comes from evidence or holder-of-key, above.
         Ok(ClientCertVerified::assertion())
     }
 
     fn verify_tls12_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, TlsError> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls12_signature(message, cert, dss, &self.algs)
     }
 
     fn verify_tls13_signature(
         &self,
-        _message: &[u8],
-        _cert: &CertificateDer<'_>,
-        _dss: &DigitallySignedStruct,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
     ) -> Result<rustls::client::danger::HandshakeSignatureValid, TlsError> {
-        Ok(rustls::client::danger::HandshakeSignatureValid::assertion())
+        rustls::crypto::verify_tls13_signature(message, cert, dss, &self.algs)
     }
 
     fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
@@ -849,7 +858,9 @@ fn build_tls_config(
     )
         .with_protocol_versions(&[&rustls::version::TLS13])
         .map_err(|e| format!("TLS config error: {:?}", e))?
-        .with_client_cert_verifier(Arc::new(PermissiveClientAuth))
+        .with_client_cert_verifier(Arc::new(PermissiveClientAuth {
+            algs: default_provider().signature_verification_algorithms,
+        }))
         .with_single_cert(certs, key)
         .map_err(|e| format!("cert chain error: {:?}", e))?;
 

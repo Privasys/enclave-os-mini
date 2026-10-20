@@ -86,9 +86,11 @@ owner (an app TEE, or a CLI agent acting for a user) creates a key in one
 call by presenting an IdP-issued **key-creation grant** (a JWT,
 `aud = privasys-vault-keycreate`). The grant carries the owner, the scope,
 the key type, the exportable flag and the full policy; the vault verifies it
-against the IdP JWKS and binds it to the caller's mutual-RA-TLS certificate:
-either the attested app-id (OID 3.6) equals the scope's app-id, or a
-holder-of-key `cnf` (`x5t#S256`) matches the caller's leaf. The handle must
+against the IdP JWKS and binds it to the caller. Either a holder-of-key
+`cnf` (`x5t#S256`) matches the caller's leaf, whose private key the caller
+proved by signing the handshake; or the caller is a TEE that the grant's own
+policy names, proven by evidence presented on the connection for its leaf
+key, and its app-id (OID 3.6) equals the scope's. The handle must
 fall under the grant's scope, and the policy's owner must equal the grant
 subject. This is the basis of the developer-platform key flow: the platform
 authors the owner-bound policy and mints the grant; the key materialises

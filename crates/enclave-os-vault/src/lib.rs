@@ -290,7 +290,7 @@ fn caller_str(ctx: &RequestContext) -> String {
 //  Policy normalisation
 // ---------------------------------------------------------------------------
 
-fn normalise_policy(mut policy: KeyPolicy) -> KeyPolicy {
+pub(crate) fn normalise_policy(mut policy: KeyPolicy) -> KeyPolicy {
     if policy.lifecycle.ttl_seconds == 0 {
         policy.lifecycle.ttl_seconds = DEFAULT_KEY_TTL_SECONDS;
     }

@@ -8,7 +8,11 @@
 //! type, exportable flag and full policy, so a caller (an app TEE or CLI agent)
 //! that holds the material but is not the owner can still create the key in a
 //! single call. The caller cannot forge or alter the grant; the vault binds it
-//! to the caller's attested app-id (OID 3.6) or a holder-of-key `cnf`.
+//! either to a holder-of-key `cnf`, or to a TEE the grant's own policy names
+//! whose app-id (OID 3.6) equals the scope's. Either way the caller proves it:
+//! the ingress server checks the handshake signature against the presented
+//! certificate, and a TEE also presents evidence for that certificate's key on
+//! this connection.
 
 use std::string::String;
 use std::vec::Vec;
@@ -20,7 +24,8 @@ use serde::Deserialize;
 use enclave_os_common::modules::RequestContext;
 use enclave_os_common::oids::APP_ID_OID_STR;
 
-use crate::types::{KeyPolicy, KeyType};
+use crate::policy::tee_matches;
+use crate::types::{KeyPolicy, KeyType, Principal};
 
 /// Dedicated audience: distinguishes a key-creation grant from an access token.
 pub const GRANT_AUDIENCE: &str = "privasys-vault-keycreate";
@@ -54,9 +59,7 @@ pub struct KeyCreationGrant {
 /// Verify a key-creation grant and bind it to the caller.
 ///
 /// Verifies the JWT signature against the IdP JWKS, checks the issuer,
-/// audience and expiry, then binds the grant to the caller's mutual-RA-TLS
-/// certificate: either the attested app-id (OID 3.6) equals the grant scope's
-/// app-id, or a holder-of-key `cnf` matches the caller's certificate.
+/// audience and expiry, then binds the grant to the caller (see [`bind_caller`]).
 pub fn verify_grant(
     grant_jwt: &str,
     ctx: &RequestContext,
@@ -82,18 +85,33 @@ pub fn verify_grant(
         return Err("key-creation grant has expired".into());
     }
 
-    let peer_der = ctx
-        .peer_cert_der
-        .as_deref()
-        .ok_or_else(|| "key creation requires a mutual-RA-TLS peer certificate".to_string())?;
-    bind_caller(&grant, peer_der)?;
+    bind_caller(&grant, ctx)?;
 
     Ok(grant)
 }
 
-/// Bind the grant to the caller's RA-TLS certificate.
-fn bind_caller(grant: &KeyCreationGrant, peer_der: &[u8]) -> Result<(), String> {
-    // Holder-of-key (e.g. a CLI agent): `cnf.x5t#S256` == thumbprint of the cert.
+/// Bind the grant to the caller.
+///
+/// A grant is only as strong as this binding: whoever passes it creates the
+/// key, with material of their choosing, under the grant's policy. Possession
+/// of a certificate is not enough, since certificate bytes are not secret.
+///
+///   - **Holder-of-key** (`cnf`, e.g. an owner's CLI): the caller's certificate
+///     thumbprint equals `cnf.x5t#S256`. The ingress server has verified the
+///     handshake signature against that certificate's key, so the caller holds
+///     the private key.
+///   - **TEE**: the caller is a TEE that the grant's own policy names, proven by
+///     evidence presented on this connection for this certificate's key, and the
+///     certificate's app-id (OID 3.6) equals the scope's. These are the checks
+///     export applies to the same policy later, so the TEE that will use the key
+///     is the only one that can create it. The app-id is trustworthy once the
+///     key is: the measured runtime is the only minter of its certificates.
+fn bind_caller(grant: &KeyCreationGrant, ctx: &RequestContext) -> Result<(), String> {
+    let peer_der = ctx
+        .peer_cert_der
+        .as_deref()
+        .ok_or_else(|| "key creation requires a mutual-RA-TLS peer certificate".to_string())?;
+
     if let Some(cnf) = &grant.cnf {
         let thumb = URL_SAFE_NO_PAD.encode(sha256(peer_der));
         if thumb == cnf.x5t_s256 {
@@ -104,7 +122,9 @@ fn bind_caller(grant: &KeyCreationGrant, peer_der: &[u8]) -> Result<(), String> 
         );
     }
 
-    // Attested app-id: the cert's OID 3.6 app-id equals the grant scope's app-id.
+    // The certificate's app-id against the scope first: cheap, and it needs no
+    // network. The certificate is only parsed here; the TEE check below is what
+    // makes its claims trustworthy.
     let evidence = crate::quote::dissect_peer_cert(peer_der, &[])?;
     let caller_app_id = evidence
         .oid_claims
@@ -126,13 +146,24 @@ fn bind_caller(grant: &KeyCreationGrant, peer_der: &[u8]) -> Result<(), String> 
     // ([0-9a-f]{32}, AppIDHex in the runtime, the same encoding the IdP pins
     // roles to), so no two distinct app-ids differ only by case. Folding case
     // only tolerates a mis-cased grant scope naming the same single app.
-    if caller_app_id.eq_ignore_ascii_case(scope_app_id) {
-        Ok(())
-    } else {
-        Err(format!(
+    if !caller_app_id.eq_ignore_ascii_case(scope_app_id) {
+        return Err(format!(
             "caller app-id {caller_app_id} does not match grant scope app-id {scope_app_id}"
-        ))
+        ));
     }
+
+    if ctx.peer_evidence.is_none() {
+        return Err("key creation under a TEE grant requires evidence on this connection".into());
+    }
+    let policy = crate::normalise_policy(grant.policy.clone());
+    let named_tee = policy.principals.tees.iter().any(|p| match p {
+        Principal::Tee(profile) => tee_matches(profile, peer_der, ctx.peer_evidence.as_ref()),
+        _ => false,
+    });
+    if !named_tee {
+        return Err("the caller is not a TEE the grant's policy names".into());
+    }
+    Ok(())
 }
 
 /// The app-id segment of an `apps.privasys.org/<app-id>` scope, or `None`.
