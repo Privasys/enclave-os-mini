@@ -28,6 +28,7 @@ struct Ca {
     finalized: bool,
     bad_nonce_once: bool,
     fail_validation: bool,
+    challenged: bool,
 }
 
 struct Mock<'a> {
@@ -130,6 +131,22 @@ impl Transport for Mock<'_> {
                 }), hdr(vec![("Location", "https://ca.test/order/1".into())])))
             }
             "https://ca.test/authz/1" => {
+                // A refused validation is reported the way Let's Encrypt
+                // does: the authorization is invalid and the reason sits in
+                // the failed challenge's error.
+                if self.ca.fail_validation && self.ca.challenged {
+                    return Ok(json(200, serde_json::json!({
+                        "status": "invalid",
+                        "challenges": [{
+                            "type": "tls-alpn-01", "url": "https://ca.test/chal/1", "token": self.ca.token,
+                            "status": "invalid",
+                            "error": {
+                                "type": "urn:ietf:params:acme:error:caa",
+                                "detail": "CAA record for shop.example.com prevents issuance",
+                            },
+                        }],
+                    }), hdr(vec![])));
+                }
                 let status = if self.ca.authz_valid { "valid" } else { "pending" };
                 Ok(json(200, serde_json::json!({
                     "status": status,
@@ -159,6 +176,7 @@ impl Transport for Mock<'_> {
                 let ext = x.extensions().iter().find(|e| e.oid == oid).unwrap();
                 let want = Sha256::digest(format!("{}.{}", self.ca.token, thumb).as_bytes());
                 self.ca.authz_valid = !self.ca.fail_validation && ext.value[2..] == want[..];
+                self.ca.challenged = true;
                 Ok(json(200, serde_json::json!({"status": "processing"}), hdr(vec![])))
             }
             "https://ca.test/order/1" => {
@@ -234,6 +252,10 @@ fn a_failed_validation_is_an_error_and_the_challenge_is_removed() {
     let mut client = Client::new(Mock { ca: &mut ca, sink_cert: shared.clone() }, &k, DIR);
     client.max_polls = 2;
     let mut sink = Sink(shared, vec![]);
-    assert!(client.obtain("shop.example.com", &mut sink).is_err());
+    let err = client.obtain("shop.example.com", &mut sink).err().expect("a refused validation is an error");
+    assert!(
+        err.contains("urn:ietf:params:acme:error:caa") && err.contains("prevents issuance"),
+        "the CA's type and detail reach the log: {err}"
+    );
     assert_eq!(sink.1.last(), Some(&false), "the challenge certificate never outlives the attempt");
 }

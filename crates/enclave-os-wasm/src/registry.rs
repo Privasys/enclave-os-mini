@@ -155,7 +155,7 @@ fn resolve_vault_backed_key(
     code_hash: &[u8; 32],
     app_id: Option<[u8; 16]>,
     byok: Option<[u8; AEAD_KEY_SIZE]>,
-) -> Result<([u8; AEAD_KEY_SIZE], String, crate::vaultkey::VaultConfig), String> {
+) -> Result<([u8; AEAD_KEY_SIZE], String, crate::vaultkey::VaultConfig, [u8; 32]), String> {
     use crate::vaultkey;
     use enclave_os_common::aead::AeadCipher;
     use enclave_os_common::ocall;
@@ -173,6 +173,11 @@ fn resolve_vault_backed_key(
     // the platform-minted grant. A policy denial is the upgrade gate (fail closed),
     // not a first boot.
     let kek = vaultkey::resolve_or_provision(&cfg, &vb.handle, &vb.grant, code_hash, app_id_slice)?;
+    // The direct-TLS branch comes from the KEK, the secret the vaults hold,
+    // never from the DEK: the DEK is generated afresh whenever the host-side
+    // wrapped blob is missing (a new KV directory), so an account derived from
+    // it would move with the host's storage, and break an adopter's CAA pin.
+    let direct_branch = enclave_os_direct::keys::direct_branch(&kek)?;
 
     let cipher = AeadCipher::from_key(kek);
     let key_id = vb.handle.as_bytes();
@@ -212,7 +217,7 @@ fn resolve_vault_backed_key(
         }
     };
 
-    Ok((dek, source, cfg))
+    Ok((dek, source, cfg, direct_branch))
 }
 
 /// Rotate a vault-backed app's storage KEK: re-wrap the `encryption_key` (the KV
@@ -237,7 +242,7 @@ fn rotate_vault_backed_key(
     new_grant: &str,
     code_hash: &[u8; 32],
     app_id: Option<[u8; 16]>,
-) -> Result<(), String> {
+) -> Result<[u8; 32], String> {
     use crate::vaultkey;
     use enclave_os_common::aead::AeadCipher;
     use enclave_os_common::ocall;
@@ -251,6 +256,9 @@ fn rotate_vault_backed_key(
     let new_kek =
         vaultkey::resolve_or_provision(new_cfg, new_handle, new_grant, code_hash, app_id_slice)?;
 
+    // The new generation's direct-TLS branch (see resolve_vault_backed_key):
+    // a rotation moves the ACME account with the vault-held secret.
+    let direct_branch = enclave_os_direct::keys::direct_branch(&new_kek)?;
     let old_cipher = AeadCipher::from_key(old_kek);
     let new_cipher = AeadCipher::from_key(new_kek);
 
@@ -273,7 +281,7 @@ fn rotate_vault_backed_key(
     // Retire the old wrapped blob (best-effort; the vault retires the old KEK
     // generation, which is what actually makes the old blob unrecoverable).
     let _ = ocall::kv_store_delete(VAULTWRAP_TABLE, old_handle.as_bytes());
-    Ok(())
+    Ok(direct_branch)
 }
 
 /// Owned per-invocation state produced by
@@ -541,6 +549,14 @@ pub struct AppMeta {
     /// which keeps the derived-`v1` behaviour).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub vault_handle: Option<String>,
+    /// Vault-backed apps: the one-way direct-TLS branch of the CURRENT KEK
+    /// generation, from which the runtime derives the app's ACME account key.
+    /// From the KEK (vault-held), never the DEK, so the same app gets the same
+    /// account on any build and any host storage, which is what lets an
+    /// adopter's CAA record pin it. Sealed so a same-MRENCLAVE replay needs no
+    /// vault round trip; a fresh load recomputes it. `None` for other apps.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub direct_branch: Option<[u8; 32]>,
     /// Whether the app has completed its initial configuration. Persisted so the
     /// freeze gate is NOT re-armed on a restart whose KV survived (a
     /// same-MRENCLAVE replay, or a vault-backed KV recovered after an
@@ -784,10 +800,12 @@ impl AppRegistry {
         // Vault-backed apps reconstruct a KEK from the constellation and
         // envelope-wrap the KV `encryption_key` under it (so data survives an
         // enclave upgrade); others keep the BYOK / generated key as before.
+        let mut direct_branch = None;
         let (app_key, key_source, vault_config) = match &vault {
             Some(vb) => {
-                let (k, src, cfg) =
+                let (k, src, cfg, branch) =
                     resolve_vault_backed_key(vb, &code_hash, app_id, encryption_key)?;
+                direct_branch = Some(branch);
                 (k, src, Some(cfg))
             }
             None => match encryption_key {
@@ -941,6 +959,7 @@ impl AppRegistry {
             app_id,
             vault_config,
             vault_handle: vault.as_ref().map(|vb| vb.handle.clone()),
+            direct_branch,
             config_complete,
             dependencies,
             txn_replay,
@@ -1045,7 +1064,7 @@ impl AppRegistry {
         let code_hash = meta.code_hash;
         let app_id = meta.app_id;
 
-        rotate_vault_backed_key(
+        let direct_branch = rotate_vault_backed_key(
             &old_cfg,
             &target_cfg,
             &old_handle,
@@ -1062,6 +1081,7 @@ impl AppRegistry {
             let m = self.known.get_mut(name).expect("known checked above");
             m.vault_handle = Some(new_handle.to_string());
             m.key_source = source.clone();
+            m.direct_branch = Some(direct_branch);
             if new_cfg.is_some() {
                 m.vault_config = Some(target_cfg);
             }

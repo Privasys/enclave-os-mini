@@ -406,10 +406,11 @@ impl WasmModule {
     }
 
     /// What direct domains need of an app: its hostname, its platform app
-    /// id, and, for a vault-backed app only, its data key (released by the
-    /// vaults to approved code, stable across upgrades), from which the
-    /// runtime derives the app's ACME account key. A generated or BYOK key
-    /// is not offered: it does not survive the way a CAA pin needs.
+    /// id, and, for a vault-backed app only, the one-way direct-TLS branch of
+    /// its vault-held KEK, from which the runtime derives the app's ACME
+    /// account key (the same app gets the same account on any build). A
+    /// generated or BYOK key is not offered: it does not survive the way a
+    /// CAA pin needs.
     pub fn direct_identity(&self, name: &str) -> Result<DirectIdentity, String> {
         let reg = self
             .registry
@@ -419,11 +420,7 @@ impl WasmModule {
         Ok(DirectIdentity {
             hostname: meta.hostname.clone(),
             app_id: meta.app_id,
-            vault_key: if meta.key_source.starts_with("vault:") {
-                Some(meta.encryption_key)
-            } else {
-                None
-            },
+            direct_branch: meta.direct_branch,
         })
     }
 
@@ -1568,7 +1565,7 @@ impl WasmModule {
 pub struct DirectIdentity {
     pub hostname: String,
     pub app_id: Option<[u8; 16]>,
-    pub vault_key: Option<[u8; enclave_os_common::types::AEAD_KEY_SIZE]>,
+    pub direct_branch: Option<[u8; 32]>,
 }
 
 static WASM_MODULE_GLOBAL: OnceLock<&'static WasmModule> = OnceLock::new();

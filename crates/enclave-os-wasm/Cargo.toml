@@ -19,6 +19,9 @@ name = "enclave_os_wasm"
 [dependencies]
 # Shared types, module trait, OCall vtable, hex utils, JWT/JWKS verification
 enclave-os-common = { path = "../../common", features = ["jwt", "crypto"] }
+# The direct-TLS branch of a vault-backed app's KEK (one derivation, shared
+# with the runtime that turns it into the ACME account key).
+enclave-os-direct = { path = "../enclave-os-direct" }
 enclave-os-kvstore = { path = "../enclave-os-kvstore" }
 enclave-os-egress = { path = "../enclave-os-egress" }
 

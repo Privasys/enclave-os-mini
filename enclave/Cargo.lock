@@ -601,6 +601,7 @@ dependencies = [
  "base64",
  "enclave-os-app-auth",
  "enclave-os-common",
+ "enclave-os-direct",
  "enclave-os-egress",
  "enclave-os-fido2",
  "enclave-os-kvstore",

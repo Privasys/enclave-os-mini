@@ -17,9 +17,10 @@
 //!   (`GET /api/v1/apps/<name>/direct`, manager role): that request runs as
 //!   a task, so its network waits suspend instead of blocking the enclave.
 //!   No order is placed before the name resolves, and failures back off.
-//! - The ACME account key derives from the app's vault-held data key, the
-//!   same scheme as the container runtime, so an adopter's CAA record can
-//!   pin issuance to code the vaults released that key to.
+//! - The ACME account key derives from the app's vault-held KEK (never the
+//!   DEK, which is regenerated when the host loses its wrapped copy), the
+//!   same scheme as the container runtime, so the same app gets the same
+//!   account on any build and an adopter's CAA record can pin it.
 //! - OID 7.4 on the app's leaves binds each name to its certificate key.
 
 use std::collections::BTreeMap;
@@ -307,8 +308,8 @@ pub fn handle_status(app: &str) -> (u16, Vec<u8>) {
     };
     // No vault-held key: no account, so an empty account_uri (the control
     // plane reads that as "direct domains need a vault-backed app").
-    if let Some(vault_key) = identity.vault_key {
-        if let Err(e) = drive(app, &vault_key) {
+    if let Some(branch) = identity.direct_branch {
+        if let Err(e) = drive(app, &branch) {
             enclave_log_error!("direct: {}: {}", app, e);
         }
     }
@@ -340,7 +341,8 @@ pub fn handle_status(app: &str) -> (u16, Vec<u8>) {
     (200, serde_json::to_vec(&status).unwrap_or_default())
 }
 
-fn drive(app: &str, vault_key: &[u8; 32]) -> Result<(), String> {
+/// `branch` is the direct-TLS branch of the app's vault-held KEK.
+fn drive(app: &str, branch: &[u8; 32]) -> Result<(), String> {
     let now = ocall::get_current_time().map_err(|_| "no trusted time".to_string())? as i64;
     let (domains, have_account) = {
         let st = STATE.lock().map_err(|_| "state lock poisoned")?;
@@ -349,7 +351,7 @@ fn drive(app: &str, vault_key: &[u8; 32]) -> Result<(), String> {
             _ => return Ok(()),
         }
     };
-    let key = keys::account_key(&keys::direct_branch(vault_key)?)?;
+    let key = keys::account_key(branch)?;
     let mut client = Client::new(Egress, &key, LETS_ENCRYPT);
     // No sleep between polls (the enclave has no timer a task can wait on):
     // each poll is a full HTTPS round trip, which paces it.

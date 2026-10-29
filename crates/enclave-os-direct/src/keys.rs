@@ -56,6 +56,12 @@ pub fn account_key(branch: &[u8]) -> Result<AccountKey, String> {
     Err("direct: no valid account key derived".into())
 }
 
+/// The ACME account key of an app, from its vault-held secret (the KEK on
+/// a WASM runtime, the reconstructed volume key on the container runtime).
+pub fn account_key_from_vault_secret(secret: &[u8]) -> Result<AccountKey, String> {
+    account_key(&direct_branch(secret)?)
+}
+
 /// An ACME account key.
 #[derive(Clone)]
 pub struct AccountKey {
@@ -126,6 +132,22 @@ mod tests {
         let (x, _) = key.coordinates();
         assert_eq!(hex(&branch), GO_BRANCH);
         assert_eq!(hex(&x), GO_X);
+    }
+
+    /// The account is a function of the vault-held secret alone: no build,
+    /// host storage or data key enters it, so an adopter's CAA pin survives
+    /// every runtime roll. Pinned to the container runtime's vector.
+    #[test]
+    fn the_account_depends_only_on_the_vault_secret() {
+        let secret = [0x11u8; 32];
+        let a = account_key_from_vault_secret(&secret).unwrap();
+        let b = account_key_from_vault_secret(&secret).unwrap();
+        assert_eq!(a.coordinates(), b.coordinates());
+        assert_eq!(hex(&a.coordinates().0), GO_X, "same account as the container runtime");
+        assert_ne!(
+            account_key_from_vault_secret(&[0x12u8; 32]).unwrap().coordinates(),
+            a.coordinates()
+        );
     }
 
     const GO_BRANCH: &str = "62197995fca676a99c0d2598c1ed744907c7fe5e00b6c46e80a0068f37c51911";

@@ -288,14 +288,31 @@ fn problem_type(body: &[u8]) -> String {
         .unwrap_or_default()
 }
 
+/// The CA's reason, as `type: detail`. A problem document carries it at the
+/// top level; an order under `error`; an authorization under each failed
+/// challenge's `error` (which is where a CAA or connection refusal lands).
 fn problem_detail(body: &[u8]) -> String {
-    serde_json::from_slice::<serde_json::Value>(body)
-        .ok()
-        .and_then(|v| {
-            let t = v.get("type").and_then(|t| t.as_str()).unwrap_or("");
-            let d = v.get("detail").and_then(|t| t.as_str()).unwrap_or("");
-            Some(format!("{t} {d}").trim().to_string())
-        })
+    let v: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(v) => v,
+        Err(_) => return String::new(),
+    };
+    let fmt = |p: &serde_json::Value| -> Option<String> {
+        let t = p.get("type").and_then(|t| t.as_str()).unwrap_or("");
+        let d = p.get("detail").and_then(|t| t.as_str()).unwrap_or("");
+        if t.is_empty() && d.is_empty() {
+            return None;
+        }
+        Some(format!("{t}: {d}").trim_end_matches(": ").to_string())
+    };
+    if let Some(s) = fmt(&v) {
+        return s;
+    }
+    if let Some(s) = v.get("error").and_then(|e| fmt(e)) {
+        return s;
+    }
+    v.get("challenges")
+        .and_then(|c| c.as_array())
+        .and_then(|cs| cs.iter().filter_map(|c| c.get("error")).find_map(|e| fmt(e)))
         .unwrap_or_default()
 }
 
