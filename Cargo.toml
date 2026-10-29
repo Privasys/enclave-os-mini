@@ -7,6 +7,7 @@ members = [
     "host",
     "tests/integration",
     "tests/sovereign-seal-unit",
+    "tests/kek-material-unit",
     "tests/wasm-docs-unit",
     "tests/code-pool-unit",
     "tests/feature-wiring-unit",

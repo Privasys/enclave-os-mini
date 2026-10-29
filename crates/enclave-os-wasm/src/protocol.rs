@@ -167,7 +167,8 @@ pub struct WasmSetDependencies {
 /// sealed to (a generation rotation). With them, the new KEK is created on the
 /// TARGET constellation instead — the graceful cross-constellation migration,
 /// mirroring the container rotate request — and the app's sealed constellation
-/// selection advances to it.
+/// selection advances to it. With `"renew": true` the new handle holds the
+/// same KEK as the current one (a renewal, before the 90-day vault expiry).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WasmRotateKey {
     /// App identifier to rotate.
@@ -210,6 +211,14 @@ pub struct WasmRotateKey {
     /// no TCB acceptance check on the dial).
     #[serde(default)]
     pub new_vault_acceptable_tcb_statuses: Option<Vec<String>>,
+    /// `true` RENEWS instead of rotating: `new_handle` is created with the
+    /// SAME KEK the current handle holds (a vault key expires 90 days after
+    /// creation and cannot be extended), so the direct-TLS branch and the ACME
+    /// account stay put, and the current handle's wrapped blob is kept. The
+    /// enclave refuses to switch when `new_handle` turns out to hold another
+    /// KEK. Absent or `false` is the rotation above, with a fresh KEK.
+    #[serde(default)]
+    pub renew: bool,
 }
 
 /// Host-driven billing freeze command.

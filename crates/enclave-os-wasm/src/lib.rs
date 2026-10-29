@@ -71,6 +71,7 @@ pub mod enclave_sdk;
 pub mod engine;
 pub mod executor;
 pub mod jwks_fetcher;
+pub mod kek_material;
 pub mod metrics;
 pub mod protocol;
 pub mod registry;
@@ -2004,6 +2005,7 @@ impl EnclaveModule for WasmModule {
                     &mgmt_url,
                     &environment,
                     new_cfg,
+                    rot.renew,
                 )
             };
             let mgmt_result = match result {

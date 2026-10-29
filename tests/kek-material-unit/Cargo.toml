@@ -1,0 +1,9 @@
+[package]
+name = "kek-material-unit"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+ring = "0.17"
+enclave-os-common = { workspace = true, features = ["crypto"] }

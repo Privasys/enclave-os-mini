@@ -524,6 +524,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "kek-material-unit"
+version = "0.1.0"
+dependencies = [
+ "enclave-os-common",
+ "ring",
+]
+
+[[package]]
 name = "lazy_static"
 version = "1.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

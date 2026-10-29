@@ -152,12 +152,13 @@ pub struct VaultBacking {
 /// into `AppMeta` by the caller.
 fn resolve_vault_backed_key(
     vb: &VaultBacking,
+    app_name: &str,
     code_hash: &[u8; 32],
     app_id: Option<[u8; 16]>,
     byok: Option<[u8; AEAD_KEY_SIZE]>,
 ) -> Result<([u8; AEAD_KEY_SIZE], String, crate::vaultkey::VaultConfig, [u8; 32]), String> {
+    use crate::kek_material::{may_generate_dek, unwrap_dek, wrap_dek};
     use crate::vaultkey;
-    use enclave_os_common::aead::AeadCipher;
     use enclave_os_common::ocall;
 
     let app_id_slice = app_id.as_ref().map(|a| a.as_slice());
@@ -172,25 +173,23 @@ fn resolve_vault_backed_key(
     // Reconstruct the KEK; on first boot resolve_or_provision creates the key with
     // the platform-minted grant. A policy denial is the upgrade gate (fail closed),
     // not a first boot.
-    let kek = vaultkey::resolve_or_provision(&cfg, &vb.handle, &vb.grant, code_hash, app_id_slice)?;
+    let (kek, origin) =
+        vaultkey::resolve_or_provision(&cfg, &vb.handle, &vb.grant, code_hash, app_id_slice, None)?;
     // The direct-TLS branch comes from the KEK, the secret the vaults hold,
     // never from the DEK: the DEK is generated afresh whenever the host-side
     // wrapped blob is missing (a new KV directory), so an account derived from
     // it would move with the host's storage, and break an adopter's CAA pin.
     let direct_branch = enclave_os_direct::keys::direct_branch(&kek)?;
 
-    let cipher = AeadCipher::from_key(kek);
+    // The blob is keyed by the handle and AAD-bound to it, so it can't be
+    // swapped between apps or generations.
     let key_id = vb.handle.as_bytes();
-    // Bind the wrapped blob to this handle so it can't be swapped between apps.
-    let aad = vb.handle.as_bytes();
 
     let (dek, source) = match ocall::kv_store_get(VAULTWRAP_TABLE, key_id)
         .map_err(|e| format!("vaultkey: host kv get: {e}"))?
     {
         Some(blob) => {
-            let key_vec = cipher
-                .decrypt(&blob, aad)
-                .map_err(|e| format!("vaultkey: unwrap encryption_key: {e}"))?;
+            let key_vec = unwrap_dek(&kek, &vb.handle, &blob)?;
             let key: [u8; AEAD_KEY_SIZE] = key_vec
                 .as_slice()
                 .try_into()
@@ -198,6 +197,9 @@ fn resolve_vault_backed_key(
             (key, format!("vault:{}", vb.handle))
         }
         None => {
+            // A key that already existed with no blob here, while the app's
+            // KV holds data: a new DEK would orphan that data, so refuse.
+            may_generate_dek(origin, app_kv_has_data(app_name)?, &vb.handle)?;
             let key = match byok {
                 Some(k) => k,
                 None => {
@@ -208,9 +210,7 @@ fn resolve_vault_backed_key(
                     k
                 }
             };
-            let blob = cipher
-                .encrypt(&key, aad)
-                .map_err(|e| format!("vaultkey: wrap encryption_key: {e}"))?;
+            let blob = wrap_dek(&kek, &vb.handle, &key)?;
             ocall::kv_store_put(VAULTWRAP_TABLE, key_id, &blob)
                 .map_err(|e| format!("vaultkey: host kv put: {e}"))?;
             (key, format!("vault:{}", vb.handle))
@@ -218,6 +218,17 @@ fn resolve_vault_backed_key(
     };
 
     Ok((dek, source, cfg, direct_branch))
+}
+
+/// Whether the app's DEK-encrypted KV table holds anything. One key is enough
+/// to answer, so the host scan is capped at one entry. The host can lie, but
+/// it can delete the data too: this guards against the enclave orphaning
+/// data by itself, not against the host.
+fn app_kv_has_data(app_name: &str) -> Result<bool, String> {
+    let table = format!("app:{}", app_name);
+    enclave_os_common::ocall::kv_store_scan(table.as_bytes(), &[], &[], 1)
+        .map(|entries| !entries.is_empty())
+        .map_err(|e| format!("vaultkey: host kv scan of {table}: {e}"))
 }
 
 /// Rotate a vault-backed app's storage KEK: re-wrap the `encryption_key` (the KV
@@ -234,6 +245,16 @@ fn resolve_vault_backed_key(
 /// handle (AAD-bound to it) and the old blob is retired. The vault retires the
 /// old KEK generation separately (owner-proxied), after which the old blob is
 /// permanently un-unwrappable.
+///
+/// `renew` re-creates the SAME KEK under `new_handle` instead of a fresh one:
+/// a vault key expires 90 days after creation and cannot be extended, so a
+/// renewal is how an app outlives it with no owner present. The new handle
+/// is created with the old KEK as its material and must reconstruct to it
+/// (compared in constant time), the direct-TLS branch does not move, and the
+/// old blob is KEPT: the old handle still holds the same KEK until it expires,
+/// so a load that still names it keeps working. A retried renewal finds the
+/// new handle already created; it holds the same KEK, so the retry completes.
+#[allow(clippy::too_many_arguments)]
 fn rotate_vault_backed_key(
     old_cfg: &crate::vaultkey::VaultConfig,
     new_cfg: &crate::vaultkey::VaultConfig,
@@ -242,45 +263,58 @@ fn rotate_vault_backed_key(
     new_grant: &str,
     code_hash: &[u8; 32],
     app_id: Option<[u8; 16]>,
+    renew: bool,
 ) -> Result<[u8; 32], String> {
+    use crate::kek_material::{check_renewed, rewrap_dek};
     use crate::vaultkey;
-    use enclave_os_common::aead::AeadCipher;
     use enclave_os_common::ocall;
 
     let app_id_slice = app_id.as_ref().map(|a| a.as_slice());
 
     // Old KEK: the key already exists, so export it (a grant is only needed to
     // CREATE). A policy denial here is the upgrade gate, not a first boot.
-    let old_kek = vaultkey::resolve_or_provision(old_cfg, old_handle, "", code_hash, app_id_slice)?;
-    // New KEK: create the new generation with the owner-minted grant.
-    let new_kek =
-        vaultkey::resolve_or_provision(new_cfg, new_handle, new_grant, code_hash, app_id_slice)?;
+    let (old_kek, _) =
+        vaultkey::resolve_or_provision(old_cfg, old_handle, "", code_hash, app_id_slice, None)?;
+    // New KEK: create the new generation with the platform-minted grant; on a
+    // renewal, from the old KEK's material.
+    let material = if renew { Some(&old_kek) } else { None };
+    let (new_kek, _) = vaultkey::resolve_or_provision(
+        new_cfg,
+        new_handle,
+        new_grant,
+        code_hash,
+        app_id_slice,
+        material,
+    )?;
+    if renew {
+        // Whether this call created the handle or a retry found it, it must
+        // hold the KEK the app has now, or the app would lose its data.
+        check_renewed(&old_kek, &new_kek, old_handle, new_handle)?;
+    }
 
     // The new generation's direct-TLS branch (see resolve_vault_backed_key):
-    // a rotation moves the ACME account with the vault-held secret.
+    // a rotation moves the ACME account with the vault-held secret; a renewal
+    // keeps the KEK, so the branch comes out the same.
     let direct_branch = enclave_os_direct::keys::direct_branch(&new_kek)?;
-    let old_cipher = AeadCipher::from_key(old_kek);
-    let new_cipher = AeadCipher::from_key(new_kek);
 
-    // Unwrap the DEK from the old blob (AAD-bound to the old handle).
+    // Move the DEK from the old blob to one for the new handle. On a renewal
+    // the KEK is the same, but the AAD is the handle, so the blob still changes.
     let blob = ocall::kv_store_get(VAULTWRAP_TABLE, old_handle.as_bytes())
         .map_err(|e| format!("vaultkey: host kv get: {e}"))?
         .ok_or_else(|| format!("vaultkey: no wrapped key at handle {old_handle}"))?;
-    let dek = old_cipher
-        .decrypt(&blob, old_handle.as_bytes())
-        .map_err(|e| format!("vaultkey: unwrap encryption_key (old KEK): {e}"))?;
+    let new_blob = rewrap_dek(&old_kek, old_handle, &new_kek, new_handle, &blob)?;
 
-    // Re-wrap under the new KEK (AAD-bound to the new handle) and persist before
-    // retiring the old blob, so a crash mid-rotation never loses the only copy.
-    let new_blob = new_cipher
-        .encrypt(&dek, new_handle.as_bytes())
-        .map_err(|e| format!("vaultkey: wrap encryption_key (new KEK): {e}"))?;
+    // Persist the new blob before anything retires the old one, so a crash
+    // mid-rotation never loses the only copy.
     ocall::kv_store_put(VAULTWRAP_TABLE, new_handle.as_bytes(), &new_blob)
         .map_err(|e| format!("vaultkey: host kv put: {e}"))?;
 
-    // Retire the old wrapped blob (best-effort; the vault retires the old KEK
-    // generation, which is what actually makes the old blob unrecoverable).
-    let _ = ocall::kv_store_delete(VAULTWRAP_TABLE, old_handle.as_bytes());
+    // A rotation retires the old wrapped blob (best-effort; the vault retires
+    // the old KEK generation, which is what actually makes the old blob
+    // unrecoverable). A renewal keeps it, see above.
+    if !renew {
+        let _ = ocall::kv_store_delete(VAULTWRAP_TABLE, old_handle.as_bytes());
+    }
     Ok(direct_branch)
 }
 
@@ -804,7 +838,7 @@ impl AppRegistry {
         let (app_key, key_source, vault_config) = match &vault {
             Some(vb) => {
                 let (k, src, cfg, branch) =
-                    resolve_vault_backed_key(vb, &code_hash, app_id, encryption_key)?;
+                    resolve_vault_backed_key(vb, name, &code_hash, app_id, encryption_key)?;
                 direct_branch = Some(branch);
                 (k, src, Some(cfg))
             }
@@ -1034,6 +1068,13 @@ impl AppRegistry {
     /// migration: the old KEK exports from the sealed selection, the new one
     /// is created on `target`, and the sealed selection advances to `target`
     /// so every later reconstruct goes there.
+    ///
+    /// `renew` re-creates the same KEK under `new_handle` (see
+    /// [`rotate_vault_backed_key`]). A renewal the enclave already completed
+    /// (the sealed handle is `new_handle` and its blob is here) answers
+    /// success again, so the control plane can retry a renewal whose answer
+    /// it lost.
+    #[allow(clippy::too_many_arguments)]
     pub fn rotate_vault_key(
         &mut self,
         name: &str,
@@ -1042,6 +1083,7 @@ impl AppRegistry {
         mgmt_url: &str,
         environment: &str,
         new_cfg: Option<crate::vaultkey::VaultConfig>,
+        renew: bool,
     ) -> Result<AppMeta, String> {
         let meta = self
             .known
@@ -1052,6 +1094,16 @@ impl AppRegistry {
             .clone()
             .ok_or_else(|| format!("app '{name}' is not vault-backed (no sealed handle)"))?;
         if old_handle == new_handle {
+            if renew {
+                let blob = enclave_os_common::ocall::kv_store_get(
+                    VAULTWRAP_TABLE,
+                    new_handle.as_bytes(),
+                )
+                .map_err(|e| format!("vaultkey: host kv get: {e}"))?;
+                if blob.is_some() {
+                    return Ok(meta.clone());
+                }
+            }
             return Err(format!(
                 "rotate: new handle equals the current handle {new_handle}"
             ));
@@ -1072,6 +1124,7 @@ impl AppRegistry {
             new_grant,
             &code_hash,
             app_id,
+            renew,
         )?;
 
         // Advance the sealed handle (the DEK is unchanged); on a migration the

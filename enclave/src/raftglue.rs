@@ -299,7 +299,9 @@ fn fetch_vault_ck(cfg: &RaftVaultConfig) -> Result<[u8; 32], String> {
         &cfg.grant,
         &code_hash,
         cfg.app_id.as_deref(),
+        None,
     )
+    .map(|(ck, _)| ck)
     .map_err(|e| format!("cluster credential: {e}"))
 }
 

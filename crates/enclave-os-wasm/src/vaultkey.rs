@@ -24,10 +24,8 @@
 
 use std::format;
 use std::string::String;
-use std::sync::OnceLock;
 use std::vec::Vec;
 
-use ring::rand::{SecureRandom, SystemRandom};
 use serde::{Deserialize, Serialize};
 
 use enclave_os_egress::{
@@ -35,15 +33,13 @@ use enclave_os_egress::{
     ClientCertIdentity, RaTlsPolicy, ReportDataBinding, RootCertStore, TeeType,
 };
 
-use enclave_os_common::hex::{hex_decode, hex_encode};
+use enclave_os_common::hex::hex_decode;
 
-/// Length of the per-generation tag prefixed to each share payload. A one-shot
-/// `CreateKey` retry must never split generations, so each share carries a
-/// random 16-byte generation id; reconstruction groups by it.
-const GENERATION_SIZE: usize = 16;
-
-/// KEK length in bytes (256-bit).
-pub const KEK_SIZE: usize = 32;
+use crate::kek_material::{
+    best_group, decode_share, encode_share, new_generation, push_share, shamir_reconstruct,
+    to_kek, KeyOrigin, Share,
+};
+pub use crate::kek_material::KEK_SIZE;
 
 /// Cap on how many vaults a single key's shares are spread across. The active
 /// constellation is small (N=4 today); this only bites if the directory ever
@@ -323,13 +319,20 @@ pub fn discover(mgmt_url: &str, environment: &str) -> Result<VaultConfig, String
 ///   - uniformly absent → generate a KEK, Shamir-split, `CreateKey` one share per
 ///     vault with the grant, return once ≥k acked;
 ///   - a partial/unreachable set → error (never create, could split generations).
+///
+/// `material`, when given, is the KEK a create splits instead of generating
+/// one: a renewal re-creates the current KEK under the next handle, because a
+/// vault key's lifetime is fixed at creation. It is ignored when the handle
+/// already exists; the caller compares what comes back. The returned
+/// [`KeyOrigin`] says which of the two happened.
 pub fn resolve_or_provision(
     cfg: &VaultConfig,
     handle: &str,
     grant: &str,
     code_hash: &[u8],
     app_id: Option<&[u8]>,
-) -> Result<[u8; KEK_SIZE], String> {
+    material: Option<&[u8; KEK_SIZE]>,
+) -> Result<([u8; KEK_SIZE], KeyOrigin), String> {
     if cfg.endpoints.is_empty() {
         return Err("vaultkey: sealed config has no vault endpoints".into());
     }
@@ -378,7 +381,7 @@ pub fn resolve_or_provision(
     }
 
     if let Some(best) = best_group(&by_gen, threshold) {
-        return to_kek(shamir_reconstruct(best)?);
+        return Ok((to_kek(shamir_reconstruct(best)?)?, KeyOrigin::Reconstructed));
     }
 
     // Fail CLOSED on the gate: the key exists but this measurement isn't
@@ -408,15 +411,11 @@ pub fn resolve_or_provision(
         ));
     }
 
-    // ---- Phase 2: first boot — generate the KEK + create the key --------
-    let rng = SystemRandom::new();
-    let mut kek = [0u8; KEK_SIZE];
-    rng.fill(&mut kek).map_err(|_| "vaultkey: rng (kek)")?;
-    let mut generation = [0u8; GENERATION_SIZE];
-    rng.fill(&mut generation)
-        .map_err(|_| "vaultkey: rng (generation)")?;
-
-    let shares = shamir_split(&kek, threshold, cfg.endpoints.len())?;
+    // ---- Phase 2: first boot — split the KEK + create the key -----------
+    // A fresh KEK, or on a renewal the given material, under a fresh
+    // generation tag either way.
+    let fresh = new_generation(material, threshold, cfg.endpoints.len())?;
+    let (kek, generation, shares) = (fresh.kek, fresh.generation, fresh.shares);
     let mut acks = 0usize;
     for (i, ep) in cfg.endpoints.iter().enumerate() {
         let payload = encode_share(&generation, &shares[i]);
@@ -449,7 +448,7 @@ pub fn resolve_or_provision(
             cfg.endpoints.len()
         ));
     }
-    Ok(kek)
+    Ok((kek, KeyOrigin::Created))
 }
 
 /// Read the Tees measurement set of a key's policy from the
@@ -573,19 +572,6 @@ fn collect_measurements(
     }
 }
 
-fn to_kek(v: Vec<u8>) -> Result<[u8; KEK_SIZE], String> {
-    if v.len() != KEK_SIZE {
-        return Err(format!(
-            "vaultkey: reconstructed KEK has {} bytes, want {}",
-            v.len(),
-            KEK_SIZE
-        ));
-    }
-    let mut out = [0u8; KEK_SIZE];
-    out.copy_from_slice(&v);
-    Ok(out)
-}
-
 fn parse_mrenclave(hex: &str) -> Result<[u8; 32], String> {
     let bytes = hex_decode(hex).ok_or("vaultkey: constellation mrenclave is not hex")?;
     if bytes.len() != 32 {
@@ -664,189 +650,6 @@ fn call_vault(
         return Ok(Vec::new());
     }
     Err("vault: unexpected response (no KeyMaterial/KeyCreated/Error)".into())
-}
-
-// ===========================================================================
-//  Share payload framing: generation(16) || X(1) || data
-// ===========================================================================
-
-fn encode_share(generation: &[u8; GENERATION_SIZE], s: &Share) -> Vec<u8> {
-    let mut out = Vec::with_capacity(GENERATION_SIZE + 1 + s.data.len());
-    out.extend_from_slice(generation);
-    out.push(s.x);
-    out.extend_from_slice(&s.data);
-    out
-}
-
-fn decode_share(payload: &[u8]) -> Result<(String, Share), String> {
-    if payload.len() < GENERATION_SIZE + 2 {
-        return Err(format!("share payload too short ({} bytes)", payload.len()));
-    }
-    let gen = hex_encode(&payload[..GENERATION_SIZE]);
-    let x = payload[GENERATION_SIZE];
-    if x == 0 {
-        return Err("share X must be non-zero".into());
-    }
-    let data = payload[GENERATION_SIZE + 1..].to_vec();
-    Ok((gen, Share { x, data }))
-}
-
-fn push_share(by_gen: &mut Vec<(String, Vec<Share>)>, gen: String, share: Share) {
-    for (g, shares) in by_gen.iter_mut() {
-        if *g == gen {
-            shares.push(share);
-            return;
-        }
-    }
-    by_gen.push((gen, std::vec![share]));
-}
-
-/// Largest same-generation group meeting the threshold.
-fn best_group(by_gen: &[(String, Vec<Share>)], threshold: usize) -> Option<&[Share]> {
-    let mut best: Option<&[Share]> = None;
-    for (_, shares) in by_gen {
-        if shares.len() >= threshold && shares.len() > best.map_or(0, |b| b.len()) {
-            best = Some(shares);
-        }
-    }
-    best
-}
-
-// ===========================================================================
-//  Shamir Secret Sharing over GF(2^8) — ported from the Go client so split
-//  and reconstruct are self-consistent (the vault stores opaque shares).
-// ===========================================================================
-
-struct Share {
-    x: u8,
-    data: Vec<u8>,
-}
-
-/// `(gfExp, gfLog)` tables for GF(2^8) with generator g=3, modulus 0x11b.
-fn gf_tables() -> &'static ([u8; 256], [u8; 256]) {
-    static TABLES: OnceLock<([u8; 256], [u8; 256])> = OnceLock::new();
-    TABLES.get_or_init(|| {
-        let mut exp = [0u8; 256];
-        let mut log = [0u8; 256];
-        let mut val: u16 = 1;
-        for i in 0..255usize {
-            exp[i] = val as u8;
-            log[val as usize] = i as u8;
-            let mut doubled = val << 1;
-            if doubled & 0x100 != 0 {
-                doubled ^= 0x11b;
-            }
-            val = doubled ^ val; // val *= 3
-        }
-        exp[255] = exp[0]; // g^255 = g^0 = 1
-        (exp, log)
-    })
-}
-
-fn gf_mul(a: u8, b: u8) -> u8 {
-    if a == 0 || b == 0 {
-        return 0;
-    }
-    let (exp, log) = gf_tables();
-    let log_sum = log[a as usize] as u16 + log[b as usize] as u16;
-    exp[(log_sum % 255) as usize]
-}
-
-fn gf_inv(a: u8) -> u8 {
-    let (exp, log) = gf_tables();
-    exp[(255 - log[a as usize] as u16) as usize]
-}
-
-#[inline]
-fn gf_add(a: u8, b: u8) -> u8 {
-    a ^ b
-}
-
-fn eval_poly(constant: u8, coeffs: &[u8], x: u8) -> u8 {
-    let mut val = 0u8;
-    for &c in coeffs.iter().rev() {
-        val = gf_add(gf_mul(val, x), c);
-    }
-    gf_add(gf_mul(val, x), constant)
-}
-
-fn lagrange_at_zero(xs: &[u8], ys: &[u8]) -> u8 {
-    let n = xs.len();
-    let mut result = 0u8;
-    for i in 0..n {
-        let mut num = 1u8;
-        let mut den = 1u8;
-        for j in 0..n {
-            if i == j {
-                continue;
-            }
-            num = gf_mul(num, xs[j]); // 0 - xs[j] = xs[j] in GF(2^8)
-            den = gf_mul(den, gf_add(xs[i], xs[j]));
-        }
-        let basis = gf_mul(num, gf_inv(den));
-        result = gf_add(result, gf_mul(ys[i], basis));
-    }
-    result
-}
-
-fn shamir_split(secret: &[u8], threshold: usize, num_shares: usize) -> Result<Vec<Share>, String> {
-    if threshold < 2 {
-        return Err("threshold must be >= 2".into());
-    }
-    if num_shares < threshold {
-        return Err("numShares must be >= threshold".into());
-    }
-    if num_shares > 255 {
-        return Err("max 255 shares (GF(256))".into());
-    }
-    if secret.is_empty() {
-        return Err("secret must not be empty".into());
-    }
-    let mut shares: Vec<Share> = (0..num_shares)
-        .map(|i| Share {
-            x: (i + 1) as u8,
-            data: Vec::with_capacity(secret.len()),
-        })
-        .collect();
-    let rng = SystemRandom::new();
-    let mut coeffs = std::vec![0u8; threshold - 1];
-    for &b in secret {
-        rng.fill(&mut coeffs).map_err(|_| "rng (shamir coeffs)")?;
-        for share in shares.iter_mut() {
-            let v = eval_poly(b, &coeffs, share.x);
-            share.data.push(v);
-        }
-    }
-    Ok(shares)
-}
-
-fn shamir_reconstruct(shares: &[Share]) -> Result<Vec<u8>, String> {
-    if shares.is_empty() {
-        return Err("no shares provided".into());
-    }
-    let data_len = shares[0].data.len();
-    for s in &shares[1..] {
-        if s.data.len() != data_len {
-            return Err("all shares must have the same data length".into());
-        }
-    }
-    let mut seen = [false; 256];
-    for s in shares {
-        if seen[s.x as usize] {
-            return Err(format!("duplicate share X={}", s.x));
-        }
-        seen[s.x as usize] = true;
-    }
-    let xs: Vec<u8> = shares.iter().map(|s| s.x).collect();
-    let mut secret = std::vec![0u8; data_len];
-    let mut ys = std::vec![0u8; shares.len()];
-    for (j, out) in secret.iter_mut().enumerate() {
-        for (i, s) in shares.iter().enumerate() {
-            ys[i] = s.data[j];
-        }
-        *out = lagrange_at_zero(&xs, &ys);
-    }
-    Ok(secret)
 }
 
 // ===========================================================================
