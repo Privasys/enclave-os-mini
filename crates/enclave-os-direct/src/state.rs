@@ -18,6 +18,13 @@
 //! forward from whatever was restored, and the app's attestation advertises
 //! which keys it serves (OID 7.4), so a rollback is visible.
 //!
+//! No order (first issuance, retry or renewal) is placed until a self-probe
+//! shows a TLS-ALPN-01 validation would reach this runtime: it serves a
+//! probe challenge certificate, connects to the name over the network with
+//! ALPN `acme-tls/1` as the CA would, and checks it was served that
+//! certificate. Every failed validation counts against the CA's limit (Let's
+//! Encrypt: 5 per account, hostname and hour); a failed probe costs nothing.
+//!
 //! The ACME work never holds the state lock across a network wait: the CA
 //! validates by connecting to the runtime while the order is in flight, and
 //! that handshake needs to read the challenge (see [`drive`]).
@@ -43,9 +50,15 @@ pub const STATE_LABEL: &str = "privasys-direct-state/v1";
 /// The host storage table holding sealed direct state.
 pub const TABLE: &[u8] = b"directstate";
 
-/// The first retry after a failed attempt, doubling up to [`MAX_BACKOFF`].
+/// The first retry after a failed order, doubling up to [`MAX_BACKOFF`].
 pub const MIN_BACKOFF: i64 = 60;
 pub const MAX_BACKOFF: i64 = 3600;
+
+/// The first retry after a failed self-probe, doubling up to
+/// [`PROBE_MAX_BACKOFF`]. A failed probe costs the CA nothing, so it retries
+/// sooner than a failed order.
+pub const PROBE_MIN_BACKOFF: i64 = 120;
+pub const PROBE_MAX_BACKOFF: i64 = 900;
 
 /// The runtime's host storage (unsealed bytes: everything stored here is
 /// sealed first).
@@ -130,6 +143,10 @@ pub struct Name {
     pub generation: u64,
     next_attempt: i64,
     backoff: i64,
+    probe: Option<binding::ProbeStatus>,
+    probe_next: i64,
+    probe_backoff: i64,
+    probe_at: i64,
 }
 
 struct App {
@@ -233,7 +250,10 @@ impl Direct {
             self.generation += 1;
             self.names.insert(
                 d.clone(),
-                Name { app: app.to_string(), served, challenge: None, generation: self.generation, next_attempt: 0, backoff: 0 },
+                Name {
+                    app: app.to_string(), served, challenge: None, generation: self.generation,
+                    next_attempt: 0, backoff: 0, probe: None, probe_next: 0, probe_backoff: 0, probe_at: 0,
+                },
             );
         }
         let account_uri = self.apps.get(app).map(|a| a.account_uri.clone()).unwrap_or_default();
@@ -280,7 +300,9 @@ impl Direct {
                 .iter()
                 .map(|d| {
                     let facts = self.names.get(d).and_then(|n| n.served.as_ref()).map(|s| s.facts.clone());
+                    let probe = self.names.get(d).and_then(|n| n.probe.clone());
                     DomainStatus {
+                        probe,
                         name: d.clone(),
                         issued: facts.is_some(),
                         not_after: facts.as_ref().map(|f| f.not_after.clone()).unwrap_or_default(),
@@ -334,6 +356,49 @@ impl Direct {
         }
     }
 
+    /// Served names whose last probe is older than [`PROBE_MAX_BACKOFF`]:
+    /// re-probed as a health signal (it costs the CA nothing), never ordered.
+    fn probe_stale(&self, app: &str, now: i64) -> Vec<String> {
+        self.names
+            .iter()
+            .filter(|(_, n)| n.app == app && n.served.is_some())
+            .filter(|(_, n)| n.probe.is_none() || n.probe_at + PROBE_MAX_BACKOFF <= now)
+            .map(|(d, _)| d.clone())
+            .collect()
+    }
+
+    /// Whether a name may be probed at `now` (not inside a probe backoff).
+    fn probe_due(&self, domain: &str, now: i64) -> bool {
+        self.names.get(domain).map(|n| n.probe_next <= now).unwrap_or(false)
+    }
+
+    fn probed(&mut self, domain: &str, now: i64, result: &Result<(), String>) -> i64 {
+        let n = match self.names.get_mut(domain) {
+            Some(n) => n,
+            None => return 0,
+        };
+        let checked_at = binding::rfc3339_unix(now);
+        n.probe_at = now;
+        match result {
+            Ok(()) => {
+                n.probe = Some(binding::ProbeStatus { ok: true, checked_at, error: String::new() });
+                n.probe_backoff = 0;
+                n.probe_next = 0;
+                0
+            }
+            Err(e) => {
+                n.probe = Some(binding::ProbeStatus { ok: false, checked_at, error: e.clone() });
+                n.probe_backoff = if n.probe_backoff == 0 {
+                    PROBE_MIN_BACKOFF
+                } else {
+                    (n.probe_backoff * 2).min(PROBE_MAX_BACKOFF)
+                };
+                n.probe_next = now + n.probe_backoff;
+                n.probe_backoff
+            }
+        }
+    }
+
     fn account_known(&self, app: &str) -> bool {
         self.apps.get(app).map(|a| !a.account_uri.is_empty()).unwrap_or(false)
     }
@@ -365,8 +430,12 @@ impl ChallengeSink for SharedSink<'_> {
 /// Issues or renews what is due for `app` at `now` (the status read calls
 /// this). The lock is taken only for short reads and writes, never across
 /// a network call: the CA's validation handshake reads the challenge while
-/// the order is in flight. `resolves` says whether a name resolves yet; no
-/// order is placed before it does.
+/// the order is in flight.
+///
+/// Before any order, the name must resolve (`resolves`) and pass the
+/// self-probe: `probe` connects to the name as the CA's validator would
+/// (SNI the name, ALPN exactly `acme-tls/1`) and returns the leaf it was
+/// served. Otherwise the name backs off and no order is placed.
 pub fn drive<T: Transport>(
     shared: &Mutex<Direct>,
     store: &dyn Store,
@@ -376,12 +445,26 @@ pub fn drive<T: Transport>(
     transport: T,
     directory: &str,
     resolves: &mut dyn FnMut(&str) -> bool,
+    probe: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
 ) -> Result<Outcome, String> {
-    let (due, have_account) = {
+    let (due, stale, have_account) = {
         let d = shared.lock().map_err(|_| "direct: state lock poisoned")?;
-        (d.due(app, now), d.account_known(app))
+        (d.due(app, now), d.probe_stale(app, now), d.account_known(app))
     };
     let mut out = Outcome::default();
+    // Health re-probes of served names that are not due: recorded, never
+    // ordered.
+    for domain in stale.iter().filter(|d| !due.contains(d)) {
+        if !shared.lock().map_err(|_| "direct: state lock poisoned")?.probe_due(domain, now) {
+            continue;
+        }
+        let reached = if !resolves(domain) {
+            Err("no DNS: the name does not resolve".to_string())
+        } else {
+            self_probe(shared, domain, probe)
+        };
+        shared.lock().map_err(|_| "direct: state lock poisoned")?.probed(domain, now, &reached);
+    }
     if due.is_empty() && have_account {
         return Ok(out);
     }
@@ -398,9 +481,17 @@ pub fn drive<T: Transport>(
         shared.lock().map_err(|_| "direct: state lock poisoned")?.set_account(app, uri);
     }
     for domain in due {
-        if !resolves(&domain) {
-            let b = shared.lock().map_err(|_| "direct: state lock poisoned")?.failed(&domain, now);
-            out.failed.push((domain, "the name does not resolve yet".into(), b));
+        if !shared.lock().map_err(|_| "direct: state lock poisoned")?.probe_due(&domain, now) {
+            continue;
+        }
+        let reached = if !resolves(&domain) {
+            Err("no DNS: the name does not resolve yet".to_string())
+        } else {
+            self_probe(shared, &domain, probe)
+        };
+        let b = shared.lock().map_err(|_| "direct: state lock poisoned")?.probed(&domain, now, &reached);
+        if let Err(e) = reached {
+            out.failed.push((domain, format!("self-probe: {e}"), b));
             continue;
         }
         let mut sink = SharedSink(shared);
@@ -422,6 +513,47 @@ pub fn drive<T: Transport>(
         }
     }
     Ok(out)
+}
+
+/// Serves a probe challenge certificate for `domain` (a random key
+/// authorization), has `probe` connect to the name as the CA would, and
+/// checks the served leaf carries that key authorization. The probe
+/// certificate is removed whatever the outcome.
+fn self_probe(
+    shared: &Mutex<Direct>,
+    domain: &str,
+    probe: &mut dyn FnMut(&str) -> Result<Vec<u8>, String>,
+) -> Result<(), String> {
+    let mut nonce = [0u8; 16];
+    SystemRandom::new().fill(&mut nonce).map_err(|_| "no randomness".to_string())?;
+    let key_authorization: String = nonce.iter().map(|b| format!("{b:02x}")).collect();
+    let cert = crate::challenge::tls_alpn_certificate(domain, &key_authorization)?;
+    shared.lock().map_err(|_| "state lock poisoned".to_string())?.set_challenge(domain, Some(&cert));
+    let served = probe(domain);
+    if let Ok(mut d) = shared.lock() {
+        d.set_challenge(domain, None);
+    }
+    let leaf = served.map_err(|e| format!("refused: {e}"))?;
+    let want = <Sha256 as sha2::Digest>::digest(key_authorization.as_bytes());
+    if acme_identifier(&leaf).as_deref() == Some(&want[..]) {
+        Ok(())
+    } else {
+        Err("wrong certificate: acme-tls/1 on this name does not reach this runtime (not spliced yet?)".into())
+    }
+}
+
+/// The digest an acmeIdentifier extension carries (RFC 8737), if any.
+fn acme_identifier(leaf: &[u8]) -> Option<Vec<u8>> {
+    use x509_parser::prelude::*;
+    let (_, cert) = X509Certificate::from_der(leaf).ok()?;
+    let oid = x509_parser::oid_registry::Oid::from(&[1, 3, 6, 1, 5, 5, 7, 1, 31]).ok()?;
+    let ext = cert.extensions().iter().find(|e| e.oid == oid)?;
+    // An OCTET STRING wrapping the 32-byte digest.
+    if ext.value.len() == 34 && ext.value[0] == 0x04 && ext.value[1] == 32 {
+        Some(ext.value[2..].to_vec())
+    } else {
+        None
+    }
 }
 
 #[cfg(test)]

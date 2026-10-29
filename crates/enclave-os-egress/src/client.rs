@@ -1586,3 +1586,102 @@ mod redaction_tests {
         assert!(!debug.contains("Set-Cookie"));
     }
 }
+
+// =========================================================================
+//  TLS reachability probe
+// =========================================================================
+
+/// Accepts any server certificate: a reachability probe reads what it is
+/// served, it does not trust it. The handshake signature is still checked,
+/// against the leaf's raw key (webpki would refuse a leaf with an unknown
+/// critical extension, which the TLS-ALPN-01 certificate carries).
+#[derive(Debug)]
+struct AnyLeaf;
+
+impl ServerCertVerifier for AnyLeaf {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &ServerName<'_>,
+        _ocsp: &[u8],
+        _now: UnixTime,
+    ) -> Result<ServerCertVerified, Error> {
+        Ok(ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        _message: &[u8],
+        _cert: &CertificateDer<'_>,
+        _dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        Err(Error::General("tls 1.2 not offered".into()))
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        let (_, leaf) = X509Certificate::from_der(cert.as_ref())
+            .map_err(|_| Error::General("unparsable leaf".into()))?;
+        let spki = rustls::pki_types::SubjectPublicKeyInfoDer::from(leaf.tbs_certificate.subject_pki.raw.to_vec());
+        rustls::crypto::verify_tls13_signature_with_raw_key(
+            message,
+            &spki,
+            dss,
+            &default_provider().signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        default_provider().signature_verification_algorithms.supported_schemes()
+    }
+}
+
+/// Connects to `host:port` with SNI `host` and exactly `alpn`, completes a
+/// TLS 1.3 handshake, and returns the server's leaf certificate (DER) and
+/// the negotiated protocol. Sends no application data and trusts nothing it
+/// is served: it answers "what does this name serve on this protocol", as a
+/// TLS-ALPN-01 validator would see it.
+pub fn tls_probe(host: &str, port: u16, alpn: &[u8]) -> Result<(Vec<u8>, Option<Vec<u8>>), String> {
+    poll_to_completion(tls_probe_inner(host, port, alpn, false))
+}
+
+/// [`tls_probe`] for code running in a request task: the network waits
+/// suspend the task, so the enclave keeps serving (including, through the
+/// platform gateway, the very connection being probed).
+pub async fn tls_probe_async(host: &str, port: u16, alpn: &[u8]) -> Result<(Vec<u8>, Option<Vec<u8>>), String> {
+    tls_probe_inner(host, port, alpn, true).await
+}
+
+async fn tls_probe_inner(
+    host: &str,
+    port: u16,
+    alpn: &[u8],
+    async_io: bool,
+) -> Result<(Vec<u8>, Option<Vec<u8>>), String> {
+    let mut config = ClientConfig::builder_with_details(Arc::new(default_provider()), Arc::new(TrustedTime))
+        .with_protocol_versions(&[&rustls::version::TLS13])
+        .map_err(|e| format!("probe config: {e}"))?
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(AnyLeaf))
+        .with_no_client_auth();
+    config.alpn_protocols = vec![alpn.to_vec()];
+    let server_name = ServerName::try_from(host.to_string()).map_err(|_| "invalid server name".to_string())?;
+    let mut conn = ClientConnection::new(Arc::new(config), server_name)
+        .map_err(|e| format!("probe init: {e}"))?;
+    let mut net = Transport::connect(host, port, async_io)?;
+    let result = tls_handshake(&mut net, &mut conn).await.and_then(|()| {
+        let leaf = conn
+            .peer_certificates()
+            .and_then(|c| c.first())
+            .map(|c| c.as_ref().to_vec())
+            .ok_or_else(|| "no certificate served".to_string())?;
+        Ok((leaf, conn.alpn_protocol().map(|p| p.to_vec())))
+    });
+    net.close();
+    result
+}

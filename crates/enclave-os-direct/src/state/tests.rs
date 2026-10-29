@@ -203,20 +203,20 @@ fn a_status_read_renews_past_the_threshold() {
 
     // First issuance.
     let mut ca = RealCa::new(&shared, T0, 90);
-    let out = drive(&shared, &store, APP, &branch, T0, &mut ca, DIR, &mut |_| true).unwrap();
+    let out = drive(&shared, &store, APP, &branch, T0, &mut ca, DIR, &mut |_| true, &mut reaches(&shared)).unwrap();
     assert_eq!(out.issued, vec![DOMAIN.to_string()], "{out:?}");
     let first = served_spki(&shared);
     assert_eq!(spki_of(&browser_leaf(&shared)), first, "the browser gets the issued certificate");
     assert!(String::from_utf8(shared.lock().unwrap().key_bindings(APP).unwrap()).unwrap().contains(&first));
 
     // Well inside the validity: nothing due, no network.
-    let out = drive(&shared, &store, APP, &branch, T0 + 10 * DAY, NoNetwork, DIR, &mut |_| true).unwrap();
+    let out = drive(&shared, &store, APP, &branch, T0 + 10 * DAY, NoNetwork, DIR, &mut |_| true, &mut reaches(&shared)).unwrap();
     assert!(out.issued.is_empty());
 
     // 29 days left: the status read renews.
     let later = T0 + 61 * DAY;
     let mut ca = RealCa::new(&shared, later, 90);
-    let out = drive(&shared, &store, APP, &branch, later, &mut ca, DIR, &mut |_| true).unwrap();
+    let out = drive(&shared, &store, APP, &branch, later, &mut ca, DIR, &mut |_| true, &mut reaches(&shared)).unwrap();
     assert_eq!(out.issued, vec![DOMAIN.to_string()], "renewed: {out:?}");
     let second = served_spki(&shared);
     assert_ne!(second, first, "a renewal has a new key, born here");
@@ -237,7 +237,7 @@ fn a_roll_restores_everything_without_network_or_approval() {
     let shared = Mutex::new(Direct::new());
     approve(&shared, &store, &branch, 1).unwrap();
     let mut ca = RealCa::new(&shared, T0, 90);
-    drive(&shared, &store, APP, &branch, T0, &mut ca, DIR, &mut |_| true).unwrap();
+    drive(&shared, &store, APP, &branch, T0, &mut ca, DIR, &mut |_| true, &mut reaches(&shared)).unwrap();
     let spki = served_spki(&shared);
 
     // A new build: new process, same host storage, same vault-held key.
@@ -251,7 +251,7 @@ fn a_roll_restores_everything_without_network_or_approval() {
     // Nothing due: a status read after the roll makes no network call (the
     // account was never needed again; the restored names are not due).
     roll.lock().unwrap().set_account(APP, "https://ca.test/acct/1".into());
-    let out = drive(&roll, &store, APP, &branch, T0 + DAY, NoNetwork, DIR, &mut |_| true).unwrap();
+    let out = drive(&roll, &store, APP, &branch, T0 + DAY, NoNetwork, DIR, &mut |_| true, &mut reaches(&roll)).unwrap();
     assert!(out.issued.is_empty() && out.failed.is_empty());
 
     // The pin's sequence still only moves forward.
@@ -262,4 +262,131 @@ fn a_roll_restores_everything_without_network_or_approval() {
     let refused = Mutex::new(Direct::new());
     assert!(!refused.lock().unwrap().restore(&store, APP, CANONICAL, &[7u8; 32]).unwrap());
     assert!(refused.lock().unwrap().name(DOMAIN).is_none());
+}
+
+/// A probe that reaches this runtime, as the CA's validator would through a
+/// gateway that splices acme-tls/1: it is served whatever challenge the
+/// runtime's handshake serves now.
+fn reaches(shared: &Mutex<Direct>) -> impl FnMut(&str) -> Result<Vec<u8>, String> + '_ {
+    move |d: &str| {
+        let c = shared.lock().unwrap().name(d).and_then(|n| n.challenge.clone()).ok_or("no challenge served")?;
+        let cfg = crate::tls::challenge_config(&c, crate::tls::tests::time())?;
+        crate::tls::tests::validate(cfg, d).map(|(leaf, _)| leaf)
+    }
+}
+
+fn probe_of(shared: &Mutex<Direct>) -> binding::ProbeStatus {
+    shared.lock().unwrap().status(APP).domains[0].probe.clone().expect("a probe ran")
+}
+
+#[test]
+fn a_successful_probe_lets_the_order_run_and_is_reported() {
+    let branch = [8u8; 32];
+    let store = MemStore::default();
+    let shared = Mutex::new(Direct::new());
+    approve(&shared, &store, &branch, 1).unwrap();
+    let mut ca = RealCa::new(&shared, T0, 90);
+    let out = drive(&shared, &store, APP, &branch, T0, &mut ca, DIR, &mut |_| true, &mut reaches(&shared)).unwrap();
+    assert_eq!(out.issued, vec![DOMAIN.to_string()]);
+    let p = probe_of(&shared);
+    assert!(p.ok && p.error.is_empty() && p.checked_at.ends_with('Z'), "{p:?}");
+    assert!(shared.lock().unwrap().name(DOMAIN).unwrap().challenge.is_none(), "the probe certificate is removed");
+}
+
+/// The gateway is not splicing yet: something else answers acme-tls/1 (a
+/// terminating proxy, another server). No order may run.
+#[test]
+fn a_wrong_certificate_blocks_the_order() {
+    let branch = [9u8; 32];
+    let store = MemStore::default();
+    let shared = Mutex::new(Direct::new());
+    approve(&shared, &store, &branch, 1).unwrap();
+    let elsewhere = crate::challenge::tls_alpn_certificate(DOMAIN, "someone-else").unwrap().cert_der;
+    let mut ca = RealCa::new(&shared, T0, 90);
+    let out = drive(&shared, &store, APP, &branch, T0, &mut ca, DIR, &mut |_| true, &mut |_: &str| Ok(elsewhere.clone())).unwrap();
+    assert!(out.issued.is_empty());
+    assert_eq!(ca.orders, 0, "no order is placed while the probe fails");
+    let p = probe_of(&shared);
+    assert!(!p.ok && p.error.contains("wrong certificate"), "{p:?}");
+    assert_eq!(out.failed[0].2, PROBE_MIN_BACKOFF);
+}
+
+#[test]
+fn an_unreachable_name_backs_off_and_never_orders() {
+    let branch = [10u8; 32];
+    let store = MemStore::default();
+    let shared = Mutex::new(Direct::new());
+    approve(&shared, &store, &branch, 1).unwrap();
+    let mut probes = 0;
+    let mut refuse = |_: &str| -> Result<Vec<u8>, String> {
+        probes += 1;
+        Err("connection refused".into())
+    };
+    let mut ca = RealCa::new(&shared, T0, 90);
+    drive(&shared, &store, APP, &branch, T0, &mut ca, DIR, &mut |_| true, &mut refuse).unwrap();
+    assert!(probe_of(&shared).error.contains("refused"));
+    // Inside the 2 minute backoff: not even probed.
+    drive(&shared, &store, APP, &branch, T0 + 60, &mut ca, DIR, &mut |_| true, &mut refuse).unwrap();
+    // Due again: probed, refused, the backoff doubles.
+    let out = drive(&shared, &store, APP, &branch, T0 + PROBE_MIN_BACKOFF, &mut ca, DIR, &mut |_| true, &mut refuse).unwrap();
+    assert_eq!(out.failed[0].2, 2 * PROBE_MIN_BACKOFF);
+    // And it caps at 15 minutes.
+    let mut t = T0 + PROBE_MIN_BACKOFF;
+    for _ in 0..6 {
+        t += PROBE_MAX_BACKOFF;
+        let out = drive(&shared, &store, APP, &branch, t, &mut ca, DIR, &mut |_| true, &mut refuse).unwrap();
+        assert!(out.failed[0].2 <= PROBE_MAX_BACKOFF);
+    }
+    drop(refuse);
+    assert_eq!(probes, 8);
+    assert_eq!(ca.orders, 0, "no order is placed while the name is unreachable");
+}
+
+#[test]
+fn no_dns_is_reported_and_never_probed_or_ordered() {
+    let branch = [11u8; 32];
+    let store = MemStore::default();
+    let shared = Mutex::new(Direct::new());
+    approve(&shared, &store, &branch, 1).unwrap();
+    let mut ca = RealCa::new(&shared, T0, 90);
+    let mut probed = false;
+    drive(&shared, &store, APP, &branch, T0, &mut ca, DIR, &mut |_| false, &mut |_: &str| {
+        probed = true;
+        Err("unused".into())
+    })
+    .unwrap();
+    assert!(!probed);
+    assert!(probe_of(&shared).error.starts_with("no DNS"));
+    assert_eq!(ca.orders, 0);
+}
+
+/// A served name that is not due is re-probed at most every 15 minutes as a
+/// health signal, and never ordered.
+#[test]
+fn a_served_name_is_reprobed_for_health_but_not_reordered() {
+    let branch = [12u8; 32];
+    let store = MemStore::default();
+    let shared = Mutex::new(Direct::new());
+    approve(&shared, &store, &branch, 1).unwrap();
+    let mut ca = RealCa::new(&shared, T0, 90);
+    drive(&shared, &store, APP, &branch, T0, &mut ca, DIR, &mut |_| true, &mut reaches(&shared)).unwrap();
+    let orders = ca.orders;
+    let mut probes = 0;
+    let t = T0 + PROBE_MAX_BACKOFF;
+    drive(&shared, &store, APP, &branch, t, &mut ca, DIR, &mut |_| true, &mut |d: &str| {
+        probes += 1;
+        reaches(&shared)(d)
+    })
+    .unwrap();
+    assert_eq!(probes, 1);
+    assert_eq!(ca.orders, orders, "a health probe never orders");
+    assert!(probe_of(&shared).ok);
+    // Within 15 minutes of it: no probe.
+    let mut again = 0;
+    drive(&shared, &store, APP, &branch, t + 60, &mut ca, DIR, &mut |_| true, &mut |_: &str| {
+        again += 1;
+        Err("unused".into())
+    })
+    .unwrap();
+    assert_eq!(again, 0);
 }

@@ -52,14 +52,28 @@ TLS-ALPN-01 (RFC 8737), with a key generated in the enclave.
   GET /api/v1/apps/<name>/direct          (manager role)
   {"supported": true, "account_uri": "https://acme-v02.api.letsencrypt.org/acme/acct/<n>",
    "domains": [{"name": "shop.example.com", "issued": true,
-                "not_after": "2027-01-27T10:45:21Z", "spki_sha256": "<hex>"}]}
+                "not_after": "2027-01-27T10:45:21Z", "spki_sha256": "<hex>",
+                "probe": {"ok": true, "checked_at": "2026-10-29T21:30:00Z"}}]}
   ```
 
   The request runs as a task, so its network waits suspend instead of
   blocking the enclave, and the CA's validation handshake is served while
-  the order is in flight. A name is ordered only once it resolves in DNS,
-  failures back off from 60 seconds to an hour, and a certificate is renewed
-  when less than 30 days remain. One CA, one account: there is no retry
+  the order is in flight. Failed orders back off from 60 seconds to an hour,
+  and a certificate is renewed when less than 30 days remain.
+- **Self-probe before every order.** Every failed validation counts against
+  the CA's limit (Let's Encrypt: 5 per account, hostname and hour), and a
+  validation fails whenever the platform gateway is not yet splicing
+  `acme-tls/1` for the name to this enclave. So before an order (first
+  issuance, retry or renewal) the enclave checks that the name resolves,
+  serves a probe challenge certificate with a random key authorization,
+  connects to the name over its egress (through the public DNS and the
+  gateway, back to itself) with SNI the name and ALPN exactly `acme-tls/1`,
+  and checks it was served that certificate. Only then does it order. A
+  failed probe backs off from 2 to 15 minutes and is reported in `probe`:
+  `no DNS`, `refused` (nothing answered), or `wrong certificate` (something
+  else answered, for instance a gateway that still terminates the name). A
+  served name is also re-probed at most every 15 minutes as a health signal;
+  that never places an order. One CA, one account: there is no retry
   against a test CA. An empty `account_uri` means the app is not
   vault-backed.
 

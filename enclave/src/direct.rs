@@ -12,6 +12,8 @@
 //!   challenge certificate, `privasys-ratls/1` the RA-TLS leaf for the
 //!   adopter name (through a cert-store alias), anything else the publicly
 //!   trusted one. A connection served that one is the direct leg.
+//! - No order is placed until a self-probe shows a TLS-ALPN-01 validation
+//!   would reach this enclave (see `enclave_os_direct::state`).
 //! - Issuance and renewal run when the control plane reads the status
 //!   (`GET /api/v1/apps/<name>/direct`, manager role): that request runs as
 //!   a task, so its network waits suspend instead of blocking the enclave.
@@ -271,7 +273,8 @@ pub fn handle_status(app: &str) -> (u16, Vec<u8>) {
         match ocall::get_current_time() {
             Ok(now) => {
                 let mut resolves = |d: &str| resolves(d);
-                match state::drive(shared(), &HostStore, app, &branch, now as i64, Egress, LETS_ENCRYPT, &mut resolves) {
+                let mut probe = |d: &str| self_probe(d);
+                match state::drive(shared(), &HostStore, app, &branch, now as i64, Egress, LETS_ENCRYPT, &mut resolves, &mut probe) {
                     Ok(out) => {
                         for d in &out.issued {
                             enclave_log_info!("direct: certificate issued for {}", d);
@@ -301,6 +304,23 @@ fn resolves(domain: &str) -> bool {
         Ok(r) if r.status == 200 => dns::resolves(&r.body),
         _ => false,
     }
+}
+
+/// Connects to `domain` from inside, as the CA's validator would: through
+/// the public DNS and the platform gateway back to this enclave, SNI the
+/// name, ALPN exactly `acme-tls/1`. Returns the leaf served. Suspends the
+/// request task while waiting, so this enclave can serve the very
+/// connection it is probing.
+fn self_probe(domain: &str) -> Result<Vec<u8>, String> {
+    let alpn = enclave_os_direct::ACME_TLS_ALPN.as_bytes();
+    let r = if enclave_os_wasm::executor::can_suspend() && enclave_os_egress::netchan::is_available() {
+        enclave_os_wasm::executor::block_on(enclave_os_egress::client::tls_probe_async(domain, 443, alpn))
+    } else {
+        // A blocking probe would wait on a handshake this enclave cannot
+        // answer while it blocks.
+        return Err("cannot probe outside a request task".into());
+    };
+    r.map(|(leaf, _)| leaf)
 }
 
 /// The enclave's egress as the ACME transport.

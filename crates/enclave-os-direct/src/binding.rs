@@ -40,6 +40,11 @@ pub fn leaf_facts(chain_pem: &str) -> Result<LeafFacts, String> {
     })
 }
 
+/// RFC 3339 UTC for Unix seconds (empty when out of range).
+pub fn rfc3339_unix(secs: i64) -> String {
+    ::time::OffsetDateTime::from_unix_timestamp(secs).map(rfc3339).unwrap_or_default()
+}
+
 /// RFC 3339 UTC, to the second (the container runtime's format).
 fn rfc3339(t: ::time::OffsetDateTime) -> String {
     let t = t.to_offset(::time::UtcOffset::UTC);
@@ -82,6 +87,19 @@ pub struct DomainStatus {
     pub not_after: String,
     #[serde(skip_serializing_if = "String::is_empty")]
     pub spki_sha256: String,
+    /// The last self-probe: whether a TLS-ALPN-01 validation would reach
+    /// this runtime. Absent before the first one.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub probe: Option<ProbeStatus>,
+}
+
+/// The outcome of a self-probe.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct ProbeStatus {
+    pub ok: bool,
+    pub checked_at: String,
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub error: String,
 }
 
 /// Renew when less than a third of the lifetime remains (30 days of a
