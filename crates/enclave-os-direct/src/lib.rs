@@ -22,6 +22,8 @@
 //!   key and CSR (the key is generated here and never leaves the enclave).
 //! - [`binding`]: the OID 7.4 value binding each direct name to the key of
 //!   its public certificate, and the status the control plane reads.
+//! - [`tls`]: the server configs (the challenge one cannot go through
+//!   `with_single_cert`, see there).
 //! - [`dns`]: a readiness check, so no order is placed (and no failed
 //!   validation spent) before the name resolves.
 
@@ -32,6 +34,7 @@ pub mod dns;
 pub mod jws;
 pub mod keys;
 pub mod policy;
+pub mod tls;
 
 /// The ALPN of the TLS-ALPN-01 challenge (RFC 8737).
 pub const ACME_TLS_ALPN: &str = "acme-tls/1";

@@ -35,8 +35,6 @@ use enclave_os_direct::binding::{self, DomainStatus, Status, DIRECT_DOMAIN_KEYS_
 use enclave_os_direct::challenge::CertAndKey;
 use enclave_os_direct::policy::{self, Approval, Pin};
 use enclave_os_direct::{dns, keys, select, Selection, LETS_ENCRYPT};
-use rustls::crypto::ring::default_provider;
-use rustls::pki_types::{CertificateDer, PrivateKeyDer, PrivatePkcs8KeyDer};
 use rustls::ServerConfig;
 use serde::{Deserialize, Serialize};
 
@@ -162,22 +160,9 @@ pub fn tls_for(sni: Option<&str>, alpn: &[String]) -> Result<DirectTls, String> 
     }
 }
 
-fn server_config(chain: Vec<Vec<u8>>, key_pkcs8: Vec<u8>, alpn: Option<&[u8]>) -> Result<Arc<ServerConfig>, String> {
-    let certs: Vec<CertificateDer<'static>> = chain.into_iter().map(CertificateDer::from).collect();
-    let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(key_pkcs8));
-    let mut config = ServerConfig::builder_with_details(
-        Arc::new(default_provider()),
-        Arc::new(crate::trustedtime::ServingTime),
-    )
-    .with_protocol_versions(&[&rustls::version::TLS13])
-    .map_err(|e| format!("direct: tls config: {e:?}"))?
-    .with_no_client_auth()
-    .with_single_cert(certs, key)
-    .map_err(|e| format!("direct: certificate: {e:?}"))?;
-    if let Some(p) = alpn {
-        config.alpn_protocols = vec![p.to_vec()];
-    }
-    Ok(Arc::new(config))
+/// The trusted clock for the direct configs (serving never waits on it).
+fn serving_time() -> Arc<dyn rustls::time_provider::TimeProvider> {
+    Arc::new(crate::trustedtime::ServingTime)
 }
 
 fn chain_der(chain_pem: &str) -> Vec<Vec<u8>> {
@@ -291,7 +276,7 @@ fn apply(app: &str, canonical: &str, domains: &[String]) {
 
 fn public_from(c: &CertRecord) -> Result<(Arc<ServerConfig>, binding::LeafFacts), String> {
     let facts = binding::leaf_facts(&c.chain_pem)?;
-    let config = server_config(chain_der(&c.chain_pem), c.key_pkcs8_der.clone(), None)?;
+    let config = enclave_os_direct::tls::public_config(chain_der(&c.chain_pem), c.key_pkcs8_der.clone(), serving_time())?;
     Ok((config, facts))
 }
 
@@ -447,9 +432,19 @@ struct Sink;
 
 impl ChallengeSink for Sink {
     fn publish(&mut self, domain: &str, cert: Option<&CertAndKey>) {
-        let config = cert.and_then(|c| {
-            server_config(vec![c.cert_der.clone()], c.key_pkcs8_der.clone(), Some(enclave_os_direct::ACME_TLS_ALPN.as_bytes())).ok()
-        });
+        // A failure here used to be swallowed, which hid that the
+        // challenge certificate cannot go through with_single_cert (see
+        // enclave_os_direct::tls): the validator then saw no challenge.
+        let config = match cert {
+            Some(c) => match enclave_os_direct::tls::challenge_config(c, serving_time()) {
+                Ok(cfg) => Some(cfg),
+                Err(e) => {
+                    enclave_log_error!("direct: {}: challenge certificate not served: {}", domain, e);
+                    None
+                }
+            },
+            None => None,
+        };
         if let Ok(mut st) = STATE.lock() {
             if let Some(n) = st.names.get_mut(domain) {
                 n.challenge = config;

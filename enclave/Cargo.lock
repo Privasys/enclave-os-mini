@@ -485,6 +485,7 @@ dependencies = [
  "hkdf",
  "p256",
  "rcgen",
+ "rustls",
  "serde",
  "serde_json",
  "sha2",

@@ -23,6 +23,8 @@ sha2 = { version = "0.10", default-features = false }
 # the enclave graph.
 rcgen = { version = "0.13", default-features = false, features = ["ring", "x509-parser"] }
 x509-parser = "0.16"
+# The server configs a direct name serves (same features as the enclave).
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 time = { version = "0.3", default-features = false }
 
 serde = { version = "1", features = ["derive"] }

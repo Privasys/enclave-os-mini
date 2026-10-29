@@ -140,10 +140,21 @@ impl Transport for Mock<'_> {
                 }), hdr(vec![])))
             }
             "https://ca.test/chal/1" => {
-                // Validate as the CA would: connect with acme-tls/1 and read
-                // the certificate the client is serving.
+                // Validate as the CA would, while the client waits on this
+                // POST: a real TLS handshake with acme-tls/1 against the
+                // config built from the certificate the client published,
+                // then read the key authorization from the served leaf.
                 let cert = self.sink_cert.borrow().clone().expect("the challenge certificate is published before the CA is told");
-                let (_, x) = X509Certificate::from_der(&cert.cert_der).unwrap();
+                let served = crate::tls::challenge_config(&cert, crate::tls::tests::time())
+                    .and_then(|cfg| crate::tls::tests::validate(cfg, "shop.example.com"));
+                let leaf = match served {
+                    Ok((leaf, alpn)) => {
+                        assert_eq!(alpn.as_deref(), Some(b"acme-tls/1".as_slice()));
+                        leaf
+                    }
+                    Err(e) => panic!("the validator could not complete a handshake: {e}"),
+                };
+                let (_, x) = X509Certificate::from_der(&leaf).unwrap();
                 let oid = x509_parser::oid_registry::Oid::from(&[1, 3, 6, 1, 5, 5, 7, 1, 31]).unwrap();
                 let ext = x.extensions().iter().find(|e| e.oid == oid).unwrap();
                 let want = Sha256::digest(format!("{}.{}", self.ca.token, thumb).as_bytes());
