@@ -1,0 +1,37 @@
+# Copyright (c) Privasys. All rights reserved.
+# Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
+
+[package]
+name = "enclave-os-direct"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+description = "Direct domains for enclave-os: an adopter hostname whose TLS ends in the enclave with a publicly trusted certificate obtained there over ACME TLS-ALPN-01, named in an owner-signed app policy. Pure code; the network is injected."
+
+[lib]
+name = "enclave_os_direct"
+
+[dependencies]
+# The ACME account key: a P-256 scalar derived from the app's vault-held key,
+# so CAA accounturi pinning survives upgrades. ES256 JWS signatures are
+# deterministic (RFC 6979), so no randomness is needed to sign.
+p256 = { version = "0.13", default-features = false, features = ["ecdsa", "alloc"] }
+hkdf = "0.12"
+sha2 = { version = "0.10", default-features = false }
+
+# Certificate key, CSR and the TLS-ALPN-01 challenge certificate. Already in
+# the enclave graph.
+rcgen = { version = "0.13", default-features = false, features = ["ring", "x509-parser"] }
+x509-parser = "0.16"
+time = { version = "0.3", default-features = false }
+
+serde = { version = "1", features = ["derive"] }
+serde_json = { version = "1", features = ["raw_value"] }
+base64 = "0.21"
+
+[dev-dependencies]
+p256 = { version = "0.13", features = ["ecdsa"] }
+
+# Standalone (not a member of the root workspace): built as a path dependency
+# of the enclave crate, and testable directly with `cargo test`.
+[workspace]

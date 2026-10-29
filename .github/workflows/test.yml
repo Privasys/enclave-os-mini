@@ -79,6 +79,7 @@ jobs:
           - enclave-os-merkle
           - enclave-os-raft
           - enclave-os-clock
+          - enclave-os-direct
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable
