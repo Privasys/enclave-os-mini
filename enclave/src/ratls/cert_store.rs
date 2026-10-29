@@ -103,6 +103,15 @@ pub struct CertStore {
     ca: Arc<CaContext>,
     /// Hostname → registered app data.
     inner: RwLock<BTreeMap<String, RegisteredApp>>,
+    /// Direct adopter hostname → the registered hostname it serves. A
+    /// direct name resolves to its app's data, with the adopter name as the
+    /// certificate name, so a client asking for RA-TLS on it gets the app's
+    /// full attested leaf.
+    aliases: RwLock<BTreeMap<String, String>>,
+    /// Registered hostname → extensions the runtime stamps beyond the app's
+    /// own config (the direct domain keys, OID 7.4). Runtime-owned: an app
+    /// cannot write them.
+    runtime_extensions: RwLock<BTreeMap<String, Vec<(&'static [u64], Vec<u8>)>>>,
     /// Monotonically increasing generation counter.  Bumped on every
     /// `register()` / `unregister()` so that consumers (IngressServer
     /// cert cache) can detect stale entries.
@@ -115,6 +124,8 @@ impl CertStore {
         Self {
             ca,
             inner: RwLock::new(BTreeMap::new()),
+            aliases: RwLock::new(BTreeMap::new()),
+            runtime_extensions: RwLock::new(BTreeMap::new()),
             generation: AtomicU64::new(0),
         }
     }
@@ -163,13 +174,51 @@ impl CertStore {
     /// Returns a cloned snapshot of the app's certificate data, or
     /// `None` if no app is registered for this hostname.
     pub fn resolve(&self, hostname: &str) -> Option<AppCertData> {
+        let canonical = self
+            .aliases
+            .read()
+            .ok()
+            .and_then(|a| a.get(hostname).cloned())
+            .unwrap_or_else(|| hostname.to_string());
         let inner = self.inner.read().ok()?;
-        let app = inner.get(hostname)?;
+        let app = inner.get(&canonical)?;
+        let mut oid_extensions = app.oid_extensions.clone();
+        if let Some(extra) = self.runtime_extensions.read().ok().and_then(|r| r.get(&canonical).cloned()) {
+            oid_extensions.extend(extra);
+        }
         Some(AppCertData {
             hostname: hostname.to_string(),
             merkle_root: app.merkle_root,
-            oid_extensions: app.oid_extensions.clone(),
+            oid_extensions,
         })
+    }
+
+    /// Sets the direct adopter hostnames served by the app registered as
+    /// `canonical`, replacing its previous ones.
+    pub fn set_aliases(&self, canonical: &str, aliases: &[String]) {
+        if let Ok(mut a) = self.aliases.write() {
+            a.retain(|_, c| c != canonical);
+            for alias in aliases {
+                a.insert(alias.clone(), canonical.to_string());
+            }
+        }
+        self.generation.fetch_add(1, Ordering::Release);
+    }
+
+    /// Sets (or with `None` removes) a runtime-owned extension on the leaves
+    /// of the app registered as `canonical` and of its aliases.
+    pub fn set_runtime_extension(&self, canonical: &str, oid: &'static [u64], value: Option<Vec<u8>>) {
+        if let Ok(mut r) = self.runtime_extensions.write() {
+            let exts = r.entry(canonical.to_string()).or_default();
+            exts.retain(|(o, _)| *o != oid);
+            if let Some(v) = value {
+                exts.push((oid, v));
+            }
+            if exts.is_empty() {
+                r.remove(canonical);
+            }
+        }
+        self.generation.fetch_add(1, Ordering::Release);
     }
 
     /// List all registered hostnames.

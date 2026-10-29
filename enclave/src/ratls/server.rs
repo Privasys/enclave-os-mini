@@ -399,7 +399,9 @@ impl IngressServer {
                 return;
             }
             match session.recv_http_request() {
-                Ok(Some(http_req)) => {
+                Ok(Some(mut http_req)) => {
+                    // The leg comes from the connection, never a header.
+                    http_req.direct = session.is_direct();
                     let close = http_req.connection_close;
                     // RA-TLS v2 evidence endpoint: served here, where the TLS
                     // session (its exporter, its peer certificate) is at hand.
@@ -632,11 +634,27 @@ impl IngressServer {
             enclave_log_info!("SNI: {} (conn_id={})", sni, conn_id);
         }
 
-        // Build the TLS config for this SNI (the v2 leaf, no evidence).
-        let tls_result = self.tls_config_for(&hello.sni)?;
+        // A direct adopter name picks its certificate by the ALPN offered
+        // (crate::direct); everything else gets the v2 leaf of its SNI.
+        #[cfg(feature = "wasm")]
+        let (config, direct_leg) = {
+            let alpn: Vec<String> = accepted
+                .client_hello()
+                .alpn()
+                .map(|protos| protos.map(|p| String::from_utf8_lossy(p).into_owned()).collect())
+                .unwrap_or_default();
+            match crate::direct::tls_for(hello.sni.as_deref(), &alpn)? {
+                crate::direct::DirectTls::Serve { config, direct } => (config, direct),
+                crate::direct::DirectTls::RaTls | crate::direct::DirectTls::NotDirect => {
+                    (self.tls_config_for(&hello.sni)?.config, false)
+                }
+            }
+        };
+        #[cfg(not(feature = "wasm"))]
+        let (config, direct_leg) = (self.tls_config_for(&hello.sni)?.config, false);
 
         // Create the ServerConnection
-        let server_conn = match accepted.into_connection(tls_result.config) {
+        let server_conn = match accepted.into_connection(config) {
             Ok(conn) => conn,
             Err(e) => {
                 return Err(format!(
@@ -647,6 +665,7 @@ impl IngressServer {
         };
 
         let mut session = RaTlsSession::new(server_conn);
+        session.set_direct(direct_leg);
 
         // Collect any initial handshake output (ServerHello, etc.)
         let output = session.collect_tls_output()
@@ -1004,6 +1023,26 @@ fn handle_http_request(
             HttpHandleResult::json(status, body)
         }
 
+        // ── Direct domains (crate::direct) ──────────────────────────
+        // The owner-signed policy: the approval is the authority, so no
+        // platform role. The status (manager): also drives issuance.
+        #[cfg(feature = "wasm")]
+        (HttpMethod::Put, path) if direct_app(path, "/policy").is_some() => {
+            let app = direct_app(path, "/policy").unwrap_or_default();
+            let (status, body) = crate::direct::handle_policy(&app, &http_req.body, verify_oidc_token);
+            HttpHandleResult::json(status, body)
+        }
+        #[cfg(feature = "wasm")]
+        (HttpMethod::Get, path) if direct_app(path, "/direct").is_some() => {
+            match verify_auth_header(http_req) {
+                Some(claims) if claims.has_manager() => {}
+                _ => return HttpHandleResult::err(403, "manager role required"),
+            }
+            let app = direct_app(path, "/direct").unwrap_or_default();
+            let (status, body) = crate::direct::handle_status(&app);
+            HttpHandleResult::json(status, body)
+        }
+
         // ── Data / module dispatch ──────────────────────────────────
         (HttpMethod::Post, "/data") => {
             handle_data_request_http(http_req, base_ctx)
@@ -1090,7 +1129,9 @@ fn handle_http_request_with_session(
         // that leg except for the bootstrap endpoint (JSON by design)
         // and operational/metadata endpoints. RA-TLS (splice) clients
         // terminate TLS here and never carry the marker.
-        if http_req.edge_terminated && path_requires_sealed(&http_req.path) {
+        // A direct adopter name gets the same rule: TLS ended here, but the
+        // client verified no attestation.
+        if (http_req.edge_terminated || http_req.direct) && path_requires_sealed(&http_req.path) {
             return HttpHandleResult::err(403, "sealed-transport-required");
         }
         return handle_http_request(http_req, base_ctx);
@@ -1146,6 +1187,16 @@ fn handle_http_request_with_session(
         content_type: Some(crate::sessionrelay::SEALED_CONTENT_TYPE.to_string()),
         extra_headers: Vec::new(),
     }
+}
+
+/// The app name in `/api/v1/apps/<name><suffix>`, the direct-domain routes.
+#[cfg(feature = "wasm")]
+fn direct_app(path: &str, suffix: &str) -> Option<String> {
+    let name = path.strip_prefix("/api/v1/apps/")?.strip_suffix(suffix)?;
+    if name.is_empty() || name.contains('/') {
+        return None;
+    }
+    Some(name.to_string())
 }
 
 /// Paths that must be sealed when reached via a gateway-terminated leg.
@@ -2197,8 +2248,8 @@ impl IngressServer {
         }
         // The gateway's terminate path serves the public certificate; evidence
         // cannot be bound to that outer leg.
-        if http_req.edge_terminated {
-            return HttpHandleResult::err(404, "no evidence on the gateway terminate path");
+        if http_req.edge_terminated || http_req.direct {
+            return HttpHandleResult::err(404, "no evidence on the gateway terminate path or a direct name");
         }
         let req: AttestRequest = match serde_json::from_slice(&http_req.body) {
             Ok(r) => r,

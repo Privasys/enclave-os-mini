@@ -405,6 +405,28 @@ impl WasmModule {
             .ok_or_else(|| format!("unknown app: '{}'", name))
     }
 
+    /// What direct domains need of an app: its hostname, its platform app
+    /// id, and, for a vault-backed app only, its data key (released by the
+    /// vaults to approved code, stable across upgrades), from which the
+    /// runtime derives the app's ACME account key. A generated or BYOK key
+    /// is not offered: it does not survive the way a CAA pin needs.
+    pub fn direct_identity(&self, name: &str) -> Result<DirectIdentity, String> {
+        let reg = self
+            .registry
+            .lock()
+            .map_err(|_| String::from("registry lock poisoned"))?;
+        let meta = reg.app_meta(name).ok_or_else(|| format!("unknown app: '{}'", name))?;
+        Ok(DirectIdentity {
+            hostname: meta.hostname.clone(),
+            app_id: meta.app_id,
+            vault_key: if meta.key_source.starts_with("vault:") {
+                Some(meta.encryption_key)
+            } else {
+                None
+            },
+        })
+    }
+
     /// Apply or lift the host-driven billing freeze for `name`.
     /// `Some(reason)` freezes; `None` unfreezes. Returns `true` when
     /// the app is known. Called from the `wasm_freeze` control command.
@@ -1541,6 +1563,13 @@ impl WasmModule {
 // that contains an `AppContext` \u2014 not a `WasmModule`. To call back
 // into the module (mutate registry, persist KV, re-register identity)
 // the enclave init code installs a `'static` reference once at startup.
+
+/// See [`WasmModule::direct_identity`].
+pub struct DirectIdentity {
+    pub hostname: String,
+    pub app_id: Option<[u8; 16]>,
+    pub vault_key: Option<[u8; enclave_os_common::types::AEAD_KEY_SIZE]>,
+}
 
 static WASM_MODULE_GLOBAL: OnceLock<&'static WasmModule> = OnceLock::new();
 

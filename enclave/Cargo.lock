@@ -478,6 +478,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "enclave-os-direct"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "hkdf",
+ "p256",
+ "rcgen",
+ "serde",
+ "serde_json",
+ "sha2",
+ "time",
+ "x509-parser",
+]
+
+[[package]]
 name = "enclave-os-egress"
 version = "0.1.0"
 dependencies = [
@@ -499,6 +514,7 @@ dependencies = [
  "cc",
  "enclave-os-clock",
  "enclave-os-common",
+ "enclave-os-direct",
  "enclave-os-egress",
  "enclave-os-fido2",
  "enclave-os-kvstore",
@@ -776,6 +792,15 @@ name = "heck"
 version = "0.5.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2304e00983f87ffb38b55b444b5e3b60a884b5d30c0fca7d82fe33449bbe55ea"
+
+[[package]]
+name = "hkdf"
+version = "0.12.4"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7b5f8eb2ad728638ea2c7d47a21db23b7b58a72ed6a38256b8a1849f15fbbdf7"
+dependencies = [
+ "hmac",
+]
 
 [[package]]
 name = "hmac"

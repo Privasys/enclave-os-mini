@@ -332,6 +332,11 @@ pub struct HttpRequest {
     /// requests on such a leg must be refused — the gateway must never
     /// see app data. Splice/RA-TLS traffic never carries the marker.
     pub edge_terminated: bool,
+    /// True when the request arrived on a direct adopter hostname over the
+    /// publicly trusted certificate: TLS ended here, but the client verified
+    /// no attestation. Set by the server from the connection, never from a
+    /// header; it gets the same rules as the gateway-terminated leg.
+    pub direct: bool,
 }
 
 /// Errors that can occur while parsing an HTTP request.
@@ -487,6 +492,7 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
             body,
             connection_close,
             edge_terminated,
+            direct: false,
         },
         total,
     ))

@@ -51,6 +51,8 @@ extern crate sgx_types;
 pub mod config_merkle;
 pub mod cpuid_cache;
 pub mod crypto;
+#[cfg(feature = "wasm")]
+pub mod direct;
 pub mod ecall;
 pub mod encauth;
 pub mod modules;

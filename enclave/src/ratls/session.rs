@@ -43,6 +43,9 @@ pub struct RaTlsSession {
     /// session.  When present, subsequent requests on this TLS session
     /// are authenticated without tokens.
     fido2_identity: Option<FidoIdentity>,
+    /// Whether the handshake served a direct adopter name's publicly trusted
+    /// certificate: every request on this connection is then the direct leg.
+    direct: bool,
 }
 
 /// Identity extracted from a successful FIDO2 registration or
@@ -75,6 +78,7 @@ impl RaTlsSession {
             client_context: None,
             peer_evidence: None,
             fido2_identity: None,
+            direct: false,
         }
     }
 
@@ -336,6 +340,16 @@ impl RaTlsSession {
             .peer_certificates()
             .and_then(|certs| certs.first())
             .map(|cert| cert.as_ref().to_vec())
+    }
+
+    /// Whether this connection is the direct leg (see the `direct` field).
+    pub fn is_direct(&self) -> bool {
+        self.direct
+    }
+
+    /// Marks this connection as the direct leg. Set once, at the handshake.
+    pub fn set_direct(&mut self, direct: bool) {
+        self.direct = direct;
     }
 
     /// Attestation tag of this connection ("none", "deterministic", "challenge").

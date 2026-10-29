@@ -48,7 +48,7 @@ kvstore = ["dep:enclave-os-kvstore"]
 merkle  = ["dep:enclave-os-merkle"]
 raft    = ["dep:enclave-os-raft", "dep:enclave-os-merkle"]
 vault   = ["dep:enclave-os-vault", "kvstore", "egress"]
-wasm    = ["dep:enclave-os-wasm", "kvstore", "egress"]
+wasm    = ["dep:enclave-os-wasm", "dep:enclave-os-direct", "kvstore", "egress"]
 fido2   = ["dep:enclave-os-fido2", "kvstore", "enclave-os-wasm?/fido2", "enclave-os-wasm?/app-auth"]
 
 [dependencies]
@@ -105,6 +105,8 @@ x509-parser        = { version = "0.16" }
 enclave-os-vault   = { path = "../crates/enclave-os-vault", optional = true }
 enclave-os-wasm    = { path = "../crates/enclave-os-wasm", optional = true }
 enclave-os-fido2   = { path = "../crates/enclave-os-fido2", optional = true }
+# Direct domains (with wasm): the ACME and policy core.
+enclave-os-direct  = { path = "../crates/enclave-os-direct", optional = true }
 
 [profile.release]
 opt-level = "s"        # optimize for size

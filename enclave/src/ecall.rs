@@ -325,6 +325,11 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
         }
     }
 
+    // Direct domains: derive their sealing key and serve the names sealed
+    // pins hold, before the first handshake (needs the cert store).
+    #[cfg(feature = "wasm")]
+    crate::direct::init(&sealed_cfg.master_key());
+
     let server = IngressServer::new(ca, crate::data_tx());
     {
         let mut st = match crate::state().lock() {
