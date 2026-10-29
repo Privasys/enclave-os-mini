@@ -325,10 +325,10 @@ pub fn finalize_and_run(_config: &EnclaveConfig, sealed_cfg: &SealedConfig) -> i
         }
     }
 
-    // Direct domains: derive their sealing key and serve the names sealed
-    // pins hold, before the first handshake (needs the cert store).
+    // Direct domains: queue every registered app for a restore of its sealed
+    // direct state (needs the cert store).
     #[cfg(feature = "wasm")]
-    crate::direct::init(&sealed_cfg.master_key());
+    crate::direct::init();
 
     let server = IngressServer::new(ca, crate::data_tx());
     {
@@ -505,6 +505,9 @@ pub extern "C" fn ecall_run(config_json: *const u8, config_len: u64) -> i32 {
             crate::ocall::log(ll, msg);
         },
         cert_store_register:   |identity| {
+            // A (re)loaded app may hold sealed direct state to restore.
+            #[cfg(feature = "wasm")]
+            crate::direct::note_registered(&identity.hostname);
             crate::ratls::cert_store::cert_store().register(identity);
         },
         cert_store_unregister: |hostname| {

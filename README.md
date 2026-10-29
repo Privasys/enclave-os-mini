@@ -128,6 +128,7 @@ Clients verify: **MRENCLAVE** (code identity) + **Config Merkle Root** (config i
 | [RA-TLS and Attestation](docs/ra-tls.md) | Certificate trust chain, X.509 OID extensions, Config Merkle tree, verification strategies, per-app certificates |
 | [Trusted Time](docs/trusted-time.md) | The one time source: sealed floor, NTS (RFC 8915), platform monitor contracts, UDP host ops |
 | [WASM Runtime](docs/wasm-runtime.md) | Wasmtime fork for SGX, WASI + Enclave OS SDK interfaces, per-app isolation, concurrency and non-blocking egress, building WASM apps |
+| [Direct Domains](docs/direct-domains.md) | An adopter hostname whose TLS ends in the enclave: owner-signed names, ACME TLS-ALPN-01 from inside the enclave, certificate choice by ALPN, OID 7.4, and the state that survives a runtime roll |
 | [Wasmtime Fork](docs/wasmtime-fork.md) | What the SGX port changes, fibers in SGX, updating to a new upstream release |
 | [Building and Usage](docs/building.md) | Prerequisites, build commands, running the enclave, WASM builds, client libraries, production deployment |
 | [Layer 4 Proxy](docs/layer4-proxy.md) | Caddy (caddy-l4) and HAProxy configuration for TCP passthrough |

@@ -17,6 +17,8 @@ name = "enclave_os_direct"
 # deterministic (RFC 6979), so no randomness is needed to sign.
 p256 = { version = "0.13", default-features = false, features = ["ecdsa", "alloc"] }
 hkdf = "0.12"
+# Sealing the direct state (AES-256-GCM) under the app's state key.
+ring = "0.17"
 sha2 = { version = "0.10", default-features = false }
 
 # Certificate key, CSR and the TLS-ALPN-01 challenge certificate. Already in

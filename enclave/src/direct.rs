@@ -2,13 +2,12 @@
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
 //! Direct domains: an adopter hostname whose TLS ends in this enclave with a
-//! publicly trusted certificate obtained here (the protocol and policy core
-//! is the `enclave-os-direct` crate; this is the enclave glue).
+//! publicly trusted certificate obtained here. The protocol, the policy and
+//! the state are the `enclave-os-direct` crate; this is the enclave glue.
 //!
 //! - The owner names the hostnames in the signed app policy
 //!   (`PUT /api/v1/apps/<name>/policy`). The approval token is the
-//!   authority, so the route needs no platform role. The accepted pin and
-//!   the names are sealed to the host KV store, so they survive restarts.
+//!   authority, so the route needs no platform role.
 //! - The handshake picks the certificate by ALPN: `acme-tls/1` gets the
 //!   challenge certificate, `privasys-ratls/1` the RA-TLS leaf for the
 //!   adopter name (through a cert-store alias), anything else the publicly
@@ -16,11 +15,11 @@
 //! - Issuance and renewal run when the control plane reads the status
 //!   (`GET /api/v1/apps/<name>/direct`, manager role): that request runs as
 //!   a task, so its network waits suspend instead of blocking the enclave.
-//!   No order is placed before the name resolves, and failures back off.
-//! - The ACME account key derives from the app's vault-held KEK (never the
-//!   DEK, which is regenerated when the host loses its wrapped copy), the
-//!   same scheme as the container runtime, so the same app gets the same
-//!   account on any build and an adopter's CAA record can pin it.
+//! - Everything an app holds (the pin, the certificates and their keys) is
+//!   sealed to the host store under a key from the app's vault-held key, not
+//!   this enclave's: when an app is loaded on any build the vaults release
+//!   that key to, its names, certificates and status come back with no
+//!   network call and no new approval.
 //! - OID 7.4 on the app's leaves binds each name to its certificate key.
 
 use std::collections::BTreeMap;
@@ -28,96 +27,116 @@ use std::string::{String, ToString};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::vec::Vec;
 
-use enclave_os_common::aead::AeadCipher;
 use enclave_os_common::ocall;
 use enclave_os_common::oidc::OidcClaims;
-use enclave_os_direct::acme::{ChallengeSink, Client, Response, Transport};
-use enclave_os_direct::binding::{self, DomainStatus, Status, DIRECT_DOMAIN_KEYS_OID};
-use enclave_os_direct::challenge::CertAndKey;
-use enclave_os_direct::policy::{self, Approval, Pin};
-use enclave_os_direct::{dns, keys, select, Selection, LETS_ENCRYPT};
+use enclave_os_direct::acme::{Response, Transport};
+use enclave_os_direct::binding::DIRECT_DOMAIN_KEYS_OID;
+use enclave_os_direct::policy::{self, Approval};
+use enclave_os_direct::state::{self, Direct, Store};
+use enclave_os_direct::{dns, select, tls, Selection, LETS_ENCRYPT};
 use rustls::ServerConfig;
-use serde::{Deserialize, Serialize};
 
 use crate::ratls::cert_store;
 use crate::{enclave_log_error, enclave_log_info};
 
-/// Host KV tables (values sealed under the direct key, AAD = table|key).
-const PINS_TABLE: &[u8] = b"directpins";
-const CERTS_TABLE: &[u8] = b"directcerts";
-const INDEX_KEY: &[u8] = b"index";
-
-/// HKDF label of the sealing key, from the enclave's sealed master key.
-const SEAL_LABEL: &[u8] = b"privasys-direct-seal/v1";
-
-/// The first retry after a failed attempt, doubling up to [`MAX_BACKOFF`].
-const MIN_BACKOFF: u64 = 60;
-const MAX_BACKOFF: u64 = 3600;
-
-static SEAL: OnceLock<AeadCipher> = OnceLock::new();
-static STATE: Mutex<State> = Mutex::new(State { names: BTreeMap::new(), apps: BTreeMap::new() });
-
-/// One direct name.
-struct Name {
-    app: String,
-    public: Option<(Arc<ServerConfig>, binding::LeafFacts)>,
-    challenge: Option<Arc<ServerConfig>>,
-    next_attempt: u64,
-    backoff: u64,
+fn shared() -> &'static Mutex<Direct> {
+    static STATE: OnceLock<Mutex<Direct>> = OnceLock::new();
+    STATE.get_or_init(|| Mutex::new(Direct::new()))
 }
 
-/// One app with direct names.
-#[derive(Default)]
-struct App {
-    canonical: String,
-    domains: Vec<String>,
-    account_uri: String,
+/// Built configs of the publicly trusted certificates, by name, with the
+/// generation they were built from.
+fn configs() -> &'static Mutex<BTreeMap<String, (u64, Arc<ServerConfig>)>> {
+    static CONFIGS: OnceLock<Mutex<BTreeMap<String, (u64, Arc<ServerConfig>)>>> = OnceLock::new();
+    CONFIGS.get_or_init(|| Mutex::new(BTreeMap::new()))
 }
 
-struct State {
-    names: BTreeMap<String, Name>,
-    apps: BTreeMap<String, App>,
+/// App hostnames registered since the last restore pass. The registration
+/// hook may run under the wasm registry lock, so it only queues; the
+/// restore runs at the next handshake or direct route.
+fn pending() -> &'static Mutex<Vec<String>> {
+    static PENDING: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+    PENDING.get_or_init(|| Mutex::new(Vec::new()))
 }
 
-/// What a sealed pin record holds: the pin and the app's hostname, so names
-/// can be served again at boot before the app itself is looked at.
-#[derive(Serialize, Deserialize)]
-struct PinRecord {
-    pin: Pin,
-    canonical: String,
-}
+/// The host KV store; every value is already sealed by the crate.
+struct HostStore;
 
-#[derive(Serialize, Deserialize)]
-struct CertRecord {
-    chain_pem: String,
-    key_pkcs8_der: Vec<u8>,
-}
-
-// ---------------------------------------------------------------------------
-//  Start-up
-// ---------------------------------------------------------------------------
-
-/// Derives the sealing key and serves every name a sealed pin holds.
-pub fn init(master_key: &[u8; 32]) {
-    let salt = ring::hkdf::Salt::new(ring::hkdf::HKDF_SHA256, SEAL_LABEL);
-    let prk = salt.extract(master_key);
-    let mut key = [0u8; 32];
-    if prk
-        .expand(&[b"seal"], ring::hkdf::HKDF_SHA256)
-        .and_then(|okm| okm.fill(&mut key))
-        .is_err()
-    {
-        enclave_log_error!("direct: sealing key not derived; direct domains disabled");
-        return;
+impl Store for HostStore {
+    fn get(&self, table: &[u8], key: &[u8]) -> Option<Vec<u8>> {
+        ocall::kv_store_get(table, key).ok().flatten()
     }
-    let _ = SEAL.set(AeadCipher::from_key(key));
+    fn put(&self, table: &[u8], key: &[u8], value: &[u8]) -> Result<(), String> {
+        ocall::kv_store_put(table, key, value).map_err(|e| format!("direct: host kv put: {e}"))
+    }
+}
 
-    let apps: Vec<String> = load(PINS_TABLE, INDEX_KEY).unwrap_or_default();
-    for app in apps {
-        if let Some(rec) = load::<PinRecord>(PINS_TABLE, app.as_bytes()) {
-            apply(&app, &rec.canonical, &rec.pin.domains);
+fn serving_time() -> Arc<dyn rustls::time_provider::TimeProvider> {
+    Arc::new(crate::trustedtime::ServingTime)
+}
+
+// ---------------------------------------------------------------------------
+//  Start-up and app registration
+// ---------------------------------------------------------------------------
+
+/// Queues every app already registered for a restore pass.
+pub fn init() {
+    if let Ok(mut p) = pending().lock() {
+        p.extend(cert_store::cert_store().hostnames());
+    }
+}
+
+/// Called when an app identity is registered (loaded or reloaded).
+pub fn note_registered(hostname: &str) {
+    if let Ok(mut p) = pending().lock() {
+        p.push(hostname.to_string());
+    }
+}
+
+/// Restores the direct state of the apps registered since the last pass.
+fn restore_pending() {
+    let hosts: Vec<String> = match pending().lock() {
+        Ok(mut p) if !p.is_empty() => std::mem::take(&mut *p),
+        _ => return,
+    };
+    let wasm = match enclave_os_wasm::global() {
+        Some(w) => w,
+        None => return,
+    };
+    let apps = wasm.list_apps();
+    for host in hosts {
+        let name = match apps.iter().find(|a| a.hostname == host) {
+            Some(a) => a.name.clone(),
+            None => continue,
+        };
+        let branch = match wasm.direct_identity(&name).ok().and_then(|i| i.direct_branch) {
+            Some(b) => b,
+            None => continue,
+        };
+        let restored = shared().lock().map(|mut d| d.restore(&HostStore, &name, &host, &branch));
+        match restored {
+            Ok(Ok(true)) => {
+                publish(&name);
+                enclave_log_info!("direct: {} restored from sealed state", name);
+            }
+            Ok(Ok(false)) => {}
+            Ok(Err(e)) => enclave_log_error!("direct: {}: restore: {}", name, e),
+            Err(_) => enclave_log_error!("direct: state lock poisoned"),
         }
     }
+}
+
+/// Pushes an app's names and key bindings to the cert store.
+fn publish(app: &str) {
+    let (canonical, domains, bindings) = match shared().lock() {
+        Ok(d) => match d.app(app) {
+            Some((c, ds)) => (c, ds, d.key_bindings(app)),
+            None => return,
+        },
+        Err(_) => return,
+    };
+    cert_store::cert_store().set_aliases(&canonical, &domains);
+    cert_store::cert_store().set_runtime_extension(&canonical, DIRECT_DOMAIN_KEYS_OID, bindings);
 }
 
 // ---------------------------------------------------------------------------
@@ -137,40 +156,36 @@ pub enum DirectTls {
 
 /// Chooses the certificate for `sni` from the ALPN the client offered.
 pub fn tls_for(sni: Option<&str>, alpn: &[String]) -> Result<DirectTls, String> {
+    restore_pending();
     let sni = match sni {
         Some(s) => s.to_ascii_lowercase(),
         None => return Ok(DirectTls::NotDirect),
     };
-    let st = STATE.lock().map_err(|_| "direct: state lock poisoned".to_string())?;
-    let name = match st.names.get(&sni) {
+    let d = shared().lock().map_err(|_| "direct: state lock poisoned".to_string())?;
+    let name = match d.name(&sni) {
         Some(n) => n,
         None => return Ok(DirectTls::NotDirect),
     };
     match select(alpn.iter().map(String::as_str)) {
         Selection::RaTls => Ok(DirectTls::RaTls),
-        Selection::Challenge => name
-            .challenge
-            .clone()
-            .map(|config| DirectTls::Serve { config, direct: false })
-            .ok_or_else(|| format!("direct: no challenge in progress for {sni}")),
-        Selection::Public => name
-            .public
-            .as_ref()
-            .map(|(config, _)| DirectTls::Serve { config: config.clone(), direct: true })
-            .ok_or_else(|| format!("direct: {sni} has no certificate yet")),
+        Selection::Challenge => {
+            let c = name.challenge.as_ref().ok_or_else(|| format!("direct: no challenge in progress for {sni}"))?;
+            let config = tls::challenge_config(c, serving_time())?;
+            Ok(DirectTls::Serve { config, direct: false })
+        }
+        Selection::Public => {
+            let served = name.served.as_ref().ok_or_else(|| format!("direct: {sni} has no certificate yet"))?;
+            let mut cache = configs().lock().map_err(|_| "direct: config lock poisoned".to_string())?;
+            if let Some((generation, config)) = cache.get(&sni) {
+                if *generation == name.generation {
+                    return Ok(DirectTls::Serve { config: config.clone(), direct: true });
+                }
+            }
+            let config = tls::public_config(served.chain_der(), served.key_pkcs8_der.clone(), serving_time())?;
+            cache.insert(sni, (name.generation, config.clone()));
+            Ok(DirectTls::Serve { config, direct: true })
+        }
     }
-}
-
-/// The trusted clock for the direct configs (serving never waits on it).
-fn serving_time() -> Arc<dyn rustls::time_provider::TimeProvider> {
-    Arc::new(crate::trustedtime::ServingTime)
-}
-
-fn chain_der(chain_pem: &str) -> Vec<Vec<u8>> {
-    x509_parser::pem::Pem::iter_from_buffer(chain_pem.as_bytes())
-        .filter_map(|p| p.ok())
-        .map(|p| p.contents)
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -185,9 +200,7 @@ pub fn handle_policy(
     body: &[u8],
     verify: fn(&str) -> Result<OidcClaims, String>,
 ) -> (u16, Vec<u8>) {
-    if SEAL.get().is_none() {
-        return json_error(503, "direct: not initialised");
-    }
+    restore_pending();
     let parsed = match policy::parse(body) {
         Ok(p) => p,
         Err(e) => return json_error(400, &e),
@@ -204,6 +217,12 @@ pub fn handle_policy(
     if parsed.doc.app_id.to_ascii_lowercase().replace('-', "") != app_id {
         return json_error(403, "the document is for a different app");
     }
+    // The state is sealed under the vault-held key: an app without one has
+    // nowhere durable to keep its pin, and could not hold an ACME account.
+    let branch = match identity.direct_branch {
+        Some(b) => b,
+        None => return json_error(409, "direct domains need a vault-backed app"),
+    };
     let claims = match verify(&parsed.token) {
         Ok(c) => c,
         Err(e) => return json_error(403, &format!("apppolicy: approval token: {e}")),
@@ -215,80 +234,22 @@ pub fn handle_policy(
         nonce: claims.nonce.as_deref(),
         exp: claims.exp as i64,
     };
-    let subject = match policy::check_approval(&parsed.doc, &parsed.raw, &approval) {
-        Ok(s) => s,
-        Err(e) => return json_error(403, &e),
+    let accepted = match shared().lock() {
+        Ok(mut d) => d.accept(&HostStore, app, &identity.hostname, &branch, &parsed, &approval),
+        Err(_) => return json_error(500, "direct: state lock poisoned"),
     };
-    let current: Option<PinRecord> = load(PINS_TABLE, app.as_bytes());
-    let pin = match policy::accept(current.as_ref().map(|r| &r.pin), &parsed.doc, &subject) {
+    let pin = match accepted {
         Ok(p) => p,
         Err(e) => return json_error(403, &e),
     };
-    let rec = PinRecord { pin: pin.clone(), canonical: identity.hostname.clone() };
-    if let Err(e) = store(PINS_TABLE, app.as_bytes(), &rec) {
-        return json_error(500, &e);
-    }
-    let mut index: Vec<String> = load(PINS_TABLE, INDEX_KEY).unwrap_or_default();
-    if !index.iter().any(|a| a == app) {
-        index.push(app.to_string());
-        let _ = store(PINS_TABLE, INDEX_KEY, &index);
-    }
-    apply(app, &identity.hostname, &pin.domains);
-    enclave_log_info!(
-        "direct: policy seq {} accepted for {} ({} domains)",
-        pin.seq,
-        app,
-        pin.domains.len()
-    );
+    publish(app);
+    enclave_log_info!("direct: policy seq {} accepted for {} ({} domains)", pin.seq, app, pin.domains.len());
     let applied: Vec<&str> = if parsed.doc.domains.is_some() { vec!["domains"] } else { vec![] };
     (
         200,
         serde_json::to_vec(&serde_json::json!({"app_id": app_id, "seq": pin.seq, "applied": applied}))
             .unwrap_or_default(),
     )
-}
-
-/// Serves exactly `domains` for `app`: names, cert-store aliases, and any
-/// sealed certificate.
-fn apply(app: &str, canonical: &str, domains: &[String]) {
-    let mut st = match STATE.lock() {
-        Ok(s) => s,
-        Err(_) => return,
-    };
-    st.names.retain(|d, n| n.app != app || domains.contains(d));
-    for d in domains {
-        if st.names.contains_key(d) {
-            continue;
-        }
-        let public = load::<CertRecord>(CERTS_TABLE, d.as_bytes()).and_then(|c| public_from(&c).ok());
-        st.names.insert(
-            d.clone(),
-            Name { app: app.to_string(), public, challenge: None, next_attempt: 0, backoff: 0 },
-        );
-    }
-    let entry = st.apps.entry(app.to_string()).or_default();
-    entry.canonical = canonical.to_string();
-    entry.domains = domains.to_vec();
-    let bindings = key_bindings_locked(&st, app);
-    drop(st);
-    cert_store::cert_store().set_aliases(canonical, domains);
-    cert_store::cert_store().set_runtime_extension(canonical, DIRECT_DOMAIN_KEYS_OID, bindings);
-}
-
-fn public_from(c: &CertRecord) -> Result<(Arc<ServerConfig>, binding::LeafFacts), String> {
-    let facts = binding::leaf_facts(&c.chain_pem)?;
-    let config = enclave_os_direct::tls::public_config(chain_der(&c.chain_pem), c.key_pkcs8_der.clone(), serving_time())?;
-    Ok((config, facts))
-}
-
-fn key_bindings_locked(st: &State, app: &str) -> Option<Vec<u8>> {
-    let issued: Vec<(String, String)> = st
-        .names
-        .iter()
-        .filter(|(_, n)| n.app == app)
-        .filter_map(|(d, n)| n.public.as_ref().map(|(_, f)| (d.clone(), f.spki_sha256.clone())))
-        .collect();
-    binding::key_bindings(&issued)
 }
 
 // ---------------------------------------------------------------------------
@@ -298,9 +259,7 @@ fn key_bindings_locked(st: &State, app: &str) -> Option<Vec<u8>> {
 /// `GET /api/v1/apps/<name>/direct`: the status the control plane reads.
 /// Also the driver: a name due for issuance or renewal is attempted here.
 pub fn handle_status(app: &str) -> (u16, Vec<u8>) {
-    if SEAL.get().is_none() {
-        return json_error(503, "direct: not initialised");
-    }
+    restore_pending();
     let identity = match enclave_os_wasm::global().map(|w| w.direct_identity(app)) {
         Some(Ok(i)) => i,
         Some(Err(e)) => return json_error(404, &e),
@@ -309,149 +268,38 @@ pub fn handle_status(app: &str) -> (u16, Vec<u8>) {
     // No vault-held key: no account, so an empty account_uri (the control
     // plane reads that as "direct domains need a vault-backed app").
     if let Some(branch) = identity.direct_branch {
-        if let Err(e) = drive(app, &branch) {
-            enclave_log_error!("direct: {}: {}", app, e);
+        match ocall::get_current_time() {
+            Ok(now) => {
+                let mut resolves = |d: &str| resolves(d);
+                match state::drive(shared(), &HostStore, app, &branch, now as i64, Egress, LETS_ENCRYPT, &mut resolves) {
+                    Ok(out) => {
+                        for d in &out.issued {
+                            enclave_log_info!("direct: certificate issued for {}", d);
+                        }
+                        for (d, why, backoff) in &out.failed {
+                            enclave_log_error!("direct: {}: {} (next attempt in {} s)", d, why, backoff);
+                        }
+                        if !out.issued.is_empty() {
+                            publish(app);
+                        }
+                    }
+                    Err(e) => enclave_log_error!("direct: {}: {}", app, e),
+                }
+            }
+            Err(_) => enclave_log_error!("direct: {}: no trusted time, nothing issued", app),
         }
     }
-    let st = match STATE.lock() {
-        Ok(s) => s,
+    let status = match shared().lock() {
+        Ok(d) => d.status(app),
         Err(_) => return json_error(500, "direct: state lock poisoned"),
     };
-    let (account_uri, domains) = st
-        .apps
-        .get(app)
-        .map(|a| (a.account_uri.clone(), a.domains.clone()))
-        .unwrap_or_default();
-    let status = Status {
-        supported: true,
-        account_uri,
-        domains: domains
-            .iter()
-            .map(|d| {
-                let facts = st.names.get(d).and_then(|n| n.public.as_ref()).map(|(_, f)| f.clone());
-                DomainStatus {
-                    name: d.clone(),
-                    issued: facts.is_some(),
-                    not_after: facts.as_ref().map(|f| f.not_after.clone()).unwrap_or_default(),
-                    spki_sha256: facts.map(|f| f.spki_sha256).unwrap_or_default(),
-                }
-            })
-            .collect(),
-    };
     (200, serde_json::to_vec(&status).unwrap_or_default())
-}
-
-/// `branch` is the direct-TLS branch of the app's vault-held KEK.
-fn drive(app: &str, branch: &[u8; 32]) -> Result<(), String> {
-    let now = ocall::get_current_time().map_err(|_| "no trusted time".to_string())? as i64;
-    let (domains, have_account) = {
-        let st = STATE.lock().map_err(|_| "state lock poisoned")?;
-        match st.apps.get(app) {
-            Some(a) if !a.domains.is_empty() => (a.domains.clone(), !a.account_uri.is_empty()),
-            _ => return Ok(()),
-        }
-    };
-    let key = keys::account_key(branch)?;
-    let mut client = Client::new(Egress, &key, LETS_ENCRYPT);
-    // No sleep between polls (the enclave has no timer a task can wait on):
-    // each poll is a full HTTPS round trip, which paces it.
-    client.poll_ms = 0;
-    client.max_polls = 40;
-    if !have_account {
-        let uri = client.account()?;
-        if let Ok(mut st) = STATE.lock() {
-            if let Some(a) = st.apps.get_mut(app) {
-                a.account_uri = uri;
-            }
-        }
-    }
-    for d in domains {
-        let due = {
-            let st = STATE.lock().map_err(|_| "state lock poisoned")?;
-            match st.names.get(&d) {
-                Some(n) => {
-                    let wants = n
-                        .public
-                        .as_ref()
-                        .map(|(_, f)| binding::needs_renewal(f.not_after_unix, now))
-                        .unwrap_or(true);
-                    wants && (n.next_attempt as i64) <= now
-                }
-                None => false,
-            }
-        };
-        if !due {
-            continue;
-        }
-        if !resolves(&d) {
-            note_failure(&d, now, "the name does not resolve yet");
-            continue;
-        }
-        let mut sink = Sink;
-        match client.obtain(&d, &mut sink) {
-            Ok(issued) => {
-                let rec = CertRecord { chain_pem: issued.chain_pem, key_pkcs8_der: issued.key_pkcs8_der };
-                let public = public_from(&rec)?;
-                store(CERTS_TABLE, d.as_bytes(), &rec)?;
-                let (canonical, bindings) = {
-                    let mut st = STATE.lock().map_err(|_| "state lock poisoned")?;
-                    if let Some(n) = st.names.get_mut(&d) {
-                        n.public = Some(public);
-                        n.backoff = 0;
-                        n.next_attempt = 0;
-                    }
-                    let canonical = st.apps.get(app).map(|a| a.canonical.clone()).unwrap_or_default();
-                    (canonical, key_bindings_locked(&st, app))
-                };
-                cert_store::cert_store().set_runtime_extension(&canonical, DIRECT_DOMAIN_KEYS_OID, bindings);
-                enclave_log_info!("direct: certificate issued for {}", d);
-            }
-            Err(e) => note_failure(&d, now, &e),
-        }
-    }
-    Ok(())
-}
-
-fn note_failure(domain: &str, now: i64, why: &str) {
-    if let Ok(mut st) = STATE.lock() {
-        if let Some(n) = st.names.get_mut(domain) {
-            n.backoff = if n.backoff == 0 { MIN_BACKOFF } else { (n.backoff * 2).min(MAX_BACKOFF) };
-            n.next_attempt = now as u64 + n.backoff;
-            enclave_log_error!("direct: {}: {} (next attempt in {} s)", domain, why, n.backoff);
-        }
-    }
 }
 
 fn resolves(domain: &str) -> bool {
     match fetch("GET", &dns::query_url(domain), &[("Accept".into(), "application/dns-json".into())], None) {
         Ok(r) if r.status == 200 => dns::resolves(&r.body),
         _ => false,
-    }
-}
-
-/// The challenge certificate, served by [`tls_for`] while the CA validates.
-struct Sink;
-
-impl ChallengeSink for Sink {
-    fn publish(&mut self, domain: &str, cert: Option<&CertAndKey>) {
-        // A failure here used to be swallowed, which hid that the
-        // challenge certificate cannot go through with_single_cert (see
-        // enclave_os_direct::tls): the validator then saw no challenge.
-        let config = match cert {
-            Some(c) => match enclave_os_direct::tls::challenge_config(c, serving_time()) {
-                Ok(cfg) => Some(cfg),
-                Err(e) => {
-                    enclave_log_error!("direct: {}: challenge certificate not served: {}", domain, e);
-                    None
-                }
-            },
-            None => None,
-        };
-        if let Ok(mut st) = STATE.lock() {
-            if let Some(n) = st.names.get_mut(domain) {
-                n.challenge = config;
-            }
-        }
     }
 }
 
@@ -490,31 +338,6 @@ fn fetch(
     } else {
         enclave_os_egress::client::https_fetch(method, url, headers, body, roots, None)
     }
-}
-
-// ---------------------------------------------------------------------------
-//  Sealed host storage
-// ---------------------------------------------------------------------------
-
-fn aad(table: &[u8], key: &[u8]) -> Vec<u8> {
-    let mut a = table.to_vec();
-    a.push(b'|');
-    a.extend_from_slice(key);
-    a
-}
-
-fn store<T: Serialize>(table: &[u8], key: &[u8], value: &T) -> Result<(), String> {
-    let seal = SEAL.get().ok_or("direct: not initialised")?;
-    let plain = serde_json::to_vec(value).map_err(|e| format!("direct: encode: {e}"))?;
-    let sealed = seal.encrypt(&plain, &aad(table, key)).map_err(|e| format!("direct: seal: {e}"))?;
-    ocall::kv_store_put(table, key, &sealed).map_err(|e| format!("direct: host kv put: {e}"))
-}
-
-fn load<T: for<'a> Deserialize<'a>>(table: &[u8], key: &[u8]) -> Option<T> {
-    let seal = SEAL.get()?;
-    let sealed = ocall::kv_store_get(table, key).ok()??;
-    let plain = seal.decrypt(&sealed, &aad(table, key)).ok()?;
-    serde_json::from_slice(&plain).ok()
 }
 
 fn hex(b: &[u8]) -> String {
