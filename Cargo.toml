@@ -11,6 +11,7 @@ members = [
     "tests/wasm-docs-unit",
     "tests/code-pool-unit",
     "tests/feature-wiring-unit",
+    "tests/relay-limits-unit",
 ]
 exclude = [
     "enclave",

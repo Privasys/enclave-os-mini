@@ -51,6 +51,8 @@ pub enum SessionError {
     UnknownSession,
     Replay,
     BadEnvelope,
+    /// The session table is at its cap (`relay_limits::MAX_SESSIONS`).
+    Full,
     Internal,
 }
 
@@ -61,6 +63,7 @@ impl SessionError {
             SessionError::Replay
             | SessionError::BadEnvelope
             | SessionError::InvalidPubKey => 400,
+            SessionError::Full => 503,
             SessionError::Crypto | SessionError::Internal => 500,
         }
     }
@@ -71,6 +74,7 @@ impl SessionError {
             SessionError::UnknownSession => "unknown session",
             SessionError::Replay => "counter replay",
             SessionError::BadEnvelope => "bad sealed envelope",
+            SessionError::Full => "too many sessions",
             SessionError::Internal => "internal error",
         }
     }
@@ -90,6 +94,8 @@ struct SessionEntry {
 
 static SESSIONS: Mutex<Option<BTreeMap<String, SessionEntry>>> = Mutex::new(None);
 static LAST_SWEEP: AtomicU64 = AtomicU64::new(0);
+/// Last sweep forced by a full table (see `relay_limits::make_room`).
+static LAST_FULL_SWEEP: AtomicU64 = AtomicU64::new(0);
 
 /// Long-lived enclave identity key (crypto-contract §8): generated on
 /// first use via `sgx_tcrypto` (Intel IPP) and reused for the ECDH of
@@ -224,6 +230,18 @@ pub fn bootstrap(sdk_pub: &[u8], now: u64) -> Result<Bootstrap, SessionError> {
 
     sweep_expired(now);
     with_table(|t| {
+        let mut last = LAST_FULL_SWEEP.load(Ordering::Relaxed);
+        let room = crate::relay_limits::make_room(
+            t,
+            crate::relay_limits::MAX_SESSIONS,
+            now,
+            &mut last,
+            |e| e.expires_at <= now,
+        );
+        LAST_FULL_SWEEP.store(last, Ordering::Relaxed);
+        if !room {
+            return Err(SessionError::Full);
+        }
         t.insert(
             session_id.clone(),
             SessionEntry {
@@ -235,7 +253,8 @@ pub fn bootstrap(sdk_pub: &[u8], now: u64) -> Result<Bootstrap, SessionError> {
                 expires_at,
             },
         );
-    });
+        Ok(())
+    })?;
 
     Ok(Bootstrap {
         session_id,
@@ -248,207 +267,12 @@ pub fn bootstrap(sdk_pub: &[u8], now: u64) -> Result<Bootstrap, SessionError> {
 
 /// Decode a sealed CBOR envelope (`{v:1, ctr:u64, ct:bytes}`).
 fn cbor_decode_envelope(buf: &[u8]) -> Result<(u64, Vec<u8>), SessionError> {
-    // Canonical encoding: 0xA3 (map of 3) + ("v", 1) + ("ctr", u64) + ("ct", bstr).
-    let mut p = 0usize;
-    if buf.len() < 1 || buf[p] != 0xA3 {
-        return Err(SessionError::BadEnvelope);
-    }
-    p += 1;
-
-    let mut version: Option<u64> = None;
-    let mut ctr: Option<u64> = None;
-    let mut ct: Option<Vec<u8>> = None;
-
-    for _ in 0..3 {
-        // Each key is a 1-or-3-char text string.
-        let key = cbor_take_text(buf, &mut p)?;
-        match key.as_str() {
-            "v" => version = Some(cbor_take_uint(buf, &mut p)?),
-            "ctr" => ctr = Some(cbor_take_uint(buf, &mut p)?),
-            "ct" => ct = Some(cbor_take_bytes(buf, &mut p)?),
-            _ => return Err(SessionError::BadEnvelope),
-        }
-    }
-
-    if version != Some(1) {
-        return Err(SessionError::BadEnvelope);
-    }
-    Ok((
-        ctr.ok_or(SessionError::BadEnvelope)?,
-        ct.ok_or(SessionError::BadEnvelope)?,
-    ))
-}
-
-fn cbor_take_text(buf: &[u8], p: &mut usize) -> Result<String, SessionError> {
-    if *p >= buf.len() {
-        return Err(SessionError::BadEnvelope);
-    }
-    let head = buf[*p];
-    if head & 0xE0 != 0x60 {
-        return Err(SessionError::BadEnvelope);
-    }
-    let len = (head & 0x1F) as usize;
-    if len > 23 {
-        return Err(SessionError::BadEnvelope); // we only emit ≤3-byte keys
-    }
-    *p += 1;
-    if *p + len > buf.len() {
-        return Err(SessionError::BadEnvelope);
-    }
-    let s = core::str::from_utf8(&buf[*p..*p + len])
-        .map_err(|_| SessionError::BadEnvelope)?
-        .to_string();
-    *p += len;
-    Ok(s)
-}
-
-fn cbor_take_uint(buf: &[u8], p: &mut usize) -> Result<u64, SessionError> {
-    if *p >= buf.len() {
-        return Err(SessionError::BadEnvelope);
-    }
-    let head = buf[*p];
-    if head & 0xE0 != 0x00 {
-        return Err(SessionError::BadEnvelope);
-    }
-    let info = head & 0x1F;
-    *p += 1;
-    let v = match info {
-        n @ 0..=23 => n as u64,
-        24 => {
-            if *p >= buf.len() {
-                return Err(SessionError::BadEnvelope);
-            }
-            let v = buf[*p] as u64;
-            *p += 1;
-            v
-        }
-        25 => {
-            if *p + 2 > buf.len() {
-                return Err(SessionError::BadEnvelope);
-            }
-            let v = u16::from_be_bytes([buf[*p], buf[*p + 1]]) as u64;
-            *p += 2;
-            v
-        }
-        26 => {
-            if *p + 4 > buf.len() {
-                return Err(SessionError::BadEnvelope);
-            }
-            let v = u32::from_be_bytes([
-                buf[*p], buf[*p + 1], buf[*p + 2], buf[*p + 3],
-            ]) as u64;
-            *p += 4;
-            v
-        }
-        27 => {
-            if *p + 8 > buf.len() {
-                return Err(SessionError::BadEnvelope);
-            }
-            let v = u64::from_be_bytes([
-                buf[*p], buf[*p + 1], buf[*p + 2], buf[*p + 3],
-                buf[*p + 4], buf[*p + 5], buf[*p + 6], buf[*p + 7],
-            ]);
-            *p += 8;
-            v
-        }
-        _ => return Err(SessionError::BadEnvelope),
-    };
-    Ok(v)
-}
-
-fn cbor_take_bytes(buf: &[u8], p: &mut usize) -> Result<Vec<u8>, SessionError> {
-    if *p >= buf.len() {
-        return Err(SessionError::BadEnvelope);
-    }
-    let head = buf[*p];
-    if head & 0xE0 != 0x40 {
-        return Err(SessionError::BadEnvelope);
-    }
-    let info = head & 0x1F;
-    *p += 1;
-    let len = match info {
-        n @ 0..=23 => n as usize,
-        24 => {
-            if *p >= buf.len() { return Err(SessionError::BadEnvelope); }
-            let n = buf[*p] as usize; *p += 1; n
-        }
-        25 => {
-            if *p + 2 > buf.len() { return Err(SessionError::BadEnvelope); }
-            let n = u16::from_be_bytes([buf[*p], buf[*p+1]]) as usize;
-            *p += 2; n
-        }
-        26 => {
-            if *p + 4 > buf.len() { return Err(SessionError::BadEnvelope); }
-            let n = u32::from_be_bytes([buf[*p], buf[*p+1], buf[*p+2], buf[*p+3]]) as usize;
-            *p += 4; n
-        }
-        27 => {
-            if *p + 8 > buf.len() { return Err(SessionError::BadEnvelope); }
-            let n = u64::from_be_bytes([
-                buf[*p], buf[*p+1], buf[*p+2], buf[*p+3],
-                buf[*p+4], buf[*p+5], buf[*p+6], buf[*p+7],
-            ]) as usize;
-            *p += 8; n
-        }
-        _ => return Err(SessionError::BadEnvelope),
-    };
-    if *p + len > buf.len() {
-        return Err(SessionError::BadEnvelope);
-    }
-    let v = buf[*p..*p + len].to_vec();
-    *p += len;
-    Ok(v)
+    crate::sealed_envelope::decode(buf).ok_or(SessionError::BadEnvelope)
 }
 
 /// Encode `{v:1, ctr, ct}` in canonical CBOR (matches the SDK encoder).
 fn cbor_encode_envelope(ctr: u64, ct: &[u8]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(ct.len() + 32);
-    out.push(0xA3); // map of 3
-    out.extend_from_slice(&[0x61, b'v']); // text "v"
-    out.push(0x01); // unsigned 1
-    out.extend_from_slice(&[0x63, b'c', b't', b'r']); // text "ctr"
-    cbor_write_uint(&mut out, ctr);
-    out.extend_from_slice(&[0x62, b'c', b't']); // text "ct"
-    cbor_write_bytes(&mut out, ct);
-    out
-}
-
-fn cbor_write_uint(out: &mut Vec<u8>, v: u64) {
-    if v <= 23 {
-        out.push(v as u8);
-    } else if v <= 0xFF {
-        out.push(0x18);
-        out.push(v as u8);
-    } else if v <= 0xFFFF {
-        out.push(0x19);
-        out.extend_from_slice(&(v as u16).to_be_bytes());
-    } else if v <= 0xFFFF_FFFF {
-        out.push(0x1A);
-        out.extend_from_slice(&(v as u32).to_be_bytes());
-    } else {
-        out.push(0x1B);
-        out.extend_from_slice(&v.to_be_bytes());
-    }
-}
-
-fn cbor_write_bytes(out: &mut Vec<u8>, b: &[u8]) {
-    let len = b.len() as u64;
-    if len <= 23 {
-        out.push(0x40 | (len as u8));
-    } else if len <= 0xFF {
-        out.push(0x58);
-        out.push(len as u8);
-    } else if len <= 0xFFFF {
-        out.push(0x59);
-        out.extend_from_slice(&(len as u16).to_be_bytes());
-    } else if len <= 0xFFFF_FFFF {
-        out.push(0x5A);
-        out.extend_from_slice(&(len as u32).to_be_bytes());
-    } else {
-        out.push(0x5B);
-        out.extend_from_slice(&len.to_be_bytes());
-    }
-    out.extend_from_slice(b);
+    crate::sealed_envelope::encode(ctr, ct)
 }
 
 // ── Open / seal ─────────────────────────────────────────────────────

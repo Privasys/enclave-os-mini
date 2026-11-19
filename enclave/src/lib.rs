@@ -62,8 +62,10 @@ pub mod peerlink;
 #[cfg(feature = "raft")]
 pub mod raftglue;
 pub mod ratls;
+pub mod relay_limits;
 pub mod rpc_client;
 pub mod sealed_config;
+pub mod sealed_envelope;
 pub mod sessionrelay;
 pub mod trustedtime;
 // vaultkey registers the RA-TLS client-cert signer + attestation provider into

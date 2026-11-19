@@ -30,7 +30,6 @@
 //! deliberately no unverified fallback: a voucher mints an
 //! authenticated session, unlike a JWT which only gates role checks).
 
-use alloc::collections::BTreeMap;
 use std::string::{String, ToString};
 use std::sync::Mutex;
 use std::vec::Vec;
@@ -43,13 +42,6 @@ extern crate alloc;
 /// Diagnostic header set when a voucher is refused (the SDK treats it
 /// as "fall back to a wallet ceremony").
 pub const ENCAUTH_REJECT_HEADER: &str = "X-Privasys-EncAuth-Reject";
-
-/// Max voucher-backed bootstrap attempts (accepted or rejected) per sid
-/// per window. Matches the Go runtime.
-const REBIND_RATE_LIMIT: u32 = 6;
-const REBIND_RATE_WINDOW_SECS: u64 = 60;
-/// Sweep threshold for the rate-limit map (forged-sid growth bound).
-const REBIND_MAP_SWEEP_LEN: usize = 10_000;
 
 /// Allowed clock skew for the voucher time window (matches Go: 30 s).
 const TIME_SKEW_SECS: u64 = 30;
@@ -175,33 +167,15 @@ pub fn verify_encauth(
 
 // ── Rate limiting ────────────────────────────────────────────────────
 
-struct RebindWindow {
-    start: u64,
-    count: u32,
-}
-
-static REBINDS: Mutex<Option<BTreeMap<String, RebindWindow>>> = Mutex::new(None);
+static REBINDS: Mutex<Option<crate::relay_limits::RebindTable>> = Mutex::new(None);
 
 /// Record one voucher-backed bootstrap attempt for `sid` and report
 /// whether it is within budget. The sid comes from a cheap unverified
-/// decode — fine for bucketing (a forged sid only rate-limits the
-/// forger's own bucket; signatures still gate acceptance).
+/// decode; the table bounds its length and the number of sids
+/// (`relay_limits::RebindTable`).
 pub fn allow_rebind(sid: &str, now: u64) -> bool {
     let mut guard = REBINDS.lock().unwrap_or_else(|e| e.into_inner());
-    let map = guard.get_or_insert_with(BTreeMap::new);
-    if map.len() > REBIND_MAP_SWEEP_LEN {
-        map.retain(|_, w| now.saturating_sub(w.start) <= REBIND_RATE_WINDOW_SECS);
-    }
-    match map.get_mut(sid) {
-        Some(w) if now.saturating_sub(w.start) <= REBIND_RATE_WINDOW_SECS => {
-            w.count += 1;
-            w.count <= REBIND_RATE_LIMIT
-        }
-        _ => {
-            map.insert(sid.to_string(), RebindWindow { start: now, count: 1 });
-            true
-        }
-    }
+    guard.get_or_insert_with(Default::default).allow(sid, now)
 }
 
 /// Extract the sid with a cheap decode and NO signature verification.
