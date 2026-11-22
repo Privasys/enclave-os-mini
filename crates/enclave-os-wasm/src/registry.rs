@@ -1494,6 +1494,11 @@ impl AppRegistry {
         }
     }
 
+    /// Whether `function` is one of the exports of the loaded app `app`.
+    pub fn has_export(&self, app: &str, function: &str) -> bool {
+        self.loaded.get(app).map_or(false, |a| a.exports.contains_key(function))
+    }
+
     /// Whether an app is currently compiled in memory.
     pub fn is_loaded(&self, name: &str) -> bool {
         self.loaded.contains_key(name)

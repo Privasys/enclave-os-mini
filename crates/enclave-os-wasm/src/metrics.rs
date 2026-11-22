@@ -258,13 +258,17 @@ impl WasmMetricsStore {
         self.api_fees.iter().cloned().collect()
     }
 
-    /// Record a failed call (error).
-    pub fn record_error(&mut self, app: &str, function: &str) {
+    /// Record a failed call (error). `is_export` says whether `function` is
+    /// one of the app's exports; any other name is recorded under
+    /// [`UNKNOWN_FUNCTION`](crate::limits::UNKNOWN_FUNCTION), so a caller
+    /// cannot add entries by naming functions that do not exist.
+    pub fn record_error(&mut self, app: &str, function: &str, is_export: bool) {
         let ac = self.apps.entry(app.to_string()).or_default();
         ac.calls_total += 1;
         ac.errors_total += 1;
 
-        let fc = ac.functions.entry(function.to_string()).or_default();
+        let name = crate::limits::metric_function_name(function, is_export);
+        let fc = ac.functions.entry(name.to_string()).or_default();
         fc.calls += 1;
         fc.errors += 1;
     }
@@ -370,6 +374,17 @@ impl WasmMetricsStore {
                     ac.https_ratls_calls += saved_ac.https_ratls_calls;
                     ac.https_ratls_bytes += saved_ac.https_ratls_bytes;
                     for (func_name, saved_fc) in saved_ac.functions {
+                        // A name too long, or past the per-app limit, joins
+                        // the unknown bucket: a snapshot written before
+                        // names were checked is bounded on its way in.
+                        let func_name = if func_name.len() > crate::limits::MAX_METRIC_NAME_LEN
+                            || (ac.functions.len() >= crate::limits::MAX_METRIC_FUNCTIONS
+                                && !ac.functions.contains_key(&func_name))
+                        {
+                            crate::limits::UNKNOWN_FUNCTION.to_string()
+                        } else {
+                            func_name
+                        };
                         let fc = ac.functions.entry(func_name).or_default();
                         fc.calls += saved_fc.calls;
                         fc.fuel_consumed += saved_fc.fuel_consumed;
@@ -424,16 +439,18 @@ mod tests {
         store.record_call("app1", "hello", 5000);
         store.record_call("app1", "hello", 3000);
         store.record_call("app1", "process", 8000);
-        store.record_error("app1", "hello");
+        store.record_error("app1", "hello", true);
+        store.record_error("app1", "no-such-function", false);
 
         let metrics = store.to_app_metrics();
         assert_eq!(metrics.len(), 1);
         let app = &metrics[0];
         assert_eq!(app.name, "app1");
-        assert_eq!(app.calls_total, 4);
+        assert_eq!(app.calls_total, 5);
         assert_eq!(app.fuel_consumed_total, 16000);
-        assert_eq!(app.errors_total, 1);
-        assert_eq!(app.functions.len(), 2);
+        assert_eq!(app.errors_total, 2);
+        assert_eq!(app.functions.len(), 3);
+        assert!(app.functions.iter().any(|f| f.name == crate::limits::UNKNOWN_FUNCTION));
 
         let hello = app.functions.iter().find(|f| f.name == "hello").unwrap();
         assert_eq!(hello.calls, 3);

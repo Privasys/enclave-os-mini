@@ -72,6 +72,7 @@ pub mod engine;
 pub mod executor;
 pub mod jwks_fetcher;
 pub mod kek_material;
+pub mod limits;
 pub mod metrics;
 pub mod protocol;
 pub mod registry;
@@ -555,9 +556,21 @@ impl WasmModule {
             Err(err) => {
                 // Preparation failed before any wasm executed; no fuel
                 // consumed and no error metric beyond the existing
-                // "error" path below.
-                if let Ok(mut m) = self.metrics.lock() {
-                    m.record_error(&call.app, &call.function);
+                // "error" path below. The app and function are the
+                // caller's words: nothing is recorded for an app that is
+                // not known, and a function that is not an export is
+                // counted under the unknown bucket.
+                let (known, is_export) = match self.registry.lock() {
+                    Ok(r) => (
+                        r.get_known(&call.app).is_some(),
+                        r.has_export(&call.app, &call.function),
+                    ),
+                    Err(_) => (false, false),
+                };
+                if known {
+                    if let Ok(mut m) = self.metrics.lock() {
+                        m.record_error(&call.app, &call.function, is_export);
+                    }
                 }
                 return err;
             }
@@ -690,7 +703,8 @@ impl WasmModule {
                         // Execution started but failed (e.g. fuel exhaustion, trap).
                         m.record_call(&call.app, &call.function, fuel_consumed);
                     }
-                    m.record_error(&call.app, &call.function);
+                    // The call ran: the function is an export.
+                    m.record_error(&call.app, &call.function, true);
                 }
             }
             // Record billable SDK resource usage (no-op if none used).
