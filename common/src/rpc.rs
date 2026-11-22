@@ -441,7 +441,7 @@ pub fn decode_kv_list_keys_resp(p: &[u8]) -> Option<Vec<Vec<u8>>> {
     if p.len() < 4 { return None; }
     let count = u32::from_le_bytes(p[0..4].try_into().ok()?) as usize;
     let mut off = 4;
-    let mut keys = Vec::with_capacity(count);
+    let mut keys = Vec::with_capacity(count.min(p.len().saturating_sub(off) / 4));
     for _ in 0..count {
         if off + 4 > p.len() { return None; }
         let kl = u32::from_le_bytes(p[off..off + 4].try_into().ok()?) as usize;
@@ -505,7 +505,7 @@ pub fn decode_kv_write_batch_req(p: &[u8]) -> Option<(&[u8], Vec<KvBatchOp>)> {
     let mut off = 2 + table_len;
     let count = u32::from_le_bytes(p[off..off + 4].try_into().ok()?) as usize;
     off += 4;
-    let mut ops = Vec::with_capacity(count);
+    let mut ops = Vec::with_capacity(count.min(p.len().saturating_sub(off) / 5));
     for _ in 0..count {
         if off + 5 > p.len() { return None; }
         let tag = p[off];
@@ -555,7 +555,7 @@ pub fn decode_kv_multi_get_req(p: &[u8]) -> Option<(&[u8], Vec<&[u8]>)> {
     let mut off = 2 + table_len;
     let count = u32::from_le_bytes(p[off..off + 4].try_into().ok()?) as usize;
     off += 4;
-    let mut keys = Vec::with_capacity(count);
+    let mut keys = Vec::with_capacity(count.min(p.len().saturating_sub(off) / 4));
     for _ in 0..count {
         if off + 4 > p.len() { return None; }
         let kl = u32::from_le_bytes(p[off..off + 4].try_into().ok()?) as usize;
@@ -589,7 +589,7 @@ pub fn decode_kv_multi_get_resp(p: &[u8]) -> Option<Vec<Option<Vec<u8>>>> {
     if p.len() < 4 { return None; }
     let count = u32::from_le_bytes(p[0..4].try_into().ok()?) as usize;
     let mut off = 4;
-    let mut values = Vec::with_capacity(count);
+    let mut values = Vec::with_capacity(count.min(p.len().saturating_sub(off)));
     for _ in 0..count {
         if off + 1 > p.len() { return None; }
         let present = p[off];
@@ -657,7 +657,7 @@ pub fn decode_kv_scan_resp(p: &[u8]) -> Option<Vec<(Vec<u8>, Vec<u8>)>> {
     if p.len() < 4 { return None; }
     let count = u32::from_le_bytes(p[0..4].try_into().ok()?) as usize;
     let mut off = 4;
-    let mut entries = Vec::with_capacity(count);
+    let mut entries = Vec::with_capacity(count.min(p.len().saturating_sub(off) / 8));
     for _ in 0..count {
         if off + 4 > p.len() { return None; }
         let kl = u32::from_le_bytes(p[off..off + 4].try_into().ok()?) as usize;
@@ -1218,8 +1218,8 @@ mod tests {
             let buffer = vec![0u8; cap as usize];
             let buf_ptr = Box::into_raw(buffer.into_boxed_slice()) as *mut u8;
             unsafe {
-                let p = SpscProducer::from_raw(header, buf_ptr);
-                let c = SpscConsumer::from_raw(header, buf_ptr);
+                let p = SpscProducer::from_raw(header, buf_ptr).unwrap();
+                let c = SpscConsumer::from_raw(header, buf_ptr).unwrap();
                 (p, c)
             }
         }

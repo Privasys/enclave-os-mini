@@ -49,6 +49,52 @@ use enclave_os_common::queue::{SpscProducer, SpscConsumer, SpscQueueHeader};
 use enclave_os_common::channel;
 
 // ==========================================================================
+//  Host pointers
+// ==========================================================================
+
+extern "C" {
+    /// SGX trusted runtime: 1 when `[addr, addr + size)` lies entirely
+    /// outside the enclave.
+    fn sgx_is_outside_enclave(addr: *const u8, size: usize) -> i32;
+}
+
+/// Whether `[ptr, ptr + len)` is non-empty and lies entirely in host memory.
+fn outside_enclave(ptr: *const u8, len: usize) -> bool {
+    !ptr.is_null() && len > 0 && unsafe { sgx_is_outside_enclave(ptr, len) } == 1
+}
+
+/// Largest startup configuration accepted from the host.
+const MAX_CONFIG_LEN: u64 = 16 * 1024 * 1024;
+
+/// Build the enclave's ends of a queue pair the host allocated: the
+/// producer of `tx` and the consumer of `rx`. Both headers and both rings
+/// must lie entirely outside the enclave; each ring's capacity is read once
+/// from its header, validated, and used from enclave memory thereafter.
+/// Nothing is logged: the RPC channel that carries logs may not exist yet.
+fn host_queue_pair(
+    tx_header: *mut u8,
+    tx_buf: *mut u8,
+    rx_header: *mut u8,
+    rx_buf: *mut u8,
+) -> Result<(SpscProducer, SpscConsumer), i32> {
+    let hdr_len = core::mem::size_of::<SpscQueueHeader>();
+    let hdr_align = core::mem::align_of::<SpscQueueHeader>();
+    for h in [tx_header, rx_header] {
+        if !outside_enclave(h, hdr_len) || (h as usize) % hdr_align != 0 {
+            return Err(-1);
+        }
+    }
+    let tx = unsafe { SpscProducer::from_raw(tx_header as *const SpscQueueHeader, tx_buf) }
+        .map_err(|_| -1)?;
+    let rx = unsafe { SpscConsumer::from_raw(rx_header as *const SpscQueueHeader, rx_buf as *const u8) }
+        .map_err(|_| -1)?;
+    if !outside_enclave(tx_buf, tx.capacity() as usize) || !outside_enclave(rx_buf, rx.capacity() as usize) {
+        return Err(-1);
+    }
+    Ok((tx, rx))
+}
+
+// ==========================================================================
 //  ecall_init_channel – set up the shared-memory RPC channel
 // ==========================================================================
 
@@ -79,18 +125,11 @@ pub extern "C" fn ecall_init_channel(
 
     // The enclave is the **producer** for enc_to_host and the **consumer**
     // for host_to_enc.
-    let request_tx = unsafe {
-        SpscProducer::from_raw(
-            enc_to_host_header as *const SpscQueueHeader,
-            enc_to_host_buf,
-        )
-    };
-    let response_rx = unsafe {
-        SpscConsumer::from_raw(
-            host_to_enc_header as *const SpscQueueHeader,
-            host_to_enc_buf as *const u8,
-        )
-    };
+    let (request_tx, response_rx) =
+        match host_queue_pair(enc_to_host_header, enc_to_host_buf, host_to_enc_header, host_to_enc_buf) {
+            Ok(pair) => pair,
+            Err(rc) => return rc,
+        };
 
     let client = RpcClient::new(request_tx, response_rx);
 
@@ -132,18 +171,11 @@ pub extern "C" fn ecall_init_data_channel(
 
     // The enclave is the **producer** for enc_to_host (TLS output to proxy)
     // and the **consumer** for host_to_enc (raw TCP data from proxy).
-    let data_tx = unsafe {
-        SpscProducer::from_raw(
-            enc_to_host_header as *const SpscQueueHeader,
-            enc_to_host_buf,
-        )
-    };
-    let data_rx = unsafe {
-        SpscConsumer::from_raw(
-            host_to_enc_header as *const SpscQueueHeader,
-            host_to_enc_buf as *const u8,
-        )
-    };
+    let (data_tx, data_rx) =
+        match host_queue_pair(enc_to_host_header, enc_to_host_buf, host_to_enc_header, host_to_enc_buf) {
+            Ok(pair) => pair,
+            Err(rc) => return rc,
+        };
 
     match crate::set_data_channel(data_tx, data_rx) {
         Ok(()) => 0,
@@ -166,11 +198,18 @@ pub fn init_enclave(
     config_len: u64,
 ) -> Result<(EnclaveConfig, SealedConfig), i32> {
     // Parse config
-    let config_bytes = if !config_json.is_null() && config_len > 0 {
-        unsafe { core::slice::from_raw_parts(config_json, config_len as usize) }
+    // The buffer is host memory ([user_check]): bounded, checked to lie
+    // outside the enclave, and copied in before it is parsed.
+    let config_copy: Vec<u8> = if !config_json.is_null() && config_len > 0 {
+        if config_len > MAX_CONFIG_LEN || !outside_enclave(config_json, config_len as usize) {
+            enclave_log_error!("Config buffer refused ({} bytes)", config_len);
+            return Err(-2);
+        }
+        unsafe { core::slice::from_raw_parts(config_json, config_len as usize) }.to_vec()
     } else {
-        b"{}" as &[u8]
+        b"{}".to_vec()
     };
+    let config_bytes: &[u8] = &config_copy;
 
     let config: EnclaveConfig = match serde_json::from_slice(config_bytes) {
         Ok(c) => c,

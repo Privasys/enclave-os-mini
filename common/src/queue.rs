@@ -62,6 +62,32 @@ pub const MSG_HEADER_SIZE: usize = 4;
 /// Maximum single message size.
 pub const MAX_MSG_SIZE: u32 = 4 * 1024 * 1024; // 4 MiB
 
+/// Smallest ring capacity accepted.
+pub const MIN_QUEUE_CAPACITY: u64 = 4096;
+
+/// Largest ring capacity accepted from a header the host wrote.
+pub const MAX_QUEUE_CAPACITY: u64 = 256 * 1024 * 1024;
+
+/// Check a ring capacity read from a shared header: a power of two between
+/// [`MIN_QUEUE_CAPACITY`] and [`MAX_QUEUE_CAPACITY`].
+pub fn validate_capacity(capacity: u64) -> Result<u64, &'static str> {
+    if !capacity.is_power_of_two() {
+        return Err("queue capacity is not a power of two");
+    }
+    if capacity < MIN_QUEUE_CAPACITY || capacity > MAX_QUEUE_CAPACITY {
+        return Err("queue capacity out of range");
+    }
+    Ok(capacity)
+}
+
+/// Bytes in use in a ring of `capacity`, or `None` when the positions are
+/// inconsistent (more in use than the ring holds).
+#[inline]
+fn used_bytes(head: u64, tail: u64, capacity: u64) -> Option<u64> {
+    let used = head.wrapping_sub(tail);
+    if used > capacity { None } else { Some(used) }
+}
+
 /// The shared queue header, laid out for cache-line alignment.
 ///
 /// Producer owns `head`, consumer owns `tail`. Both in host memory.
@@ -136,6 +162,9 @@ impl SpscQueueHeader {
 pub struct SpscProducer {
     header: *const SpscQueueHeader,
     buf_ptr: *mut u8,
+    /// Ring capacity, read once from the header and validated. The header
+    /// field itself sits in shared memory and is never read again.
+    capacity: u64,
 }
 
 unsafe impl Send for SpscProducer {}
@@ -148,8 +177,17 @@ impl SpscProducer {
     /// - `header` must point to a valid, aligned `SpscQueueHeader`
     /// - `buf_ptr` must point to a `[u8; header.capacity]` buffer
     /// - Only one producer may exist for a given queue
-    pub unsafe fn from_raw(header: *const SpscQueueHeader, buf_ptr: *mut u8) -> Self {
-        Self { header, buf_ptr }
+    ///
+    /// Fails when the header's capacity is not acceptable
+    /// ([`validate_capacity`]).
+    pub unsafe fn from_raw(header: *const SpscQueueHeader, buf_ptr: *mut u8) -> Result<Self, &'static str> {
+        let capacity = validate_capacity(core::ptr::read_volatile(&(*header).capacity))?;
+        Ok(Self { header, buf_ptr, capacity })
+    }
+
+    /// The ring capacity this handle uses.
+    pub fn capacity(&self) -> u64 {
+        self.capacity
     }
 
     /// Try to write a message. Returns `Ok(())` if written, `Err(())` if full.
@@ -161,10 +199,14 @@ impl SpscProducer {
             return Err(());
         }
 
-        // Check available space
+        // Check available space. Positions the peer left inconsistent read
+        // as a full queue.
         let head = hdr.head.load(Ordering::Relaxed);
         let tail = hdr.tail.load(Ordering::Acquire);
-        let free = hdr.capacity - head.wrapping_sub(tail);
+        let free = match used_bytes(head, tail, self.capacity) {
+            Some(used) => self.capacity - used,
+            None => return Err(()),
+        };
 
         if free < total {
             return Err(()); // Queue is full
@@ -172,13 +214,13 @@ impl SpscProducer {
 
         // Write length header
         let len_bytes = (msg.len() as u32).to_le_bytes();
-        self.write_bytes(hdr, head, &len_bytes);
+        self.write_bytes(head, &len_bytes);
 
         // Write payload
-        self.write_bytes(hdr, head + MSG_HEADER_SIZE as u64, msg);
+        self.write_bytes(head.wrapping_add(MSG_HEADER_SIZE as u64), msg);
 
         // Publish: advance head with Release ordering
-        hdr.head.store(head + total, Ordering::Release);
+        hdr.head.store(head.wrapping_add(total), Ordering::Release);
         Ok(())
     }
 
@@ -196,9 +238,11 @@ impl SpscProducer {
     }
 
     /// Write bytes into the ring buffer at the given offset, handling wrap-around.
-    fn write_bytes(&self, hdr: &SpscQueueHeader, offset: u64, data: &[u8]) {
-        let cap = hdr.capacity as usize;
-        let start = hdr.mask(offset);
+    /// `data` is never longer than the capacity (the caller checked it
+    /// against the free space), so both copies stay inside the buffer.
+    fn write_bytes(&self, offset: u64, data: &[u8]) {
+        let cap = self.capacity as usize;
+        let start = (offset & (self.capacity - 1)) as usize;
         let end = start + data.len();
 
         if end <= cap {
@@ -237,6 +281,8 @@ impl SpscProducer {
 pub struct SpscConsumer {
     header: *const SpscQueueHeader,
     buf_ptr: *const u8,
+    /// Ring capacity, read once from the header and validated.
+    capacity: u64,
 }
 
 unsafe impl Send for SpscConsumer {}
@@ -247,8 +293,14 @@ impl SpscConsumer {
     ///
     /// # Safety
     /// Same requirements as `SpscProducer::from_raw`.
-    pub unsafe fn from_raw(header: *const SpscQueueHeader, buf_ptr: *const u8) -> Self {
-        Self { header, buf_ptr }
+    pub unsafe fn from_raw(header: *const SpscQueueHeader, buf_ptr: *const u8) -> Result<Self, &'static str> {
+        let capacity = validate_capacity(core::ptr::read_volatile(&(*header).capacity))?;
+        Ok(Self { header, buf_ptr, capacity })
+    }
+
+    /// The ring capacity this handle uses.
+    pub fn capacity(&self) -> u64 {
+        self.capacity
     }
 
     /// Try to read a message. Returns `Some(Vec<u8>)` or `None` if empty.
@@ -265,12 +317,14 @@ impl SpscConsumer {
 
         // Read length header
         let mut len_bytes = [0u8; MSG_HEADER_SIZE];
-        self.read_bytes(hdr, tail, &mut len_bytes);
+        self.read_bytes(tail, &mut len_bytes);
         let msg_len = u32::from_le_bytes(len_bytes) as u64;
 
-        if msg_len > MAX_MSG_SIZE as u64 {
+        // A message longer than the ring could hold is corrupt too: reading
+        // it would run past the buffer.
+        if msg_len > MAX_MSG_SIZE as u64 || msg_len > self.capacity - MSG_HEADER_SIZE as u64 {
             // Corrupted message – skip and advance tail past the header
-            hdr.tail.store(tail + MSG_HEADER_SIZE as u64, Ordering::Release);
+            hdr.tail.store(tail.wrapping_add(MSG_HEADER_SIZE as u64), Ordering::Release);
             return None;
         }
 
@@ -281,10 +335,10 @@ impl SpscConsumer {
 
         // Read payload
         let mut payload = vec![0u8; msg_len as usize];
-        self.read_bytes(hdr, tail + MSG_HEADER_SIZE as u64, &mut payload);
+        self.read_bytes(tail.wrapping_add(MSG_HEADER_SIZE as u64), &mut payload);
 
         // Advance tail
-        hdr.tail.store(tail + total, Ordering::Release);
+        hdr.tail.store(tail.wrapping_add(total), Ordering::Release);
 
         Some(payload)
     }
@@ -300,9 +354,11 @@ impl SpscConsumer {
     }
 
     /// Read bytes from the ring buffer at the given offset, handling wrap-around.
-    fn read_bytes(&self, hdr: &SpscQueueHeader, offset: u64, out: &mut [u8]) {
-        let cap = hdr.capacity as usize;
-        let start = hdr.mask(offset);
+    /// `out` is never longer than the capacity (checked by the caller), so
+    /// both copies stay inside the buffer.
+    fn read_bytes(&self, offset: u64, out: &mut [u8]) {
+        let cap = self.capacity as usize;
+        let start = (offset & (self.capacity - 1)) as usize;
         let end = start + out.len();
 
         if end <= cap {
@@ -374,10 +430,61 @@ mod tests {
         let buffer = vec![0u8; capacity as usize];
         let buf_ptr = Box::into_raw(buffer.into_boxed_slice()) as *mut u8;
         unsafe {
-            let producer = SpscProducer::from_raw(header, buf_ptr);
-            let consumer = SpscConsumer::from_raw(header, buf_ptr);
+            let producer = SpscProducer::from_raw(header, buf_ptr).unwrap();
+            let consumer = SpscConsumer::from_raw(header, buf_ptr).unwrap();
             (producer, consumer)
         }
+    }
+
+    // ================================================================
+    //  Host-written header values
+    // ================================================================
+
+    #[test]
+    fn capacities_are_validated() {
+        assert!(validate_capacity(4096).is_ok());
+        assert!(validate_capacity(MAX_QUEUE_CAPACITY).is_ok());
+        assert!(validate_capacity(0).is_err());
+        assert!(validate_capacity(2048).is_err());
+        assert!(validate_capacity(4097).is_err());
+        assert!(validate_capacity(MAX_QUEUE_CAPACITY * 2).is_err());
+    }
+
+    #[test]
+    fn a_bad_header_capacity_is_refused() {
+        let mut hdr = SpscQueueHeader::new(4096);
+        hdr.capacity = 5000;
+        let header = Box::into_raw(Box::new(hdr));
+        let buf_ptr = Box::into_raw(vec![0u8; 8192].into_boxed_slice()) as *mut u8;
+        unsafe {
+            assert!(SpscProducer::from_raw(header, buf_ptr).is_err());
+            assert!(SpscConsumer::from_raw(header, buf_ptr).is_err());
+        }
+    }
+
+    #[test]
+    fn the_capacity_is_read_once() {
+        let (producer, consumer) = alloc_test_queue(4096);
+        // A later change to the shared header is not used.
+        unsafe { (*(producer.header as *mut SpscQueueHeader)).capacity = 1 << 40 };
+        producer.try_send(b"still fine").unwrap();
+        assert_eq!(consumer.try_recv().unwrap(), b"still fine");
+        assert_eq!(producer.capacity(), 4096);
+    }
+
+    #[test]
+    fn inconsistent_positions_read_as_full_and_long_lengths_as_corrupt() {
+        let (producer, consumer) = alloc_test_queue(4096);
+        let hdr = unsafe { &*producer.header };
+        // More in use than the ring holds: the producer refuses to write.
+        hdr.head.store(10_000, Ordering::Release);
+        assert!(producer.try_send(b"x").is_err());
+        // A length prefix longer than the ring is skipped, never read.
+        hdr.head.store(8, Ordering::Release);
+        hdr.tail.store(0, Ordering::Release);
+        unsafe { core::ptr::copy_nonoverlapping((8192u32).to_le_bytes().as_ptr(), consumer.buf_ptr as *mut u8, 4) };
+        assert!(consumer.try_recv().is_none());
+        assert_eq!(hdr.tail.load(Ordering::Acquire), MSG_HEADER_SIZE as u64);
     }
 
     // ================================================================

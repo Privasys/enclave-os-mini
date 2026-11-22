@@ -72,11 +72,11 @@ impl SharedChannel {
         let consumer = SpscConsumer::from_raw(
             self.enc_to_host_header as *const SpscQueueHeader,
             self.enc_to_host_buf as *const u8,
-        );
+        ).expect("host queue capacity");
         let producer = SpscProducer::from_raw(
             self.host_to_enc_header as *const SpscQueueHeader,
             self.host_to_enc_buf,
-        );
+        ).expect("host queue capacity");
         (consumer, producer)
     }
 }
