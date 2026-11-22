@@ -2866,48 +2866,15 @@ fn verify_app_token(
         .and_then(|v| v.as_str())
         .map(|s| s.to_string());
 
-    // Extract roles from the configured roles_claim path.
-    let mut roles = Vec::new();
-    if let Some(val) = claims.get(&oidc.roles_claim) {
-        collect_role_strings(val, &mut roles);
-    }
-    // Also check standard paths for compatibility.
-    if let Some(val) = claims.get("roles") {
-        collect_role_strings(val, &mut roles);
-    }
-    if let Some(ra) = claims.get("realm_access") {
-        if let Some(val) = ra.get("roles") {
-            collect_role_strings(val, &mut roles);
-        }
-    }
-
-    roles.sort();
-    roles.dedup();
+    // Roles come from the configured roles_claim alone (a top-level claim,
+    // or a dotted path such as `realm_access.roles`), never from other
+    // claims the issuer may fill for its own purposes.
+    let roles = crate::limits::roles_from_claims(&claims, &oidc.roles_claim);
 
     // A `wallet` claim on this token is deliberately NOT read. It asserts that
     // a wallet authenticated the SESSION, which is not what
     // `free_for:["wallet"]` means — see wallet_class_unavailable.
     Ok((roles, sub))
-}
-
-/// Collect role strings from a JSON value (array of strings or map
-/// `{ "role": {...} }`).
-fn collect_role_strings(val: &serde_json::Value, out: &mut Vec<String>) {
-    match val {
-        serde_json::Value::Array(arr) => {
-            for item in arr {
-                if let Some(s) = item.as_str() {
-                    out.push(s.to_string());
-                }
-            }
-        }
-        serde_json::Value::Object(map) => {
-            for key in map.keys() {
-                out.push(key.clone());
-            }
-        }
-        _ => {}
-    }
 }
 
 /// Decode base64url (no padding) to bytes.
