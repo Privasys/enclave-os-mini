@@ -348,32 +348,24 @@ const MAX_LOADED_APPS: usize = 10;
 
 /// Parse a single `@auth` annotation value into a policy and optional roles.
 ///
-/// Supported forms:
+/// Supported forms (case-insensitive, spaces allowed around `(`, `)` and
+/// commas):
 ///   - `"public"`                   → (Public, [])
 ///   - `"authenticated"`            → (Authenticated, [])
+///   - `"owner"`                    → (Owner, [])
 ///   - `"role(role-a, role-b)"`     → (Role, ["role-a", "role-b"])
-fn parse_auth_annotation(value: &str) -> (FunctionPolicy, Vec<String>) {
-    let v = value.trim();
-    if v.eq_ignore_ascii_case("public") {
-        return (FunctionPolicy::Public, Vec::new());
-    }
-    if v.eq_ignore_ascii_case("authenticated") {
-        return (FunctionPolicy::Authenticated, Vec::new());
-    }
-    if v.eq_ignore_ascii_case("owner") {
-        return (FunctionPolicy::Owner, Vec::new());
-    }
-    // role(role-a, role-b, ...)
-    if let Some(inner) = v.strip_prefix("role(").and_then(|s| s.strip_suffix(')')) {
-        let roles: Vec<String> = inner
-            .split(',')
-            .map(|r| r.trim().to_string())
-            .filter(|r| !r.is_empty())
-            .collect();
-        return (FunctionPolicy::Role, roles);
-    }
-    // Unrecognised → default to authenticated (safe fallback).
-    (FunctionPolicy::Authenticated, Vec::new())
+///
+/// Anything else, and a `role()` naming no role, is an error that refuses
+/// the app's load: it never falls back to a policy the developer did not
+/// write.
+fn parse_auth_annotation(value: &str) -> Result<(FunctionPolicy, Vec<String>), String> {
+    use crate::limits::AuthAnnotation;
+    Ok(match crate::limits::parse_auth_annotation(value)? {
+        AuthAnnotation::Public => (FunctionPolicy::Public, Vec::new()),
+        AuthAnnotation::Authenticated => (FunctionPolicy::Authenticated, Vec::new()),
+        AuthAnnotation::Owner => (FunctionPolicy::Owner, Vec::new()),
+        AuthAnnotation::Role(roles) => (FunctionPolicy::Role, roles),
+    })
 }
 
 /// Extract per-function auth policies from docs `auth:*` keys.
@@ -386,14 +378,14 @@ fn parse_auth_annotation(value: &str) -> (FunctionPolicy, Vec<String>) {
 fn merge_auth_from_docs(
     docs: &BTreeMap<String, String>,
     permissions: Option<AppPermissions>,
-) -> Option<AppPermissions> {
+) -> Result<Option<AppPermissions>, String> {
     let auth_entries: Vec<(&str, &str)> = docs
         .iter()
         .filter_map(|(k, v)| k.strip_prefix("auth:").map(|name| (name, v.as_str())))
         .collect();
 
     if auth_entries.is_empty() {
-        return permissions;
+        return Ok(permissions);
     }
 
     // Start with existing permissions or a fresh default.
@@ -411,7 +403,8 @@ fn merge_auth_from_docs(
     });
 
     for (name, value) in auth_entries {
-        let (policy, roles) = parse_auth_annotation(value);
+        let (policy, roles) = parse_auth_annotation(value)
+            .map_err(|e| format!("function '{name}': {e}"))?;
         if name == "__default__" {
             perms.default_policy = policy;
             perms.default_roles = roles;
@@ -427,7 +420,7 @@ fn merge_auth_from_docs(
         }
     }
 
-    Some(perms)
+    Ok(Some(perms))
 }
 
 /// Read the `egress` docs entry (the WIT `@egress` annotation: a JSON list of
@@ -870,7 +863,7 @@ impl AppRegistry {
         // on the auth-created permissions; both are folded into the measured
         // configuration hash below (an attested price).
         let permissions = match docs {
-            Some(ref d) => merge_price_from_docs(d, merge_auth_from_docs(d, permissions)),
+            Some(ref d) => merge_price_from_docs(d, merge_auth_from_docs(d, permissions)?),
             None => permissions,
         };
         let permissions = merge_egress(egress, permissions);
