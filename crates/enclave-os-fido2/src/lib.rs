@@ -382,6 +382,12 @@ impl Fido2Module {
             Err(e) => return Fido2Response::Error { error: e },
         };
 
+        // The hint is echoed back in allowCredentials; a credential ID is
+        // far shorter than this.
+        if credential_id_b64.map_or(false, |c| c.len() > MAX_CREDENTIAL_ID_B64_LEN) {
+            return Fido2Response::Error { error: "credential ID too long".into() };
+        }
+
         let challenge = match challenge::create_challenge(
             now,
             challenge::PendingCeremony {

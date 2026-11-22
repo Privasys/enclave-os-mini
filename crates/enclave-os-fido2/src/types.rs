@@ -45,6 +45,10 @@ pub const CHALLENGE_BYTES: usize = 32;
 /// Longest accepted user handle, user name or browser session ID.
 pub const MAX_FIELD_LEN: usize = 256;
 
+/// Longest accepted base64url credential ID (WebAuthn caps the raw ID at
+/// 1023 bytes).
+pub const MAX_CREDENTIAL_ID_B64_LEN: usize = 1366;
+
 // ---------------------------------------------------------------------------
 //  FIDO2 wire protocol — request (standard WebAuthn, camelCase)
 // ---------------------------------------------------------------------------

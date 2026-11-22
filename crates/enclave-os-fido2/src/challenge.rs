@@ -77,6 +77,16 @@ pub fn create_challenge(
     now: u64,
     pending: PendingCeremony,
 ) -> Result<String, String> {
+    for (what, field) in [
+        ("session ID", pending.browser_session_id.as_deref()),
+        ("user handle", pending.user_handle.as_deref()),
+        ("user name", pending.user_name.as_deref()),
+    ] {
+        if field.map_or(false, |f| f.len() > MAX_FIELD_LEN) {
+            return Err(format!("{what} must be at most {MAX_FIELD_LEN} bytes"));
+        }
+    }
+
     let rng = SystemRandom::new();
     let mut bytes = [0u8; CHALLENGE_BYTES];
     rng.fill(&mut bytes).map_err(|_| "RNG failure")?;
@@ -97,14 +107,23 @@ pub fn create_challenge(
     let mut guard = CHALLENGE_STORE.lock().map_err(|_| "challenge store lock poisoned")?;
     let store = guard.as_mut().ok_or("challenge store not initialised")?;
 
-    // Evict expired entries if at capacity
+    // At capacity: drop expired entries, then, if still full, the oldest
+    // pending challenge. A flood of begins then only displaces older
+    // ceremonies, the flood's own first, instead of refusing every begin.
     if store.len() >= MAX_PENDING_CHALLENGES {
         store.retain(|_, e| e.expires_at > now);
     }
-
-    // If still at capacity after eviction, reject
-    if store.len() >= MAX_PENDING_CHALLENGES {
-        return Err("too many pending challenges".into());
+    while store.len() >= MAX_PENDING_CHALLENGES {
+        let oldest = store
+            .iter()
+            .min_by_key(|(_, e)| e.expires_at)
+            .map(|(k, _)| k.clone());
+        match oldest {
+            Some(k) => {
+                store.remove(&k);
+            }
+            None => break,
+        }
     }
 
     store.insert(b64.clone(), entry);
@@ -150,4 +169,42 @@ pub fn consume_challenge(
         app: entry.app,
         extends_user: entry.extends_user,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn begin(now: u64, sid: &str) -> Result<String, String> {
+        create_challenge(
+            now,
+            PendingCeremony {
+                browser_session_id: Some(sid.to_string()),
+                ceremony: Ceremony::Authentication,
+                user_handle: None,
+                user_name: None,
+                app: None,
+                extends_user: false,
+            },
+        )
+    }
+
+    /// One test: the store is a global, and tests run in parallel.
+    #[test]
+    fn a_full_store_evicts_the_oldest_and_fields_are_bounded() {
+        init();
+        let first = begin(1_000, "first").unwrap();
+        for _ in 1..MAX_PENDING_CHALLENGES {
+            begin(1_001, "flood").unwrap();
+        }
+        // Full and nothing expired: one more begin still succeeds, and only
+        // the oldest pending challenge is gone.
+        let late = begin(1_002, "late").unwrap();
+        assert!(consume_challenge(&first, 1_002, Ceremony::Authentication).is_err());
+        assert!(consume_challenge(&late, 1_002, Ceremony::Authentication).is_ok());
+
+        let long = "x".repeat(MAX_FIELD_LEN + 1);
+        assert!(begin(1_002, &long).is_err());
+        assert!(begin(1_002, &"x".repeat(MAX_FIELD_LEN)).is_ok());
+    }
 }
