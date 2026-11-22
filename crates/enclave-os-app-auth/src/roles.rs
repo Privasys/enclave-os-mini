@@ -5,9 +5,15 @@
 //!
 //! Keys use the `roles:` prefix within the `app:<name>` table:
 //!
-//! - `roles:<user_handle>` — JSON array of role strings
-//! - `roles:__manifest__` — JSON array of all known user handles
+//! - `roles:<user_handle>` — JSON array of role strings; its presence (even
+//!   `[]`) records that the user has been seen
+//! - `roles:__manifest__` — JSON array of the user handles [`list_users`]
+//!   shows: every user given roles explicitly, and users enrolled with
+//!   non-empty default roles up to [`MAX_ENROLLED_MANIFEST`]
 //! - `roles:__default__` — JSON array of roles auto-assigned to new users
+//!
+//! The per-call lookup ([`get_or_enroll_user_roles`]) reads only the user's
+//! own key; the manifest is touched only when a user is first given roles.
 //!
 //! This store never confers [`ADMIN_ROLE`]. Admin comes only from the `roles`
 //! claim of an OIDC token issued by the identity provider; it is refused on
@@ -57,6 +63,10 @@ const DEFAULT_KEY: &[u8] = b"roles:__default__";
 /// Longest accepted user handle. Comfortably above a FIDO2 user handle (64
 /// bytes at most) and an OIDC `sub`, while keeping the key bounded.
 const MAX_HANDLE_LEN: usize = 256;
+
+/// Most users automatic enrollment adds to the manifest. Users given roles
+/// explicitly ([`set_user_roles`]) are always added.
+pub const MAX_ENROLLED_MANIFEST: usize = 4096;
 
 /// Reject a handle that is unusable or that would address a reserved key.
 ///
@@ -114,22 +124,36 @@ pub fn get_user_roles(store: &SealedKvStore, user_handle: &str) -> Result<Vec<St
 
 /// Get a user's roles, enrolling them with the default roles if new.
 ///
-/// - A known user (in the manifest) gets their stored roles.
+/// - A known user (their role key exists, even as `[]`) gets their stored
+///   roles. Only that key is read: this runs on every authenticated call.
 /// - A new user is recorded with the configured default roles, which may be
-///   empty. Being first confers nothing.
+///   empty. Being first confers nothing. They join the manifest only when
+///   the defaults are non-empty and the manifest holds fewer than
+///   [`MAX_ENROLLED_MANIFEST`] users.
 pub fn get_or_enroll_user_roles(
     store: &SealedKvStore,
     user_handle: &str,
 ) -> Result<Vec<String>, String> {
-    let manifest = load_manifest(store)?;
-
-    if manifest.contains(&user_handle.to_string()) {
-        return get_user_roles(store, user_handle);
+    let key = user_key(user_handle)?;
+    if let Some(bytes) = store.get(&key)? {
+        return serde_json::from_slice(&bytes)
+            .map(without_admin)
+            .map_err(|e| format!("roles deserialization failed: {e}"));
     }
 
     // New user: assign defaults (may be empty).
     let defaults = get_default_roles(store)?;
-    set_user_roles(store, user_handle, &defaults)?;
+    let value = serde_json::to_vec(&defaults)
+        .map_err(|e| format!("roles serialization failed: {e}"))?;
+    store.put(&key, &value)?;
+    if !defaults.is_empty() {
+        let mut manifest = load_manifest(store)?;
+        let handle = user_handle.to_string();
+        if manifest.len() < MAX_ENROLLED_MANIFEST && !manifest.contains(&handle) {
+            manifest.push(handle);
+            save_manifest(store, &manifest)?;
+        }
+    }
     Ok(defaults)
 }
 
@@ -348,6 +372,26 @@ mod store_tests {
         // Other roles are unaffected.
         set_user_roles(&s, "alice", &roles(&["editor"])).unwrap();
         assert_eq!(get_user_roles(&s, "alice").unwrap(), roles(&["editor"]));
+    }
+
+    #[test]
+    fn enrollment_with_no_default_roles_leaves_the_manifest_alone() {
+        let s = store("no-manifest");
+        assert_eq!(get_or_enroll_user_roles(&s, "alice").unwrap(), Vec::<String>::new());
+        assert!(s.get(MANIFEST_KEY).unwrap().is_none());
+        // Seen: a later default does not re-enroll her.
+        set_default_roles(&s, &roles(&["viewer"])).unwrap();
+        assert_eq!(get_or_enroll_user_roles(&s, "alice").unwrap(), Vec::<String>::new());
+        // A new user with non-empty defaults is listed.
+        assert_eq!(get_or_enroll_user_roles(&s, "bob").unwrap(), roles(&["viewer"]));
+        assert_eq!(list_users(&s).unwrap(), vec![("bob".to_string(), roles(&["viewer"]))]);
+    }
+
+    #[test]
+    fn a_known_user_is_found_without_the_manifest() {
+        let s = store("direct-lookup");
+        s.put(b"roles:carol", br#"["editor"]"#).unwrap();
+        assert_eq!(get_or_enroll_user_roles(&s, "carol").unwrap(), roles(&["editor"]));
     }
 
     /// The case that matters for a store written before the fix: an `admin`
