@@ -587,11 +587,20 @@ fn parse_http_reply(raw: &[u8], eof: bool) -> Result<Option<Vec<u8>>, String> {
             if size == 0 {
                 break;
             }
-            if p.len() < size + 2 {
+            // A chunk size is read from the wire: bounded before any
+            // arithmetic, so it can neither wrap nor index past the buffer.
+            const MAX_CHUNK: usize = 1024 * 1024;
+            if size > MAX_CHUNK {
+                return Err("chunk too large".to_string());
+            }
+            let Some(needed) = size.checked_add(2) else {
+                return Err("chunk too large".to_string());
+            };
+            if p.len() < needed {
                 return Ok(None);
             }
             out.extend_from_slice(&p[..size]);
-            p = &p[size + 2..];
+            p = &p[needed..];
         }
         out
     } else {
