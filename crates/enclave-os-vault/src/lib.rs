@@ -468,6 +468,7 @@ fn handle_export(handle: &str, approvals: &[ApprovalToken], ctx: &RequestContext
     };
     match evaluate_op(
         &record.policy,
+        record.policy_version,
         Operation::ExportKey,
         handle,
         approvals,
@@ -502,6 +503,7 @@ fn handle_delete(handle: &str, approvals: &[ApprovalToken], ctx: &RequestContext
     let caller = caller_str(ctx);
     if let Err(e) = evaluate_op(
         &record.policy,
+        record.policy_version,
         Operation::DeleteKey,
         handle,
         approvals,
@@ -561,6 +563,7 @@ fn handle_update_policy(
 
     if let Err(e) = evaluate_op(
         &record.policy,
+        record.policy_version,
         Operation::UpdatePolicy,
         handle,
         approvals,
@@ -717,7 +720,7 @@ fn require_op(
         return Err(VaultResponse::Error(msg));
     }
     let caller = caller_str(ctx);
-    if let Err(e) = evaluate_op(&record.policy, op, handle, approvals, ctx, None) {
+    if let Err(e) = evaluate_op(&record.policy, record.policy_version, op, handle, approvals, ctx, None) {
         let _ = audit_and_save(&mut record, op_name(op), &caller, AuditDecision::Denied, &e);
         return Err(VaultResponse::Error(e));
     }
@@ -970,7 +973,16 @@ fn handle_issue_approval(
             Ok(s) => s,
             Err(_) => return VaultResponse::Error("kv store lock poisoned".into()),
         };
-        match signing::issue_approval_token(&mut store, handle, op, mgr_idx, &claims.sub, now, ttl)
+        match signing::issue_approval_token(
+            &mut store,
+            handle,
+            op,
+            mgr_idx,
+            &claims.sub,
+            record.policy_version,
+            now,
+            ttl,
+        )
         {
             Ok(t) => t,
             Err(e) => return VaultResponse::Error(e),
@@ -1306,6 +1318,7 @@ fn handle_promote_pending(
 
     if let Err(e) = evaluate_op(
         &record.policy,
+        record.policy_version,
         Operation::PromoteProfile,
         handle,
         approvals,

@@ -100,11 +100,11 @@ fn oidc_step_up_amr_gate() {
 
     // owner bearer carrying a webauthn step-up: allowed.
     let c_ok = ctx_with_amr("dev", &["webauthn"]);
-    assert!(evaluate_op(&policy, Operation::PromoteProfile, "h", &[], &c_ok, None).is_ok());
+    assert!(evaluate_op(&policy, 1, Operation::PromoteProfile, "h", &[], &c_ok, None).is_ok());
 
     // same owner, no webauthn in amr: denied.
     let c_no = ctx_with_amr("dev", &["pwd"]);
-    assert!(evaluate_op(&policy, Operation::PromoteProfile, "h", &[], &c_no, None).is_err());
+    assert!(evaluate_op(&policy, 1, Operation::PromoteProfile, "h", &[], &c_no, None).is_err());
 }
 
 #[test]
@@ -132,19 +132,19 @@ fn oidc_step_up_operation_bound() {
     // correct, operation-bound token -> allowed.
     let good = vault_op_binding(handle, digest, version, nonce, exp);
     let ok = ctx_step_up("dev", &["webauthn"], Some(&good), Some(nonce), exp);
-    assert!(evaluate_op(&policy, Operation::PromoteProfile, handle, &[], &ok, Some(&binding)).is_ok());
+    assert!(evaluate_op(&policy, 1, Operation::PromoteProfile, handle, &[], &ok, Some(&binding)).is_ok());
 
     // token bound to a DIFFERENT measurement -> denied.
     let wrong = vault_op_binding(handle, "deadbeef", version, nonce, exp);
     let bad = ctx_step_up("dev", &["webauthn"], Some(&wrong), Some(nonce), exp);
-    assert!(evaluate_op(&policy, Operation::PromoteProfile, handle, &[], &bad, Some(&binding)).is_err());
+    assert!(evaluate_op(&policy, 1, Operation::PromoteProfile, handle, &[], &bad, Some(&binding)).is_err());
 
     // operation_bound but the handler supplied no binding -> fail closed.
-    assert!(evaluate_op(&policy, Operation::PromoteProfile, handle, &[], &ok, None).is_err());
+    assert!(evaluate_op(&policy, 1, Operation::PromoteProfile, handle, &[], &ok, None).is_err());
 
     // operation_bound but the token carries no vault_op -> fail closed.
     let noop = ctx_step_up("dev", &["webauthn"], None, Some(nonce), exp);
-    assert!(evaluate_op(&policy, Operation::PromoteProfile, handle, &[], &noop, Some(&binding)).is_err());
+    assert!(evaluate_op(&policy, 1, Operation::PromoteProfile, handle, &[], &noop, Some(&binding)).is_err());
 }
 
 #[test]
@@ -174,16 +174,16 @@ fn oidc_step_up_export_operation_bound() {
     // Correct export-bound token (empty measurement) -> allowed.
     let good = vault_op_binding(handle, "", version, nonce, exp);
     let ok = ctx_step_up("dev", &["webauthn"], Some(&good), Some(nonce), exp);
-    assert!(evaluate_op(&policy, Operation::ExportKey, handle, &[], &ok, Some(&binding)).is_ok());
+    assert!(evaluate_op(&policy, 1, Operation::ExportKey, handle, &[], &ok, Some(&binding)).is_ok());
 
     // A token bound to a non-empty measurement (e.g. a captured promote
     // approval for the same handle) -> denied. Export and promote can never
     // share a binding.
     let promote = vault_op_binding(handle, "abc123", version, nonce, exp);
     let bad = ctx_step_up("dev", &["webauthn"], Some(&promote), Some(nonce), exp);
-    assert!(evaluate_op(&policy, Operation::ExportKey, handle, &[], &bad, Some(&binding)).is_err());
+    assert!(evaluate_op(&policy, 1, Operation::ExportKey, handle, &[], &bad, Some(&binding)).is_err());
 
     // operation_bound but no vault_op on the token -> fail closed.
     let noop = ctx_step_up("dev", &["webauthn"], None, Some(nonce), exp);
-    assert!(evaluate_op(&policy, Operation::ExportKey, handle, &[], &noop, Some(&binding)).is_err());
+    assert!(evaluate_op(&policy, 1, Operation::ExportKey, handle, &[], &noop, Some(&binding)).is_err());
 }

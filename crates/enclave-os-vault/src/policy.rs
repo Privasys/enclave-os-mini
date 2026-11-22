@@ -295,10 +295,12 @@ fn measurement_matches(identity: &crate::quote::QuoteIdentity, allowed: &[Measur
 // ---------------------------------------------------------------------------
 
 /// Verify the caller is allowed to perform `op` on the key whose policy
-/// is `policy`. The `handle` and `approvals` parameters are needed to
-/// evaluate [`Condition::ManagerApproval`].
+/// is `policy` (at `policy_version`). The `handle`, `policy_version` and
+/// `approvals` parameters are needed to evaluate
+/// [`Condition::ManagerApproval`].
 pub fn evaluate_op(
     policy: &KeyPolicy,
+    policy_version: u32,
     op: Operation,
     handle: &str,
     approvals: &[ApprovalToken],
@@ -321,6 +323,7 @@ pub fn evaluate_op(
         match evaluate_conditions(
             &rule.requires,
             policy,
+            policy_version,
             op,
             handle,
             approvals,
@@ -362,6 +365,7 @@ fn rule_grants_to(rule: &OperationRule, caller: PrincipalRef) -> bool {
 fn evaluate_conditions(
     conditions: &[Condition],
     policy: &KeyPolicy,
+    policy_version: u32,
     op: Operation,
     handle: &str,
     approvals: &[ApprovalToken],
@@ -453,6 +457,10 @@ fn evaluate_conditions(
                         handle,
                         op,
                         mgr_idx,
+                        // A subject-bound manager's approval must come from
+                        // that subject; a role-based one names no subject.
+                        if mgr_sub.is_empty() { None } else { Some(mgr_sub) },
+                        policy_version,
                         distinct_from,
                         *fresh_for_seconds,
                         now,

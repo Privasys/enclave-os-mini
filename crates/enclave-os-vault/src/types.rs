@@ -599,6 +599,11 @@ pub struct ApprovalClaims {
     /// requires `approver_sub != proposer_sub`.
     #[serde(default)]
     pub approver_sub: String,
+    /// The key's `policy_version` when the approval was given. A token is
+    /// accepted only while the policy is unchanged; tokens without it are
+    /// refused.
+    #[serde(default)]
+    pub policy_version: Option<u32>,
     /// Issued at (unix seconds).
     pub iat: u64,
     /// Expires at (unix seconds).

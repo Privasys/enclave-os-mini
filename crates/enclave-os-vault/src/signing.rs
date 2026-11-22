@@ -71,14 +71,17 @@ pub(crate) fn load_or_init_public_key(store: &mut SealedKvStore) -> Result<Vec<u
 /// Sign an [`ApprovalToken`] for the given (handle, op, manager) triple.
 ///
 /// `approver_sub` is the OIDC `sub` of the manager who authenticated to
-/// request the token; it is recorded in the claims so a role-based
-/// [`Condition::ManagerApproval`] can enforce separation of duties.
+/// request the token; it is recorded in the claims so a subject-bound
+/// [`Condition::ManagerApproval`] can check it is that manager and a
+/// role-based one can enforce separation of duties. `policy_version` is the
+/// key's policy version now: the token is accepted only while it is current.
 pub(crate) fn issue_approval_token(
     store: &mut SealedKvStore,
     handle: &str,
     op: Operation,
     manager: u32,
     approver_sub: &str,
+    policy_version: u32,
     iat: u64,
     ttl_seconds: u64,
 ) -> Result<ApprovalToken, String> {
@@ -89,6 +92,7 @@ pub(crate) fn issue_approval_token(
         op,
         manager,
         approver_sub: approver_sub.to_string(),
+        policy_version: Some(policy_version),
         iat,
         exp: iat.saturating_add(ttl_seconds),
     };
@@ -111,16 +115,21 @@ pub(crate) fn issue_approval_token(
 ///   4. the manager *index* is pinned (a token can only be issued by the
 ///      vault for a manager who has authenticated, so the policy lookup
 ///      catches reshuffles),
-///   5. if `distinct_from` is `Some(proposer_sub)` (role-based co-sign /
+///   5. if `expected_approver` is `Some(sub)` (a subject-bound manager), the
+///      token's `approver_sub` must be that manager's current `sub`; in all
+///      cases the token must carry the key's current `policy_version`,
+///   6. if `distinct_from` is `Some(proposer_sub)` (role-based co-sign /
 ///      separation of duties), the token's `approver_sub` must be present
 ///      and different from the proposer's sub,
-///   6. `now <= exp`,
-///   7. `now - iat <= fresh_for_seconds`.
+///   7. `now <= exp`,
+///   8. `now - iat <= fresh_for_seconds`.
 pub(crate) fn verify_approval_token(
     token: &ApprovalToken,
     handle: &str,
     op: Operation,
     manager: u32,
+    expected_approver: Option<&str>,
+    policy_version: u32,
     distinct_from: Option<&str>,
     fresh_for_seconds: u64,
     now: u64,
@@ -158,6 +167,23 @@ pub(crate) fn verify_approval_token(
         return Err(format!(
             "manager mismatch (token={}, expected={})",
             claims.manager, manager
+        ));
+    }
+    // The index alone is not the manager: the slot may have been given to
+    // someone else since the token was issued.
+    if let Some(sub) = expected_approver {
+        if claims.approver_sub != sub {
+            return Err(format!(
+                "approver mismatch (token approver_sub '{}' is not the manager at index {})",
+                claims.approver_sub, manager
+            ));
+        }
+    }
+    // Approval is for the policy as it was when given.
+    if claims.policy_version != Some(policy_version) {
+        return Err(format!(
+            "policy changed since approval (token policy_version {:?}, key {})",
+            claims.policy_version, policy_version
         ));
     }
     if let Some(proposer_sub) = distinct_from {
