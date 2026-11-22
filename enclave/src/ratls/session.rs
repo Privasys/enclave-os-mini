@@ -31,6 +31,8 @@ pub struct RaTlsSession {
     tls_conn: rustls::ServerConnection,
     /// Accumulation buffer for incomplete application-level frames.
     read_buf: Vec<u8>,
+    /// Bytes of `read_buf` taken from the shared read budget.
+    reserved: usize,
     /// Attestation tag of this connection: "none" until the client asks for
     /// evidence after the handshake, then "deterministic" or "challenge".
     attestation: &'static str,
@@ -60,6 +62,12 @@ pub struct FidoIdentity {
     pub authenticated_at: u64,
 }
 
+impl Drop for RaTlsSession {
+    fn drop(&mut self) {
+        crate::read_budget::SESSION_BUFFERS.release(self.reserved);
+    }
+}
+
 // SAFETY: RaTlsSession contains only owned types. rustls::ServerConnection
 // is Send. Ready for future multi-threaded worker dispatch.
 unsafe impl Send for RaTlsSession {}
@@ -74,12 +82,18 @@ impl RaTlsSession {
         Self {
             tls_conn,
             read_buf: Vec::new(),
+            reserved: 0,
             attestation: "none",
             client_context: None,
             peer_evidence: None,
             fido2_identity: None,
             direct: false,
         }
+    }
+
+    /// Decrypted bytes buffered and not yet taken as a request.
+    pub fn buffered_len(&self) -> usize {
+        self.read_buf.len()
     }
 
     /// Whether the TLS handshake is still in progress.
@@ -184,6 +198,9 @@ impl RaTlsSession {
         match protocol::parse_http_request(&self.read_buf) {
             Ok((request, consumed)) => {
                 self.read_buf.drain(..consumed);
+                let released = consumed.min(self.reserved);
+                self.reserved -= released;
+                crate::read_budget::SESSION_BUFFERS.release(released);
                 Ok(Some(request))
             }
             Err(protocol::HttpParseError::Incomplete) => Ok(None),
@@ -265,7 +282,19 @@ impl RaTlsSession {
             use std::io::Read;
             match reader.read(&mut buf) {
                 Ok(0) => break,
-                Ok(n) => self.read_buf.extend_from_slice(&buf[..n]),
+                Ok(n) => {
+                    // Every buffered byte counts against the enclave-wide
+                    // budget; a connection that would cross it is closed.
+                    if !crate::read_budget::SESSION_BUFFERS.try_reserve(n) {
+                        enclave_log_error!(
+                            "request buffers full ({} bytes buffered), closing connection",
+                            crate::read_budget::SESSION_BUFFERS.used()
+                        );
+                        return Err("request buffer budget exhausted");
+                    }
+                    self.reserved += n;
+                    self.read_buf.extend_from_slice(&buf[..n]);
+                }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
                 Err(e) => {
                     enclave_log_error!(

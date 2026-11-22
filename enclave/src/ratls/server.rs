@@ -353,6 +353,22 @@ impl IngressServer {
             SessionState::Established(mut session) => {
                 match self.process_session_data(conn_id, &mut session, data) {
                     Ok(()) => {
+                        // Behind a suspended request, only a little more may
+                        // be buffered: those bytes wait in the enclave heap
+                        // until the request finishes.
+                        #[cfg(feature = "wasm")]
+                        if crate::read_budget::over_pending_limit(
+                            self.pending.contains_key(&conn_id),
+                            session.buffered_len(),
+                        ) {
+                            enclave_log_error!(
+                                "conn_id={} buffered {} bytes behind a suspended request, closing",
+                                conn_id,
+                                session.buffered_len()
+                            );
+                            self.send_close(conn_id);
+                            return;
+                        }
                         // Dispatch any complete HTTP requests
                         self.dispatch_requests(conn_id, &mut session);
                         self.sessions.insert(

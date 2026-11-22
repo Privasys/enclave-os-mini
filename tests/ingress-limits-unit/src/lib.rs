@@ -3,7 +3,8 @@
 
 //! Lightweight test proxy for the ingress server's pure bounds:
 //! `enclave/src/sni_limits.rs` (hostname normalisation and the per-name TLS
-//! caches).
+//! caches) and `enclave/src/read_budget.rs` (the shared budget for
+//! buffered request bytes).
 //!
 //! The enclave crate cannot be compiled outside SGX, so this crate includes
 //! the files via `#[path]`; their `#[cfg(test)]` modules then run with
@@ -12,3 +13,7 @@
 #[allow(dead_code)]
 #[path = "../../../enclave/src/sni_limits.rs"]
 mod sni_limits;
+
+#[allow(dead_code)]
+#[path = "../../../enclave/src/read_budget.rs"]
+mod read_budget;

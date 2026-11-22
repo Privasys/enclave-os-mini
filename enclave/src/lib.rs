@@ -62,6 +62,7 @@ pub mod peerlink;
 #[cfg(feature = "raft")]
 pub mod raftglue;
 pub mod ratls;
+pub mod read_budget;
 pub mod relay_limits;
 pub mod rpc_client;
 pub mod sealed_config;
