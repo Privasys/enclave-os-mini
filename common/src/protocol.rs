@@ -458,7 +458,11 @@ pub fn parse_http_request(buf: &[u8]) -> Result<(HttpRequest, usize), HttpParseE
             }
         } else if h.name.eq_ignore_ascii_case("x-privasys-edge") {
             if let Ok(val) = core::str::from_utf8(h.value) {
-                edge_terminated = val.trim().eq_ignore_ascii_case("terminate");
+                // Any copy saying terminate marks the request: a later
+                // copy never clears what an earlier one set.
+                if val.trim().eq_ignore_ascii_case("terminate") {
+                    edge_terminated = true;
+                }
             }
         }
         // All other headers are silently ignored.
@@ -620,6 +624,16 @@ pub fn check_outbound_request(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn any_terminate_copy_of_the_edge_header_marks_the_request() {
+        let req = b"GET /x HTTP/1.1\r\nHost: a\r\nX-Privasys-Edge: terminate\r\nX-Privasys-Edge: splice\r\n\r\n";
+        assert!(parse_http_request(req).unwrap().0.edge_terminated);
+        let req = b"GET /x HTTP/1.1\r\nHost: a\r\nX-Privasys-Edge: splice\r\nX-Privasys-Edge: Terminate\r\n\r\n";
+        assert!(parse_http_request(req).unwrap().0.edge_terminated);
+        let req = b"GET /x HTTP/1.1\r\nHost: a\r\nX-Privasys-Edge: splice\r\n\r\n";
+        assert!(!parse_http_request(req).unwrap().0.edge_terminated);
+    }
 
     // ── Request / Response serde tests ──────────────────────────────
 
