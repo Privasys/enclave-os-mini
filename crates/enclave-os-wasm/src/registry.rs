@@ -1689,6 +1689,13 @@ impl AppRegistry {
         };
 
         // ── Marshal parameters ─────────────────────────────────────
+        // Sized first: a `bytes` parameter expands to one value per byte.
+        let mut budget = crate::limits::ParamBudget::new();
+        for p in params {
+            if let Err(message) = count_param(p, &mut budget) {
+                return Err(WasmResult::Error { message });
+            }
+        }
         let val_params: Vec<Val> = params.iter().map(param_to_val).collect();
 
         // ── Determine expected result count ────────────────────────
@@ -1738,6 +1745,46 @@ impl AppRegistry {
 // ---------------------------------------------------------------------------
 //  Value conversions: WasmParam ↔ wasmtime::component::Val
 // ---------------------------------------------------------------------------
+
+/// Count what `p` expands to against the per-call parameter limits.
+fn count_param(p: &WasmParam, budget: &mut crate::limits::ParamBudget) -> Result<(), String> {
+    match p {
+        WasmParam::Bool(_)
+        | WasmParam::S32(_)
+        | WasmParam::S64(_)
+        | WasmParam::U32(_)
+        | WasmParam::U64(_)
+        | WasmParam::F32(_)
+        | WasmParam::F64(_) => budget.take(1, 0),
+        WasmParam::String(s) => budget.take(1, s.len()),
+        WasmParam::Enum(name) => budget.take(1, name.len()),
+        WasmParam::Bytes(v) => budget.take(v.len().saturating_add(1), v.len()),
+        WasmParam::Flags(names) => {
+            let bytes = names.iter().fold(0usize, |acc, n| acc.saturating_add(n.len()));
+            budget.take(names.len().saturating_add(1), bytes)
+        }
+        WasmParam::List(items) | WasmParam::Tuple(items) => {
+            budget.take(1, 0)?;
+            items.iter().try_for_each(|i| count_param(i, budget))
+        }
+        WasmParam::Record(fields) => {
+            budget.take(1, 0)?;
+            for (name, v) in fields {
+                budget.take(0, name.len())?;
+                count_param(v, budget)?;
+            }
+            Ok(())
+        }
+        WasmParam::Option(inner) => {
+            budget.take(1, 0)?;
+            inner.as_deref().map_or(Ok(()), |v| count_param(v, budget))
+        }
+        WasmParam::Variant(name, payload) => {
+            budget.take(1, name.len())?;
+            payload.as_deref().map_or(Ok(()), |v| count_param(v, budget))
+        }
+    }
+}
 
 /// Convert a [`WasmParam`] to a wasmtime [`Val`].
 fn param_to_val(p: &WasmParam) -> Val {
