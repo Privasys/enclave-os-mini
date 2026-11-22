@@ -16,9 +16,47 @@ use std::sync::Mutex;
 use enclave_os_common::jwks::{extract_jwt_kid, JwksCache};
 
 use crate::client::{https_fetch, mozilla_root_store};
+use crate::ttl_cache::TtlMap;
 
 /// Cache TTL — keys are re-fetched after this many seconds.
 const JWKS_CACHE_TTL_SECS: u64 = 3600; // 1 hour
+
+/// How long a discovered JWKS URI is reused before discovery runs again.
+const DISCOVERY_TTL_SECS: u64 = 3600;
+
+/// How long a failed discovery or JWKS fetch is answered from memory (the
+/// same error) before the provider is contacted again.
+const FAILURE_TTL_SECS: u64 = 30;
+
+/// Most issuers (discovery) and URIs (failures) remembered.
+const MAX_REMEMBERED: usize = 256;
+
+/// Issuer → JWKS URI found by OIDC discovery.
+static DISCOVERED: Mutex<TtlMap<String>> = Mutex::new(TtlMap::new(MAX_REMEMBERED));
+
+/// Recent failures by what failed (`discovery:<issuer>`, `jwks:<uri>`).
+static FAILURES: Mutex<TtlMap<String>> = Mutex::new(TtlMap::new(MAX_REMEMBERED));
+
+/// Trusted time, or the fetcher fails closed.
+fn now_secs() -> Result<u64, String> {
+    enclave_os_common::ocall::get_current_time()
+        .map_err(|_| "JWKS cache: no trusted time".to_string())
+}
+
+/// Run `f` unless `key` failed less than [`FAILURE_TTL_SECS`] ago (then
+/// that error is returned again); a new failure is remembered.
+fn unless_recently_failed<T>(key: &str, now: u64, f: impl FnOnce() -> Result<T, String>) -> Result<T, String> {
+    if let Some(e) = FAILURES.lock().unwrap_or_else(|e| e.into_inner()).get(key, now) {
+        return Err(e.clone());
+    }
+    let result = f();
+    let mut failures = FAILURES.lock().unwrap_or_else(|e| e.into_inner());
+    match &result {
+        Ok(_) => failures.remove(key),
+        Err(e) => failures.insert(key, e.clone(), now, FAILURE_TTL_SECS),
+    }
+    result
+}
 
 /// Per-issuer cached JWKS entry.
 struct CacheEntry {
@@ -89,12 +127,22 @@ fn fetch_jwks(jwks_uri: &str) -> Result<JwksCache, String> {
     JwksCache::from_json(&resp.body)
 }
 
-/// Resolve the JWKS URI: explicit `jwks_uri` if non-empty, else OIDC discovery.
+/// Resolve the JWKS URI: explicit `jwks_uri` if non-empty, else OIDC
+/// discovery, whose answer is reused for [`DISCOVERY_TTL_SECS`].
 fn resolve_jwks_uri(issuer: &str, jwks_uri: &str) -> Result<String, String> {
     if !jwks_uri.is_empty() {
         return Ok(jwks_uri.to_string());
     }
-    discover_jwks_uri(issuer)
+    let now = now_secs()?;
+    if let Some(uri) = DISCOVERED.lock().unwrap_or_else(|e| e.into_inner()).get(issuer, now) {
+        return Ok(uri.clone());
+    }
+    let uri = unless_recently_failed(&format!("discovery:{issuer}"), now, || discover_jwks_uri(issuer))?;
+    DISCOVERED
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(issuer, uri.clone(), now, DISCOVERY_TTL_SECS);
+    Ok(uri)
 }
 
 /// Get or fetch a [`JwksCache`] for the given JWKS URI (TTL-based expiry).
@@ -102,8 +150,7 @@ fn get_or_fetch_cache(jwks_uri: &str) -> Result<(), String> {
     ensure_store();
     // A 0 here would keep a cached key set "fresh" for ever (a rotated-out
     // key would stay trusted); without trusted time, fail closed.
-    let now = enclave_os_common::ocall::get_current_time()
-        .map_err(|_| "JWKS cache: no trusted time".to_string())?;
+    let now = now_secs()?;
 
     let needs_fetch = {
         let store = JWKS_STORE.lock().unwrap_or_else(|e| e.into_inner());
@@ -114,7 +161,7 @@ fn get_or_fetch_cache(jwks_uri: &str) -> Result<(), String> {
     };
 
     if needs_fetch {
-        let cache = fetch_jwks(jwks_uri)?;
+        let cache = unless_recently_failed(&format!("jwks:{jwks_uri}"), now, || fetch_jwks(jwks_uri))?;
         let mut store = JWKS_STORE.lock().unwrap_or_else(|e| e.into_inner());
         let store = store.as_mut().unwrap();
         store.insert(

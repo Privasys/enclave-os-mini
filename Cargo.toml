@@ -14,6 +14,7 @@ members = [
     "tests/relay-limits-unit",
     "tests/ingress-limits-unit",
     "tests/wasm-limits-unit",
+    "tests/egress-cache-unit",
 ]
 exclude = [
     "enclave",
