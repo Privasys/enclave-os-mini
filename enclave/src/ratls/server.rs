@@ -104,6 +104,8 @@ pub struct IngressServer {
     leaf_by_spki: BTreeMap<[u8; 32], LeafKey>,
     /// Deterministic quotes, one per leaf key, cached for the key's lifetime.
     det_quotes: BTreeMap<[u8; 32], DetQuote>,
+    /// Rate limit on sweeping retired keys out of `leaf_by_spki`.
+    leaf_sweep: crate::sni_limits::Sweep,
     /// Requests suspended mid-handling (e.g. a guest waiting on egress),
     /// keyed by conn_id. A connection has at most one: HTTP/1.1 answers in
     /// order, so its next requests stay buffered in the session meanwhile.
@@ -160,6 +162,7 @@ impl IngressServer {
             leaf_keys: BTreeMap::new(),
             leaf_by_spki: BTreeMap::new(),
             det_quotes: BTreeMap::new(),
+            leaf_sweep: crate::sni_limits::Sweep::new(),
             #[cfg(feature = "wasm")]
             pending: BTreeMap::new(),
         }
@@ -244,7 +247,8 @@ impl IngressServer {
     /// Invalidate cached cert for a hostname (called when an app is
     /// loaded/unloaded).
     pub fn invalidate_cached_config(&mut self, hostname: &str) {
-        self.cached_configs.remove(hostname);
+        let key = crate::sni_limits::normalize_hostname(hostname);
+        self.cached_configs.remove(&key);
     }
 
     // ====================================================================
@@ -690,9 +694,17 @@ impl IngressServer {
         &mut self,
         sni: &Option<String>,
     ) -> Result<TlsConfigResult, String> {
-        let app_data = sni.as_deref()
+        // Keyed by the normalised name when it names a registered app; every
+        // other name shares one entry, so unknown names add nothing.
+        let normalized = sni.as_deref().map(crate::sni_limits::normalize_hostname);
+        let app_data = normalized
+            .as_deref()
             .and_then(|h| cert_store::cert_store().resolve(h));
-        let cache_key = sni.clone().unwrap_or_default();
+        let cache_key = crate::sni_limits::cache_key(
+            normalized.as_deref().unwrap_or(""),
+            app_data.is_some(),
+        );
+        let app_data = if cache_key.is_empty() { None } else { app_data };
         // Our own leaf: stamped with trusted time, or with the frozen floor
         // when there is none (validity is the client's check, not ours).
         let now = crate::trustedtime::issue_secs();
@@ -709,6 +721,11 @@ impl IngressServer {
         }
 
         let tls_result = build_tls_config(&self.ca, &key, app_data.as_ref(), now)?;
+        crate::sni_limits::make_room(
+            &mut self.cached_configs,
+            &cache_key,
+            crate::sni_limits::MAX_NAME_ENTRIES,
+        );
         self.cached_configs.insert(cache_key, CachedConfig {
             config: tls_result.config.clone(),
             expires_at: key.created + attestation::DETERMINISTIC_VALIDITY_SECS,
@@ -2189,17 +2206,21 @@ impl IngressServer {
     /// The leaf key of an SNI, rotated at its 24-hour lifetime; rotated keys
     /// stay answerable for 15 minutes so a client that received the old leaf
     /// just before a rotation can still be served.
+    /// `sni` is a cache key from `sni_limits::cache_key`, never a raw name.
     fn leaf_key_for(&mut self, sni: &str, now: u64) -> Result<LeafKey, String> {
-        let retire_before = now.saturating_sub(attestation::DETERMINISTIC_VALIDITY_SECS + PREVIOUS_KEY_RETENTION_SECS);
-        let stale: Vec<[u8; 32]> = self
-            .leaf_by_spki
-            .iter()
-            .filter(|(_, k)| k.created < retire_before)
-            .map(|(h, _)| *h)
-            .collect();
-        for h in stale {
-            self.leaf_by_spki.remove(&h);
-            self.det_quotes.remove(&h);
+        // Retired keys are swept at most once a minute, not per connection.
+        if self.leaf_sweep.due(now, crate::sni_limits::PRUNE_INTERVAL_SECS) {
+            let retire_before = now.saturating_sub(attestation::DETERMINISTIC_VALIDITY_SECS + PREVIOUS_KEY_RETENTION_SECS);
+            let stale: Vec<[u8; 32]> = self
+                .leaf_by_spki
+                .iter()
+                .filter(|(_, k)| k.created < retire_before)
+                .map(|(h, _)| *h)
+                .collect();
+            for h in stale {
+                self.leaf_by_spki.remove(&h);
+                self.det_quotes.remove(&h);
+            }
         }
         if let Some(k) = self.leaf_keys.get(sni) {
             if now < k.created + attestation::DETERMINISTIC_VALIDITY_SECS {
@@ -2207,6 +2228,7 @@ impl IngressServer {
             }
         }
         let k = attestation::new_leaf_key(now)?;
+        crate::sni_limits::make_room(&mut self.leaf_keys, sni, crate::sni_limits::MAX_NAME_ENTRIES);
         self.leaf_keys.insert(sni.to_string(), k.clone());
         self.leaf_by_spki.insert(k.spki_hash, k.clone());
         Ok(k)

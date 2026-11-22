@@ -581,7 +581,10 @@ fn parse_sni_extension(data: &[u8]) -> Option<String> {
     if 5 + name_len > data.len() {
         return None;
     }
-    String::from_utf8(data[5..5 + name_len].to_vec()).ok()
+    // DNS names are case-insensitive: one spelling per name from here on.
+    String::from_utf8(data[5..5 + name_len].to_vec())
+        .ok()
+        .map(|n| crate::sni_limits::normalize_hostname(&n))
 }
 
 // ===========================================================================

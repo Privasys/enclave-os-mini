@@ -12,6 +12,7 @@ members = [
     "tests/code-pool-unit",
     "tests/feature-wiring-unit",
     "tests/relay-limits-unit",
+    "tests/ingress-limits-unit",
 ]
 exclude = [
     "enclave",

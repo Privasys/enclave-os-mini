@@ -67,6 +67,7 @@ pub mod rpc_client;
 pub mod sealed_config;
 pub mod sealed_envelope;
 pub mod sessionrelay;
+pub mod sni_limits;
 pub mod trustedtime;
 // vaultkey registers the RA-TLS client-cert signer + attestation provider into
 // egress, so it only compiles when egress is linked (vault/wasm/egress flavors).

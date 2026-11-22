@@ -174,12 +174,7 @@ impl CertStore {
     /// Returns a cloned snapshot of the app's certificate data, or
     /// `None` if no app is registered for this hostname.
     pub fn resolve(&self, hostname: &str) -> Option<AppCertData> {
-        let canonical = self
-            .aliases
-            .read()
-            .ok()
-            .and_then(|a| a.get(hostname).cloned())
-            .unwrap_or_else(|| hostname.to_string());
+        let canonical = self.canonical_hostname(hostname)?;
         let inner = self.inner.read().ok()?;
         let app = inner.get(&canonical)?;
         let mut oid_extensions = app.oid_extensions.clone();
@@ -191,6 +186,26 @@ impl CertStore {
             merkle_root: app.merkle_root,
             oid_extensions,
         })
+    }
+
+    /// The registered hostname `hostname` reaches: itself or the app a direct
+    /// alias serves. Names compare case-insensitively (an incoming name is
+    /// already lowercased, a registered one may not be). `None` when no app
+    /// is registered for it.
+    pub fn canonical_hostname(&self, hostname: &str) -> Option<String> {
+        let aliased = self.aliases.read().ok().and_then(|a| {
+            a.get(hostname).cloned().or_else(|| {
+                a.iter()
+                    .find(|(k, _)| k.eq_ignore_ascii_case(hostname))
+                    .map(|(_, v)| v.clone())
+            })
+        });
+        let name = aliased.unwrap_or_else(|| hostname.to_string());
+        let inner = self.inner.read().ok()?;
+        if inner.contains_key(&name) {
+            return Some(name);
+        }
+        inner.keys().find(|k| k.eq_ignore_ascii_case(&name)).cloned()
     }
 
     /// Sets the direct adopter hostnames served by the app registered as
