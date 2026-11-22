@@ -775,6 +775,8 @@ mod module_tests {
             peer_cert_der: None,
             peer_evidence: None,
             attestation: "none".into(),
+            fido2_user: None,
+            app_name: None,
             oidc_claims,
         }
     }

@@ -42,6 +42,9 @@ pub const SESSION_TOKEN_BYTES: usize = 32;
 /// Challenge length in bytes.
 pub const CHALLENGE_BYTES: usize = 32;
 
+/// Longest accepted user handle, user name or browser session ID.
+pub const MAX_FIELD_LEN: usize = 256;
+
 // ---------------------------------------------------------------------------
 //  FIDO2 wire protocol — request (standard WebAuthn, camelCase)
 // ---------------------------------------------------------------------------
@@ -348,6 +351,9 @@ pub struct SessionTokenEntry {
     pub credential_id: String,
     /// Browser session ID this token is bound to.
     pub browser_session_id: String,
+    /// The app the ceremony was run for. Only that app accepts the token;
+    /// `None` (the request named no loaded app) is accepted by none.
+    pub app: Option<String>,
     /// Unix timestamp of expiry.
     pub expires_at: u64,
 }

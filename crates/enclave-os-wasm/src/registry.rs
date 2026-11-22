@@ -1499,6 +1499,15 @@ impl AppRegistry {
         self.loaded.contains_key(name)
     }
 
+    /// The name of the known app whose hostname is `hostname`, compared
+    /// case-insensitively.
+    pub fn app_name_for_hostname(&self, hostname: &str) -> Option<String> {
+        self.known
+            .iter()
+            .find(|(_, m)| m.hostname.eq_ignore_ascii_case(hostname))
+            .map(|(n, _)| n.clone())
+    }
+
     /// Get metadata for a known app.
     pub fn get_known(&self, name: &str) -> Option<&AppMeta> {
         self.known.get(name)

@@ -406,6 +406,13 @@ impl WasmModule {
             .ok_or_else(|| format!("unknown app: '{}'", name))
     }
 
+    /// The name of the known app registered under `hostname`, compared
+    /// case-insensitively.
+    pub fn app_for_hostname(&self, hostname: &str) -> Option<String> {
+        let reg = self.registry.lock().ok()?;
+        reg.app_name_for_hostname(hostname)
+    }
+
     /// What direct domains need of an app: its hostname, its platform app
     /// id, and, for a vault-backed app only, the one-way direct-TLS branch of
     /// its vault-held KEK, from which the runtime derives the app's ACME
@@ -846,7 +853,7 @@ impl WasmModule {
                     return Err(Response::Data(serialize_or_error(&err)));
                 }
             };
-            let auth = match verify_auth_token(token_str, &permissions, role_store.as_ref()) {
+            let auth = match verify_auth_token(token_str, &call.app, &permissions, role_store.as_ref()) {
                 Ok(a) => a,
                 Err(e) => {
                     let err = WasmResult::Error {
@@ -898,7 +905,7 @@ impl WasmModule {
         };
 
         // Verify the token (FIDO2 session token or OIDC JWT).
-        let auth = match verify_auth_token(token_str, &permissions, role_store.as_ref()) {
+        let auth = match verify_auth_token(token_str, &call.app, &permissions, role_store.as_ref()) {
             Ok(r) => r,
             Err(e) => {
                 let err = WasmResult::Error {
@@ -1078,7 +1085,7 @@ impl WasmModule {
         // clients migrate to platform bearers on configure.
         if let Some(p) = permissions {
             if !owners.is_empty() {
-                let auth = verify_auth_token(token, p, role_store).map_err(|e| {
+                let auth = verify_auth_token(token, &call.app, p, role_store).map_err(|e| {
                     deny(format!(
                         "configure is owner/admin-only: app_auth verification failed: {e}"
                     ))
@@ -1135,7 +1142,7 @@ impl WasmModule {
             }
         };
 
-        let caller_roles = match verify_auth_token(token_str, &permissions, role_store.as_ref()) {
+        let caller_roles = match verify_auth_token(token_str, &req.app, &permissions, role_store.as_ref()) {
             Ok(auth) => auth.roles,
             Err(e) => {
                 let err = WasmManagementResult::Error {
@@ -1233,7 +1240,7 @@ impl WasmModule {
                 }
             };
 
-            let auth = match verify_auth_token(token_str, &permissions, Some(&role_store)) {
+            let auth = match verify_auth_token(token_str, &req.app, &permissions, Some(&role_store)) {
                 Ok(r) => r,
                 Err(e) => {
                     return WasmManagementResult::Error {
@@ -2705,6 +2712,7 @@ fn build_app_role_store(
 /// sealed KV space. That store never confers `admin`; see enclave-os-app-auth.
 fn verify_auth_token(
     token: &str,
+    app: &str,
     permissions: &crate::protocol::AppPermissions,
     role_store: Option<&enclave_os_kvstore::SealedKvStore>,
 ) -> Result<AuthResult, String> {
@@ -2713,7 +2721,7 @@ fn verify_auth_token(
     if permissions.fido2 && is_fido2_session_token(token) {
         let now = enclave_os_common::ocall::get_current_time()
             .map_err(|_| "cannot validate the session token: no trusted time".to_string())?;
-        match enclave_os_fido2::sessions::validate_token(token, now) {
+        match enclave_os_fido2::sessions::validate_token_for_app(token, now, app) {
             Ok(entry) => {
                 let user_id = entry.user_handle.clone();
                 let roles = {

@@ -30,10 +30,33 @@ const AAGUID_ALLOW_KEY: &[u8] = b"fido2:aaguid_allow";
 //  Credential CRUD
 // ---------------------------------------------------------------------------
 
-/// Store a new credential.
-pub fn store_credential(record: &CredentialRecord, credential_id_b64: &str) -> Result<(), String> {
+/// Store a newly registered credential.
+///
+/// Refuses a credential ID that is already stored: a registration never
+/// replaces an existing credential. Refuses a user handle that already has
+/// credentials unless `extends_user` (the handle's own user, signed in,
+/// began this registration). Both checks run under the store lock that
+/// also writes, so a concurrent registration cannot slip between them.
+pub fn store_new_credential(
+    record: &CredentialRecord,
+    credential_id_b64: &str,
+    extends_user: bool,
+) -> Result<(), String> {
     let kv = kv_store().ok_or("kv store not initialised")?;
     let store = kv.lock().map_err(|_| "kv store lock poisoned")?;
+
+    if store.get(&cred_key(credential_id_b64))?.is_some() {
+        return Err("credential already registered".into());
+    }
+    if !extends_user {
+        if let Some(bytes) = store.get(&user_index_key(&record.rp_id, &record.user_handle))? {
+            let ids: Vec<String> =
+                serde_json::from_slice(&bytes).map_err(|e| format!("deserialise index: {e}"))?;
+            if !ids.is_empty() {
+                return Err("user handle already registered; sign in to add a credential".into());
+            }
+        }
+    }
 
     let json = serde_json::to_vec(record).map_err(|e| format!("serialise credential: {e}"))?;
     store.put(&cred_key(credential_id_b64), &json)?;

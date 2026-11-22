@@ -419,6 +419,8 @@ impl IngressServer {
                             peer_evidence: session.peer_evidence().cloned(),
                             attestation: session.attestation().to_string(),
                             oidc_claims: None,
+                            fido2_user: None,
+                            app_name: None,
                         };
                         match self.run_request(conn_id, http_req, base_ctx, close) {
                             Some(result) => result,
@@ -1516,6 +1518,10 @@ fn handle_fido2_request(
     // FIDO2 does not use OIDC auth — the ceremony authenticates the session.
     // We still check for session tokens (for browser connections using
     // previously issued tokens).
+    // The app the request's Host names: session tokens issued here are bound
+    // to it, and a token presented here must have been issued for it.
+    let app_name = fido2_app_for_host(http_req);
+    let mut fido2_user = None;
     let oidc_claims = if let Some(ref auth) = http_req.authorization {
         // Check if it's a FIDO2 session token (hex, 64 chars)
         if auth.len() == 64 && auth.chars().all(|c| c.is_ascii_hexdigit()) {
@@ -1524,8 +1530,18 @@ fn handle_fido2_request(
                 Ok(t) => t,
                 Err(_) => return HttpHandleResult::err(503, "no trusted time"),
             };
-            match enclave_os_fido2::sessions::validate_token(auth, now) {
-                Ok(_entry) => None, // Token valid — no OIDC claims needed
+            // With no app named, a token can vouch for no one here: it is
+            // left unused rather than refused.
+            let valid = match app_name.as_deref() {
+                Some(app) => enclave_os_fido2::sessions::validate_token_for_app(auth, now, app).map(Some),
+                None => Ok(None),
+            };
+            match valid {
+                Ok(None) => None,
+                Ok(Some(entry)) => {
+                    fido2_user = Some(entry.user_handle);
+                    None // Token valid — no OIDC claims needed
+                }
                 Err(_) => return HttpHandleResult::err(401, "invalid session token"),
             }
         } else if crate::oidc_config().is_some() {
@@ -1543,6 +1559,8 @@ fn handle_fido2_request(
         peer_evidence: base_ctx.peer_evidence.clone(),
         attestation: base_ctx.attestation.clone(),
         oidc_claims,
+        fido2_user,
+        app_name,
     };
 
     // Inject the endpoint path as the serde `"type"` discriminator so
@@ -1640,6 +1658,8 @@ fn handle_data_request_http(
         peer_evidence: base_ctx.peer_evidence.clone(),
         attestation: base_ctx.attestation.clone(),
         oidc_claims,
+        fido2_user: None,
+        app_name: None,
     };
 
     let req = Request::Data(http_req.body.clone());
@@ -1718,6 +1738,8 @@ fn handle_rpc_request(
         peer_evidence: base_ctx.peer_evidence.clone(),
         attestation: base_ctx.attestation.clone(),
         oidc_claims,
+        fido2_user: None,
+        app_name: None,
     };
 
     // GET /rpc/<app>/schema → wasm_schema envelope
@@ -1810,6 +1832,24 @@ fn handle_rpc_request(
 /// The single loaded app is resolved inside the WASM module so callers don't
 /// need to know the app name. The MCP-spec `inputSchema` field is rewritten
 /// to snake-case `input_schema` to match the public MCP HTTP contract.
+/// The loaded app a FIDO2 request's `Host` names: its registered hostname or
+/// a direct alias of it, compared case-insensitively. `None` when the host
+/// names no loaded app.
+#[cfg(feature = "fido2")]
+fn fido2_app_for_host(http_req: &enclave_os_common::protocol::HttpRequest) -> Option<String> {
+    let host = crate::sni_limits::normalize_host_header(http_req.host.as_deref()?);
+    let canonical = cert_store::cert_store().canonical_hostname(&host)?;
+    #[cfg(feature = "wasm")]
+    {
+        enclave_os_wasm::global()?.app_for_hostname(&canonical)
+    }
+    #[cfg(not(feature = "wasm"))]
+    {
+        let _ = canonical;
+        None
+    }
+}
+
 /// Derive the target app name from the request's Host header: the platform
 /// gateway routes `<app>.apps-<env>.privasys.org` to this enclave, so the
 /// first DNS label is the app. Returns "" when there is no usable Host
@@ -1856,6 +1896,8 @@ fn handle_mcp_tools_request(
         peer_evidence: base_ctx.peer_evidence.clone(),
         attestation: base_ctx.attestation.clone(),
         oidc_claims,
+        fido2_user: None,
+        app_name: None,
     };
 
     const PREFIX: &str = "/api/v1/mcp/tools";

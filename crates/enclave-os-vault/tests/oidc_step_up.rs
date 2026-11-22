@@ -41,6 +41,8 @@ fn ctx_with_amr(sub: &str, amr: &[&str]) -> RequestContext {
         peer_cert_der: None,
         peer_evidence: None,
         attestation: "none".into(),
+        fido2_user: None,
+        app_name: None,
         oidc_claims: Some(OidcClaims {
             sub: sub.to_string(),
             roles: Vec::new(),
@@ -67,6 +69,8 @@ fn ctx_step_up(
         peer_cert_der: None,
         peer_evidence: None,
         attestation: "none".into(),
+        fido2_user: None,
+        app_name: None,
         oidc_claims: Some(OidcClaims {
             sub: sub.to_string(),
             roles: Vec::new(),

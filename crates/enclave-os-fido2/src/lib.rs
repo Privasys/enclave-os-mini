@@ -107,7 +107,7 @@ impl EnclaveModule for Fido2Module {
                 user_name,
                 user_handle,
                 session_id,
-            } => self.handle_register_begin(&user_name, &user_handle, session_id),
+            } => self.handle_register_begin(&user_name, &user_handle, session_id, ctx),
 
             Fido2Request::RegisterComplete {
                 challenge,
@@ -127,7 +127,7 @@ impl EnclaveModule for Fido2Module {
             Fido2Request::AuthenticateBegin {
                 credential_id,
                 session_id,
-            } => self.handle_authenticate_begin(credential_id.as_deref(), session_id),
+            } => self.handle_authenticate_begin(credential_id.as_deref(), session_id, ctx),
 
             Fido2Request::AuthenticateComplete {
                 challenge,
@@ -164,18 +164,40 @@ impl Fido2Module {
         user_name: &str,
         user_handle: &str,
         session_id: Option<String>,
+        ctx: &RequestContext,
     ) -> Fido2Response {
         let now = match current_time_secs() {
             Ok(t) => t,
             Err(e) => return Fido2Response::Error { error: e },
         };
 
+        if let Err(e) = validate_user_handle(user_handle) {
+            return Fido2Response::Error { error: e };
+        }
+
+        // A handle that already has credentials belongs to someone: only
+        // that user, signed in with a session token, may add another.
+        let existing = match credentials::list_credentials(&self.rp_id, user_handle) {
+            Ok(ids) => !ids.is_empty(),
+            Err(e) => return Fido2Response::Error { error: e },
+        };
+        let extends_user = ctx.fido2_user.as_deref() == Some(user_handle);
+        if existing && !extends_user {
+            return Fido2Response::Error {
+                error: "user handle already registered; sign in to add a credential".into(),
+            };
+        }
+
         let challenge = match challenge::create_challenge(
             now,
-            session_id,
-            Ceremony::Registration,
-            Some(user_handle.to_string()),
-            Some(user_name.to_string()),
+            challenge::PendingCeremony {
+                browser_session_id: session_id,
+                ceremony: Ceremony::Registration,
+                user_handle: Some(user_handle.to_string()),
+                user_name: Some(user_name.to_string()),
+                app: ctx.app_name.clone(),
+                extends_user,
+            },
         ) {
             Ok(c) => c,
             Err(e) => return Fido2Response::Error { error: e },
@@ -231,6 +253,8 @@ impl Fido2Module {
 
         // Session ID was stored at begin time
         let session_id = consumed.browser_session_id;
+        let app = consumed.app;
+        let extends_user = consumed.extends_user;
         let user_handle = consumed.user_handle.unwrap_or_default();
         let user_name = consumed.user_name.unwrap_or_default();
 
@@ -323,14 +347,16 @@ impl Fido2Module {
             push_token,
         };
 
-        if let Err(e) = credentials::store_credential(&record, credential_id_b64) {
+        // A credential ID is never re-registered, and a handle that gained
+        // credentials since begin is only extended by its signed-in user.
+        if let Err(e) = credentials::store_new_credential(&record, credential_id_b64, extends_user) {
             return Fido2Response::Error { error: e };
         }
 
         // 12. Issue session token for browser (if session_id was provided at begin)
         let session_token = match session_id {
             Some(ref sid) => {
-                match sessions::issue_token(now, &user_handle, credential_id_b64, sid) {
+                match sessions::issue_token(now, &user_handle, credential_id_b64, sid, app) {
                     Ok(token) => Some(token),
                     Err(e) => return Fido2Response::Error { error: e },
                 }
@@ -349,6 +375,7 @@ impl Fido2Module {
         &self,
         credential_id_b64: Option<&str>,
         session_id: Option<String>,
+        ctx: &RequestContext,
     ) -> Fido2Response {
         let now = match current_time_secs() {
             Ok(t) => t,
@@ -357,10 +384,14 @@ impl Fido2Module {
 
         let challenge = match challenge::create_challenge(
             now,
-            session_id,
-            Ceremony::Authentication,
-            None,
-            None,
+            challenge::PendingCeremony {
+                browser_session_id: session_id,
+                ceremony: Ceremony::Authentication,
+                user_handle: None,
+                user_name: None,
+                app: ctx.app_name.clone(),
+                extends_user: false,
+            },
         ) {
             Ok(c) => c,
             Err(e) => return Fido2Response::Error { error: e },
@@ -406,6 +437,7 @@ impl Fido2Module {
             };
 
         let session_id = consumed.browser_session_id;
+        let app = consumed.app;
 
         // 2. Parse and verify clientDataJSON
         let (_client_data, client_data_raw) = match webauthn::parse_client_data(
@@ -498,7 +530,7 @@ impl Fido2Module {
         // 10. Issue session token for browser
         let session_token = match session_id {
             Some(ref sid) => {
-                match sessions::issue_token(now, &record.user_handle, credential_id_b64, sid) {
+                match sessions::issue_token(now, &record.user_handle, credential_id_b64, sid, app) {
                     Ok(token) => Some(token),
                     Err(e) => return Fido2Response::Error { error: e },
                 }
@@ -514,6 +546,25 @@ impl Fido2Module {
 }
 
 // ---------------------------------------------------------------------------
+//  Input checks
+// ---------------------------------------------------------------------------
+
+/// A user handle the enclave will register: non-empty, bounded, and free of
+/// control characters.
+pub fn validate_user_handle(user_handle: &str) -> Result<(), String> {
+    if user_handle.is_empty() {
+        return Err("user handle must not be empty".into());
+    }
+    if user_handle.len() > MAX_FIELD_LEN {
+        return Err(format!("user handle must be at most {MAX_FIELD_LEN} bytes"));
+    }
+    if user_handle.chars().any(|c| c.is_control()) {
+        return Err("user handle must not contain control characters".into());
+    }
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 //  Time helper
 // ---------------------------------------------------------------------------
 
@@ -521,4 +572,18 @@ impl Fido2Module {
 /// would keep every challenge and session unexpired.
 fn current_time_secs() -> Result<u64, String> {
     enclave_os_common::ocall::get_current_time().map_err(|_| "no trusted time".to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn user_handles_are_bounded_and_printable() {
+        assert!(validate_user_handle("dXNlci1oYW5kbGU").is_ok());
+        assert!(validate_user_handle(&"a".repeat(MAX_FIELD_LEN)).is_ok());
+        assert!(validate_user_handle("").is_err());
+        assert!(validate_user_handle(&"a".repeat(MAX_FIELD_LEN + 1)).is_err());
+        assert!(validate_user_handle("a\nb").is_err());
+    }
 }

@@ -119,6 +119,15 @@ pub struct RequestContext {
     /// JSON envelope.  `None` when no bearer token was provided (e.g.
     /// healthz, or RA-TLS-only vault GetSecret).
     pub oidc_claims: Option<crate::oidc::OidcClaims>,
+
+    /// User handle of a valid FIDO2 session token presented with the
+    /// request. Set only on the FIDO2 ceremony routes; `None` elsewhere.
+    pub fido2_user: Option<String>,
+
+    /// The loaded app the request's `Host` names. Set only on the FIDO2
+    /// ceremony routes, where the session token issued is bound to it;
+    /// `None` elsewhere.
+    pub app_name: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

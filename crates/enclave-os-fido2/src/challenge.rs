@@ -34,6 +34,22 @@ struct ChallengeEntry {
     user_handle: Option<String>,
     /// User display name (stored at begin, needed at complete).
     user_name: Option<String>,
+    /// The app the ceremony is for (the session token is bound to it).
+    app: Option<String>,
+    /// Registration only: the signed-in user is adding a credential to
+    /// their own handle.
+    extends_user: bool,
+}
+
+/// What a begin request records for its complete.
+#[derive(Debug, Clone)]
+pub struct PendingCeremony {
+    pub browser_session_id: Option<String>,
+    pub ceremony: Ceremony,
+    pub user_handle: Option<String>,
+    pub user_name: Option<String>,
+    pub app: Option<String>,
+    pub extends_user: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -59,10 +75,7 @@ pub fn init() {
 /// Returns the base64url-encoded challenge string.
 pub fn create_challenge(
     now: u64,
-    browser_session_id: Option<String>,
-    ceremony: Ceremony,
-    user_handle: Option<String>,
-    user_name: Option<String>,
+    pending: PendingCeremony,
 ) -> Result<String, String> {
     let rng = SystemRandom::new();
     let mut bytes = [0u8; CHALLENGE_BYTES];
@@ -73,10 +86,12 @@ pub fn create_challenge(
     let entry = ChallengeEntry {
         challenge: bytes.to_vec(),
         expires_at: now + CHALLENGE_TTL_SECS,
-        browser_session_id,
-        ceremony,
-        user_handle,
-        user_name,
+        browser_session_id: pending.browser_session_id,
+        ceremony: pending.ceremony,
+        user_handle: pending.user_handle,
+        user_name: pending.user_name,
+        app: pending.app,
+        extends_user: pending.extends_user,
     };
 
     let mut guard = CHALLENGE_STORE.lock().map_err(|_| "challenge store lock poisoned")?;
@@ -101,6 +116,8 @@ pub struct ConsumedChallenge {
     pub browser_session_id: Option<String>,
     pub user_handle: Option<String>,
     pub user_name: Option<String>,
+    pub app: Option<String>,
+    pub extends_user: bool,
 }
 
 /// Consume a challenge — returns the stored metadata if valid.
@@ -130,5 +147,7 @@ pub fn consume_challenge(
         browser_session_id: entry.browser_session_id,
         user_handle: entry.user_handle,
         user_name: entry.user_name,
+        app: entry.app,
+        extends_user: entry.extends_user,
     })
 }

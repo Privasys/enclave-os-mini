@@ -38,6 +38,7 @@ pub fn issue_token(
     user_handle: &str,
     credential_id: &str,
     browser_session_id: &str,
+    app: Option<String>,
 ) -> Result<String, String> {
     let rng = SystemRandom::new();
     let mut bytes = [0u8; SESSION_TOKEN_BYTES];
@@ -49,6 +50,7 @@ pub fn issue_token(
         user_handle: user_handle.to_string(),
         credential_id: credential_id.to_string(),
         browser_session_id: browser_session_id.to_string(),
+        app,
         expires_at: now + SESSION_TOKEN_TTL_SECS,
     };
 
@@ -82,10 +84,38 @@ pub fn validate_token(token: &str, now: u64) -> Result<SessionTokenEntry, String
     Ok(entry.clone())
 }
 
+/// Validate a session token presented to `app`. A token is accepted only by
+/// the app its ceremony was run for.
+pub fn validate_token_for_app(token: &str, now: u64, app: &str) -> Result<SessionTokenEntry, String> {
+    let entry = validate_token(token, now)?;
+    if entry.app.as_deref() != Some(app) {
+        return Err("session token was not issued for this app".into());
+    }
+    Ok(entry)
+}
+
 /// Revoke a session token (explicit logout).
 pub fn revoke_token(token: &str) -> Result<(), String> {
     let mut guard = TOKEN_STORE.lock().map_err(|_| "token store lock poisoned")?;
     let store = guard.as_mut().ok_or("token store not initialised")?;
     store.remove(token);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_token_is_accepted_only_by_its_app() {
+        init();
+        let a = issue_token(100, "alice", "cred", "sid", Some("app-a".into())).unwrap();
+        assert!(validate_token_for_app(&a, 101, "app-a").is_ok());
+        assert!(validate_token_for_app(&a, 101, "app-b").is_err());
+
+        // A ceremony that named no app yields a token no app accepts.
+        let none = issue_token(100, "alice", "cred", "sid", None).unwrap();
+        assert!(validate_token_for_app(&none, 101, "app-a").is_err());
+        assert!(validate_token_for_app(&none, 101, "").is_err());
+    }
 }
