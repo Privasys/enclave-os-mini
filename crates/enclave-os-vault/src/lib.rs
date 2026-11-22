@@ -276,6 +276,36 @@ fn audit_and_save(
         .map_err(|e| VaultResponse::Error(format!("kv put failed: {e}")))
 }
 
+/// Denials of callers who are not principals of the key, counted instead
+/// of audited.
+static UNAUDITED_DENIALS: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Denials not written to an audit log: callers who are none of the key's
+/// principals.
+pub fn unaudited_denials() -> u64 {
+    UNAUDITED_DENIALS.load(core::sync::atomic::Ordering::Relaxed)
+}
+
+/// Record a denial. The key's audit log is permanent, so it records the
+/// denials of the key's own principals (and of a platform manager bearer,
+/// which stages profiles); anyone else's denial is only counted in memory,
+/// so callers outside the policy cannot grow the log.
+fn audit_denial(
+    ctx: &RequestContext,
+    record: &mut KeyRecord,
+    op: &str,
+    caller: &str,
+    decision: AuditDecision,
+    reason: &str,
+) -> Result<(), VaultResponse> {
+    let platform = ctx.oidc_claims.as_ref().map_or(false, |c| c.is_manager);
+    if resolve_caller(&record.policy, ctx).is_none() && !platform {
+        UNAUDITED_DENIALS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return Ok(());
+    }
+    audit_and_save(record, op, caller, decision, reason)
+}
+
 fn caller_str(ctx: &RequestContext) -> String {
     if let Some(c) = ctx.oidc_claims.as_ref() {
         format!("oidc:{}", c.sub)
@@ -489,7 +519,7 @@ fn handle_export(handle: &str, approvals: &[ApprovalToken], ctx: &RequestContext
             }
         }
         Err(e) => {
-            let _ = audit_and_save(&mut record, "ExportKey", &caller, AuditDecision::Denied, &e);
+            let _ = audit_denial(ctx, &mut record, "ExportKey", &caller, AuditDecision::Denied, &e);
             VaultResponse::Error(e)
         }
     }
@@ -510,7 +540,7 @@ fn handle_delete(handle: &str, approvals: &[ApprovalToken], ctx: &RequestContext
         ctx,
         None,
     ) {
-        let _ = audit_and_save(&mut record, "DeleteKey", &caller, AuditDecision::Denied, &e);
+        let _ = audit_denial(ctx, &mut record, "DeleteKey", &caller, AuditDecision::Denied, &e);
         return VaultResponse::Error(e);
     }
 
@@ -570,7 +600,7 @@ fn handle_update_policy(
         ctx,
         None,
     ) {
-        let _ = audit_and_save(
+        let _ = audit_denial(ctx, 
             &mut record,
             "UpdatePolicy",
             &caller,
@@ -585,7 +615,7 @@ fn handle_update_policy(
     };
     let new_policy = normalise_policy(new_policy);
     if let Err(e) = evaluate_policy_update(&record.policy, &new_policy, role) {
-        let _ = audit_and_save(
+        let _ = audit_denial(ctx, 
             &mut record,
             "UpdatePolicy",
             &caller,
@@ -696,7 +726,7 @@ fn require_op(
 ) -> Result<KeyRecord, VaultResponse> {
     let mut record = load_record(handle)?;
     if expired(&record) {
-        let _ = audit_and_save(
+        let _ = audit_denial(ctx, 
             &mut record,
             op_name(op),
             &caller_str(ctx),
@@ -710,7 +740,7 @@ fn require_op(
             "key {} has type {:?}, op {:?} requires {:?}",
             handle, record.key_type, op, expect_type
         );
-        let _ = audit_and_save(
+        let _ = audit_denial(ctx, 
             &mut record,
             op_name(op),
             &caller_str(ctx),
@@ -721,7 +751,7 @@ fn require_op(
     }
     let caller = caller_str(ctx);
     if let Err(e) = evaluate_op(&record.policy, record.policy_version, op, handle, approvals, ctx, None) {
-        let _ = audit_and_save(&mut record, op_name(op), &caller, AuditDecision::Denied, &e);
+        let _ = audit_denial(ctx, &mut record, op_name(op), &caller, AuditDecision::Denied, &e);
         return Err(VaultResponse::Error(e));
     }
     if let Err(e) = audit_and_save(
@@ -916,7 +946,7 @@ fn handle_issue_approval(
     let claims = match ctx.oidc_claims.as_ref() {
         Some(c) => c,
         None => {
-            let _ = audit_and_save(
+            let _ = audit_denial(ctx, 
                 &mut record,
                 "IssueApprovalToken",
                 "anonymous",
@@ -942,7 +972,7 @@ fn handle_issue_approval(
         Some(i) => i as u32,
         None => {
             let msg = "caller is not an OIDC manager of this key".to_string();
-            let _ = audit_and_save(
+            let _ = audit_denial(ctx, 
                 &mut record,
                 "IssueApprovalToken",
                 &format!("oidc:{}", claims.sub),
@@ -1133,7 +1163,7 @@ fn handle_stage_pending(
     let stager = match check_stage_authority(&record, ctx) {
         Ok(s) => s,
         Err(e) => {
-            let _ = audit_and_save(
+            let _ = audit_denial(ctx, 
                 &mut record,
                 "StagePendingProfile",
                 &caller,
@@ -1223,7 +1253,7 @@ fn handle_stage_pending(
             "too many pending profiles (max {}): promote or revoke some first",
             crate::types::MAX_PENDING_PROFILES
         );
-        let _ = audit_and_save(
+        let _ = audit_denial(ctx, 
             &mut record,
             "StagePendingProfile",
             &caller,
@@ -1325,7 +1355,7 @@ fn handle_promote_pending(
         ctx,
         op_binding.as_ref(),
     ) {
-        let _ = audit_and_save(
+        let _ = audit_denial(ctx, 
             &mut record,
             "PromotePendingProfile",
             &caller,
@@ -1339,7 +1369,7 @@ fn handle_promote_pending(
         Some(p) => p,
         None => {
             let msg = format!("pending profile id {} not found", pending_id);
-            let _ = audit_and_save(
+            let _ = audit_denial(ctx, 
                 &mut record,
                 "PromotePendingProfile",
                 &caller,
@@ -1364,7 +1394,7 @@ fn handle_promote_pending(
             "pending profile is missing required OID {}: required_oids are append/strengthen-only",
             missing
         );
-        let _ = audit_and_save(
+        let _ = audit_denial(ctx, 
             &mut record,
             "PromotePendingProfile",
             &caller,
@@ -1403,7 +1433,7 @@ fn handle_revoke_pending(handle: &str, pending_id: u32, ctx: &RequestContext) ->
     };
     let caller = caller_str(ctx);
     if let Err(e) = check_pending_mutability(&record, ctx) {
-        let _ = audit_and_save(
+        let _ = audit_denial(ctx, 
             &mut record,
             "RevokePendingProfile",
             &caller,
@@ -1416,7 +1446,7 @@ fn handle_revoke_pending(handle: &str, pending_id: u32, ctx: &RequestContext) ->
     record.pending_profiles.retain(|p| p.id != pending_id);
     if record.pending_profiles.len() == before {
         let msg = format!("pending profile id {} not found", pending_id);
-        let _ = audit_and_save(
+        let _ = audit_denial(ctx, 
             &mut record,
             "RevokePendingProfile",
             &caller,
