@@ -711,7 +711,7 @@ against the app's JWKS, not the platform's.
 | `issuer` | string | yes | OIDC issuer URL |
 | `jwks_uri` | string | yes | JWKS endpoint for token signature verification |
 | `audience` | string | yes | Expected `aud` claim in app user tokens |
-| `roles_claim` | string | no | Claim path for roles (default: `"roles"`) |
+| `roles_claim` | string | no | Claim path for roles (default: `"roles"`). A top-level claim of that name, or a dotted path such as `realm_access.roles`. App roles are read from this claim only; no other claim is consulted. |
 
 **FunctionPermission fields**
 
@@ -727,6 +727,13 @@ against the app's JWKS, not the platform's.
 | `public` | No | Anyone can call, no token needed |
 | `authenticated` | Yes | Valid token from the app's OIDC provider, any role |
 | `role` | Yes | Valid token with at least one of the specified roles |
+
+A WASM app declares its policies with `@auth` annotations in its WIT:
+`@auth public`, `@auth authenticated`, `@auth owner` or
+`@auth role(role-a, role-b)`. Annotations are read case-insensitively, with
+optional spaces around the parentheses and commas, so `role(admin)` and
+`Role ( admin )` are the same. An unrecognised annotation, or a `role()`
+naming no role, makes the app's load fail with an error naming the function.
 
 ### Token delivery
 

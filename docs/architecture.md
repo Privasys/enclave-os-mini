@@ -271,6 +271,9 @@ routes) the task suspends and the loop goes on with other connections. The
 loop resumes a task once something wakes it, typically a Data Channel
 message for its outbound connection. A connection has at most one suspended
 request (HTTP/1.1 answers in order); at most 8 are suspended at once.
+Request bytes buffered across all connections share a 32 MiB budget, and at
+most 64 KiB may wait behind a suspended request; a connection that would
+cross either limit is closed.
 
 Waits that cannot suspend still block, as before: code outside a task
 (start-up, raft replay), a wait inside a guest call's synchronous host

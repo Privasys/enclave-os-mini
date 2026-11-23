@@ -238,6 +238,8 @@ ApprovalClaims {
     handle:  String,
     op:      Operation,
     manager: u32,                          // index into principals.managers
+    approver_sub:   String,                // the approver's OIDC sub
+    policy_version: u32,                   // the key's policy_version at issuance
     iat:     u64,
     exp:     u64,
 }
@@ -251,6 +253,10 @@ today, approvals are vault-local).
 `Condition::ManagerApproval { manager, fresh_for_seconds }` succeeds iff
 the request carries an `ApprovalToken` whose claims match `(handle, op,
 manager)` and whose age is within `fresh_for_seconds` at verification time.
+For a subject-bound manager, the token's `approver_sub` must be the `sub`
+of the manager now at that index. The token is accepted only while the
+key's `policy_version` equals the one it carries: an approval given before
+a policy change is not accepted after it, and the manager approves again.
 
 ---
 
