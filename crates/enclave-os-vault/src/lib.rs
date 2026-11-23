@@ -20,6 +20,7 @@ pub mod grant;
 pub mod policy;
 pub mod quote;
 pub mod signing;
+pub mod threshold;
 pub mod types;
 
 use std::string::String;
@@ -165,6 +166,16 @@ impl EnclaveModule for VaultModule {
             VaultRequest::RevokePendingProfile { handle, pending_id } => {
                 handle_revoke_pending(&handle, pending_id, ctx)
             }
+
+            req @ (VaultRequest::FrostDkgRound1 { .. }
+            | VaultRequest::FrostDkgRound2 { .. }
+            | VaultRequest::FrostDkgRound3 { .. }
+            | VaultRequest::FrostDkgCommit { .. }
+            | VaultRequest::FrostDkgAbort { .. }
+            | VaultRequest::FrostSignRound1 { .. }
+            | VaultRequest::FrostSignRound2 { .. }
+            | VaultRequest::FrostSignAbort { .. }
+            | VaultRequest::FrostAggregate { .. }) => threshold::handle(req, ctx),
         };
 
         match serde_json::to_vec(&resp) {
@@ -180,7 +191,7 @@ impl EnclaveModule for VaultModule {
 //  KV layout
 // ---------------------------------------------------------------------------
 
-fn record_key(handle: &str) -> Vec<u8> {
+pub(crate) fn record_key(handle: &str) -> Vec<u8> {
     format!("key:{}", handle).into_bytes()
 }
 
@@ -188,7 +199,7 @@ fn owner_index_key(owner_sub: &str) -> Vec<u8> {
     format!("index:{}", owner_sub).into_bytes()
 }
 
-fn add_to_owner_index(store: &SealedKvStore, owner_sub: &str, handle: &str) -> Result<(), String> {
+pub(crate) fn add_to_owner_index(store: &SealedKvStore, owner_sub: &str, handle: &str) -> Result<(), String> {
     let key = owner_index_key(owner_sub);
     let mut handles: Vec<String> = match store.get(&key) {
         Ok(Some(b)) => serde_json::from_slice(&b).unwrap_or_default(),
@@ -220,12 +231,12 @@ fn remove_from_owner_index(
 //  KV access helpers
 // ---------------------------------------------------------------------------
 
-fn kv() -> Result<&'static std::sync::Mutex<SealedKvStore>, VaultResponse> {
+pub(crate) fn kv() -> Result<&'static std::sync::Mutex<SealedKvStore>, VaultResponse> {
     enclave_os_kvstore::kv_store()
         .ok_or_else(|| VaultResponse::Error("kv store not initialised".into()))
 }
 
-fn load_record(handle: &str) -> Result<KeyRecord, VaultResponse> {
+pub(crate) fn load_record(handle: &str) -> Result<KeyRecord, VaultResponse> {
     let kv = kv()?;
     let store = kv
         .lock()
@@ -244,11 +255,11 @@ fn load_record(handle: &str) -> Result<KeyRecord, VaultResponse> {
 
 /// Trusted time, Unix seconds. `None` when there is none: every caller
 /// fails closed (a 0 would make every expiry look far away).
-fn now_secs() -> Option<u64> {
+pub(crate) fn now_secs() -> Option<u64> {
     enclave_os_common::ocall::get_current_time().ok()
 }
 
-const NO_TRUSTED_TIME: &str = "no trusted time: time-bound operations are refused";
+pub(crate) const NO_TRUSTED_TIME: &str = "no trusted time: time-bound operations are refused";
 
 // ---------------------------------------------------------------------------
 //  Audit
@@ -256,7 +267,7 @@ const NO_TRUSTED_TIME: &str = "no trusted time: time-bound operations are refuse
 
 /// Append one audit entry to `record` and save the record. Used by every
 /// op handler after a policy decision has been made.
-fn audit_and_save(
+pub(crate) fn audit_and_save(
     record: &mut KeyRecord,
     op: &str,
     caller: &str,
@@ -306,7 +317,7 @@ fn audit_denial(
     audit_and_save(record, op, caller, decision, reason)
 }
 
-fn caller_str(ctx: &RequestContext) -> String {
+pub(crate) fn caller_str(ctx: &RequestContext) -> String {
     if let Some(c) = ctx.oidc_claims.as_ref() {
         format!("oidc:{}", c.sub)
     } else if ctx.peer_cert_der.is_some() {
@@ -364,6 +375,31 @@ fn normalise_profile(profile: &mut AttestationProfile) {
 //  Handlers — key management
 // ---------------------------------------------------------------------------
 
+/// What a grant must satisfy for `handle`, whoever presents it: the handle is
+/// not reserved and falls under the grant's scope, and the granted policy is
+/// owned by the grant's subject.
+pub(crate) fn check_grant_for_handle(
+    handle: &str,
+    grant: &crate::grant::KeyCreationGrant,
+) -> Result<(), String> {
+    if handle.is_empty() {
+        return Err("handle must not be empty".into());
+    }
+    if handle.starts_with("__") {
+        return Err("handles starting with '__' are reserved for internal use".into());
+    }
+    if handle != grant.scope && !handle.starts_with(&format!("{}/", grant.scope)) {
+        return Err(format!(
+            "handle '{handle}' is outside the grant scope '{}'",
+            grant.scope
+        ));
+    }
+    if owner_oidc_sub(&grant.policy.principals.owner).as_deref() != Some(grant.sub.as_str()) {
+        return Err("grant policy owner does not match the grant subject".into());
+    }
+    Ok(())
+}
+
 fn handle_create(
     handle: &str,
     material_b64: &str,
@@ -386,18 +422,13 @@ fn handle_create(
         Ok(g) => g,
         Err(e) => return VaultResponse::Error(e),
     };
-
-    // The handle must fall under the grant's scope.
-    if handle != grant.scope && !handle.starts_with(&format!("{}/", grant.scope)) {
-        return VaultResponse::Error(format!(
-            "handle '{handle}' is outside the grant scope '{}'",
-            grant.scope
-        ));
+    if let Err(e) = check_grant_for_handle(handle, &grant) {
+        return VaultResponse::Error(e);
     }
-
-    // The granted policy must be owned by the grant subject.
-    if owner_oidc_sub(&grant.policy.principals.owner).as_deref() != Some(grant.sub.as_str()) {
-        return VaultResponse::Error("grant policy owner does not match the grant subject".into());
+    if grant.key_type == KeyType::FrostEd25519 {
+        return VaultResponse::Error(
+            "a FrostEd25519 key is created by the FrostDkg rounds, not CreateKey".into(),
+        );
     }
 
     let key_type = grant.key_type;
@@ -446,6 +477,7 @@ fn handle_create(
         pending_profiles: Vec::new(),
         audit_next_seq: 0,
         next_pending_id: 0,
+        threshold_vaults: Vec::new(),
     };
 
     if let Err(e) = audit_and_save(
@@ -717,7 +749,7 @@ fn handle_list(ctx: &RequestContext) -> VaultResponse {
 
 /// Shared prelude: load record, check not expired, check key_type matches,
 /// run policy with conditions, audit, and on success return the record.
-fn require_op(
+pub(crate) fn require_op(
     handle: &str,
     op: Operation,
     expect_type: KeyType,
@@ -1473,7 +1505,7 @@ fn handle_revoke_pending(handle: &str, pending_id: u32, ctx: &RequestContext) ->
 
 /// Whether the key has expired. Without trusted time a key counts as
 /// expired: fail closed.
-fn expired(record: &KeyRecord) -> bool {
+pub(crate) fn expired(record: &KeyRecord) -> bool {
     now_secs().map_or(true, |now| now > record.expires_at)
 }
 

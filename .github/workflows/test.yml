@@ -80,6 +80,7 @@ jobs:
           - enclave-os-raft
           - enclave-os-clock
           - enclave-os-direct
+          - enclave-os-frost
     steps:
       - uses: actions/checkout@v6
       - uses: dtolnay/rust-toolchain@stable

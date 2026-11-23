@@ -8,6 +8,7 @@
 //! handles, types, usage flags and operation policies), not opaque
 //! "secrets". See `docs/vault.md` for the design.
 
+use std::collections::BTreeMap;
 use std::string::String;
 use std::vec::Vec;
 
@@ -212,6 +213,71 @@ pub enum VaultRequest {
 
     /// Drop a pending profile without promoting it.
     RevokePendingProfile { handle: String, pending_id: u32 },
+
+    // --- Threshold keys (FROST Ed25519) -----------------------------------
+    //
+    // A threshold key (`KeyType::FrostEd25519`) is created by distributed key
+    // generation and used by `t` of its vaults together. The CLIENT drives
+    // the rounds, calling each vault directly with its own credentials and
+    // relaying opaque messages between them; the vaults never call each
+    // other. Bytes go as base64url (no padding). See `crate::threshold`.
+    /// DKG round 1, on each participant. `vaults` lists the participants'
+    /// endpoints (participant `i` at `vaults[i - 1]`); `index` is this vault's.
+    /// `grant` is a key-creation grant for `key_type = FrostEd25519`,
+    /// `exportable = false`, bound to the caller as for `CreateKey`.
+    FrostDkgRound1 {
+        session: String,
+        handle: String,
+        grant: String,
+        index: u16,
+        threshold: u16,
+        vaults: Vec<String>,
+    },
+    /// DKG round 2: every participant's round 1 message (by index).
+    FrostDkgRound2 {
+        session: String,
+        handle: String,
+        round1: BTreeMap<u16, FrostRound1Message>,
+    },
+    /// DKG round 3: the sealed round 2 packages sent to this vault (by sender).
+    FrostDkgRound3 {
+        session: String,
+        handle: String,
+        packages_b64: BTreeMap<u16, String>,
+    },
+    /// DKG commit: the other participants' confirmations for this vault (by
+    /// sender). The vault stores its share once all of them check out.
+    FrostDkgCommit {
+        session: String,
+        handle: String,
+        confirmations_b64: BTreeMap<u16, String>,
+    },
+    FrostDkgAbort { session: String },
+    /// Signing round 1: authorised like `Sign` (the key's policy, with
+    /// `approvals`); returns this vault's commitment.
+    FrostSignRound1 {
+        session: String,
+        handle: String,
+        message_b64: String,
+        #[serde(default)]
+        approvals: Vec<ApprovalToken>,
+    },
+    /// Signing round 2: every signer's round 1 commitment (by index); returns
+    /// this vault's signature share for the message round 1 was given.
+    FrostSignRound2 {
+        session: String,
+        handle: String,
+        commitments_b64: BTreeMap<u16, String>,
+    },
+    FrostSignAbort { session: String },
+    /// Combine the signers' shares into the Ed25519 signature, verified under
+    /// the group key. Public data; any participant answers its principals.
+    FrostAggregate {
+        handle: String,
+        message_b64: String,
+        commitments_b64: BTreeMap<u16, String>,
+        shares_b64: BTreeMap<u16, String>,
+    },
 }
 
 /// A vault RPC response, JSON-encoded inside `Response::Data`.
@@ -285,7 +351,50 @@ pub enum VaultResponse {
     },
     PendingProfileRevoked,
 
+    FrostDkgRound1 {
+        package: Vec<u8>,
+        dh_public: Vec<u8>,
+        quote: Vec<u8>,
+    },
+    /// This vault's sealed round 2 package for each other participant.
+    FrostDkgSealed {
+        packages: BTreeMap<u16, Vec<u8>>,
+    },
+    /// The group key this vault derived, and its confirmation for each other
+    /// participant.
+    FrostDkgConfirm {
+        public_key: Vec<u8>,
+        confirmations: BTreeMap<u16, Vec<u8>>,
+    },
+    /// This vault stored its share. `public_key` is the 32-byte Ed25519
+    /// group key.
+    ThresholdKeyCreated {
+        handle: String,
+        index: u16,
+        threshold: u16,
+        public_key: Vec<u8>,
+        expires_at: u64,
+    },
+    /// This vault's signing commitment; `index` is its participant index,
+    /// the key the client files it under.
+    FrostCommitment {
+        index: u16,
+        commitment: Vec<u8>,
+    },
+    FrostSignatureShare {
+        share: Vec<u8>,
+    },
+    FrostDone,
+
     Error(String),
+}
+
+/// A participant's DKG round 1 message, as the client relays it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FrostRound1Message {
+    pub package_b64: String,
+    pub dh_public_b64: String,
+    pub quote_b64: String,
 }
 
 /// Public-only metadata for a key.
@@ -330,6 +439,10 @@ pub enum KeyType {
     P256SigningKey,
     /// HMAC-SHA-256 key. Supports `Mac`.
     HmacSha256Key,
+    /// One vault's share of a threshold Ed25519 key (FROST, RFC 9591),
+    /// created by the `FrostDkg*` rounds and used by the `FrostSign*` rounds
+    /// (EdDSA, by the threshold of vaults together). Never exportable.
+    FrostEd25519,
 }
 
 // ---------------------------------------------------------------------------
@@ -811,4 +924,8 @@ pub struct KeyRecord {
     /// Monotonic counter for [`PendingProfile::id`] allocation.
     #[serde(default)]
     pub next_pending_id: u32,
+    /// Threshold keys: the participants' endpoints, participant `i` at
+    /// `threshold_vaults[i - 1]`. Empty for other keys.
+    #[serde(default)]
+    pub threshold_vaults: Vec<String>,
 }

@@ -59,6 +59,9 @@ pub(crate) fn validate_material(
                 })?;
             Ok(Some(kp.public_key().as_ref().to_vec()))
         }
+        KeyType::FrostEd25519 => {
+            Err("a FrostEd25519 key is created by the FrostDkg rounds, not from material".into())
+        }
     }
 }
 

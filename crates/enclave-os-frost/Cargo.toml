@@ -1,0 +1,30 @@
+# Copyright (c) Privasys. All rights reserved.
+# Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
+
+[package]
+name = "enclave-os-frost"
+version = "0.1.0"
+edition = "2021"
+license = "AGPL-3.0"
+description = "Threshold Ed25519 (FROST, RFC 9591) for the Enclave Vault: one vault's DKG and signing state for client-orchestrated rounds, nonces in memory only."
+
+[lib]
+name = "enclave_os_frost"
+
+# Host-buildable on purpose (no sgx_types), so its tests run in CI. Pure: the
+# vault crate does the I/O and the attestation checks. Not a member of the
+# root workspace.
+[workspace]
+
+[dependencies]
+curve25519-dalek = "4.1"
+frost-ed25519 = { version = "3.0.0", default-features = false, features = ["serialization"] }
+ring = "0.17"
+rand_core = { version = "0.6", features = ["getrandom"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+zeroize = "1"
+
+[dev-dependencies]
+ed25519-dalek = "2"
