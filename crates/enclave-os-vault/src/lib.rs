@@ -467,13 +467,14 @@ struct CreateExtras {
 /// links (formats §9.1).
 pub const CAPABILITY_GENERATIONS: &str = "generations-v1";
 
-/// The generation number of a handle ending in "/v<digits>", if it does.
-fn handle_generation(handle: &str) -> Option<u64> {
-    let (_, n) = handle.rsplit_once("/v")?;
-    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
-        return None;
+/// Whether a handle's last segment is a generation marker "gen-<digits>"
+/// (formats §9.1): the suffix user-secret generations use, and nothing else.
+fn is_generation_handle(handle: &str) -> bool {
+    let last = handle.rsplit('/').next().unwrap_or(handle);
+    match last.strip_prefix("gen-") {
+        Some(n) => !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
     }
-    n.parse().ok()
 }
 
 /// Where a new key's policy comes from.
@@ -711,14 +712,15 @@ fn handle_create(
     if extras.predecessor.as_deref() == Some(handle) {
         return VaultResponse::Error("a key cannot succeed itself".into());
     }
-    // A later generation exists only through a renewal (Security): whoever
-    // mints grants must not be able to plant "<name>/v<n+1>" with a value of
-    // its choosing as a first creation. Generation 1 is how every key starts.
+    // A generation ("<name>/gen-<n>") exists only through a renewal (Security):
+    // whoever mints grants must not be able to plant a newer generation with
+    // a value of its choosing as a first creation. The marker is used by
+    // nothing else, so first creations at ".../v<n>" are untouched.
     let first_creation = extras.predecessor.is_none() && extras.policy.is_none();
-    if first_creation && handle_generation(handle).is_some_and(|n| n >= 2) {
+    if first_creation && is_generation_handle(handle) {
         return VaultResponse::Error(
-            "a handle ending in /v<n> with n >= 2 can only be created by a renewal \
-             (a predecessor here, or the policy carried from the source)"
+            "a handle ending in gen-<n> is a generation and can only be created by a \
+             renewal (a predecessor here, or the policy carried from the source)"
                 .into(),
         );
     }
@@ -2066,11 +2068,14 @@ mod step1_tests {
 
     #[test]
     fn handle_generations() {
-        assert_eq!(handle_generation("apps.privasys.org/x/storage-kek/v1"), Some(1));
-        assert_eq!(handle_generation("users/s/secret/v12"), Some(12));
-        assert_eq!(handle_generation("users/s/secret"), None);
-        assert_eq!(handle_generation("users/s/v2x"), None);
-        assert_eq!(handle_generation("users/s/v"), None);
-        assert_eq!(handle_generation("users/s/data-v2"), None);
+        assert!(is_generation_handle("users/s/secret/gen-2"));
+        assert!(is_generation_handle("users/s/secret/gen-12"));
+        assert!(!is_generation_handle("users/s/secret"));
+        assert!(!is_generation_handle("users/s/secret/gen-"));
+        assert!(!is_generation_handle("users/s/secret/gen-2x"));
+        assert!(!is_generation_handle("users/s/gen-2/secret"));
+        // The control plane's and Drive's generations stay ordinary creations.
+        assert!(!is_generation_handle("apps.privasys.org/x/storage-kek/v2"));
+        assert!(!is_generation_handle("users/s/data/o/mek/v7"));
     }
 }

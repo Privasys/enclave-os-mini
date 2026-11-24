@@ -420,7 +420,7 @@ pub enum VaultResponse {
         quote_b64: String,
         /// What this build enforces beyond step 1, by name (formats §9.1):
         /// "generations-v1" = `GetKeyInfo` reports `renewed_in_place_from`, a
-        /// first creation of a handle ending in `/v<n>` (n >= 2) is refused,
+        /// first creation of a generation handle (last segment `gen-<n>`) is refused,
         /// and a carried create keeps the source's exportable flag and type.
         /// A client trusts a generation link only from a build listing it.
         #[serde(default)]
