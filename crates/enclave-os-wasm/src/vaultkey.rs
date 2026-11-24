@@ -238,8 +238,15 @@ enum VaultRequest {
         policy_version: Option<u32>,
         #[serde(skip_serializing_if = "Option::is_none")]
         source_billing_id: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        carried_exportable: Option<bool>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        carried_key_type: Option<serde_json::Value>,
     },
     GetPolicy {
+        handle: String,
+    },
+    GetKeyInfo {
         handle: String,
     },
     GetVaultIdentity,
@@ -256,8 +263,17 @@ struct VaultResponse {
     policy: Option<PolicyResp>,
     #[serde(rename = "VaultIdentity")]
     vault_identity: Option<VaultIdentityResp>,
+    #[serde(rename = "KeyInfo")]
+    key_info: Option<KeyInfoResp>,
     #[serde(rename = "Error")]
     error: Option<String>,
+}
+
+/// `GetKeyInfo` response: what a carried create must keep of the source key.
+#[derive(Deserialize)]
+struct KeyInfoResp {
+    key_type: serde_json::Value,
+    exportable: bool,
 }
 
 /// `GetPolicy` response: the policy is walked generically (we only
@@ -284,6 +300,40 @@ pub struct Renewal {
     policy: Option<serde_json::Value>,
     policy_version: Option<u32>,
     source_billing_id: Option<String>,
+    carried_exportable: Option<bool>,
+    carried_key_type: Option<serde_json::Value>,
+}
+
+/// The source key's type and exportable flag, from EVERY source vault, which
+/// must agree: a carried create keeps both (Security).
+fn read_key_shape(
+    cfg: &VaultConfig,
+    handle: &str,
+    code_hash: &[u8],
+    app_id: Option<&[u8]>,
+) -> Result<(serde_json::Value, bool), String> {
+    let root_store = root_store_from_der(cfg.ca_roots_der.iter().cloned())
+        .map_err(|e| format!("vaultkey: bad CA roots: {e}"))?;
+    let policy = build_ratls_policy(cfg, code_hash, app_id)?;
+    let mut found: Option<(serde_json::Value, bool)> = None;
+    for ep in &cfg.endpoints {
+        let req = VaultRequest::GetKeyInfo { handle: handle.into() };
+        let info = match call_vault_response(ep, &req, &root_store, &policy) {
+            Ok(Some(vr)) => vr
+                .key_info
+                .ok_or_else(|| format!("vaultkey: {ep} returned no key info for {handle:?}"))?,
+            Ok(None) => return Err(format!("vaultkey: {ep} does not answer GetKeyInfo")),
+            Err(e) => return Err(format!("vaultkey: {ep} GetKeyInfo for {handle:?}: {e}")),
+        };
+        match &found {
+            None => found = Some((info.key_type, info.exportable)),
+            Some((t, x)) if *t == info.key_type && *x == info.exportable => {}
+            Some(_) => {
+                return Err(format!("vaultkey: the source vaults disagree on {handle:?}'s type"))
+            }
+        }
+    }
+    found.ok_or_else(|| "vaultkey: no source vault".into())
 }
 
 /// A constellation's identity: its sorted member ids and its one billing id,
@@ -451,6 +501,8 @@ pub fn plan_renewal(
             policy: None,
             policy_version: None,
             source_billing_id: None,
+            carried_exportable: None,
+            carried_key_type: None,
         }));
     }
     let source_billing_id = match (&source, source_oidc) {
@@ -468,11 +520,14 @@ pub fn plan_renewal(
         return Err("vaultkey: the source and target are under different billing; keys do not cross".into());
     }
     let (policy, version) = read_current_policy(old_cfg, old_handle, code_hash, app_id)?;
+    let (key_type, exportable) = read_key_shape(old_cfg, old_handle, code_hash, app_id)?;
     Ok(Some(Renewal {
         predecessor: if renew { Some(old_handle.to_string()) } else { None },
         policy: Some(policy),
         policy_version: Some(version),
         source_billing_id: Some(source_billing_id),
+        carried_exportable: Some(exportable),
+        carried_key_type: Some(key_type),
     }))
 }
 
@@ -653,6 +708,8 @@ pub fn resolve_or_provision(
                     policy: renewal.and_then(|r| r.policy.clone()),
                     policy_version: renewal.and_then(|r| r.policy_version),
                     source_billing_id: renewal.and_then(|r| r.source_billing_id.clone()),
+                    carried_exportable: renewal.and_then(|r| r.carried_exportable),
+                    carried_key_type: renewal.and_then(|r| r.carried_key_type.clone()),
                 },
                 &root_store,
                 &policy,
@@ -925,6 +982,8 @@ mod renewal_tests {
             policy: None,
             policy_version: None,
             source_billing_id: None,
+            carried_exportable: None,
+            carried_key_type: None,
         };
         let s = serde_json::to_string(&req).unwrap();
         assert_eq!(s, r#"{"CreateKey":{"handle":"h","material_b64":"AA","grant":"g"}}"#);

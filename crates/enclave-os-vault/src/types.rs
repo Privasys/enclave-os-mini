@@ -87,6 +87,13 @@ pub enum VaultRequest {
         /// opaquely and never returned.
         #[serde(default)]
         key_check: Option<KeyCheck>,
+        /// With a carried policy: the source key's `exportable` and
+        /// `key_type` (from its `GetKeyInfo`). A carried create must keep
+        /// them; the vault refuses a grant that says otherwise (Security).
+        #[serde(default)]
+        carried_exportable: Option<bool>,
+        #[serde(default)]
+        carried_key_type: Option<KeyType>,
     },
 
     /// Export the raw key material.
@@ -411,6 +418,13 @@ pub enum VaultResponse {
         billing_id: String,
         mrenclave: String,
         quote_b64: String,
+        /// What this build enforces beyond step 1, by name (formats §9.1):
+        /// "generations-v1" = `GetKeyInfo` reports `renewed_in_place_from`, a
+        /// first creation of a handle ending in `/v<n>` (n >= 2) is refused,
+        /// and a carried create keeps the source's exportable flag and type.
+        /// A client trusts a generation link only from a build listing it.
+        #[serde(default)]
+        capabilities: Vec<String>,
     },
     /// A policy checked against formats §5.1, and its digest.
     CanonicalPolicy {
@@ -583,6 +597,12 @@ pub struct KeyInfo {
     /// Threshold keys: this vault's part (public).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threshold: Option<ThresholdKeyInfo>,
+    /// The key this one renewed IN PLACE on this vault (formats §9.1),
+    /// absent for a first creation or a carried move. A client that takes a
+    /// name's newest generation accepts generation n > 1 only when it names
+    /// generation n - 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub renewed_in_place_from: Option<String>,
 }
 
 /// Entry returned by `VaultRequest::ListKeys`.

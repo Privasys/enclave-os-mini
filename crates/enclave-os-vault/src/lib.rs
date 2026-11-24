@@ -91,6 +91,8 @@ impl EnclaveModule for VaultModule {
                 holder_records,
                 source_billing_id,
                 key_check,
+                carried_exportable,
+                carried_key_type,
             } => handle_create(
                 &handle,
                 &material_b64,
@@ -102,6 +104,8 @@ impl EnclaveModule for VaultModule {
                     holder_records,
                     source_billing_id,
                     key_check,
+                    carried_exportable,
+                    carried_key_type,
                 },
                 ctx,
             ),
@@ -455,6 +459,21 @@ struct CreateExtras {
     holder_records: Vec<serde_json::Value>,
     source_billing_id: Option<String>,
     key_check: Option<crate::types::KeyCheck>,
+    carried_exportable: Option<bool>,
+    carried_key_type: Option<KeyType>,
+}
+
+/// The capability this build publishes in `GetVaultIdentity` for generation
+/// links (formats §9.1).
+pub const CAPABILITY_GENERATIONS: &str = "generations-v1";
+
+/// The generation number of a handle ending in "/v<digits>", if it does.
+fn handle_generation(handle: &str) -> Option<u64> {
+    let (_, n) = handle.rsplit_once("/v")?;
+    if n.is_empty() || !n.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    n.parse().ok()
 }
 
 /// Where a new key's policy comes from.
@@ -515,6 +534,9 @@ fn new_key_policy(
         if rec.key_type != grant.key_type {
             return Err("predecessor is of another key type".into());
         }
+        if rec.exportable != grant.exportable {
+            return Err("the grant changes whether the key is exportable; a renewal keeps it".into());
+        }
         check_renewal_caller(&rec.policy, ctx)?;
         return Ok(NewKeyPolicy {
             policy: rec.policy,
@@ -551,10 +573,24 @@ fn new_key_policy(
             None => return Err("a carried policy needs source_billing_id".into()),
         }
         check_renewal_caller(&policy, ctx)?;
+        // The source key's exportable flag and type travel with its policy;
+        // a grant may not change them on the way (Security).
+        let carried_exportable = extras
+            .carried_exportable
+            .ok_or_else(|| "a carried policy needs the source's carried_exportable".to_string())?;
+        let carried_key_type = extras
+            .carried_key_type
+            .ok_or_else(|| "a carried policy needs the source's carried_key_type".to_string())?;
+        if carried_exportable != grant.exportable || carried_key_type != grant.key_type {
+            return Err(
+                "the grant changes the key's type or whether it is exportable; a carried key keeps both"
+                    .into(),
+            );
+        }
         return Ok(NewKeyPolicy {
             policy,
             policy_version: version,
-            exportable: grant.exportable,
+            exportable: carried_exportable,
             key_check: extras.key_check,
             how: match &extras.predecessor {
                 Some(p) => format!("carried from {p}"),
@@ -635,6 +671,7 @@ fn handle_identity() -> VaultResponse {
         billing_id,
         mrenclave,
         quote_b64: URL_SAFE_NO_PAD.encode(quote),
+        capabilities: vec![CAPABILITY_GENERATIONS.to_string()],
     }
 }
 
@@ -673,6 +710,17 @@ fn handle_create(
     let key_type = grant.key_type;
     if extras.predecessor.as_deref() == Some(handle) {
         return VaultResponse::Error("a key cannot succeed itself".into());
+    }
+    // A later generation exists only through a renewal (Security): whoever
+    // mints grants must not be able to plant "<name>/v<n+1>" with a value of
+    // its choosing as a first creation. Generation 1 is how every key starts.
+    let first_creation = extras.predecessor.is_none() && extras.policy.is_none();
+    if first_creation && handle_generation(handle).is_some_and(|n| n >= 2) {
+        return VaultResponse::Error(
+            "a handle ending in /v<n> with n >= 2 can only be created by a renewal \
+             (a predecessor here, or the policy carried from the source)"
+                .into(),
+        );
     }
     let chosen = match new_key_policy(&grant, extras, ctx) {
         Ok(c) => c,
@@ -1132,6 +1180,7 @@ fn handle_get_info(handle: &str, ctx: &RequestContext) -> VaultResponse {
         policy_version: record.policy_version,
         public_key: record.public_key,
         threshold,
+        renewed_in_place_from: record.renewed_in_place_from,
     })
 }
 
@@ -2013,5 +2062,15 @@ mod step1_tests {
         assert!(check_same_value(KeyType::HmacSha256Key, &[1; 32], &[1; 33]).is_err());
         // A Shamir share is fresh by design: the value is whole only across vaults.
         assert!(check_same_value(KeyType::RawShare, &[1; 32], &[2; 32]).is_ok());
+    }
+
+    #[test]
+    fn handle_generations() {
+        assert_eq!(handle_generation("apps.privasys.org/x/storage-kek/v1"), Some(1));
+        assert_eq!(handle_generation("users/s/secret/v12"), Some(12));
+        assert_eq!(handle_generation("users/s/secret"), None);
+        assert_eq!(handle_generation("users/s/v2x"), None);
+        assert_eq!(handle_generation("users/s/v"), None);
+        assert_eq!(handle_generation("users/s/data-v2"), None);
     }
 }
