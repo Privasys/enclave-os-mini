@@ -174,7 +174,7 @@ fn resolve_vault_backed_key(
     // the platform-minted grant. A policy denial is the upgrade gate (fail closed),
     // not a first boot.
     let (kek, origin) =
-        vaultkey::resolve_or_provision(&cfg, &vb.handle, &vb.grant, code_hash, app_id_slice, None)?;
+        vaultkey::resolve_or_provision(&cfg, &vb.handle, &vb.grant, code_hash, app_id_slice, None, None)?;
     // The direct-TLS branch comes from the KEK, the secret the vaults hold,
     // never from the DEK: the DEK is generated afresh whenever the host-side
     // wrapped blob is missing (a new KV directory), so an account derived from
@@ -264,6 +264,7 @@ fn rotate_vault_backed_key(
     code_hash: &[u8; 32],
     app_id: Option<[u8; 16]>,
     renew: bool,
+    source_oidc: Option<&(String, String)>,
 ) -> Result<[u8; 32], String> {
     use crate::kek_material::{check_renewed, rewrap_dek};
     use crate::vaultkey;
@@ -273,8 +274,21 @@ fn rotate_vault_backed_key(
 
     // Old KEK: the key already exists, so export it (a grant is only needed to
     // CREATE). A policy denial here is the upgrade gate, not a first boot.
-    let (old_kek, _) =
-        vaultkey::resolve_or_provision(old_cfg, old_handle, "", code_hash, app_id_slice, None)?;
+    let (old_kek, _) = vaultkey::resolve_or_provision(
+        old_cfg, old_handle, "", code_hash, app_id_slice, None, None,
+    )?;
+    // Where the new generation's policy comes from (formats §9): copied in
+    // place, or read fresh from the source vaults and carried; nothing (the
+    // grant's policy) when the target vaults predate step 1.
+    let renewal = vaultkey::plan_renewal(
+        old_cfg,
+        new_cfg,
+        old_handle,
+        renew,
+        source_oidc,
+        code_hash,
+        app_id_slice,
+    )?;
     // New KEK: create the new generation with the platform-minted grant; on a
     // renewal, from the old KEK's material.
     let material = if renew { Some(&old_kek) } else { None };
@@ -285,6 +299,7 @@ fn rotate_vault_backed_key(
         code_hash,
         app_id_slice,
         material,
+        renewal.as_ref(),
     )?;
     if renew {
         // Whether this call created the handle or a retry found it, it must
@@ -1077,6 +1092,7 @@ impl AppRegistry {
         environment: &str,
         new_cfg: Option<crate::vaultkey::VaultConfig>,
         renew: bool,
+        source_oidc: Option<(String, String)>,
     ) -> Result<AppMeta, String> {
         let meta = self
             .known
@@ -1118,6 +1134,7 @@ impl AppRegistry {
             &code_hash,
             app_id,
             renew,
+            source_oidc.as_ref(),
         )?;
 
         // Advance the sealed handle (the DEK is unchanged); on a migration the

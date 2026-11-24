@@ -207,6 +207,15 @@ pub struct WasmRotateKey {
     /// selection for a later re-author).
     #[serde(default)]
     pub new_vault_oidc_issuer: Option<String>,
+    /// SOURCE constellation OIDC issuer and audience, for a renewal or
+    /// rotation that carries the key's policy from a vault built before step 1
+    /// (it has no identity call): the enclave derives the source's interim
+    /// billing id from them (formats §1, §9). Ignored when the source vaults
+    /// answer `GetVaultIdentity`.
+    #[serde(default)]
+    pub source_vault_oidc_issuer: Option<String>,
+    #[serde(default)]
+    pub source_vault_oidc_audience: Option<String>,
     /// TARGET constellation acceptable Intel TCB statuses (empty/absent =
     /// no TCB acceptance check on the dial).
     #[serde(default)]

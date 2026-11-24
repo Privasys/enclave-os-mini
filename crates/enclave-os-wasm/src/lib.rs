@@ -2027,6 +2027,10 @@ impl EnclaveModule for WasmModule {
                     &environment,
                     new_cfg,
                     rot.renew,
+                    match (&rot.source_vault_oidc_issuer, &rot.source_vault_oidc_audience) {
+                        (Some(i), Some(a)) => Some((i.clone(), a.clone())),
+                        _ => None,
+                    },
                 )
             };
             let mgmt_result = match result {

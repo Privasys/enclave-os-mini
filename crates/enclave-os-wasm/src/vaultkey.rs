@@ -230,10 +230,19 @@ enum VaultRequest {
         handle: String,
         material_b64: String,
         grant: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        predecessor: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        policy: Option<serde_json::Value>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        policy_version: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        source_billing_id: Option<String>,
     },
     GetPolicy {
         handle: String,
     },
+    GetVaultIdentity,
 }
 
 /// Subset of the server's `VaultResponse` we care about.
@@ -245,6 +254,8 @@ struct VaultResponse {
     key_created: Option<KeyCreatedResp>,
     #[serde(rename = "Policy")]
     policy: Option<PolicyResp>,
+    #[serde(rename = "VaultIdentity")]
+    vault_identity: Option<VaultIdentityResp>,
     #[serde(rename = "Error")]
     error: Option<String>,
 }
@@ -254,6 +265,204 @@ struct VaultResponse {
 #[derive(Deserialize)]
 struct PolicyResp {
     policy: serde_json::Value,
+    #[serde(default)]
+    policy_version: u32,
+}
+
+/// `GetVaultIdentity` response (formats §1): what a renewal needs of it.
+#[derive(Deserialize)]
+struct VaultIdentityResp {
+    member_id: String,
+    billing_id: String,
+}
+
+/// Where a new generation's policy comes from (formats §9), sent with its
+/// `CreateKey`: the predecessor on the same vaults, or the policy carried
+/// from the source vaults with its version and the source's billing id.
+pub struct Renewal {
+    predecessor: Option<String>,
+    policy: Option<serde_json::Value>,
+    policy_version: Option<u32>,
+    source_billing_id: Option<String>,
+}
+
+/// A constellation's identity: its sorted member ids and its one billing id,
+/// or `None` when its vaults predate step 1 (no identity call).
+struct ConstellationIdentity {
+    members: Vec<String>,
+    billing_id: String,
+}
+
+/// Send one request and return the decoded response. A vault that does not
+/// know the request echoes it back (the runtime's fallback for unhandled
+/// data): that is reported as `Ok(None)`.
+fn call_vault_response(
+    endpoint: &str,
+    req: &VaultRequest,
+    root_store: &RootCertStore,
+    policy: &RaTlsPolicy,
+) -> Result<Option<VaultResponse>, String> {
+    let body = serde_json::to_vec(req).map_err(|e| format!("marshal request: {e}"))?;
+    let url = format!("https://{endpoint}/data");
+    let resp = https_fetch("POST", &url, &[], Some(&body), root_store, Some(policy))?;
+    if resp.status < 200 || resp.status >= 300 {
+        return Err(format!("vault HTTP {}", resp.status));
+    }
+    if resp.body.trim_ascii() == body.as_slice() {
+        return Ok(None);
+    }
+    let vr: VaultResponse =
+        serde_json::from_slice(&resp.body).map_err(|e| format!("decode response: {e}"))?;
+    if let Some(msg) = vr.error {
+        return Err(msg);
+    }
+    Ok(Some(vr))
+}
+
+/// Ask every vault of `cfg` for its identity. All must answer alike: every one
+/// knows the call (step 1 or later) with one billing id, or none does.
+fn constellation_identity(
+    cfg: &VaultConfig,
+    code_hash: &[u8],
+    app_id: Option<&[u8]>,
+) -> Result<Option<ConstellationIdentity>, String> {
+    let root_store = root_store_from_der(cfg.ca_roots_der.iter().cloned())
+        .map_err(|e| format!("vaultkey: bad CA roots: {e}"))?;
+    let policy = build_ratls_policy(cfg, code_hash, app_id)?;
+    let mut members = Vec::new();
+    let mut billing: Option<String> = None;
+    let mut v1 = 0usize;
+    for ep in &cfg.endpoints {
+        match call_vault_response(ep, &VaultRequest::GetVaultIdentity, &root_store, &policy)? {
+            None => v1 += 1,
+            Some(vr) => {
+                let id = vr
+                    .vault_identity
+                    .ok_or_else(|| format!("vaultkey: {ep} returned no identity"))?;
+                match &billing {
+                    None => billing = Some(id.billing_id),
+                    Some(b) if *b == id.billing_id => {}
+                    Some(_) => {
+                        return Err("vaultkey: the constellation's vaults disagree on billing".into())
+                    }
+                }
+                members.push(id.member_id);
+            }
+        }
+    }
+    if v1 == cfg.endpoints.len() {
+        return Ok(None);
+    }
+    if v1 > 0 {
+        return Err("vaultkey: the constellation mixes vault builds with and without the identity call".into());
+    }
+    members.sort();
+    members.dedup();
+    if members.len() != cfg.endpoints.len() {
+        return Err("vaultkey: two endpoints answered with the same member id".into());
+    }
+    Ok(Some(ConstellationIdentity {
+        members,
+        billing_id: billing.unwrap_or_default(),
+    }))
+}
+
+/// The key's current policy and version, read fresh from the source vaults:
+/// at least the threshold must answer, and all that answer must agree.
+fn read_current_policy(
+    cfg: &VaultConfig,
+    handle: &str,
+    code_hash: &[u8],
+    app_id: Option<&[u8]>,
+) -> Result<(serde_json::Value, u32), String> {
+    let root_store = root_store_from_der(cfg.ca_roots_der.iter().cloned())
+        .map_err(|e| format!("vaultkey: bad CA roots: {e}"))?;
+    let policy = build_ratls_policy(cfg, code_hash, app_id)?;
+    let mut found: Option<(serde_json::Value, u32)> = None;
+    let mut answered = 0usize;
+    for ep in &cfg.endpoints {
+        let req = VaultRequest::GetPolicy { handle: handle.into() };
+        let Ok(Some(vr)) = call_vault_response(ep, &req, &root_store, &policy) else {
+            continue;
+        };
+        let Some(p) = vr.policy else { continue };
+        match &found {
+            None => found = Some((p.policy, p.policy_version)),
+            Some((v, n)) if *v == p.policy && *n == p.policy_version => {}
+            Some(_) => {
+                return Err(format!(
+                    "vaultkey: the source vaults disagree on {handle:?}'s policy; not carrying it"
+                ))
+            }
+        }
+        answered += 1;
+    }
+    match found {
+        Some(f) if answered >= cfg.threshold() => Ok(f),
+        _ => Err(format!(
+            "vaultkey: only {answered} source vaults returned {handle:?}'s policy (threshold {})",
+            cfg.threshold()
+        )),
+    }
+}
+
+/// The step 1 interim billing id (formats §1), for a source vault built before
+/// the identity call: hex SHA-256 of "privasys-billing-implicit-v0\n" iss "\n" aud.
+pub fn implicit_billing_id(issuer: &str, audience: &str) -> String {
+    let d = ring::digest::digest(
+        &ring::digest::SHA256,
+        format!("privasys-billing-implicit-v0\n{issuer}\n{audience}").as_bytes(),
+    );
+    d.as_ref().iter().map(|b| format!("{b:02x}")).collect()
+}
+
+/// Decide where the new generation's policy comes from (formats §9):
+///   - target vaults built before step 1: `None`, the grant's policy, as before;
+///   - the same vaults and a renewal: in place, naming the predecessor;
+///   - otherwise (a move, or a rotation): the policy read fresh from the source
+///     vaults, carried with its version and the source's billing id.
+pub fn plan_renewal(
+    old_cfg: &VaultConfig,
+    new_cfg: &VaultConfig,
+    old_handle: &str,
+    renew: bool,
+    source_oidc: Option<&(String, String)>,
+    code_hash: &[u8],
+    app_id: Option<&[u8]>,
+) -> Result<Option<Renewal>, String> {
+    let Some(target) = constellation_identity(new_cfg, code_hash, app_id)? else {
+        return Ok(None);
+    };
+    let source = constellation_identity(old_cfg, code_hash, app_id)?;
+    if renew && source.as_ref().map(|s| &s.members) == Some(&target.members) {
+        return Ok(Some(Renewal {
+            predecessor: Some(old_handle.to_string()),
+            policy: None,
+            policy_version: None,
+            source_billing_id: None,
+        }));
+    }
+    let source_billing_id = match (&source, source_oidc) {
+        (Some(s), _) => s.billing_id.clone(),
+        (None, Some((iss, aud))) => implicit_billing_id(iss, aud),
+        (None, None) => {
+            return Err(
+                "vaultkey: the source vaults have no identity call and the command gives no \
+                 source issuer and audience; refusing to carry the policy"
+                    .into(),
+            )
+        }
+    };
+    if source_billing_id != target.billing_id {
+        return Err("vaultkey: the source and target are under different billing; keys do not cross".into());
+    }
+    let (policy, version) = read_current_policy(old_cfg, old_handle, code_hash, app_id)?;
+    Ok(Some(Renewal {
+        predecessor: if renew { Some(old_handle.to_string()) } else { None },
+        policy: Some(policy),
+        policy_version: Some(version),
+        source_billing_id: Some(source_billing_id),
+    }))
 }
 
 #[derive(Deserialize)]
@@ -332,6 +541,7 @@ pub fn resolve_or_provision(
     code_hash: &[u8],
     app_id: Option<&[u8]>,
     material: Option<&[u8; KEK_SIZE]>,
+    renewal: Option<&Renewal>,
 ) -> Result<([u8; KEK_SIZE], KeyOrigin), String> {
     if cfg.endpoints.is_empty() {
         return Err("vaultkey: sealed config has no vault endpoints".into());
@@ -428,6 +638,10 @@ pub fn resolve_or_provision(
                     handle: handle.into(),
                     material_b64: b64url_nopad_encode(&payload),
                     grant: grant.into(),
+                    predecessor: renewal.and_then(|r| r.predecessor.clone()),
+                    policy: renewal.and_then(|r| r.policy.clone()),
+                    policy_version: renewal.and_then(|r| r.policy_version),
+                    source_billing_id: renewal.and_then(|r| r.source_billing_id.clone()),
                 },
                 &root_store,
                 &policy,
@@ -675,4 +889,34 @@ fn b64url_nopad_encode(data: &[u8]) -> String {
         }
     }
     out
+}
+
+#[cfg(test)]
+mod renewal_tests {
+    use super::*;
+
+    #[test]
+    fn implicit_billing_id_matches_the_vault_vectors() {
+        // enclave-os-vault/testdata/v2_vectors.json, billing_id_implicit_v0
+        assert_eq!(
+            implicit_billing_id("https://privasys.id", "privasys-platform-test"),
+            "496a3f7c36ae5521bce1a4b3fb0cbea4e5e255e564cecd378947d1a5bc9b62c6"
+        );
+    }
+
+    #[test]
+    fn create_key_omits_renewal_fields_when_absent() {
+        let req = VaultRequest::CreateKey {
+            handle: "h".into(),
+            material_b64: "AA".into(),
+            grant: "g".into(),
+            predecessor: None,
+            policy: None,
+            policy_version: None,
+            source_billing_id: None,
+        };
+        let s = serde_json::to_string(&req).unwrap();
+        assert_eq!(s, r#"{"CreateKey":{"handle":"h","material_b64":"AA","grant":"g"}}"#);
+        assert_eq!(serde_json::to_string(&VaultRequest::GetVaultIdentity).unwrap(), r#""GetVaultIdentity""#);
+    }
 }
