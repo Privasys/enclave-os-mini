@@ -893,7 +893,7 @@ fn handle_delete(
     // succeeded, checked before the approval is spent (formats §9.2).
     let (op, target, detail) = match &after {
         Some(a) => {
-            if let Err(e) = check_successor_succeeded(handle, a) {
+            if let Err(e) = check_successor_succeeded(&record, a) {
                 let _ = audit_denial(ctx, &mut record, "DeleteKey", &caller, AuditDecision::Denied, &e);
                 return VaultResponse::Error(e);
             }
@@ -964,18 +964,41 @@ fn remove_record(
 
 /// The old key of a migration or upgrade may go only once its successor has
 /// succeeded, where this vault can see it (formats §9.2).
-fn check_successor_succeeded(handle: &str, after: &crate::types::DeleteAfter) -> Result<(), String> {
+fn check_successor_succeeded(old: &KeyRecord, after: &crate::types::DeleteAfter) -> Result<(), String> {
     // Promote K then "delete K after K" would delete the key just promoted.
-    if after.successor == handle {
+    if after.successor == old.handle {
         return Err("a key cannot be the successor of itself".into());
     }
-    let Ok(succ) = load_record(&after.successor) else {
+    let succ = load_record(&after.successor).ok();
+    successor_check(old, after, succ.as_ref(), now_secs())
+}
+
+/// The successor checks of formats §9.2, given the successor's record when it
+/// is on this vault.
+fn successor_check(
+    old: &KeyRecord,
+    after: &crate::types::DeleteAfter,
+    succ: Option<&KeyRecord>,
+    now: Option<u64>,
+) -> Result<(), String> {
+    if after.successor == old.handle {
+        return Err("a key cannot be the successor of itself".into());
+    }
+    let Some(succ) = succ else {
         // On another constellation: the client presents the delete only after
         // confirming the new key works; the binding confines it to that one.
         return Ok(());
     };
-    if expired(&succ) {
+    if !now.is_some_and(|n| n <= succ.expires_at) {
         return Err("the successor has expired".into());
+    }
+    // Any live key here would otherwise pass for a created successor
+    // (Security): it must belong to the same owner and be newer.
+    if succ.policy.principals.owner != old.policy.principals.owner {
+        return Err("the successor belongs to another owner".into());
+    }
+    if succ.created_at <= old.created_at {
+        return Err("the successor is not newer than the key it replaces".into());
     }
     if after.successor_target != "-" {
         let promoted = succ.policy.principals.tees.iter().any(|p| {
@@ -2013,8 +2036,46 @@ mod step1_tests {
             successor: "apps.privasys.org/x/k".into(),
             successor_target: "-".into(),
         };
-        let e = check_successor_succeeded("apps.privasys.org/x/k", &after).unwrap_err();
+        let mut old = record(None, 100);
+        old.handle = "apps.privasys.org/x/k".into();
+        let e = check_successor_succeeded(&old, &after).unwrap_err();
         assert!(e.contains("successor of itself"), "{e}");
+    }
+
+    /// Security: a created successor ("-") on this vault must be the same
+    /// owner's and newer, or any live key would pass.
+    #[test]
+    fn delete_after_needs_a_newer_successor_of_the_same_owner() {
+        let after = crate::types::DeleteAfter {
+            successor: "apps.privasys.org/x/k2".into(),
+            successor_target: "-".into(),
+        };
+        let mut old = record(None, 100);
+        old.handle = "apps.privasys.org/x/k1".into();
+        old.created_at = 10;
+        let mut succ = record(None, 100);
+        succ.handle = "apps.privasys.org/x/k2".into();
+        succ.created_at = 20;
+        assert!(successor_check(&old, &after, Some(&succ), Some(50)).is_ok());
+        // On another constellation: not visible here, the client's word.
+        assert!(successor_check(&old, &after, None, Some(50)).is_ok());
+
+        let mut other = succ.clone();
+        other.policy.principals.owner = Principal::Oidc {
+            issuer: "https://privasys.id".into(),
+            sub: "someone-else".into(),
+            required_roles: vec![],
+        };
+        let e = successor_check(&old, &after, Some(&other), Some(50)).unwrap_err();
+        assert!(e.contains("another owner"), "{e}");
+
+        let mut older = succ.clone();
+        older.created_at = 10;
+        let e = successor_check(&old, &after, Some(&older), Some(50)).unwrap_err();
+        assert!(e.contains("not newer"), "{e}");
+
+        let e = successor_check(&old, &after, Some(&succ), Some(101)).unwrap_err();
+        assert!(e.contains("expired"), "{e}");
     }
 
     fn record(renewed_in_place_from: Option<&str>, expires_at: u64) -> KeyRecord {
