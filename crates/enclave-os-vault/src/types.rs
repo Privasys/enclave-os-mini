@@ -1050,6 +1050,14 @@ impl Default for Mutability {
 // ---------------------------------------------------------------------------
 
 /// The full access policy attached to a key.
+///
+/// **Serialisation is part of the protocol.** `PD(current)` in an
+/// `update_policy_from` approval (formats §5.3) and the FROST quote context
+/// hash this type as the vault serialises it. A NEW field on this type, or on
+/// any type it contains, must be `#[serde(default, skip_serializing_if = ...)]`
+/// at its default, so that an unchanged stored policy serialises exactly as
+/// before; otherwise every pending approval of an unchanged key would stop
+/// matching after an upgrade.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct KeyPolicy {
     /// Schema version; currently 1.
