@@ -372,6 +372,21 @@ pub fn delete_after_target(successor: &str, successor_target: &str) -> Result<St
     )))
 }
 
+/// `PD` of a policy as the vault stores and returns it (`GetPolicy`): its own
+/// serialisation, in RFC 8785 form (formats §5.3, "PD(current)").
+pub fn stored_policy_digest(policy: &KeyPolicy) -> Result<String, String> {
+    let json = serde_json::to_string(policy).map_err(|e| format!("serialise policy: {e}"))?;
+    Ok(hex(&sha256(jcs(&parse_strict(&json)?).as_bytes())))
+}
+
+/// Target of an `update_policy_from` (formats §5.3):
+/// hex H("privasys-update-policy-from-v1\n" PD(current) "\n" PD(new)).
+pub fn update_from_target(current_pd: &str, new_pd: &str) -> String {
+    hex(&sha256(
+        format!("privasys-update-policy-from-v1\n{current_pd}\n{new_pd}").as_bytes(),
+    ))
+}
+
 /// How long a binding v2 may live for `op` (formats §5): 600 s, except a
 /// `delete_after`, presented only once its migration has finished (24 h).
 pub fn max_lifetime(op: &str) -> u64 {
@@ -650,7 +665,32 @@ mod vectors {
             "AAECAwQFBgcICQoLDA0ODw",
             1764000600,
         );
+        // update_policy_from (formats §5.3): the current policy is the sample as
+        // the vault would store and return it; the new one is the sample as sent.
+        let stored = canonical_policy(SAMPLE_POLICY).unwrap().policy;
+        let stored_json = serde_json::to_string(&stored).unwrap();
+        let current_pd = stored_policy_digest(&stored).unwrap();
+        let from_target = update_from_target(&current_pd, &pd);
+        let from_text = binding_v2_text(
+            &members,
+            "update_policy_from",
+            "apps.privasys.org/0123456789abcdef0123456789abcdef/data-v2",
+            &from_target,
+            3,
+            "oidc:0:test-subject-1",
+            "-",
+            "AAECAwQFBgcICQoLDA0ODw",
+            1764000600,
+        );
         serde_json::json!({
+            "binding_v2_update_policy_from": {
+                "current_policy_as_get_policy_returns_it": stored_json,
+                "current_pd": current_pd,
+                "new_pd": pd,
+                "target": from_target,
+                "text": from_text,
+                "vault_op": vault_op_v2(&from_text),
+            },
             "policy_digest": {
                 "policy_as_sent": SAMPLE_POLICY,
                 "jcs": canonical,

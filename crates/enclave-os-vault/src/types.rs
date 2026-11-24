@@ -423,6 +423,7 @@ pub enum VaultResponse {
         /// first creation of a generation handle (last segment `gen-<n>`) is refused,
         /// and a carried create keeps the source's exportable flag and type.
         /// A client trusts a generation link only from a build listing it.
+        /// "update-policy-from-v1" = it accepts `update_policy_from` (§5.3).
         #[serde(default)]
         capabilities: Vec<String>,
     },
@@ -885,6 +886,10 @@ fn is_zero_u8(v: &u8) -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BindingV2Request {
     pub members: Vec<String>,
+    /// For `update_policy_from` (formats §5.3): `PD` of the policy being
+    /// replaced, as `GetPolicy` returns it. Absent: plain `update_policy`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub replaced_pd: Option<String>,
 }
 
 /// The successor a `delete_after` is bound to (formats §9.2).

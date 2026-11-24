@@ -4,6 +4,14 @@
     "billing_id": "496a3f7c36ae5521bce1a4b3fb0cbea4e5e255e564cecd378947d1a5bc9b62c6",
     "issuer": "https://privasys.id"
   },
+  "binding_v2_update_policy_from": {
+    "current_pd": "169e828ed4aa5c1ff14cf7ecfe9006a5fb693d16042a3aa14f145d04b42b30e6",
+    "current_policy_as_get_policy_returns_it": "{\"version\":1,\"principals\":{\"owner\":{\"Oidc\":{\"issuer\":\"https://privasys.id\",\"sub\":\"tëst-sübject-1 é\\n\",\"required_roles\":[]}},\"managers\":[{\"Oidc\":{\"issuer\":\"https://privasys.id\",\"sub\":\"\",\"required_roles\":[\"privasys-platform:app:0123456789abcdef0123456789abcdef:approver\"]}}],\"auditors\":[],\"tees\":[]},\"operations\":[{\"ops\":[\"PromoteProfile\",\"UpdatePolicy\",\"DeleteKey\"],\"principals\":[\"Owner\",{\"Manager\":0}],\"requires\":[{\"OidcStepUp\":{\"required_amr\":[\"webauthn\"],\"operation_bound\":true,\"fresh_for_seconds\":300,\"binding\":2}}]}],\"mutability\":{\"owner_can\":[\"Managers\",\"Auditors\",\"Tees\",\"Operations\",\"Lifecycle\",\"PendingProfiles\"],\"manager_can\":[],\"immutable\":[\"Owner\",\"Mutability\"]},\"lifecycle\":{\"ttl_seconds\":7776000,\"auto_migrate_to_next_attestation_profile\":false}}",
+    "new_pd": "13d12bd0e9e8cc004b125a0819e4a25e49ed9531d14a478d463342f9bdb1223f",
+    "target": "3eb18194caee41a19961d2566e5576f1281726092ed64b3bf4f280716b37d161",
+    "text": "privasys-vault-approval/v2\n2\n1111111111111111111111111111111111111111111111111111111111111111\n2222222222222222222222222222222222222222222222222222222222222222\nupdate_policy_from\napps.privasys.org/0123456789abcdef0123456789abcdef/data-v2\n3eb18194caee41a19961d2566e5576f1281726092ed64b3bf4f280716b37d161\n3\noidc:0:test-subject-1\n-\nAAECAwQFBgcICQoLDA0ODw\n1764000600",
+    "vault_op": "_V5snvtMPHQ0q8mmH3xH2XOuOVTnASF4Njd0x2hdDR8"
+  },
   "binding_v2_update_policy_with_pd": {
     "approver": "oidc:0:test-subject-1",
     "exp": 1764000600,

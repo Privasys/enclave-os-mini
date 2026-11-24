@@ -467,6 +467,10 @@ struct CreateExtras {
 /// links (formats §9.1).
 pub const CAPABILITY_GENERATIONS: &str = "generations-v1";
 
+/// The capability a build publishes when it accepts `update_policy_from`
+/// (formats §5.3).
+pub const CAPABILITY_UPDATE_FROM: &str = "update-policy-from-v1";
+
 /// Whether a handle's last segment is a generation marker "gen-<digits>"
 /// (formats §9.1): the suffix user-secret generations use, and nothing else.
 fn is_generation_handle(handle: &str) -> bool {
@@ -672,7 +676,10 @@ fn handle_identity() -> VaultResponse {
         billing_id,
         mrenclave,
         quote_b64: URL_SAFE_NO_PAD.encode(quote),
-        capabilities: vec![CAPABILITY_GENERATIONS.to_string()],
+        capabilities: vec![
+            CAPABILITY_GENERATIONS.to_string(),
+            CAPABILITY_UPDATE_FROM.to_string(),
+        ],
     }
 }
 
@@ -1103,13 +1110,34 @@ fn handle_update_policy(
             Err(e) => return VaultResponse::Error(format!("new_policy does not parse: {e}")),
         }
     };
+    // update_policy_from (formats §5.3): the approval also names the policy it
+    // replaces; it must be the one this vault holds now.
+    let replaced_pd = binding.as_ref().and_then(|b| b.replaced_pd.clone());
+    let (op, target) = match replaced_pd {
+        None => ("update_policy", canonical.map(|c| c.pd)),
+        Some(replaced) => {
+            let current = match v2::stored_policy_digest(&record.policy) {
+                Ok(pd) => pd,
+                Err(e) => return VaultResponse::Error(e),
+            };
+            if replaced != current {
+                let e = "replaced_pd is not this key's current policy: the policy changed since the approval was asked for".to_string();
+                let _ = audit_denial(ctx, &mut record, "UpdatePolicy", &caller, AuditDecision::Denied, &e);
+                return VaultResponse::Error(e);
+            }
+            (
+                "update_policy_from",
+                canonical.map(|c| v2::update_from_target(&current, &c.pd)),
+            )
+        }
+    };
     let op_binding = crate::policy::OpBinding {
         measurement_digest_hex: String::new(),
         policy_version: record.policy_version,
         v1: false,
         v2: Some(crate::policy::OpBindingV2 {
-            op: "update_policy",
-            target: canonical.map(|c| c.pd),
+            op,
+            target,
             members: binding.map(|b| b.members),
         }),
     };
