@@ -32,7 +32,7 @@ vault plays in a quorum, and there is no cross-vault coordination.
 ```text
 KeyRecord
   handle:        stable string ("tenant42/master-kek")
-  key_type:      KeyType              (RawShare | Aes256GcmKey | P256SigningKey | HmacSha256Key)
+  key_type:      KeyType              (RawShare | Aes256GcmKey | P256SigningKey | HmacSha256Key | FrostEd25519)
   exportable:    bool                  (gates ExportKey)
   public_key:    Option<Vec<u8>>       (for asymmetric keys, raw EC point)
   created_at, expires_at, policy_version
@@ -54,6 +54,7 @@ sealing round-trip.
 | `Aes256GcmKey` | `Wrap`, `Unwrap`, optional `ExportKey` | 32-byte AES-256 KEK / DEK. |
 | `P256SigningKey` | `Sign`, optional `ExportKey` | PKCS#8 v1 ECDSA-P256 private key. Returns IEEE-P1363 fixed-length 64-byte signatures. |
 | `HmacSha256Key` | `Mac`, optional `ExportKey` | 32-64 byte HMAC key. |
+| `FrostEd25519` | threshold signing and resharing (§2.6) | One vault's share of a threshold Ed25519 key (FROST(Ed25519, SHA-512), RFC 9591, crate `enclave-os-frost`). Created by distributed key generation; never exportable. |
 
 `exportable` is opt-in per key. Default for non-`RawShare` types is
 **non-exportable**: the enclave performs the operation; the raw private
@@ -128,6 +129,22 @@ KV. Every mutating or denied request appends one entry.
 | `ListPendingProfiles { handle }` | Owner / auditor / managers. |
 | `PromotePendingProfile { handle, pending_id, approvals? }` | Subject to `Mutability` for `PolicyField::Tees` — typically requires the configured threshold of fresh `ApprovalToken`s. Promotes the profile into `policy.principals.tees`. |
 | `RevokePendingProfile { handle, pending_id }` | Owner / managers. Drops without promoting. |
+
+### 2.6 Threshold Ed25519 keys (FROST)
+
+The client orchestrates every round across the constellation; the vaults never
+call each other. Each vault's round-1 message carries an SGX quote over the
+round binding, and every vault verifies the others' quotes (a DEBUG enclave is
+refused). Sessions belong to their caller (OIDC subject + client certificate),
+hold at most 16 per caller, and end on any failed round. Signing nonces live
+in enclave memory only and are single-use.
+
+| RPC | Description |
+|---|---|
+| `FrostDkgRound1` / `FrostDkgRound2` / `FrostDkgRound3` / `FrostDkgCommit` (`FrostDkgAbort`) | Distributed key generation under a key-creation grant: round 1 packages plus an X25519 key, round 2 packages sealed (AES-GCM) to each peer, round 3 HMAC confirmations, then commit. The context binds the participant list and the threshold. |
+| `FrostSignRound1` / `FrostSignRound2` / `FrostAggregate` (`FrostSignAbort`) | Signing: commitments (the policy's `Sign` rule is checked and audited here), signature shares over the message the vault kept, aggregation into one EdDSA signature (principals only). |
+| `FrostReshareTarget1` / `FrostReshareDeal` / `FrostReshareTarget2` / `FrostReshareCommit` (`FrostReshareAbort`) | Resharing (renewal or move, same handle and public key, the threshold may change): the target vaults quote their key and the policy, each helper deals λᵢ·sᵢ with a Feldman VSS sealed to the target, the targets verify and sum, then confirm. A helper deals only under an owner step-up whose measurement slot is the resharing context (handle, group key, helpers, threshold, target vaults, target MRENCLAVE). |
+| `FrostReshareFinalize` / `FrostReshareRollback` | A renewal in place keeps the previous share as `prev:<handle>` until finalize; rollback restores it. |
 
 ---
 
