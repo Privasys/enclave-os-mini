@@ -788,5 +788,10 @@ pub fn verify(public_key: &[u8], message: &[u8], signature: &[u8]) -> Result<(),
     vk.verify(message, &sig).map_err(err)
 }
 
+pub mod reshare;
+
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod reshare_tests;

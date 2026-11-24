@@ -549,6 +549,46 @@ fn evaluate_conditions(
     Ok(())
 }
 
+/// The owner, with a fresh WebAuthn step-up bound to this operation: what
+/// resharing a threshold key requires, as exporting a secret does. Whatever
+/// the key's policy says, only its owner moves it, and only with a wallet
+/// approval naming exactly where it goes (`binding_hex`, carried in the
+/// step-up's measurement slot).
+pub(crate) fn require_owner_step_up(
+    policy: &KeyPolicy,
+    policy_version: u32,
+    handle: &str,
+    binding_hex: &str,
+    ctx: &RequestContext,
+) -> Result<(), String> {
+    match resolve_caller(policy, ctx) {
+        Some((_, CallerRole::Owner)) => {}
+        _ => return Err("only the key's owner may reshare it".into()),
+    }
+    let step_up = [Condition::OidcStepUp {
+        required_amr: vec!["webauthn".into()],
+        operation_bound: true,
+        fresh_for_seconds: RESHARE_STEP_UP_FRESH_SECONDS,
+    }];
+    let binding = OpBinding {
+        measurement_digest_hex: binding_hex.to_string(),
+        policy_version,
+    };
+    evaluate_conditions(
+        &step_up,
+        policy,
+        policy_version,
+        Operation::UpdatePolicy,
+        handle,
+        &[],
+        ctx,
+        Some(&binding),
+    )
+}
+
+/// How fresh the owner's step-up must be to reshare (as for export).
+pub(crate) const RESHARE_STEP_UP_FRESH_SECONDS: u64 = 300;
+
 // ---------------------------------------------------------------------------
 //  Policy update evaluation
 // ---------------------------------------------------------------------------

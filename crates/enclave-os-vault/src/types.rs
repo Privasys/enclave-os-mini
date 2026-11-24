@@ -278,6 +278,61 @@ pub enum VaultRequest {
         commitments_b64: BTreeMap<u16, String>,
         shares_b64: BTreeMap<u16, String>,
     },
+
+    // --- Resharing a threshold key (same group key, new shares) ----------
+    //
+    // Renewal, and moving a key to another constellation, as `secrets renew`
+    // does for a Shamir secret: the client drives it, the old vaults (the
+    // helpers) deal only to the owner with a fresh wallet step-up naming
+    // exactly where the key goes. See `crate::threshold`.
+    /// Round 1 on each NEW participant (`index` of `vaults`): a creation
+    /// grant for the handle, the old key's public key package and the
+    /// helpers (old participant indices). The handle may already hold the
+    /// old key on this vault (renewal in place).
+    FrostReshareTarget1 {
+        session: String,
+        handle: String,
+        grant: String,
+        index: u16,
+        threshold: u16,
+        vaults: Vec<String>,
+        helpers: Vec<u16>,
+        old_public_key_package_b64: String,
+    },
+    /// On each helper: deal this vault's share to the new participants, whose
+    /// quotes must carry `target_mrenclave`. The bearer must be the key's
+    /// owner with a fresh step-up (operation `reshare`) whose measurement slot
+    /// is the hex resharing context.
+    FrostReshareDeal {
+        session: String,
+        handle: String,
+        helpers: Vec<u16>,
+        threshold: u16,
+        vaults: Vec<String>,
+        target_mrenclave: String,
+        targets: BTreeMap<u16, FrostTargetMessage>,
+    },
+    /// Round 2 on each new participant: every new participant's first message
+    /// and every helper's deal for this vault.
+    FrostReshareTarget2 {
+        session: String,
+        handle: String,
+        targets: BTreeMap<u16, FrostTargetMessage>,
+        deals: BTreeMap<u16, FrostDealMessage>,
+    },
+    /// Store the new share once every other new participant confirmed. A
+    /// renewal in place keeps the previous record until finalized.
+    FrostReshareCommit {
+        session: String,
+        handle: String,
+        confirmations_b64: BTreeMap<u16, String>,
+    },
+    FrostReshareAbort { session: String },
+    /// Owner: drop the previous record kept by a renewal in place.
+    FrostReshareFinalize { handle: String },
+    /// Owner: put the previous record back (a renewal that did not commit on
+    /// every vault).
+    FrostReshareRollback { handle: String },
 }
 
 /// A vault RPC response, JSON-encoded inside `Response::Data`.
@@ -384,9 +439,45 @@ pub enum VaultResponse {
     FrostSignatureShare {
         share: Vec<u8>,
     },
+    FrostReshareTarget {
+        dh_public: Vec<u8>,
+        quote: Vec<u8>,
+    },
+    /// A helper's deal: its commitment and one sealed piece per new vault.
+    FrostReshareDealt {
+        commitment: Vec<Vec<u8>>,
+        sealed: BTreeMap<u16, Vec<u8>>,
+    },
     FrostDone,
 
     Error(String),
+}
+
+/// A new participant's first resharing message, as the client relays it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FrostTargetMessage {
+    pub dh_public_b64: String,
+    pub quote_b64: String,
+}
+
+/// A helper's deal for one new participant, as the client relays it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct FrostDealMessage {
+    pub commitment_b64: Vec<String>,
+    pub sealed_b64: String,
+}
+
+/// What a vault holds of a threshold key (public).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ThresholdKeyInfo {
+    /// This vault's participant index.
+    pub index: u16,
+    pub threshold: u16,
+    pub participants: u16,
+    /// The participants' endpoints, participant `i` at `vaults[i - 1]`.
+    pub vaults: Vec<String>,
+    /// Serialised FROST public key package (verifying shares + group key).
+    pub public_key_package: Vec<u8>,
 }
 
 /// A participant's DKG round 1 message, as the client relays it.
@@ -410,6 +501,9 @@ pub struct KeyInfo {
     /// for symmetric keys.
     #[serde(default)]
     pub public_key: Option<Vec<u8>>,
+    /// Threshold keys: this vault's part (public).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub threshold: Option<ThresholdKeyInfo>,
 }
 
 /// Entry returned by `VaultRequest::ListKeys`.

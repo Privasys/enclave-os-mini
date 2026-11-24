@@ -36,9 +36,10 @@ use enclave_os_frost as frost;
 use frost::{Round1Msg, StoredShare};
 
 use crate::grant::KeyCreationGrant;
-use crate::policy::resolve_caller;
+use crate::policy::{resolve_caller, CallerRole};
 use crate::types::{
-    ApprovalToken, AuditDecision, KeyRecord, KeyType, Operation, VaultRequest, VaultResponse,
+    ApprovalToken, AuditDecision, FrostTargetMessage, KeyRecord, KeyType, Operation,
+    ThresholdKeyInfo, VaultRequest, VaultResponse,
 };
 use crate::{
     add_to_owner_index, audit_and_save, caller_str, check_grant_for_handle, expired, kv,
@@ -64,8 +65,11 @@ struct PendingKey {
 struct State {
     dkg: frost::DkgStore,
     sign: frost::SignStore,
+    reshare: frost::reshare::ReshareStore,
+    /// Keys being generated or reshared onto this vault, by session.
     pending: BTreeMap<String, PendingKey>,
-    /// Who opened each session ("dkg:<id>" / "sign:<id>"), and when.
+    /// Who opened each session ("dkg:<id>" / "sign:<id>" / "reshare:<id>"),
+    /// and when.
     owners: BTreeMap<String, (String, u64)>,
 }
 
@@ -74,6 +78,7 @@ impl State {
         State {
             dkg: frost::DkgStore::new(),
             sign: frost::SignStore::new(),
+            reshare: frost::reshare::ReshareStore::new(),
             pending: BTreeMap::new(),
             owners: BTreeMap::new(),
         }
@@ -83,8 +88,9 @@ impl State {
         self.owners
             .retain(|_, (_, created)| now < created.saturating_add(frost::DKG_SESSION_TTL_SECS));
         let owners = &self.owners;
-        self.pending
-            .retain(|id, _| owners.contains_key(&format!("dkg:{id}")));
+        self.pending.retain(|id, _| {
+            owners.contains_key(&format!("dkg:{id}")) || owners.contains_key(&format!("reshare:{id}"))
+        });
     }
 
     /// Record the caller that opens a session. One caller holds at most
@@ -337,6 +343,106 @@ fn run(req: VaultRequest, ctx: &RequestContext) -> Result<VaultResponse, String>
             })
         }
 
+        VaultRequest::FrostReshareTarget1 {
+            session,
+            handle,
+            grant,
+            index,
+            threshold,
+            vaults,
+            helpers,
+            old_public_key_package_b64,
+        } => reshare_target1(
+            &session,
+            &handle,
+            &grant,
+            index,
+            threshold,
+            vaults,
+            helpers,
+            &old_public_key_package_b64,
+            &caller,
+            ctx,
+        ),
+        VaultRequest::FrostReshareDeal {
+            session,
+            handle,
+            helpers,
+            threshold,
+            vaults,
+            target_mrenclave,
+            targets,
+        } => reshare_deal(&session, &handle, &helpers, threshold, &vaults, &target_mrenclave, &targets, ctx),
+        VaultRequest::FrostReshareTarget2 {
+            session,
+            handle,
+            targets,
+            deals,
+        } => {
+            let targets = decode_targets(&targets)?;
+            let mut d = BTreeMap::new();
+            for (i, m) in &deals {
+                let commitment = m
+                    .commitment_b64
+                    .iter()
+                    .map(|c| unb64(c, "commitment"))
+                    .collect::<Result<Vec<_>, _>>()?;
+                d.insert(*i, (commitment, unb64(&m.sealed_b64, "sealed piece")?));
+            }
+            let now = now()?;
+            let out = with_state(|st| {
+                st.check_owner(&format!("reshare:{session}"), &caller, now)?;
+                st.reshare
+                    .round2(&session, &handle, &targets, &d, &verify_vault_quote, now)
+            })?;
+            Ok(VaultResponse::FrostDkgConfirm {
+                public_key: out.group_public_key,
+                confirmations: out.confirmations,
+            })
+        }
+        VaultRequest::FrostReshareCommit {
+            session,
+            handle,
+            confirmations_b64,
+        } => {
+            let confirmations = map_unb64(&confirmations_b64, "confirmation")?;
+            let now = now()?;
+            let (share, p) = with_state(|st| {
+                st.check_owner(&format!("reshare:{session}"), &caller, now)?;
+                let p = st
+                    .pending
+                    .remove(&session)
+                    .ok_or("unknown or expired threshold session")?;
+                let share = st.reshare.commit(&session, &handle, &confirmations, now);
+                st.owners.remove(&format!("reshare:{session}"));
+                Ok((share?, p))
+            })?;
+            if p.handle != handle {
+                return Err("resharing session is for another key".into());
+            }
+            let (public_key, expires_at) = store_reshared(&p, &share, now, ctx)?;
+            Ok(VaultResponse::ThresholdKeyCreated {
+                handle,
+                index: p.index,
+                threshold: p.threshold,
+                public_key,
+                expires_at,
+            })
+        }
+        VaultRequest::FrostReshareAbort { session } => {
+            let now = now()?;
+            with_state(|st| {
+                st.check_owner(&format!("reshare:{session}"), &caller, now)?;
+                st.reshare.abort(&session);
+                st.pending.remove(&session);
+                st.owners.remove(&format!("reshare:{session}"));
+                Ok(())
+            })?;
+            Ok(VaultResponse::FrostDone)
+        }
+        VaultRequest::FrostReshareFinalize { handle } => reshare_finish(&handle, false, ctx),
+        VaultRequest::FrostReshareRollback { handle } => reshare_finish(&handle, true, ctx),
+
         _ => Err("not a threshold request".into()),
     }
 }
@@ -366,6 +472,14 @@ const SGX_FLAGS_DEBUG: u8 = 0x02;
 /// verified by the configured attestation servers, and its report data must
 /// carry `binding` (the first 32 bytes; the rest zero).
 fn verify_vault_quote(quote: &[u8], binding: &[u8; 32]) -> Result<(), String> {
+    let mine = enclave_os_egress::enclave_self_mrenclave()
+        .ok_or("this enclave's MRENCLAVE is not available")?;
+    verify_quote_of(quote, binding, &mine)
+}
+
+/// The same checks against a named build: a quote from a vault whose
+/// MRENCLAVE is `expected` (a resharing's target constellation).
+fn verify_quote_of(quote: &[u8], binding: &[u8; 32], expected: &[u8; 32]) -> Result<(), String> {
     // A DEBUG enclave's memory is readable by its host: never a participant.
     // SGX quote v3: 48-byte header, then the report body, whose ATTRIBUTES
     // flags (u64 LE) sit at body offset 48; bit 1 is DEBUG.
@@ -385,14 +499,12 @@ fn verify_vault_quote(quote: &[u8], binding: &[u8; 32]) -> Result<(), String> {
         }
     }
     let identity = crate::quote::parse_quote(quote)?;
-    let mine = enclave_os_egress::enclave_self_mrenclave()
-        .ok_or("this enclave's MRENCLAVE is not available")?;
     if identity.tee != crate::quote::TeeType::Sgx
         || !identity
             .measurement
-            .eq_ignore_ascii_case(&crate::quote::hex_encode(&mine))
+            .eq_ignore_ascii_case(&crate::quote::hex_encode(expected))
     {
-        return Err("the quote is not from a vault of this build".into());
+        return Err("the quote is not from a vault of the expected build".into());
     }
     let rd = crate::quote::extract_report_data(quote)?;
     if rd[..32] != binding[..] || rd[32..].iter().any(|b| *b != 0) {
@@ -428,6 +540,7 @@ fn check_creation(
     vaults: &[String],
     threshold: u16,
     index: u16,
+    allow_existing: bool,
 ) -> Result<(), String> {
     check_grant_for_handle(handle, grant)?;
     if grant.key_type != KeyType::FrostEd25519 {
@@ -450,6 +563,9 @@ fn check_creation(
         if v.is_empty() || v.len() > 256 || vaults[..i].contains(v) {
             return Err("vaults must be distinct, non-empty host:port endpoints".into());
         }
+    }
+    if allow_existing {
+        return Ok(());
     }
     let kv = kv().map_err(response_error)?;
     let store = kv.lock().map_err(|_| "kv store lock poisoned".to_string())?;
@@ -474,7 +590,7 @@ fn dkg_round1(
     let now = now()?;
     // Bound to the caller, as for CreateKey.
     let grant = crate::grant::verify_grant(grant_jwt, ctx, now)?;
-    check_creation(handle, &grant, &vaults, threshold, index)?;
+    check_creation(handle, &grant, &vaults, threshold, index, false)?;
     let n = vaults.len() as u16;
     let out = with_state(|st| {
         st.open(format!("dkg:{session}"), caller, now)?;
@@ -594,6 +710,321 @@ fn sign_round1(
     })
 }
 
+// ---------------------------------------------------------------------------
+//  Resharing (renewal, and moving a key to another constellation)
+// ---------------------------------------------------------------------------
+
+/// KV key of the record a renewal in place keeps until it is finalized.
+pub(crate) fn previous_key(handle: &str) -> Vec<u8> {
+    format!("prev:{handle}").into_bytes()
+}
+
+/// A threshold key's public part on this vault, for `GetKeyInfo`.
+pub(crate) fn key_info(record: &KeyRecord) -> Option<ThresholdKeyInfo> {
+    if record.key_type != KeyType::FrostEd25519 {
+        return None;
+    }
+    let share = StoredShare::from_bytes(&record.material).ok()?;
+    Some(ThresholdKeyInfo {
+        index: share.index,
+        threshold: share.min_signers,
+        participants: share.max_signers,
+        vaults: record.threshold_vaults.clone(),
+        public_key_package: share.public_key_package.clone(),
+    })
+}
+
+/// What a resharing binds: the key (handle and group key), the helpers, the
+/// new participants and threshold, and the new vaults' build. The new
+/// vaults' quotes bind it, every helper recomputes it, and the owner's
+/// wallet approval carries it (hex) in its measurement slot.
+pub fn reshare_context(
+    handle: &str,
+    group_key: &[u8],
+    helpers: &[u16],
+    threshold: u16,
+    vaults: &[String],
+    target_mrenclave: &[u8; 32],
+) -> [u8; 32] {
+    let mut h = ring::digest::Context::new(&ring::digest::SHA256);
+    h.update(b"privasys-vault-frost-reshare-v1");
+    h.update(&(handle.len() as u64).to_be_bytes());
+    h.update(handle.as_bytes());
+    h.update(&(group_key.len() as u64).to_be_bytes());
+    h.update(group_key);
+    h.update(&(helpers.len() as u64).to_be_bytes());
+    for i in helpers {
+        h.update(&i.to_be_bytes());
+    }
+    h.update(&threshold.to_be_bytes());
+    h.update(&(vaults.len() as u64).to_be_bytes());
+    for v in vaults {
+        h.update(&(v.len() as u64).to_be_bytes());
+        h.update(v.as_bytes());
+    }
+    h.update(target_mrenclave);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finish().as_ref());
+    out
+}
+
+/// What the new vaults' quotes bind: the resharing context and the key's
+/// policy. A helper computes it from the policy it holds, a new vault from the
+/// policy its creation grant carries: a renewal cannot change the key's
+/// policy (its owner, principals, rules), whoever authored the grant.
+fn quote_context(context: &[u8; 32], policy: &crate::types::KeyPolicy) -> Result<[u8; 32], String> {
+    let bytes = serde_json::to_vec(policy).map_err(|e| format!("serialise policy: {e}"))?;
+    let mut h = ring::digest::Context::new(&ring::digest::SHA256);
+    h.update(b"privasys-vault-frost-reshare-policy-v1");
+    h.update(context);
+    h.update(&bytes);
+    let mut out = [0u8; 32];
+    out.copy_from_slice(h.finish().as_ref());
+    Ok(out)
+}
+
+fn decode_targets(
+    targets: &BTreeMap<u16, FrostTargetMessage>,
+) -> Result<BTreeMap<u16, frost::reshare::TargetMsg>, String> {
+    targets
+        .iter()
+        .map(|(j, m)| {
+            Ok((
+                *j,
+                frost::reshare::TargetMsg {
+                    dh_public: unb64(&m.dh_public_b64, "X25519 key")?,
+                    quote: unb64(&m.quote_b64, "quote")?,
+                },
+            ))
+        })
+        .collect()
+}
+
+fn mrenclave_bytes(hex: &str) -> Result<[u8; 32], String> {
+    enclave_os_common::hex::hex_decode(hex)
+        .and_then(|b| <[u8; 32]>::try_from(b.as_slice()).ok())
+        .ok_or_else(|| "target_mrenclave must be 32 bytes of hex".to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reshare_target1(
+    session: &str,
+    handle: &str,
+    grant_jwt: &str,
+    index: u16,
+    threshold: u16,
+    vaults: Vec<String>,
+    helpers: Vec<u16>,
+    old_pkp_b64: &str,
+    caller: &str,
+    ctx: &RequestContext,
+) -> Result<VaultResponse, String> {
+    let now = now()?;
+    // Bound to the caller, as for CreateKey.
+    let grant = crate::grant::verify_grant(grant_jwt, ctx, now)?;
+    let old_pkp = unb64(old_pkp_b64, "old public key package")?;
+    let group = frost::reshare::group_key_of(&old_pkp)?;
+    // The handle may hold the old key here already (renewal in place); then
+    // the new key must be that key.
+    let existing = load_record(handle).ok();
+    if let Some(r) = &existing {
+        if r.key_type != KeyType::FrostEd25519 || r.public_key.as_deref() != Some(&group[..]) {
+            return Err("the handle holds another key on this vault".into());
+        }
+    }
+    check_creation(handle, &grant, &vaults, threshold, index, existing.is_some())?;
+    let mine = enclave_os_egress::enclave_self_mrenclave()
+        .ok_or("this enclave's MRENCLAVE is not available")?;
+    let context = reshare_context(handle, &group, &helpers, threshold, &vaults, &mine);
+    let context = quote_context(&context, &normalise_policy(grant.policy.clone()))?;
+    if let Some(r) = &existing {
+        let kv = kv().map_err(response_error)?;
+        let store = kv.lock().map_err(|_| "kv store lock poisoned".to_string())?;
+        if let Ok(Some(_)) = store.get(&previous_key(&r.handle)) {
+            return Err("a previous renewal of this key is not finalized: finalize or roll it back first".into());
+        }
+    }
+    let n = vaults.len() as u16;
+    let out = with_state(|st| {
+        st.open(format!("reshare:{session}"), caller, now)?;
+        let out = st
+            .reshare
+            .round1(session, handle, &context, index, threshold, n, &old_pkp, &helpers, now)
+            .inspect_err(|_| {
+                st.owners.remove(&format!("reshare:{session}"));
+            })?;
+        st.pending.insert(
+            session.to_string(),
+            PendingKey {
+                handle: handle.to_string(),
+                index,
+                threshold,
+                grant,
+                vaults,
+            },
+        );
+        Ok(out)
+    })?;
+    let Some(quote) = enclave_os_egress::enclave_attestation_quote(&out.binding) else {
+        let _ = with_state(|st| {
+            st.reshare.abort(session);
+            st.pending.remove(session);
+            st.owners.remove(&format!("reshare:{session}"));
+            Ok(())
+        });
+        return Err("this vault could not produce an attestation quote".into());
+    };
+    Ok(VaultResponse::FrostReshareTarget {
+        dh_public: out.dh_public,
+        quote,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn reshare_deal(
+    session: &str,
+    handle: &str,
+    helpers: &[u16],
+    threshold: u16,
+    vaults: &[String],
+    target_mrenclave: &str,
+    targets: &BTreeMap<u16, FrostTargetMessage>,
+    ctx: &RequestContext,
+) -> Result<VaultResponse, String> {
+    let mut record = threshold_record(handle)?;
+    let share = StoredShare::from_bytes(&record.material)?;
+    let target = mrenclave_bytes(target_mrenclave)?;
+    let group = share.group_public_key()?;
+    let n = u16::try_from(vaults.len()).map_err(|_| "too many vaults".to_string())?;
+    let context = reshare_context(handle, &group, helpers, threshold, vaults, &target);
+    let caller = caller_str(ctx);
+    // As exporting a secret: the owner, with a wallet approval of exactly
+    // this move.
+    if let Err(e) = crate::policy::require_owner_step_up(
+        &record.policy,
+        record.policy_version,
+        handle,
+        &crate::quote::hex_encode(&context),
+        ctx,
+    ) {
+        let _ = crate::audit_denial(ctx, &mut record, "ReshareDeal", &caller, AuditDecision::Denied, &e);
+        return Err(e);
+    }
+    let targets = decode_targets(targets)?;
+    let verify = |q: &[u8], b: &[u8; 32]| verify_quote_of(q, b, &target);
+    let bound = quote_context(&context, &record.policy)?;
+    let deal = frost::reshare::deal(&share, session, handle, &bound, helpers, threshold, n, &targets, &verify)
+        .map_err(|e| {
+            if e.contains("quote does not bind") {
+                format!("{e} (or the renewal would change the key's policy)")
+            } else {
+                e
+            }
+        })?;
+    audit_and_save(
+        &mut record,
+        "ReshareDeal",
+        &caller,
+        AuditDecision::Allowed,
+        &format!(
+            "to {n} vaults, threshold {threshold}, build {}",
+            &target_mrenclave[..target_mrenclave.len().min(16)]
+        ),
+    )
+    .map_err(response_error)?;
+    Ok(VaultResponse::FrostReshareDealt {
+        commitment: deal.commitment,
+        sealed: deal.sealed,
+    })
+}
+
+/// Store a reshared key. A renewal in place keeps the previous record (under
+/// [`previous_key`]) until the owner finalizes, so a resharing that did not
+/// commit everywhere can be rolled back.
+fn store_reshared(
+    p: &PendingKey,
+    share: &StoredShare,
+    now: u64,
+    ctx: &RequestContext,
+) -> Result<(Vec<u8>, u64), String> {
+    let Ok(mut old) = load_record(&p.handle) else {
+        return store_record(p, share, now, ctx);
+    };
+    let public_key = share.group_public_key()?;
+    if old.public_key.as_deref() != Some(&public_key[..]) {
+        return Err("the handle holds another key on this vault".into());
+    }
+    let kv = kv().map_err(response_error)?;
+    {
+        let store = kv.lock().map_err(|_| "kv store lock poisoned".to_string())?;
+        if let Ok(Some(_)) = store.get(&previous_key(&p.handle)) {
+            return Err("a previous renewal of this key is not finalized yet".into());
+        }
+        let bytes = serde_json::to_vec(&old).map_err(|e| format!("serialise record: {e}"))?;
+        store
+            .put(&previous_key(&p.handle), &bytes)
+            .map_err(|e| format!("kv put failed: {e}"))?;
+    }
+    let policy = normalise_policy(p.grant.policy.clone());
+    old.expires_at = now.saturating_add(policy.lifecycle.ttl_seconds);
+    old.policy = policy;
+    old.policy_version = old.policy_version.saturating_add(1);
+    old.material = share.to_bytes()?.to_vec();
+    old.threshold_vaults = p.vaults.clone();
+    old.created_at = now;
+    let expires_at = old.expires_at;
+    audit_and_save(
+        &mut old,
+        "ReshareKey",
+        &caller_str(ctx),
+        AuditDecision::Allowed,
+        &format!(
+            "in place, participant={}/{} threshold={}",
+            p.index,
+            p.vaults.len(),
+            p.threshold
+        ),
+    )
+    .map_err(response_error)?;
+    Ok((public_key, expires_at))
+}
+
+/// Owner: finalize (drop the kept previous record) or roll back (restore it).
+fn reshare_finish(handle: &str, rollback: bool, ctx: &RequestContext) -> Result<VaultResponse, String> {
+    let mut record = load_record(handle).map_err(response_error)?;
+    match resolve_caller(&record.policy, ctx) {
+        Some((_, CallerRole::Owner)) => {}
+        _ => return Err("only the key's owner may finalize or roll back a renewal".into()),
+    }
+    let kv = kv().map_err(response_error)?;
+    let previous = {
+        let store = kv.lock().map_err(|_| "kv store lock poisoned".to_string())?;
+        store
+            .get(&previous_key(handle))
+            .map_err(|e| format!("kv get failed: {e}"))?
+    };
+    let Some(previous) = previous else {
+        return Ok(VaultResponse::FrostDone);
+    };
+    let op = if rollback { "ReshareRollback" } else { "ReshareFinalize" };
+    if rollback {
+        let mut restored: KeyRecord =
+            serde_json::from_slice(&previous).map_err(|e| format!("corrupt previous record: {e}"))?;
+        // Keep the audit log running on.
+        restored.audit_next_seq = record.audit_next_seq;
+        audit_and_save(&mut restored, op, &caller_str(ctx), AuditDecision::Allowed, "")
+            .map_err(response_error)?;
+    } else {
+        audit_and_save(&mut record, op, &caller_str(ctx), AuditDecision::Allowed, "")
+            .map_err(response_error)?;
+    }
+    let mut store = kv.lock().map_err(|_| "kv store lock poisoned".to_string())?;
+    store
+        .delete(&previous_key(handle))
+        .map_err(|e| format!("kv delete failed: {e}"))?;
+    Ok(VaultResponse::FrostDone)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -642,9 +1073,9 @@ mod tests {
         let mut quote = vec![0u8; 600];
         quote[0] = 3;
         quote[SGX_QUOTE_ATTRIBUTES_FLAGS] = SGX_FLAGS_DEBUG | 0x01;
-        let e = verify_vault_quote(&quote, &[0u8; 32]).unwrap_err();
+        let e = verify_quote_of(&quote, &[0u8; 32], &[1u8; 32]).unwrap_err();
         assert!(e.contains("DEBUG"), "{e}");
-        assert!(verify_vault_quote(&quote[..50], &[0u8; 32]).unwrap_err().contains("too short"));
+        assert!(verify_quote_of(&quote[..50], &[0u8; 32], &[1u8; 32]).unwrap_err().contains("too short"));
     }
 
     #[test]
@@ -667,6 +1098,30 @@ mod tests {
         assert_ne!(a, dkg_context(&v(&["a:1", "b:2", "c:3"]), 2));
         assert_ne!(dkg_context(&v(&["a:1", "b:2", "c:3"]), 2), dkg_context(&v(&["a:1", "b:2", "c:3"]), 3));
         assert_ne!(dkg_context(&v(&["a:1b", ":2"]), 2), dkg_context(&v(&["a:1", "b:2"]), 2));
+    }
+
+    #[test]
+    fn the_reshare_context_matches_the_go_client() {
+        // The same vector is asserted by the Go client (frost_test.go), which
+        // computes the step-up binding the owner approves.
+        let v = vec!["a:1".to_string(), "b:2".to_string(), "c:3".to_string()];
+        let c = reshare_context("vaults/x/k", &[1u8; 32], &[1, 3], 2, &v, &[9u8; 32]);
+        assert_eq!(
+            crate::quote::hex_encode(&c),
+            "e6077b2adf28720e9348c478cc1668cf47604c8b4ede5d3def858bc65d7b6ea6"
+        );
+    }
+
+    #[test]
+    fn the_reshare_context_binds_every_input() {
+        let v = |xs: &[&str]| xs.iter().map(|x| x.to_string()).collect::<Vec<_>>();
+        let base = reshare_context("h", &[1u8; 32], &[1, 2], 2, &v(&["a:1", "b:2"]), &[9u8; 32]);
+        assert_ne!(base, reshare_context("h2", &[1u8; 32], &[1, 2], 2, &v(&["a:1", "b:2"]), &[9u8; 32]));
+        assert_ne!(base, reshare_context("h", &[2u8; 32], &[1, 2], 2, &v(&["a:1", "b:2"]), &[9u8; 32]));
+        assert_ne!(base, reshare_context("h", &[1u8; 32], &[1, 3], 2, &v(&["a:1", "b:2"]), &[9u8; 32]));
+        assert_ne!(base, reshare_context("h", &[1u8; 32], &[1, 2], 3, &v(&["a:1", "b:2"]), &[9u8; 32]));
+        assert_ne!(base, reshare_context("h", &[1u8; 32], &[1, 2], 2, &v(&["a:1", "c:3"]), &[9u8; 32]));
+        assert_ne!(base, reshare_context("h", &[1u8; 32], &[1, 2], 2, &v(&["a:1", "b:2"]), &[8u8; 32]));
     }
 
     #[test]

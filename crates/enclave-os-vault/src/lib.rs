@@ -175,7 +175,14 @@ impl EnclaveModule for VaultModule {
             | VaultRequest::FrostSignRound1 { .. }
             | VaultRequest::FrostSignRound2 { .. }
             | VaultRequest::FrostSignAbort { .. }
-            | VaultRequest::FrostAggregate { .. }) => threshold::handle(req, ctx),
+            | VaultRequest::FrostAggregate { .. }
+            | VaultRequest::FrostReshareTarget1 { .. }
+            | VaultRequest::FrostReshareDeal { .. }
+            | VaultRequest::FrostReshareTarget2 { .. }
+            | VaultRequest::FrostReshareCommit { .. }
+            | VaultRequest::FrostReshareAbort { .. }
+            | VaultRequest::FrostReshareFinalize { .. }
+            | VaultRequest::FrostReshareRollback { .. }) => threshold::handle(req, ctx),
         };
 
         match serde_json::to_vec(&resp) {
@@ -301,7 +308,7 @@ pub fn unaudited_denials() -> u64 {
 /// denials of the key's own principals (and of a platform manager bearer,
 /// which stages profiles); anyone else's denial is only counted in memory,
 /// so callers outside the policy cannot grow the log.
-fn audit_denial(
+pub(crate) fn audit_denial(
     ctx: &RequestContext,
     record: &mut KeyRecord,
     op: &str,
@@ -604,6 +611,7 @@ fn handle_delete(handle: &str, approvals: &[ApprovalToken], ctx: &RequestContext
     if let Err(e) = store.delete(&record_key(handle)) {
         return VaultResponse::Error(format!("kv delete failed: {e}"));
     }
+    let _ = store.delete(&threshold::previous_key(handle));
     let _ = remove_from_owner_index(&store, &owner_sub, handle);
     VaultResponse::KeyDeleted
 }
@@ -696,6 +704,7 @@ fn handle_get_info(handle: &str, ctx: &RequestContext) -> VaultResponse {
     if resolve_caller(&record.policy, ctx).is_none() {
         return VaultResponse::Error("caller is not in policy.principals".into());
     }
+    let threshold = threshold::key_info(&record);
     VaultResponse::KeyInfo(KeyInfo {
         handle: record.handle,
         key_type: record.key_type,
@@ -704,6 +713,7 @@ fn handle_get_info(handle: &str, ctx: &RequestContext) -> VaultResponse {
         expires_at: record.expires_at,
         policy_version: record.policy_version,
         public_key: record.public_key,
+        threshold,
     })
 }
 
