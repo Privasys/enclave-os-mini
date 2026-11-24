@@ -656,6 +656,8 @@ fn store_record(
         audit_next_seq: 0,
         next_pending_id: 0,
         threshold_vaults: p.vaults.clone(),
+        key_check: None,
+        predecessor: None,
     };
     audit_and_save(
         &mut record,

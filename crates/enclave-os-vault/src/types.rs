@@ -62,6 +62,31 @@ pub enum VaultRequest {
         /// IdP-issued grant (JWT) carrying owner, scope, key_type, exportable
         /// and policy.
         grant: String,
+        /// Renewal in place (formats §9): the handle of the key this one
+        /// succeeds, on this vault. The vault copies its policy, version and
+        /// key check value, and ignores the grant's policy.
+        #[serde(default)]
+        predecessor: Option<String>,
+        /// Renewal onto another constellation, or rotation (formats §9): the
+        /// key's current policy, read fresh from the source vault by the app
+        /// and carried verbatim. Takes the place of the grant's policy.
+        #[serde(default)]
+        policy: Option<Box<serde_json::value::RawValue>>,
+        /// The carried policy's version at the source.
+        #[serde(default)]
+        policy_version: Option<u32>,
+        /// Holder records the carried policy names (step 3; refused if
+        /// non-empty before then).
+        #[serde(default)]
+        holder_records: Vec<serde_json::Value>,
+        /// The source vault's billing id: a carried policy is accepted only
+        /// from a vault under this vault's billing configuration.
+        #[serde(default)]
+        source_billing_id: Option<String>,
+        /// The key check value of the whole key (formats §10.4), stored
+        /// opaquely and never returned.
+        #[serde(default)]
+        key_check: Option<KeyCheck>,
     },
 
     /// Export the raw key material.
@@ -72,6 +97,9 @@ pub enum VaultRequest {
         handle: String,
         #[serde(default)]
         approvals: Vec<ApprovalToken>,
+        /// Binding v2 fields, for a key whose step-up takes `binding: 2`.
+        #[serde(default)]
+        binding: Option<BindingV2Request>,
     },
 
     /// Delete a key and its policy.
@@ -79,14 +107,44 @@ pub enum VaultRequest {
         handle: String,
         #[serde(default)]
         approvals: Vec<ApprovalToken>,
+        /// Binding v2 fields, for a key whose step-up takes `binding: 2`.
+        #[serde(default)]
+        binding: Option<BindingV2Request>,
+        /// The old key of a migration or upgrade (formats §9.2): the delete
+        /// is bound to its successor and refused until the successor, where
+        /// this vault can see it, has succeeded.
+        #[serde(default)]
+        after: Option<DeleteAfter>,
     },
 
-    /// Replace the policy on an existing key.
+    /// Delete the previous generation after an automatic renewal (formats
+    /// §9.1), by an enclave the key's policy names, with no approval.
+    RetireKey {
+        handle: String,
+        successor: String,
+        successor_members: Vec<String>,
+    },
+
+    /// Replace the policy on an existing key. `new_policy` is kept as sent:
+    /// a v2 approval binds the digest of exactly this JSON (formats §5.1).
     UpdatePolicy {
         handle: String,
-        new_policy: KeyPolicy,
+        new_policy: Box<serde_json::value::RawValue>,
         #[serde(default)]
         approvals: Vec<ApprovalToken>,
+        /// Binding v2 fields, for a key whose step-up takes `binding: 2`.
+        #[serde(default)]
+        binding: Option<BindingV2Request>,
+    },
+
+    /// This vault's identity (formats §1): member id, billing id and a quote
+    /// binding them. Unauthenticated.
+    GetVaultIdentity,
+
+    /// Check a policy against formats §5.1 and return its digest, storing
+    /// nothing. Unauthenticated.
+    CanonicalisePolicy {
+        policy: Box<serde_json::value::RawValue>,
     },
 
     /// Read the policy for a key (metadata only).
@@ -209,6 +267,9 @@ pub enum VaultRequest {
         pending_id: u32,
         #[serde(default)]
         approvals: Vec<ApprovalToken>,
+        /// Binding v2 fields, for a key whose step-up takes `binding: 2`.
+        #[serde(default)]
+        binding: Option<BindingV2Request>,
     },
 
     /// Drop a pending profile without promoting it.
@@ -342,11 +403,29 @@ pub enum VaultResponse {
         handle: String,
         expires_at: u64,
     },
+    /// This vault's identity (formats §1). The quote's report data is
+    /// `H("privasys-vault-identity-v1\n" member_id "\n" billing_id)`.
+    VaultIdentity {
+        member_id: String,
+        member_public_key: String,
+        billing_id: String,
+        mrenclave: String,
+        quote_b64: String,
+    },
+    /// A policy checked against formats §5.1, and its digest.
+    CanonicalPolicy {
+        policy: KeyPolicy,
+        pd: String,
+    },
     KeyMaterial {
         material: Vec<u8>,
         expires_at: u64,
     },
     KeyDeleted,
+    /// `RetireKey`: whether the predecessor was still here to delete.
+    KeyRetired {
+        was_present: bool,
+    },
     PolicyUpdated {
         policy_version: u32,
     },
@@ -768,7 +847,41 @@ pub enum Condition {
         operation_bound: bool,
         #[serde(default)]
         fresh_for_seconds: u64,
+        /// Which binding the token's `vault_op` carries: absent or 0 for v1
+        /// (every key created before v2), 2 for binding v2 (formats §5). A
+        /// v2 condition is always operation-bound, and takes only v2.
+        #[serde(default, skip_serializing_if = "is_zero_u8")]
+        binding: u8,
     },
+}
+
+fn is_zero_u8(v: &u8) -> bool {
+    *v == 0
+}
+
+/// The request's part of a binding v2 (formats §5): the members it names,
+/// sorted. Every other field the vault takes from its own state, the
+/// operation, or the token.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct BindingV2Request {
+    pub members: Vec<String>,
+}
+
+/// The successor a `delete_after` is bound to (formats §9.2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DeleteAfter {
+    pub successor: String,
+    /// The successor's promote target (its profile digest), or `-` when the
+    /// successor was created rather than promoted.
+    pub successor_target: String,
+}
+
+/// The key check value of a whole key (formats §10.4): an Argon2id digest
+/// under a random salt. Stored opaquely and never returned.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct KeyCheck {
+    pub salt_b64: String,
+    pub digest_hex: String,
 }
 
 // ---------------------------------------------------------------------------
@@ -922,6 +1035,11 @@ pub struct KeyPolicy {
     pub mutability: Mutability,
     #[serde(default)]
     pub lifecycle: Lifecycle,
+    /// `"none"` opts the key out of approval by default (formats §4): a new
+    /// policy without approval rules on promote, update, delete and export
+    /// is refused unless it says so. Absent on every key created before v2.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -1022,4 +1140,11 @@ pub struct KeyRecord {
     /// `threshold_vaults[i - 1]`. Empty for other keys.
     #[serde(default)]
     pub threshold_vaults: Vec<String>,
+    /// The key check value of the whole key (formats §10.4), if the creator
+    /// gave one. Never returned by any call.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key_check: Option<KeyCheck>,
+    /// The key this one succeeds, when created by a renewal (formats §9).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub predecessor: Option<String>,
 }

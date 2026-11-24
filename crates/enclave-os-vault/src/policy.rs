@@ -48,6 +48,25 @@ pub struct OpBinding {
     pub measurement_digest_hex: String,
     /// The key's `policy_version` at the time of the operation.
     pub policy_version: u32,
+    /// Whether this operation has a v1 form. Update and delete do not: a v1
+    /// operation-bound condition on them fails closed, as it always has, so
+    /// that an export approval (same v1 slot) can never be spent on them.
+    pub v1: bool,
+    /// What a binding v2 needs (formats §5), for a condition with
+    /// `binding: 2`. `None` where the handler has no v2 form.
+    pub v2: Option<OpBindingV2>,
+}
+
+/// The operation's part of a binding v2: its name and target, computed by
+/// the vault, and the members the request names.
+pub struct OpBindingV2 {
+    /// `promote`, `export`, `update_policy`, `delete`, ...
+    pub op: &'static str,
+    /// The target as formats §5 defines it per op, or why it could not be
+    /// computed (for example a new policy that is not canonical).
+    pub target: Result<String, String>,
+    /// The request's sorted member ids, if it sent any.
+    pub members: Option<Vec<String>>,
 }
 
 /// Canonical digest of an [`AttestationProfile`] for operation binding: the
@@ -483,6 +502,7 @@ fn evaluate_conditions(
                 required_amr,
                 operation_bound,
                 fresh_for_seconds,
+                binding: binding_version,
             } => {
                 let claims = ctx
                     .oidc_claims
@@ -517,8 +537,19 @@ fn evaluate_conditions(
                 // cannot promote a different/forged measurement. Fail closed when
                 // the handler supplied no binding (op has no target) or the token
                 // lacks the claims. See the vault promote-step-up design.
+                //
+                // Binding v2 (formats §5): the key's condition says which
+                // version it takes, and it takes only that one.
+                match *binding_version {
+                    0 => {}
+                    2 => {
+                        check_binding_v2(claims, handle, op_binding, now()?)?;
+                        continue;
+                    }
+                    v => return Err(format!("OidcStepUp: unknown binding version {v}")),
+                }
                 if *operation_bound {
-                    let binding = op_binding.ok_or_else(|| {
+                    let binding = op_binding.filter(|b| b.v1).ok_or_else(|| {
                         "OidcStepUp: operation_bound required but this operation \
                          carries no binding context"
                             .to_string()
@@ -569,10 +600,13 @@ pub(crate) fn require_owner_step_up(
         required_amr: vec!["webauthn".into()],
         operation_bound: true,
         fresh_for_seconds: RESHARE_STEP_UP_FRESH_SECONDS,
+        binding: 0,
     }];
     let binding = OpBinding {
         measurement_digest_hex: binding_hex.to_string(),
         policy_version,
+        v1: true,
+        v2: None,
     };
     evaluate_conditions(
         &step_up,
@@ -584,6 +618,69 @@ pub(crate) fn require_owner_step_up(
         ctx,
         Some(&binding),
     )
+}
+
+
+/// Check a token's `vault_op` against binding v2 (formats §5): the request
+/// names this vault among its members, and the text rebuilt from the
+/// operation, the key's state and the token's own fields hashes to it.
+fn check_binding_v2(
+    claims: &enclave_os_common::oidc::OidcClaims,
+    handle: &str,
+    op_binding: Option<&OpBinding>,
+    now: u64,
+) -> Result<(), String> {
+    let binding = op_binding.ok_or_else(|| {
+        "OidcStepUp: binding v2 required but this operation carries no binding".to_string()
+    })?;
+    let v2 = binding.v2.as_ref().ok_or_else(|| {
+        "OidcStepUp: binding v2 required but this operation has no v2 form".to_string()
+    })?;
+    let members = v2.members.as_ref().ok_or_else(|| {
+        "OidcStepUp: binding v2 required: the request must name its members".to_string()
+    })?;
+    let target = v2.target.as_ref().map_err(|e| format!("OidcStepUp: {e}"))?;
+    let (_, own, _) = crate::v2::own_identity()?;
+    crate::v2::check_members(members, &own)?;
+
+    let vault_op = claims
+        .vault_op
+        .as_deref()
+        .ok_or_else(|| "OidcStepUp: token has no vault_op binding claim".to_string())?;
+    let nonce = claims
+        .nonce
+        .as_deref()
+        .ok_or_else(|| "OidcStepUp: token has no nonce claim".to_string())?;
+    if now > claims.exp || claims.exp > now.saturating_add(crate::v2::max_lifetime(v2.op)) {
+        return Err("OidcStepUp: binding v2 expiry out of range".into());
+    }
+    let approver = format!("oidc:0:{}", claims.sub);
+    for (name, value) in [
+        ("handle", handle),
+        ("target", target.as_str()),
+        ("approver", approver.as_str()),
+        ("nonce", nonce),
+    ] {
+        crate::v2::check_line(name, value)?;
+    }
+    let text = crate::v2::binding_v2_text(
+        members,
+        v2.op,
+        handle,
+        target,
+        binding.policy_version,
+        &approver,
+        "-",
+        nonce,
+        claims.exp,
+    );
+    if crate::v2::vault_op_v2(&text) != vault_op {
+        return Err("OidcStepUp: vault_op does not bind this operation (binding v2)".into());
+    }
+    if !crate::v2::spend_binding(&text, claims.exp, now) {
+        return Err("OidcStepUp: this approval was already used".into());
+    }
+    Ok(())
 }
 
 /// How fresh the owner's step-up must be to reshare (as for export).
@@ -1076,6 +1173,7 @@ mod auto_migrate_tests {
                 ttl_seconds: 0,
                 auto_migrate_to_next_attestation_profile: auto,
             },
+            approval: None,
         }
     }
 

@@ -33,6 +33,7 @@ fn owner_policy(sub: &str, ops: Vec<Operation>) -> KeyPolicy {
         }],
         mutability: Default::default(),
         lifecycle: Default::default(),
+        approval: None,
     }
 }
 
@@ -96,6 +97,7 @@ fn oidc_step_up_amr_gate() {
         required_amr: vec!["webauthn".into()],
         operation_bound: false,
         fresh_for_seconds: 0, // freshness skipped (no clock in unit env)
+        binding: 0,
     }];
 
     // owner bearer carrying a webauthn step-up: allowed.
@@ -117,6 +119,7 @@ fn oidc_step_up_operation_bound() {
         required_amr: vec!["webauthn".into()],
         operation_bound: true,
         fresh_for_seconds: 0,
+        binding: 0,
     }];
 
     let handle = "apps.privasys.org/x/storage-kek/v1";
@@ -127,6 +130,8 @@ fn oidc_step_up_operation_bound() {
     let binding = OpBinding {
         measurement_digest_hex: digest.to_string(),
         policy_version: version,
+        v1: true,
+        v2: None,
     };
 
     // correct, operation-bound token -> allowed.
@@ -160,6 +165,7 @@ fn oidc_step_up_export_operation_bound() {
         required_amr: vec!["webauthn".into()],
         operation_bound: true,
         fresh_for_seconds: 0,
+        binding: 0,
     }];
 
     let handle = "users/dev/my-secret";
@@ -169,6 +175,8 @@ fn oidc_step_up_export_operation_bound() {
     let binding = OpBinding {
         measurement_digest_hex: String::new(),
         policy_version: version,
+        v1: true,
+        v2: None,
     };
 
     // Correct export-bound token (empty measurement) -> allowed.

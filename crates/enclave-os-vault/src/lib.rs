@@ -22,6 +22,7 @@ pub mod quote;
 pub mod signing;
 pub mod threshold;
 pub mod types;
+pub mod v2;
 
 use std::string::String;
 use std::vec::Vec;
@@ -36,7 +37,7 @@ use enclave_os_kvstore::SealedKvStore;
 use crate::policy::{evaluate_op, evaluate_policy_update, resolve_caller, CallerRole};
 
 use crate::types::{
-    ApprovalToken, AttestationProfile, AuditDecision, KeyInfo, KeyListEntry, KeyPolicy, KeyRecord,
+    ApprovalToken, AttestationProfile, AuditDecision, BindingV2Request, KeyInfo, KeyListEntry, KeyPolicy, KeyRecord,
     KeyType, Operation, PendingProfile, PendingProfileSource, PolicyField, Principal, VaultRequest,
     VaultResponse, DEFAULT_APPROVAL_TOKEN_TTL_SECONDS, DEFAULT_KEY_TTL_SECONDS,
     MAX_APPROVAL_TOKEN_TTL_SECONDS, MAX_KEY_TTL_SECONDS,
@@ -84,18 +85,56 @@ impl EnclaveModule for VaultModule {
                 handle,
                 material_b64,
                 grant,
-            } => handle_create(&handle, &material_b64, &grant, ctx),
-            VaultRequest::ExportKey { handle, approvals } => {
-                handle_export(&handle, &approvals, ctx)
-            }
-            VaultRequest::DeleteKey { handle, approvals } => {
-                handle_delete(&handle, &approvals, ctx)
-            }
+                predecessor,
+                policy,
+                policy_version,
+                holder_records,
+                source_billing_id,
+                key_check,
+            } => handle_create(
+                &handle,
+                &material_b64,
+                &grant,
+                CreateExtras {
+                    predecessor,
+                    policy,
+                    policy_version,
+                    holder_records,
+                    source_billing_id,
+                    key_check,
+                },
+                ctx,
+            ),
+            VaultRequest::ExportKey {
+                handle,
+                approvals,
+                binding,
+            } => handle_export(&handle, &approvals, binding, ctx),
+            VaultRequest::DeleteKey {
+                handle,
+                approvals,
+                binding,
+                after,
+            } => handle_delete(&handle, &approvals, binding, after, ctx),
+            VaultRequest::RetireKey {
+                handle,
+                successor,
+                successor_members,
+            } => handle_retire(&handle, &successor, &successor_members, ctx),
             VaultRequest::UpdatePolicy {
                 handle,
                 new_policy,
                 approvals,
-            } => handle_update_policy(&handle, new_policy, &approvals, ctx),
+                binding,
+            } => handle_update_policy(&handle, &new_policy, &approvals, binding, ctx),
+            VaultRequest::GetVaultIdentity => handle_identity(),
+            VaultRequest::CanonicalisePolicy { policy } => match v2::canonical_policy(policy.get()) {
+                Ok(c) => VaultResponse::CanonicalPolicy {
+                    policy: c.policy,
+                    pd: c.pd,
+                },
+                Err(e) => VaultResponse::Error(e),
+            },
             VaultRequest::GetPolicy { handle } => handle_get_policy(&handle, ctx),
             VaultRequest::GetKeyInfo { handle } => handle_get_info(&handle, ctx),
             VaultRequest::ListKeys => handle_list(ctx),
@@ -162,7 +201,8 @@ impl EnclaveModule for VaultModule {
                 handle,
                 pending_id,
                 approvals,
-            } => handle_promote_pending(&handle, pending_id, &approvals, ctx),
+                binding,
+            } => handle_promote_pending(&handle, pending_id, &approvals, binding, ctx),
             VaultRequest::RevokePendingProfile { handle, pending_id } => {
                 handle_revoke_pending(&handle, pending_id, ctx)
             }
@@ -407,10 +447,168 @@ pub(crate) fn check_grant_for_handle(
     Ok(())
 }
 
+/// What a `CreateKey` may carry beyond the grant (formats §9, §10.4).
+struct CreateExtras {
+    predecessor: Option<String>,
+    policy: Option<Box<serde_json::value::RawValue>>,
+    policy_version: Option<u32>,
+    holder_records: Vec<serde_json::Value>,
+    source_billing_id: Option<String>,
+    key_check: Option<crate::types::KeyCheck>,
+}
+
+/// Where a new key's policy comes from.
+struct NewKeyPolicy {
+    policy: KeyPolicy,
+    policy_version: u32,
+    exportable: bool,
+    key_check: Option<crate::types::KeyCheck>,
+    /// For the audit log.
+    how: String,
+}
+
+/// Whether any rule granting `op` asks for a binding v2 step-up.
+fn rule_takes_binding_v2(policy: &KeyPolicy, op: Operation) -> bool {
+    policy.operations.iter().filter(|r| r.ops.contains(&op)).any(|r| {
+        r.requires
+            .iter()
+            .any(|c| matches!(c, crate::types::Condition::OidcStepUp { binding: 2, .. }))
+    })
+}
+
+/// The caller of a renewal must be the key's owner or one of its enclaves,
+/// under the policy being renewed.
+fn check_renewal_caller(policy: &KeyPolicy, ctx: &RequestContext) -> Result<(), String> {
+    match resolve_caller(policy, ctx) {
+        Some((_, CallerRole::Owner)) | Some((_, CallerRole::Tee)) => Ok(()),
+        _ => Err("a renewal must come from the key's owner or an enclave its policy names".into()),
+    }
+}
+
+/// Decide the new key's policy (formats §9): copied from a predecessor on
+/// this vault, carried by the app from another constellation, or the grant's
+/// for a first creation.
+fn new_key_policy(
+    grant: &crate::grant::KeyCreationGrant,
+    extras: CreateExtras,
+    ctx: &RequestContext,
+) -> Result<NewKeyPolicy, String> {
+    if !extras.holder_records.is_empty() {
+        return Err("holder records are not accepted before step 3".into());
+    }
+    if let Some(kc) = &extras.key_check {
+        check_key_check(kc)?;
+    }
+
+    // Renewal in place: the predecessor is here.
+    if let (Some(pred), None) = (&extras.predecessor, &extras.policy) {
+        let rec = load_record(pred).map_err(|e| match e {
+            VaultResponse::Error(m) => format!("predecessor: {m}"),
+            _ => "predecessor not found".into(),
+        })?;
+        if expired(&rec) {
+            return Err("predecessor has expired".into());
+        }
+        if rec.key_type != grant.key_type {
+            return Err("predecessor is of another key type".into());
+        }
+        check_renewal_caller(&rec.policy, ctx)?;
+        return Ok(NewKeyPolicy {
+            policy: rec.policy,
+            policy_version: rec.policy_version,
+            exportable: rec.exportable,
+            key_check: rec.key_check.or(extras.key_check),
+            how: format!("renewal in place from {pred}"),
+        });
+    }
+
+    // Moved from another constellation, or rotated: the policy the app read
+    // from the source vault, carried verbatim and parsed as the vault parses
+    // its own records (not held to the strictness of a policy being approved).
+    if let Some(raw) = &extras.policy {
+        let policy: KeyPolicy = serde_json::from_str(raw.get())
+            .map_err(|e| format!("carried policy does not parse: {e}"))?;
+        let policy = normalise_policy(policy);
+        let version = extras
+            .policy_version
+            .ok_or_else(|| "a carried policy needs its policy_version".to_string())?;
+        if version == 0 {
+            return Err("carried policy_version must be at least 1".into());
+        }
+        let (_, _, own_billing) = v2::own_identity()?;
+        match extras.source_billing_id.as_deref() {
+            Some(b) if b == own_billing => {}
+            Some(_) => {
+                return Err(
+                    "the source is under another billing configuration: keys do not cross it"
+                        .into(),
+                )
+            }
+            None => return Err("a carried policy needs source_billing_id".into()),
+        }
+        check_renewal_caller(&policy, ctx)?;
+        return Ok(NewKeyPolicy {
+            policy,
+            policy_version: version,
+            exportable: grant.exportable,
+            key_check: extras.key_check,
+            how: match &extras.predecessor {
+                Some(p) => format!("carried from {p}"),
+                None => "carried (rotation)".into(),
+            },
+        });
+    }
+
+    // A first creation: the grant's policy, which must ask for approvals.
+    let policy = normalise_policy(grant.policy.clone());
+    v2::check_approval_by_default(&policy, grant.exportable)?;
+    Ok(NewKeyPolicy {
+        policy,
+        policy_version: 1,
+        exportable: grant.exportable,
+        key_check: extras.key_check,
+        how: "created".into(),
+    })
+}
+
+/// A key check value is opaque to the vault, but must be well formed.
+fn check_key_check(kc: &crate::types::KeyCheck) -> Result<(), String> {
+    match URL_SAFE_NO_PAD.decode(&kc.salt_b64) {
+        Ok(s) if s.len() == 16 => {}
+        _ => return Err("key_check salt must be 16 bytes, base64url".into()),
+    }
+    if kc.digest_hex.len() != 64 || !kc.digest_hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f')) {
+        return Err("key_check digest must be 64 lower-case hex digits".into());
+    }
+    Ok(())
+}
+
+fn handle_identity() -> VaultResponse {
+    let (public_key, member_id, billing_id) = match v2::own_identity() {
+        Ok(v) => v,
+        Err(e) => return VaultResponse::Error(e),
+    };
+    let report = v2::identity_report_data(&member_id, &billing_id);
+    let Some(quote) = enclave_os_egress::enclave_attestation_quote(&report) else {
+        return VaultResponse::Error("no attestation quote available".into());
+    };
+    let mrenclave = enclave_os_egress::enclave_self_mrenclave()
+        .map(|m| v2::hex(m.as_slice()))
+        .unwrap_or_default();
+    VaultResponse::VaultIdentity {
+        member_id,
+        member_public_key: v2::hex(&public_key),
+        billing_id,
+        mrenclave,
+        quote_b64: URL_SAFE_NO_PAD.encode(quote),
+    }
+}
+
 fn handle_create(
     handle: &str,
     material_b64: &str,
     grant_jwt: &str,
+    extras: CreateExtras,
     ctx: &RequestContext,
 ) -> VaultResponse {
     if handle.is_empty() {
@@ -439,8 +637,19 @@ fn handle_create(
     }
 
     let key_type = grant.key_type;
-    let exportable = grant.exportable;
-    let owner_sub = grant.sub.clone();
+    if extras.predecessor.as_deref() == Some(handle) {
+        return VaultResponse::Error("a key cannot succeed itself".into());
+    }
+    let predecessor = extras.predecessor.clone();
+    let chosen = match new_key_policy(&grant, extras, ctx) {
+        Ok(c) => c,
+        Err(e) => return VaultResponse::Error(e),
+    };
+    let exportable = chosen.exportable;
+    let owner_sub = match owner_oidc_sub(&chosen.policy.principals.owner) {
+        Some(s) => s,
+        None => return VaultResponse::Error("the key's owner is not an OIDC subject".into()),
+    };
 
     let material = match URL_SAFE_NO_PAD.decode(material_b64) {
         Ok(b) if !b.is_empty() => b,
@@ -452,7 +661,7 @@ fn handle_create(
         Err(e) => return VaultResponse::Error(e),
     };
 
-    let policy = normalise_policy(grant.policy);
+    let policy = chosen.policy;
     let expires_at = now.saturating_add(policy.lifecycle.ttl_seconds);
 
     let kv = match kv() {
@@ -478,13 +687,15 @@ fn handle_create(
         material,
         public_key,
         policy,
-        policy_version: 1,
+        policy_version: chosen.policy_version,
         created_at: now,
         expires_at,
         pending_profiles: Vec::new(),
         audit_next_seq: 0,
         next_pending_id: 0,
         threshold_vaults: Vec::new(),
+        key_check: chosen.key_check,
+        predecessor,
     };
 
     if let Err(e) = audit_and_save(
@@ -492,7 +703,7 @@ fn handle_create(
         "CreateKey",
         &caller_str(ctx),
         AuditDecision::Allowed,
-        &format!("owner={owner_sub}"),
+        &format!("owner={owner_sub}; {}", chosen.how),
     ) {
         return e;
     }
@@ -513,7 +724,12 @@ fn handle_create(
     }
 }
 
-fn handle_export(handle: &str, approvals: &[ApprovalToken], ctx: &RequestContext) -> VaultResponse {
+fn handle_export(
+    handle: &str,
+    approvals: &[ApprovalToken],
+    binding: Option<BindingV2Request>,
+    ctx: &RequestContext,
+) -> VaultResponse {
     let mut record = match load_record(handle) {
         Ok(r) => r,
         Err(e) => return e,
@@ -534,6 +750,12 @@ fn handle_export(handle: &str, approvals: &[ApprovalToken], ctx: &RequestContext
     let op_binding = crate::policy::OpBinding {
         measurement_digest_hex: String::new(),
         policy_version: record.policy_version,
+        v1: true,
+        v2: Some(crate::policy::OpBindingV2 {
+            op: "export",
+            target: Ok("-".into()),
+            members: binding.map(|b| b.members),
+        }),
     };
     match evaluate_op(
         &record.policy,
@@ -564,12 +786,43 @@ fn handle_export(handle: &str, approvals: &[ApprovalToken], ctx: &RequestContext
     }
 }
 
-fn handle_delete(handle: &str, approvals: &[ApprovalToken], ctx: &RequestContext) -> VaultResponse {
+fn handle_delete(
+    handle: &str,
+    approvals: &[ApprovalToken],
+    binding: Option<BindingV2Request>,
+    after: Option<crate::types::DeleteAfter>,
+    ctx: &RequestContext,
+) -> VaultResponse {
     let mut record = match load_record(handle) {
         Ok(r) => r,
         Err(e) => return e,
     };
     let caller = caller_str(ctx);
+    // The old key of a migration or upgrade: refused until its successor has
+    // succeeded, checked before the approval is spent (formats §9.2).
+    let (op, target, detail) = match &after {
+        Some(a) => {
+            if let Err(e) = check_successor_succeeded(handle, a) {
+                let _ = audit_denial(ctx, &mut record, "DeleteKey", &caller, AuditDecision::Denied, &e);
+                return VaultResponse::Error(e);
+            }
+            let target = v2::delete_after_target(&a.successor, &a.successor_target);
+            ("delete_after", target, format!("after {}", a.successor))
+        }
+        None => ("delete", Ok("-".into()), String::new()),
+    };
+    // A v1 condition has no binding for delete (an operation-bound one fails
+    // closed, as before); binding v2 binds the handle and policy version.
+    let op_binding = crate::policy::OpBinding {
+        measurement_digest_hex: String::new(),
+        policy_version: record.policy_version,
+        v1: false,
+        v2: Some(crate::policy::OpBindingV2 {
+            op,
+            target,
+            members: binding.map(|b| b.members),
+        }),
+    };
     if let Err(e) = evaluate_op(
         &record.policy,
         record.policy_version,
@@ -577,49 +830,138 @@ fn handle_delete(handle: &str, approvals: &[ApprovalToken], ctx: &RequestContext
         handle,
         approvals,
         ctx,
-        None,
+        Some(&op_binding),
     ) {
         let _ = audit_denial(ctx, &mut record, "DeleteKey", &caller, AuditDecision::Denied, &e);
         return VaultResponse::Error(e);
     }
 
+    match remove_record(&mut record, "DeleteKey", &caller, &detail) {
+        Ok(()) => VaultResponse::KeyDeleted,
+        Err(e) => e,
+    }
+}
+
+/// Delete a key's record after auditing it. The record itself disappears, so
+/// its audit chain dies too: deletion is final and auditors snapshot the log
+/// before it goes.
+fn remove_record(
+    record: &mut KeyRecord,
+    what: &str,
+    caller: &str,
+    detail: &str,
+) -> Result<(), VaultResponse> {
+    let handle = record.handle.clone();
     let owner_sub = match owner_oidc_sub(&record.policy.principals.owner) {
         Some(s) => s,
-        None => return VaultResponse::Error("policy owner is not OIDC; cannot index".into()),
+        None => return Err(VaultResponse::Error("policy owner is not OIDC; cannot index".into())),
     };
+    let _ = audit_and_save(record, what, caller, AuditDecision::Allowed, detail);
 
-    // Audit before delete so the entry survives... but the record itself
-    // is about to disappear, so the audit chain for this key dies too.
-    // That's acceptable: deletion is final and auditors should snapshot
-    // the log before it goes.
-    let _ = audit_and_save(
-        &mut record,
-        "DeleteKey",
-        &caller,
-        AuditDecision::Allowed,
-        "",
-    );
-
-    let kv = match kv() {
-        Ok(k) => k,
-        Err(e) => return e,
-    };
+    let kv = kv()?;
     let mut store = match kv.lock() {
         Ok(s) => s,
-        Err(_) => return VaultResponse::Error("kv store lock poisoned".into()),
+        Err(_) => return Err(VaultResponse::Error("kv store lock poisoned".into())),
     };
-    if let Err(e) = store.delete(&record_key(handle)) {
-        return VaultResponse::Error(format!("kv delete failed: {e}"));
+    if let Err(e) = store.delete(&record_key(&handle)) {
+        return Err(VaultResponse::Error(format!("kv delete failed: {e}")));
     }
-    let _ = store.delete(&threshold::previous_key(handle));
-    let _ = remove_from_owner_index(&store, &owner_sub, handle);
-    VaultResponse::KeyDeleted
+    let _ = store.delete(&threshold::previous_key(&handle));
+    let _ = remove_from_owner_index(&store, &owner_sub, &handle);
+    Ok(())
+}
+
+/// The old key of a migration or upgrade may go only once its successor has
+/// succeeded, where this vault can see it (formats §9.2).
+fn check_successor_succeeded(handle: &str, after: &crate::types::DeleteAfter) -> Result<(), String> {
+    // Promote K then "delete K after K" would delete the key just promoted.
+    if after.successor == handle {
+        return Err("a key cannot be the successor of itself".into());
+    }
+    let Ok(succ) = load_record(&after.successor) else {
+        // On another constellation: the client presents the delete only after
+        // confirming the new key works; the binding confines it to that one.
+        return Ok(());
+    };
+    if expired(&succ) {
+        return Err("the successor has expired".into());
+    }
+    if after.successor_target != "-" {
+        let promoted = succ.policy.principals.tees.iter().any(|p| {
+            matches!(p, Principal::Tee(t) if crate::policy::profile_binding_digest(t) == after.successor_target)
+        });
+        if !promoted {
+            return Err("the successor's promote has not been applied yet".into());
+        }
+    }
+    Ok(())
+}
+
+fn handle_retire(
+    handle: &str,
+    successor: &str,
+    successor_members: &[String],
+    ctx: &RequestContext,
+) -> VaultResponse {
+    let mut record = match load_record(handle) {
+        Ok(r) => r,
+        Err(_) => return VaultResponse::KeyRetired { was_present: false },
+    };
+    let caller = caller_str(ctx);
+    let refuse = |record: &mut KeyRecord, e: String| {
+        let _ = audit_denial(ctx, record, "RetireKey", &caller, AuditDecision::Denied, &e);
+        VaultResponse::Error(e)
+    };
+    if record.key_type == KeyType::FrostEd25519 {
+        return refuse(&mut record, "a threshold key is renewed by resharing, not retired".into());
+    }
+    match resolve_caller(&record.policy, ctx) {
+        Some((_, CallerRole::Tee)) => {}
+        _ => return refuse(&mut record, "only an enclave the key's policy names may retire it".into()),
+    }
+    if successor == handle {
+        return refuse(&mut record, "a key cannot succeed itself".into());
+    }
+    let own = match v2::own_identity() {
+        Ok((_, m, _)) => m,
+        Err(e) => return refuse(&mut record, e),
+    };
+    let sorted = successor_members.windows(2).all(|w| w[0] < w[1]);
+    if successor_members.is_empty() || !sorted {
+        return refuse(&mut record, "successor_members must be sorted, unique and non-empty".into());
+    }
+    // Only a generation this vault KNOWS is superseded may be retired: its
+    // successor is here, unexpired, and records it as its predecessor. The
+    // live generation is never reachable, whatever the caller claims (Security).
+    // A key that moved to another constellation is not retired this way.
+    if !successor_members.iter().any(|m| m == &own) {
+        return refuse(
+            &mut record,
+            "the successor is not on this vault: only a key superseded here can be retired".into(),
+        );
+    }
+    let detail = match load_record(successor) {
+        Ok(succ) if !expired(&succ) && succ.predecessor.as_deref() == Some(handle) => {
+            format!("renewed in place by {successor}")
+        }
+        _ => {
+            return refuse(
+                &mut record,
+                "this vault holds no live successor recording this key as its predecessor".into(),
+            )
+        }
+    };
+    match remove_record(&mut record, "RetireKey", &caller, &detail) {
+        Ok(()) => VaultResponse::KeyRetired { was_present: true },
+        Err(e) => e,
+    }
 }
 
 fn handle_update_policy(
     handle: &str,
-    new_policy: KeyPolicy,
+    new_policy_raw: &serde_json::value::RawValue,
     approvals: &[ApprovalToken],
+    binding: Option<BindingV2Request>,
     ctx: &RequestContext,
 ) -> VaultResponse {
     let mut record = match load_record(handle) {
@@ -631,6 +973,33 @@ fn handle_update_policy(
     }
     let caller = caller_str(ctx);
 
+    // A key whose update rule takes binding v2 approves exactly the JSON sent
+    // (formats §5.1): it must be canonical, and it is stored as sent. Other
+    // keys take the policy as before, normalised.
+    let takes_v2 = rule_takes_binding_v2(&record.policy, Operation::UpdatePolicy);
+    let canonical = v2::canonical_policy(new_policy_raw.get());
+    let new_policy = if takes_v2 {
+        match &canonical {
+            Ok(c) => c.policy.clone(),
+            Err(e) => return VaultResponse::Error(e.clone()),
+        }
+    } else {
+        match serde_json::from_str::<KeyPolicy>(new_policy_raw.get()) {
+            Ok(p) => normalise_policy(p),
+            Err(e) => return VaultResponse::Error(format!("new_policy does not parse: {e}")),
+        }
+    };
+    let op_binding = crate::policy::OpBinding {
+        measurement_digest_hex: String::new(),
+        policy_version: record.policy_version,
+        v1: false,
+        v2: Some(crate::policy::OpBindingV2 {
+            op: "update_policy",
+            target: canonical.map(|c| c.pd),
+            members: binding.map(|b| b.members),
+        }),
+    };
+
     if let Err(e) = evaluate_op(
         &record.policy,
         record.policy_version,
@@ -638,7 +1007,7 @@ fn handle_update_policy(
         handle,
         approvals,
         ctx,
-        None,
+        Some(&op_binding),
     ) {
         let _ = audit_denial(ctx, 
             &mut record,
@@ -653,7 +1022,15 @@ fn handle_update_policy(
         Some((_pref, role)) => role,
         None => return VaultResponse::Error("caller is not in policy.principals".into()),
     };
-    let new_policy = normalise_policy(new_policy);
+    // Approval by default (formats §4): an update may not take away the
+    // approvals a key has. A key that never had them (created before v2) may
+    // still be updated, and an update may add them.
+    if v2::check_approval_by_default(&record.policy, record.exportable).is_ok() {
+        if let Err(e) = v2::check_approval_by_default(&new_policy, record.exportable) {
+            let _ = audit_denial(ctx, &mut record, "UpdatePolicy", &caller, AuditDecision::Denied, &e);
+            return VaultResponse::Error(e);
+        }
+    }
     if let Err(e) = evaluate_policy_update(&record.policy, &new_policy, role) {
         let _ = audit_denial(ctx, 
             &mut record,
@@ -1364,6 +1741,7 @@ fn handle_promote_pending(
     handle: &str,
     pending_id: u32,
     approvals: &[ApprovalToken],
+    binding: Option<BindingV2Request>,
     ctx: &RequestContext,
 ) -> VaultResponse {
     let mut record = match load_record(handle) {
@@ -1381,11 +1759,18 @@ fn handle_promote_pending(
         .pending_profiles
         .iter()
         .position(|p| p.id == pending_id);
-    let op_binding = pos_opt.map(|p| crate::policy::OpBinding {
-        measurement_digest_hex: crate::policy::profile_binding_digest(
-            &record.pending_profiles[p].profile,
-        ),
-        policy_version: record.policy_version,
+    let op_binding = pos_opt.map(|p| {
+        let digest = crate::policy::profile_binding_digest(&record.pending_profiles[p].profile);
+        crate::policy::OpBinding {
+            measurement_digest_hex: digest.clone(),
+            policy_version: record.policy_version,
+            v1: true,
+            v2: Some(crate::policy::OpBindingV2 {
+                op: "promote",
+                target: Ok(digest),
+                members: binding.as_ref().map(|b| b.members.clone()),
+            }),
+        }
     });
 
     if let Err(e) = evaluate_op(
@@ -1523,5 +1908,20 @@ fn owner_oidc_sub(owner: &Principal) -> Option<String> {
     match owner {
         Principal::Oidc { sub, .. } => Some(sub.clone()),
         Principal::Tee(_) | Principal::Fido2 { .. } => None,
+    }
+}
+
+#[cfg(test)]
+mod step1_tests {
+    use super::*;
+
+    #[test]
+    fn delete_after_refuses_a_key_naming_itself_as_successor() {
+        let after = crate::types::DeleteAfter {
+            successor: "apps.privasys.org/x/k".into(),
+            successor_target: "-".into(),
+        };
+        let e = check_successor_succeeded("apps.privasys.org/x/k", &after).unwrap_err();
+        assert!(e.contains("successor of itself"), "{e}");
     }
 }
