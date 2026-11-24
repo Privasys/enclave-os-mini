@@ -465,6 +465,9 @@ struct NewKeyPolicy {
     key_check: Option<crate::types::KeyCheck>,
     /// For the audit log.
     how: String,
+    /// Set only for a renewal in place: the predecessor on this vault, and
+    /// its material (a single-vault key must keep exactly the same value).
+    in_place_from: Option<(String, Vec<u8>)>,
 }
 
 /// Whether any rule granting `op` asks for a binding v2 step-up.
@@ -519,6 +522,7 @@ fn new_key_policy(
             exportable: rec.exportable,
             key_check: rec.key_check.or(extras.key_check),
             how: format!("renewal in place from {pred}"),
+            in_place_from: Some((pred.clone(), rec.material)),
         });
     }
 
@@ -556,6 +560,8 @@ fn new_key_policy(
                 Some(p) => format!("carried from {p}"),
                 None => "carried (rotation)".into(),
             },
+            // A carried create never supersedes anything here (Security).
+            in_place_from: None,
         });
     }
 
@@ -568,7 +574,35 @@ fn new_key_policy(
         exportable: grant.exportable,
         key_check: extras.key_check,
         how: "created".into(),
+        in_place_from: None,
     })
+}
+
+/// A renewal in place keeps the key's value. For every key type but a Shamir
+/// share (whose share is fresh by design, the value being whole only across
+/// the vaults), the vault holds the whole value and compares it (Security).
+fn check_same_value(key_type: KeyType, old: &[u8], new: &[u8]) -> Result<(), String> {
+    if key_type == KeyType::RawShare {
+        return Ok(());
+    }
+    let same = old.len() == new.len()
+        && old.iter().zip(new).fold(0u8, |acc, (a, b)| acc | (a ^ b)) == 0;
+    if same {
+        Ok(())
+    } else {
+        Err("a renewal must keep the key's value".into())
+    }
+}
+
+/// Whether `succ` is a live renewal of `handle` made on this vault: the only
+/// kind of successor that lets `RetireKey` delete `handle` (Security).
+fn superseded_in_place(handle: &str, succ: &KeyRecord) -> bool {
+    superseded_in_place_at(handle, succ, now_secs())
+}
+
+fn superseded_in_place_at(handle: &str, succ: &KeyRecord, now: Option<u64>) -> bool {
+    let live = now.is_some_and(|n| n <= succ.expires_at);
+    live && succ.renewed_in_place_from.as_deref() == Some(handle)
 }
 
 /// A key check value is opaque to the vault, but must be well formed.
@@ -640,7 +674,6 @@ fn handle_create(
     if extras.predecessor.as_deref() == Some(handle) {
         return VaultResponse::Error("a key cannot succeed itself".into());
     }
-    let predecessor = extras.predecessor.clone();
     let chosen = match new_key_policy(&grant, extras, ctx) {
         Ok(c) => c,
         Err(e) => return VaultResponse::Error(e),
@@ -660,6 +693,14 @@ fn handle_create(
         Ok(p) => p,
         Err(e) => return VaultResponse::Error(e),
     };
+    // A renewal keeps the value. A single-vault key holds the whole value
+    // here, so the vault checks it; a split key's share is fresh by design.
+    if let Some((_, old)) = &chosen.in_place_from {
+        if let Err(e) = check_same_value(key_type, old, &material) {
+            return VaultResponse::Error(e);
+        }
+    }
+    let renewed_in_place_from = chosen.in_place_from.map(|(p, _)| p);
 
     let policy = chosen.policy;
     let expires_at = now.saturating_add(policy.lifecycle.ttl_seconds);
@@ -695,7 +736,7 @@ fn handle_create(
         next_pending_id: 0,
         threshold_vaults: Vec::new(),
         key_check: chosen.key_check,
-        predecessor,
+        renewed_in_place_from,
     };
 
     if let Err(e) = audit_and_save(
@@ -941,7 +982,7 @@ fn handle_retire(
         );
     }
     let detail = match load_record(successor) {
-        Ok(succ) if !expired(&succ) && succ.predecessor.as_deref() == Some(handle) => {
+        Ok(succ) if superseded_in_place(handle, &succ) => {
             format!("renewed in place by {successor}")
         }
         _ => {
@@ -1923,5 +1964,54 @@ mod step1_tests {
         };
         let e = check_successor_succeeded("apps.privasys.org/x/k", &after).unwrap_err();
         assert!(e.contains("successor of itself"), "{e}");
+    }
+
+    fn record(renewed_in_place_from: Option<&str>, expires_at: u64) -> KeyRecord {
+        let policy: KeyPolicy = serde_json::from_str(
+            r#"{"version":1,"principals":{"owner":{"Oidc":{"issuer":"https://privasys.id","sub":"o","required_roles":[]}},"managers":[],"auditors":[],"tees":[]},"operations":[]}"#,
+        )
+        .unwrap();
+        KeyRecord {
+            handle: "x".into(),
+            key_type: KeyType::RawShare,
+            exportable: true,
+            material: vec![1],
+            public_key: None,
+            policy,
+            policy_version: 1,
+            created_at: 0,
+            expires_at,
+            pending_profiles: Vec::new(),
+            audit_next_seq: 0,
+            next_pending_id: 0,
+            threshold_vaults: Vec::new(),
+            key_check: None,
+            renewed_in_place_from: renewed_in_place_from.map(String::from),
+        }
+    }
+
+    /// Security's forged-link case: an enclave named by K's policy creates X
+    /// on K's vaults with a carried policy naming K as predecessor, then asks
+    /// to retire K. A carried create records no in-place link, so X never
+    /// supersedes K, and only a live in-place renewal of K does.
+    #[test]
+    fn only_a_live_in_place_renewal_supersedes_a_key() {
+        let k = "apps.privasys.org/x/data-v1";
+        let carried = record(None, 100);
+        assert!(!superseded_in_place_at(k, &carried, Some(50)));
+        let in_place = record(Some(k), 100);
+        assert!(superseded_in_place_at(k, &in_place, Some(50)));
+        assert!(!superseded_in_place_at(k, &in_place, Some(101)), "an expired successor");
+        assert!(!superseded_in_place_at(k, &in_place, None), "no trusted time");
+        assert!(!superseded_in_place_at("apps.privasys.org/x/other", &in_place, Some(50)));
+    }
+
+    #[test]
+    fn an_in_place_renewal_keeps_a_whole_key_value() {
+        assert!(check_same_value(KeyType::Aes256GcmKey, &[1; 32], &[1; 32]).is_ok());
+        assert!(check_same_value(KeyType::Aes256GcmKey, &[1; 32], &[2; 32]).is_err());
+        assert!(check_same_value(KeyType::HmacSha256Key, &[1; 32], &[1; 33]).is_err());
+        // A Shamir share is fresh by design: the value is whole only across vaults.
+        assert!(check_same_value(KeyType::RawShare, &[1; 32], &[2; 32]).is_ok());
     }
 }

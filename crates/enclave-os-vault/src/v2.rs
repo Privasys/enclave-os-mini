@@ -17,7 +17,7 @@ use std::fmt;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 
-use crate::types::{Condition, KeyPolicy, Operation};
+use crate::types::{Condition, KeyPolicy, Operation, PrincipalRef};
 
 /// Domain of the binding v2 text (formats §5).
 pub const BINDING_V2_DOMAIN: &str = "privasys-vault-approval/v2";
@@ -241,15 +241,17 @@ pub fn canonical_policy(raw: &str) -> Result<CanonicalPolicy, String> {
     })
 }
 
-fn is_default_like(v: &serde_json::Value) -> bool {
+/// The policy fields the vault's own serialisation leaves out at their
+/// default, with that default (Security: an exemption by name, not by value,
+/// so an unknown name is always refused).
+fn is_known_default(name: &str, v: &serde_json::Value) -> bool {
     use serde_json::Value;
-    match v {
-        Value::Null => true,
-        Value::Bool(b) => !b,
-        Value::Number(n) => n.as_u64() == Some(0),
-        Value::String(s) => s.is_empty(),
-        Value::Array(a) => a.is_empty(),
-        Value::Object(o) => o.is_empty(),
+    match name {
+        // KeyPolicy::approval
+        "approval" => v.is_null(),
+        // Condition::OidcStepUp::binding
+        "binding" => matches!(v, Value::Number(n) if n.as_u64() == Some(0)),
+        _ => false,
     }
 }
 
@@ -268,7 +270,7 @@ fn first_unknown_field(
                     // The typed form leaves out a field at its default (an
                     // absent option, binding 0); sent at that default it is
                     // known and inert. Anything else it dropped is unknown.
-                    None if is_default_like(sv) => {}
+                    None if is_known_default(k, sv) => {}
                     None => return Some(p),
                     Some(tv) => {
                         if let Some(x) = first_unknown_field(sv, tv, &p) {
@@ -453,10 +455,16 @@ pub fn check_approval_by_default(policy: &KeyPolicy, exportable: bool) -> Result
         ops.push(Operation::ExportKey);
     }
     for op in ops {
-        for rule in policy.operations.iter().filter(|r| r.ops.contains(&op)) {
-            let asks = rule.requires.iter().any(|c| {
-                matches!(c, Condition::OidcStepUp { .. } | Condition::ManagerApproval { .. })
-            });
+        // Rules a person can use (Security): an app fetching its own key under
+        // a rule for its enclaves only (`Tee`, `AnyTee`) is not a governance act.
+        let by_people = policy.operations.iter().filter(|r| {
+            r.ops.contains(&op)
+                && r.principals.iter().any(|p| {
+                    matches!(p, PrincipalRef::Owner | PrincipalRef::Manager(_) | PrincipalRef::Auditor(_))
+                })
+        });
+        for rule in by_people {
+            let asks = rule.requires.iter().any(is_wallet_approval);
             if !asks {
                 return Err(format!(
                     "a rule lets {op:?} happen without an approval: add an approval rule, \
@@ -466,6 +474,22 @@ pub fn check_approval_by_default(policy: &KeyPolicy, exportable: bool) -> Result
         }
     }
     Ok(())
+}
+
+/// What counts as an approval for approval by default (Security; the
+/// portal's notice uses the same rule): a passkey step-up (`webauthn` in
+/// `required_amr`) bound to the operation (binding v2, or v1
+/// `operation_bound`). A fresh token alone, or a co-sign alone, is not.
+pub fn is_wallet_approval(c: &Condition) -> bool {
+    match c {
+        Condition::OidcStepUp {
+            required_amr,
+            operation_bound,
+            binding,
+            ..
+        } => required_amr.iter().any(|a| a == "webauthn") && (*binding == 2 || *operation_bound),
+        _ => false,
+    }
 }
 
 #[cfg(test)]
@@ -539,14 +563,19 @@ mod tests {
     #[test]
     fn canonical_policy_refuses_unknown_and_unnormalised() {
         assert!(canonical_policy(&policy(STEP_UP, r#","x":1"#)).is_err());
-        assert!(canonical_policy(&policy(STEP_UP, r#","x":null"#)).is_ok());
+        // Only the known fields may be sent at a default the vault omits.
+        assert!(canonical_policy(&policy(STEP_UP, r#","x":null"#)).is_err());
+        assert!(canonical_policy(&policy(STEP_UP, r#","x":false"#)).is_err());
+        assert!(canonical_policy(&policy(STEP_UP, r#","approval":null"#)).is_ok());
         let upper = policy(STEP_UP, "").replace(
             r#""tees":[]"#,
-            r#""tees":[{"Tee":{"measurements":[{"Mrenclave":"AB"}],"required_oids":[]}}]"#,
+            r#""tees":[{"Tee":{"name":"app","measurements":[{"Mrenclave":"AB"}],"attestation_servers":[],"required_oids":[]}}]"#,
         );
-        assert!(canonical_policy(&upper).is_err());
+        let e = canonical_policy(&upper).err().unwrap();
+        assert!(e.contains("not normalised"), "{e}");
         let zero_ttl = policy(STEP_UP, "").replace("7776000", "0");
-        assert!(canonical_policy(&zero_ttl).is_err());
+        let e = canonical_policy(&zero_ttl).err().unwrap();
+        assert!(e.contains("not normalised"), "{e}");
     }
 
     #[test]
@@ -557,6 +586,38 @@ mod tests {
         assert!(delete_after_target("h\n2", "-").is_err());
         assert_eq!(max_lifetime("delete_after"), 86_400);
         assert_eq!(max_lifetime("delete"), 600);
+    }
+
+    /// The shape of an app key as the control plane writes it: the app's
+    /// enclaves export their share under an AnyTee rule with no approval, and
+    /// every person's rule asks for a bound passkey step-up.
+    fn app_key_policy(person_requires: &str) -> String {
+        format!(
+            r#"{{"version":1,"principals":{{"owner":{{"Oidc":{{"issuer":"https://privasys.id","sub":"o","required_roles":[]}}}},"managers":[{{"Oidc":{{"issuer":"https://privasys.id","sub":"","required_roles":["privasys-platform:app:0123456789abcdef0123456789abcdef:approver"]}}}}],"auditors":[],"tees":[{{"Tee":{{"name":"app","measurements":[{{"Mrenclave":"ab"}}],"attestation_servers":[],"required_oids":[]}}}}]}},"operations":[{{"ops":["ExportKey"],"principals":["AnyTee"],"requires":[]}},{{"ops":["ExportKey"],"principals":["Owner"],"requires":[{person_requires}]}},{{"ops":["PromoteProfile"],"principals":["Owner",{{"Manager":0}}],"requires":[{person_requires}]}},{{"ops":["UpdatePolicy","DeleteKey"],"principals":["Owner",{{"Manager":0}}],"requires":[{person_requires}]}}],"lifecycle":{{"ttl_seconds":7776000,"auto_migrate_to_next_attestation_profile":false}}}}"#
+        )
+    }
+
+    #[test]
+    fn approval_by_default_on_a_real_app_key() {
+        // The app's own AnyTee export needs no approval; the people's rules do.
+        let ok = canonical_policy(&app_key_policy(STEP_UP)).unwrap().policy;
+        assert!(check_approval_by_default(&ok, true).is_ok());
+
+        // A v1 bound passkey step-up counts too.
+        let v1 = r#"{"OidcStepUp":{"required_amr":["webauthn"],"operation_bound":true,"fresh_for_seconds":300}}"#;
+        let p = canonical_policy(&app_key_policy(v1)).unwrap().policy;
+        assert!(check_approval_by_default(&p, true).is_ok());
+
+        // A fresh token alone (no webauthn), or webauthn without a binding, is
+        // not an approval; nor is a co-sign alone.
+        for weak in [
+            r#"{"OidcStepUp":{"required_amr":[],"operation_bound":false,"fresh_for_seconds":300}}"#,
+            r#"{"OidcStepUp":{"required_amr":["webauthn"],"operation_bound":false,"fresh_for_seconds":300}}"#,
+            r#"{"ManagerApproval":{"manager":0,"fresh_for_seconds":900}}"#,
+        ] {
+            let p = canonical_policy(&app_key_policy(weak)).unwrap().policy;
+            assert!(check_approval_by_default(&p, true).is_err(), "{weak}");
+        }
     }
 }
 

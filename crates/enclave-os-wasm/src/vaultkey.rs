@@ -368,7 +368,9 @@ fn constellation_identity(
 }
 
 /// The key's current policy and version, read fresh from the source vaults:
-/// at least the threshold must answer, and all that answer must agree.
+/// EVERY source vault must answer, and all must agree (Security). A threshold
+/// that answers could all hold the version from before a partial update, and
+/// carrying it would quietly undo the owner's change.
 fn read_current_policy(
     cfg: &VaultConfig,
     handle: &str,
@@ -382,10 +384,19 @@ fn read_current_policy(
     let mut answered = 0usize;
     for ep in &cfg.endpoints {
         let req = VaultRequest::GetPolicy { handle: handle.into() };
-        let Ok(Some(vr)) = call_vault_response(ep, &req, &root_store, &policy) else {
-            continue;
+        let vr = match call_vault_response(ep, &req, &root_store, &policy) {
+            Ok(Some(vr)) => vr,
+            Ok(None) => return Err(format!("vaultkey: {ep} does not answer GetPolicy")),
+            Err(e) => {
+                return Err(format!(
+                    "vaultkey: {ep} did not return {handle:?}'s policy ({e}); every source vault \
+                     must answer before the policy is carried"
+                ))
+            }
         };
-        let Some(p) = vr.policy else { continue };
+        let Some(p) = vr.policy else {
+            return Err(format!("vaultkey: {ep} returned no policy for {handle:?}"));
+        };
         match &found {
             None => found = Some((p.policy, p.policy_version)),
             Some((v, n)) if *v == p.policy && *n == p.policy_version => {}
@@ -398,10 +409,10 @@ fn read_current_policy(
         answered += 1;
     }
     match found {
-        Some(f) if answered >= cfg.threshold() => Ok(f),
+        Some(f) if answered == cfg.endpoints.len() => Ok(f),
         _ => Err(format!(
-            "vaultkey: only {answered} source vaults returned {handle:?}'s policy (threshold {})",
-            cfg.threshold()
+            "vaultkey: {answered} of {} source vaults returned {handle:?}'s policy",
+            cfg.endpoints.len()
         )),
     }
 }

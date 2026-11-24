@@ -657,7 +657,7 @@ fn store_record(
         next_pending_id: 0,
         threshold_vaults: p.vaults.clone(),
         key_check: None,
-        predecessor: None,
+        renewed_in_place_from: None,
     };
     audit_and_save(
         &mut record,

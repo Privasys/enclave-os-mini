@@ -1144,7 +1144,9 @@ pub struct KeyRecord {
     /// gave one. Never returned by any call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_check: Option<KeyCheck>,
-    /// The key this one succeeds, when created by a renewal (formats §9).
+    /// The key this one renewed IN PLACE (formats §9.1): set only when the
+    /// policy was copied from a predecessor on this vault, never from a
+    /// request, so a carried create cannot claim to supersede a key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub predecessor: Option<String>,
+    pub renewed_in_place_from: Option<String>,
 }
