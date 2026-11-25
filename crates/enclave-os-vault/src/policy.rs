@@ -683,6 +683,49 @@ fn check_binding_v2(
     Ok(())
 }
 
+/// The owner's bound `create` approval of a new key (formats §9.3.1): the
+/// bearer is the policy owner, with a fresh passkey step-up whose binding v2
+/// names `create`, the handle, and `PD` of the policy as the vault will store
+/// it, at policy version 0.
+pub(crate) fn require_owner_create(
+    policy: &KeyPolicy,
+    handle: &str,
+    members: Option<Vec<String>>,
+    ctx: &RequestContext,
+) -> Result<(), String> {
+    let owner = crate::owner_oidc_sub(&policy.principals.owner)
+        .ok_or_else(|| "the key's owner is not an OIDC subject".to_string())?;
+    let claims = ctx.oidc_claims.as_ref().ok_or_else(|| {
+        "this handle needs its owner's create approval: the bearer must be the owner's step-up"
+            .to_string()
+    })?;
+    if claims.sub != owner {
+        return Err("only the key's owner may approve its creation".into());
+    }
+    let pd = crate::v2::stored_policy_digest(policy)?;
+    let binding = OpBinding {
+        measurement_digest_hex: String::new(),
+        policy_version: 0,
+        v1: false,
+        v2: Some(OpBindingV2 {
+            op: "create",
+            target: Ok(pd),
+            members,
+        }),
+    };
+    evaluate_conditions(
+        &[crate::v2::canonical_step_up()],
+        policy,
+        0,
+        Operation::UpdatePolicy,
+        handle,
+        &[],
+        ctx,
+        Some(&binding),
+    )
+    .map_err(|e| format!("the owner's create approval: {e}"))
+}
+
 /// How fresh the owner's step-up must be to reshare (as for export).
 pub(crate) const RESHARE_STEP_UP_FRESH_SECONDS: u64 = 300;
 

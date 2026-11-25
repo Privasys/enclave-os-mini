@@ -45,6 +45,7 @@ use crate::{
     add_to_owner_index, audit_and_save, caller_str, check_grant_for_handle, expired, kv,
     load_record, normalise_policy, now_secs, record_key, require_op, NO_TRUSTED_TIME,
 };
+use crate::types::{BindingV2Request, PendingCreation};
 
 // ---------------------------------------------------------------------------
 //  In-memory state
@@ -60,6 +61,8 @@ struct PendingKey {
     threshold: u16,
     grant: KeyCreationGrant,
     vaults: Vec<String>,
+    /// Made with the owner's bound create approval (a re-created name).
+    created_by_owner_approval: bool,
 }
 
 struct State {
@@ -141,7 +144,7 @@ fn with_state<T>(f: impl FnOnce(&mut State) -> Result<T, String>) -> Result<T, S
 
 /// Who the caller is, for session ownership: its OIDC subject and its TLS
 /// client certificate.
-fn caller_id(ctx: &RequestContext) -> String {
+pub(crate) fn caller_id(ctx: &RequestContext) -> String {
     let sub = ctx.oidc_claims.as_ref().map(|c| c.sub.as_str()).unwrap_or("");
     let cert = ctx
         .peer_cert_der
@@ -190,7 +193,8 @@ fn run(req: VaultRequest, ctx: &RequestContext) -> Result<VaultResponse, String>
             index,
             threshold,
             vaults,
-        } => dkg_round1(&session, &handle, &grant, index, threshold, vaults, &caller, ctx),
+            binding,
+        } => dkg_round1(&session, &handle, &grant, index, threshold, vaults, binding, &caller, ctx),
 
         VaultRequest::FrostDkgRound2 {
             session,
@@ -254,7 +258,7 @@ fn run(req: VaultRequest, ctx: &RequestContext) -> Result<VaultResponse, String>
             if p.handle != handle {
                 return Err("DKG session is for another key".into());
             }
-            let (public_key, expires_at) = store_record(&p, &share, now, ctx)?;
+            let (public_key, expires_at) = store_record(&p, &share, now, &session, &caller, ctx)?;
             Ok(VaultResponse::ThresholdKeyCreated {
                 handle,
                 index: p.index,
@@ -264,14 +268,16 @@ fn run(req: VaultRequest, ctx: &RequestContext) -> Result<VaultResponse, String>
             })
         }
 
-        VaultRequest::FrostDkgAbort { session } => {
+        VaultRequest::FrostDkgAbort { session, handle } => {
             let now = now()?;
-            with_state(|st| {
-                st.check_owner(&format!("dkg:{session}"), &caller, now)?;
-                st.drop_dkg(&session);
-                Ok(())
+            let open = with_state(|st| {
+                if st.check_owner(&format!("dkg:{session}"), &caller, now).is_ok() {
+                    st.drop_dkg(&session);
+                    return Ok(true);
+                }
+                Ok(false)
             })?;
-            Ok(VaultResponse::FrostDone)
+            abort_pending(open, &session, handle.as_deref(), &caller, now, ctx, "dkg")
         }
 
         VaultRequest::FrostSignRound1 {
@@ -324,9 +330,9 @@ fn run(req: VaultRequest, ctx: &RequestContext) -> Result<VaultResponse, String>
             commitments_b64,
             shares_b64,
         } => {
-            let record = load_record(&handle).map_err(response_error)?;
+            let record = crate::load_for(&handle, ctx).map_err(response_error)?;
             if resolve_caller(&record.policy, ctx).is_none() {
-                return Err("caller is not in policy.principals".into());
+                return Err(crate::tomb::NOT_A_PRINCIPAL.into());
             }
             let record = threshold_record(&handle)?;
             let share = StoredShare::from_bytes(&record.material)?;
@@ -352,6 +358,7 @@ fn run(req: VaultRequest, ctx: &RequestContext) -> Result<VaultResponse, String>
             vaults,
             helpers,
             old_public_key_package_b64,
+            binding,
         } => reshare_target1(
             &session,
             &handle,
@@ -361,6 +368,7 @@ fn run(req: VaultRequest, ctx: &RequestContext) -> Result<VaultResponse, String>
             vaults,
             helpers,
             &old_public_key_package_b64,
+            binding,
             &caller,
             ctx,
         ),
@@ -420,7 +428,7 @@ fn run(req: VaultRequest, ctx: &RequestContext) -> Result<VaultResponse, String>
             if p.handle != handle {
                 return Err("resharing session is for another key".into());
             }
-            let (public_key, expires_at) = store_reshared(&p, &share, now, ctx)?;
+            let (public_key, expires_at) = store_reshared(&p, &share, now, &session, &caller, ctx)?;
             Ok(VaultResponse::ThresholdKeyCreated {
                 handle,
                 index: p.index,
@@ -429,16 +437,18 @@ fn run(req: VaultRequest, ctx: &RequestContext) -> Result<VaultResponse, String>
                 expires_at,
             })
         }
-        VaultRequest::FrostReshareAbort { session } => {
+        VaultRequest::FrostReshareAbort { session, handle } => {
             let now = now()?;
-            with_state(|st| {
-                st.check_owner(&format!("reshare:{session}"), &caller, now)?;
-                st.reshare.abort(&session);
-                st.pending.remove(&session);
-                st.owners.remove(&format!("reshare:{session}"));
-                Ok(())
+            let open = with_state(|st| {
+                if st.check_owner(&format!("reshare:{session}"), &caller, now).is_ok() {
+                    st.reshare.abort(&session);
+                    st.pending.remove(&session);
+                    st.owners.remove(&format!("reshare:{session}"));
+                    return Ok(true);
+                }
+                Ok(false)
             })?;
-            Ok(VaultResponse::FrostDone)
+            abort_pending(open, &session, handle.as_deref(), &caller, now, ctx, "reshare")
         }
         VaultRequest::FrostReshareFinalize { handle } => reshare_finish(&handle, false, ctx),
         VaultRequest::FrostReshareRollback { handle } => reshare_finish(&handle, true, ctx),
@@ -567,13 +577,93 @@ fn check_creation(
     if allow_existing {
         return Ok(());
     }
-    let kv = kv().map_err(response_error)?;
-    let store = kv.lock().map_err(|_| "kv store lock poisoned".to_string())?;
-    match store.get(&record_key(handle)) {
-        Ok(Some(_)) => Err("handle already exists".into()),
-        Ok(None) => Ok(()),
-        Err(e) => Err(format!("kv get failed: {e}")),
+    crate::check_handle_free(handle)
+}
+
+/// A threshold key new on this vault under a re-created name needs the
+/// owner's bound create approval (formats §9.3.1); beneath one, only a
+/// linked renewal. `renewal` is whether this is a resharing.
+fn check_threshold_name(
+    handle: &str,
+    grant: &KeyCreationGrant,
+    renewal: bool,
+    binding: Option<BindingV2Request>,
+    ctx: &RequestContext,
+) -> Result<bool, String> {
+    if !renewal && crate::is_generation_handle(handle) {
+        return Err("a handle ending in gen-<n> is a generation and can only be created by a renewal".into());
     }
+    match crate::check_name_rule(handle, renewal)? {
+        crate::NameRule::ReCreated => {
+            crate::check_stored_form(&grant.policy)?;
+            crate::policy::require_owner_create(
+                &normalise_policy(grant.policy.clone()),
+                handle,
+                binding.map(|b| b.members),
+                ctx,
+            )?;
+            Ok(true)
+        }
+        _ => Ok(false),
+    }
+}
+
+/// Abort a key this session committed here and that has served nothing yet
+/// (formats §9.3.1). No tombstone: it never existed as a usable key. The
+/// abort stays in the handle's audit log.
+pub(crate) fn abort_pending(
+    session_was_open: bool,
+    session: &str,
+    handle: Option<&str>,
+    caller: &str,
+    now: u64,
+    ctx: &RequestContext,
+    kind: &str,
+) -> Result<VaultResponse, String> {
+    let Some(handle) = handle else {
+        if session_was_open {
+            return Ok(VaultResponse::FrostDone);
+        }
+        return Err("unknown or expired threshold session".into());
+    };
+    let mut record = match crate::lookup(handle).map_err(response_error)? {
+        crate::tomb::Lookup::Live(r) => r,
+        // Nothing committed here (or long gone): nothing to undo.
+        _ => return Ok(VaultResponse::FrostDone),
+    };
+    let ok = match &record.pending_creation {
+        Some(p) => {
+            p.session == session
+                && p.caller == caller
+                && now <= p.committed_at.saturating_add(frost::DKG_SESSION_TTL_SECS)
+        }
+        None => false,
+    };
+    if !ok {
+        return Err(
+            "only a key this session committed here, unused and within the session's time, \
+             can be aborted; delete it instead"
+                .into(),
+        );
+    }
+    let owner = crate::owner_oidc_sub(&record.policy.principals.owner);
+    audit_and_save(
+        &mut record,
+        "AbortPendingKey",
+        &caller_str(ctx),
+        AuditDecision::Allowed,
+        &format!("{kind} session {session}"),
+    )
+    .map_err(response_error)?;
+    let kv = kv().map_err(response_error)?;
+    let mut store = kv.lock().map_err(|_| "kv store lock poisoned".to_string())?;
+    store
+        .delete(&record_key(handle))
+        .map_err(|e| format!("kv delete failed: {e}"))?;
+    if let Some(owner) = owner {
+        let _ = crate::remove_from_owner_index(&store, &owner, handle);
+    }
+    Ok(VaultResponse::FrostDone)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -584,6 +674,7 @@ fn dkg_round1(
     index: u16,
     threshold: u16,
     vaults: Vec<String>,
+    binding: Option<BindingV2Request>,
     caller: &str,
     ctx: &RequestContext,
 ) -> Result<VaultResponse, String> {
@@ -591,6 +682,7 @@ fn dkg_round1(
     // Bound to the caller, as for CreateKey.
     let grant = crate::grant::verify_grant(grant_jwt, ctx, now)?;
     check_creation(handle, &grant, &vaults, threshold, index, false)?;
+    let created_by_owner_approval = check_threshold_name(handle, &grant, false, binding, ctx)?;
     let n = vaults.len() as u16;
     let out = with_state(|st| {
         st.open(format!("dkg:{session}"), caller, now)?;
@@ -608,6 +700,7 @@ fn dkg_round1(
                 threshold,
                 grant,
                 vaults,
+                created_by_owner_approval,
             },
         );
         Ok(out)
@@ -630,18 +723,19 @@ fn store_record(
     p: &PendingKey,
     share: &StoredShare,
     now: u64,
+    session: &str,
+    caller: &str,
     ctx: &RequestContext,
 ) -> Result<(Vec<u8>, u64), String> {
     let policy = normalise_policy(p.grant.policy.clone());
     let expires_at = now.saturating_add(policy.lifecycle.ttl_seconds);
     let public_key = share.group_public_key()?;
-    {
+    crate::check_handle_free(&p.handle)?;
+    let audit_next_seq = {
         let kv = kv().map_err(response_error)?;
         let store = kv.lock().map_err(|_| "kv store lock poisoned".to_string())?;
-        if let Ok(Some(_)) = store.get(&record_key(&p.handle)) {
-            return Err("handle already exists".into());
-        }
-    }
+        crate::tomb::next_audit_seq(&store, &p.handle)
+    };
     let mut record = KeyRecord {
         handle: p.handle.clone(),
         key_type: KeyType::FrostEd25519,
@@ -653,11 +747,18 @@ fn store_record(
         created_at: now,
         expires_at,
         pending_profiles: Vec::new(),
-        audit_next_seq: 0,
+        audit_next_seq,
         next_pending_id: 0,
         threshold_vaults: p.vaults.clone(),
         key_check: None,
         renewed_in_place_from: None,
+        created_by_owner_approval: p.created_by_owner_approval,
+        // Until it serves something, its own session may still abort it.
+        pending_creation: Some(PendingCreation {
+            session: session.to_string(),
+            caller: caller.to_string(),
+            committed_at: now,
+        }),
     };
     audit_and_save(
         &mut record,
@@ -818,6 +919,7 @@ fn reshare_target1(
     vaults: Vec<String>,
     helpers: Vec<u16>,
     old_pkp_b64: &str,
+    binding: Option<BindingV2Request>,
     caller: &str,
     ctx: &RequestContext,
 ) -> Result<VaultResponse, String> {
@@ -835,6 +937,11 @@ fn reshare_target1(
         }
     }
     check_creation(handle, &grant, &vaults, threshold, index, existing.is_some())?;
+    // New on this vault: the name rules of a re-created name apply.
+    let created_by_owner_approval = match &existing {
+        Some(r) => r.created_by_owner_approval,
+        None => check_threshold_name(handle, &grant, true, binding, ctx)?,
+    };
     let mine = enclave_os_egress::enclave_self_mrenclave()
         .ok_or("this enclave's MRENCLAVE is not available")?;
     let context = reshare_context(handle, &group, &helpers, threshold, &vaults, &mine);
@@ -863,6 +970,7 @@ fn reshare_target1(
                 threshold,
                 grant,
                 vaults,
+                created_by_owner_approval,
             },
         );
         Ok(out)
@@ -923,6 +1031,8 @@ fn reshare_deal(
                 e
             }
         })?;
+    // Having served, the key can no longer be aborted.
+    record.pending_creation = None;
     audit_and_save(
         &mut record,
         "ReshareDeal",
@@ -947,10 +1057,12 @@ fn store_reshared(
     p: &PendingKey,
     share: &StoredShare,
     now: u64,
+    session: &str,
+    caller: &str,
     ctx: &RequestContext,
 ) -> Result<(Vec<u8>, u64), String> {
     let Ok(mut old) = load_record(&p.handle) else {
-        return store_record(p, share, now, ctx);
+        return store_record(p, share, now, session, caller, ctx);
     };
     let public_key = share.group_public_key()?;
     if old.public_key.as_deref() != Some(&public_key[..]) {

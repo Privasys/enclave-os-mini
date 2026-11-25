@@ -21,6 +21,7 @@ pub mod policy;
 pub mod quote;
 pub mod signing;
 pub mod threshold;
+pub mod tomb;
 pub mod types;
 pub mod v2;
 
@@ -80,6 +81,8 @@ impl EnclaveModule for VaultModule {
             Err(_) => return None,
         };
 
+        housekeeping();
+
         let resp = match vault_req {
             VaultRequest::CreateKey {
                 handle,
@@ -93,6 +96,7 @@ impl EnclaveModule for VaultModule {
                 key_check,
                 carried_exportable,
                 carried_key_type,
+                binding,
             } => handle_create(
                 &handle,
                 &material_b64,
@@ -106,6 +110,7 @@ impl EnclaveModule for VaultModule {
                     key_check,
                     carried_exportable,
                     carried_key_type,
+                    binding,
                 },
                 ctx,
             ),
@@ -263,7 +268,7 @@ pub(crate) fn add_to_owner_index(store: &SealedKvStore, owner_sub: &str, handle:
     store.put(&key, &bytes)
 }
 
-fn remove_from_owner_index(
+pub(crate) fn remove_from_owner_index(
     store: &SealedKvStore,
     owner_sub: &str,
     handle: &str,
@@ -287,17 +292,84 @@ pub(crate) fn kv() -> Result<&'static std::sync::Mutex<SealedKvStore>, VaultResp
         .ok_or_else(|| VaultResponse::Error("kv store not initialised".into()))
 }
 
-pub(crate) fn load_record(handle: &str) -> Result<KeyRecord, VaultResponse> {
+/// Find a handle as it stands, finishing a cut-short deletion or purging an
+/// expired tombstone on the way (formats §9.3).
+pub(crate) fn lookup(handle: &str) -> Result<tomb::Lookup, VaultResponse> {
     let kv = kv()?;
-    let store = kv
+    let mut store = kv
         .lock()
         .map_err(|_| VaultResponse::Error("kv store lock poisoned".into()))?;
-    let bytes = store
-        .get(&record_key(handle))
-        .map_err(|e| VaultResponse::Error(format!("kv get failed: {e}")))?
-        .ok_or_else(|| VaultResponse::Error("key not found".into()))?;
-    serde_json::from_slice::<KeyRecord>(&bytes)
-        .map_err(|e| VaultResponse::Error(format!("corrupt record: {e}")))
+    tomb::lookup(&mut store, handle, now_secs()).map_err(VaultResponse::Error)
+}
+
+/// A live key's record, for the vault's own use (a predecessor, a successor,
+/// a threshold session already authorised). A deleted key is "not found".
+pub(crate) fn load_record(handle: &str) -> Result<KeyRecord, VaultResponse> {
+    match lookup(handle)? {
+        tomb::Lookup::Live(r) => Ok(r),
+        _ => Err(VaultResponse::Error("key not found".into())),
+    }
+}
+
+/// Whether `ctx` may learn about a key under `policy`: one of its principals,
+/// or the platform's manager bearer (which stages profiles).
+fn may_see(policy: &KeyPolicy, ctx: &RequestContext) -> bool {
+    resolve_caller(policy, ctx).is_some()
+        || ctx.oidc_claims.as_ref().map_or(false, |c| c.is_manager)
+}
+
+/// A key's record for a request by `ctx`. Anyone outside the key's policy
+/// gets the same answer for a live key and a deleted one (no existence
+/// oracle, Security); the key's principals learn that it was deleted.
+pub(crate) fn load_for(handle: &str, ctx: &RequestContext) -> Result<KeyRecord, VaultResponse> {
+    match lookup(handle)? {
+        tomb::Lookup::Live(r) if may_see(&r.policy, ctx) => Ok(r),
+        tomb::Lookup::Live(_) => {
+            UNAUDITED_DENIALS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+            Err(VaultResponse::Error(tomb::NOT_A_PRINCIPAL.into()))
+        }
+        tomb::Lookup::Deleted(t) if may_see(&t.final_policy, ctx) => {
+            Err(VaultResponse::Error(tomb::deleted_message(&t)))
+        }
+        tomb::Lookup::Deleted(_) => Err(VaultResponse::Error(tomb::NOT_A_PRINCIPAL.into())),
+        tomb::Lookup::Missing => Err(VaultResponse::Error("key not found".into())),
+    }
+}
+
+/// Refuse to create `handle` while it has a tombstone or a key. Every
+/// creation path calls this (Security).
+pub(crate) fn check_handle_free(handle: &str) -> Result<(), String> {
+    match lookup(handle).map_err(response_text)? {
+        tomb::Lookup::Missing => Ok(()),
+        tomb::Lookup::Live(_) => Err("handle already exists".into()),
+        tomb::Lookup::Deleted(t) => Err(tomb::creation_refusal(&t)),
+    }
+}
+
+pub(crate) fn response_text(r: VaultResponse) -> String {
+    match r {
+        VaultResponse::Error(e) => e,
+        _ => "unexpected vault response".into(),
+    }
+}
+
+/// Seconds between two housekeeping passes.
+const HOUSEKEEPING_EVERY: u64 = 300;
+static LAST_HOUSEKEEPING: core::sync::atomic::AtomicU64 = core::sync::atomic::AtomicU64::new(0);
+
+/// Finish cut-short deletions and purge expired tombstones, at most every
+/// [`HOUSEKEEPING_EVERY`] seconds, on the back of ordinary requests.
+fn housekeeping() {
+    let Some(now) = now_secs() else { return };
+    let last = LAST_HOUSEKEEPING.load(core::sync::atomic::Ordering::Relaxed);
+    if now < last.saturating_add(HOUSEKEEPING_EVERY) {
+        return;
+    }
+    LAST_HOUSEKEEPING.store(now, core::sync::atomic::Ordering::Relaxed);
+    let Ok(kv) = kv() else { return };
+    if let Ok(mut store) = kv.lock() {
+        tomb::housekeep(&mut store, Some(now));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -461,6 +533,7 @@ struct CreateExtras {
     key_check: Option<crate::types::KeyCheck>,
     carried_exportable: Option<bool>,
     carried_key_type: Option<KeyType>,
+    binding: Option<BindingV2Request>,
 }
 
 /// The capability this build publishes in `GetVaultIdentity` for generation
@@ -473,12 +546,75 @@ pub const CAPABILITY_UPDATE_FROM: &str = "update-policy-from-v1";
 
 /// Whether a handle's last segment is a generation marker "gen-<digits>"
 /// (formats §9.1): the suffix user-secret generations use, and nothing else.
-fn is_generation_handle(handle: &str) -> bool {
+pub(crate) fn is_generation_handle(handle: &str) -> bool {
     let last = handle.rsplit('/').next().unwrap_or(handle);
     match last.strip_prefix("gen-") {
         Some(n) => !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()),
         None => false,
     }
+}
+
+/// What the handle's name allows (formats §9.3.1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum NameRule {
+    /// No `new-<digits>` segment.
+    Plain,
+    /// The last segment is `new-<digits>`: a re-created name, made only with
+    /// the owner's bound `create` approval.
+    ReCreated,
+    /// Beneath a `new-<digits>` segment: only a linked renewal, ending in
+    /// `gen-<digits>`.
+    BeneathReCreated,
+}
+
+fn is_new_segment(seg: &str) -> bool {
+    match seg.strip_prefix("new-") {
+        Some(n) => !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()),
+        None => false,
+    }
+}
+
+pub(crate) fn name_rule(handle: &str) -> NameRule {
+    let segs: Vec<&str> = handle.split('/').collect();
+    let (last, rest) = segs.split_last().expect("split yields at least one segment");
+    if is_new_segment(last) {
+        NameRule::ReCreated
+    } else if rest.iter().any(|s| is_new_segment(s)) {
+        NameRule::BeneathReCreated
+    } else {
+        NameRule::Plain
+    }
+}
+
+/// The checks a creation makes on the handle's name before anything else:
+/// `renewal` is whether it is a renewal (a predecessor here or a carried
+/// policy).
+pub(crate) fn check_name_rule(handle: &str, renewal: bool) -> Result<NameRule, String> {
+    let rule = name_rule(handle);
+    if rule == NameRule::BeneathReCreated && !(renewal && is_generation_handle(handle)) {
+        return Err(
+            "beneath a re-created name (new-<k>) only a renewal ending in gen-<m> may be \
+             created; to change the value, delete the key and re-create the name"
+                .into(),
+        );
+    }
+    Ok(rule)
+}
+
+/// A re-created name's policy is approved as the vault will store it: the
+/// policy must already be in stored form (formats §9.3.1).
+pub(crate) fn check_stored_form(policy: &KeyPolicy) -> Result<(), String> {
+    let a = serde_json::to_value(policy).map_err(|e| format!("serialise policy: {e}"))?;
+    let b = serde_json::to_value(normalise_policy(policy.clone()))
+        .map_err(|e| format!("serialise policy: {e}"))?;
+    if a != b {
+        return Err(
+            "a re-created name's policy must be in the vault's stored form \
+             (lower-case hex, a TTL within the vault's bounds), as CanonicalisePolicy returns it"
+                .into(),
+        );
+    }
+    Ok(())
 }
 
 /// Where a new key's policy comes from.
@@ -679,6 +815,7 @@ fn handle_identity() -> VaultResponse {
         capabilities: vec![
             CAPABILITY_GENERATIONS.to_string(),
             CAPABILITY_UPDATE_FROM.to_string(),
+            tomb::CAPABILITY_TOMBSTONES.to_string(),
         ],
     }
 }
@@ -687,7 +824,7 @@ fn handle_create(
     handle: &str,
     material_b64: &str,
     grant_jwt: &str,
-    extras: CreateExtras,
+    mut extras: CreateExtras,
     ctx: &RequestContext,
 ) -> VaultResponse {
     if handle.is_empty() {
@@ -731,10 +868,50 @@ fn handle_create(
                 .into(),
         );
     }
+    let rule = match check_name_rule(handle, !first_creation) {
+        Ok(r) => r,
+        Err(e) => return VaultResponse::Error(e),
+    };
+    // Every creation path stops at a tombstone (formats §9.3).
+    if let Err(e) = check_handle_free(handle) {
+        return VaultResponse::Error(e);
+    }
+    // A re-created name: its policy as sent must be its stored form.
+    if rule == NameRule::ReCreated {
+        let sent = match &extras.policy {
+            Some(raw) => match serde_json::from_str::<KeyPolicy>(raw.get()) {
+                Ok(p) => p,
+                Err(e) => return VaultResponse::Error(format!("carried policy does not parse: {e}")),
+            },
+            None if extras.predecessor.is_none() => grant.policy.clone(),
+            None => {
+                return VaultResponse::Error(
+                    "a re-created name (new-<k>) is not a renewal in place".into(),
+                )
+            }
+        };
+        if let Err(e) = check_stored_form(&sent) {
+            return VaultResponse::Error(e);
+        }
+    }
+    let binding = extras.binding.take();
     let chosen = match new_key_policy(&grant, extras, ctx) {
         Ok(c) => c,
         Err(e) => return VaultResponse::Error(e),
     };
+    // The owner's bound create approval, checked against exactly the policy
+    // stored (Security): never a grant alone.
+    let created_by_owner_approval = rule == NameRule::ReCreated;
+    if created_by_owner_approval {
+        if let Err(e) = crate::policy::require_owner_create(
+            &chosen.policy,
+            handle,
+            binding.map(|b| b.members),
+            ctx,
+        ) {
+            return VaultResponse::Error(e);
+        }
+    }
     let exportable = chosen.exportable;
     let owner_sub = match owner_oidc_sub(&chosen.policy.principals.owner) {
         Some(s) => s,
@@ -766,7 +943,7 @@ fn handle_create(
         Ok(k) => k,
         Err(e) => return e,
     };
-    {
+    let audit_next_seq = {
         let store = match kv.lock() {
             Ok(s) => s,
             Err(_) => return VaultResponse::Error("kv store lock poisoned".into()),
@@ -776,7 +953,8 @@ fn handle_create(
             Ok(None) => {}
             Err(e) => return VaultResponse::Error(format!("kv get failed: {e}")),
         }
-    }
+        tomb::next_audit_seq(&store, handle)
+    };
 
     let mut record = KeyRecord {
         handle: handle.to_string(),
@@ -789,11 +967,13 @@ fn handle_create(
         created_at: now,
         expires_at,
         pending_profiles: Vec::new(),
-        audit_next_seq: 0,
+        audit_next_seq,
         next_pending_id: 0,
         threshold_vaults: Vec::new(),
         key_check: chosen.key_check,
         renewed_in_place_from,
+        created_by_owner_approval,
+        pending_creation: None,
     };
 
     if let Err(e) = audit_and_save(
@@ -801,7 +981,11 @@ fn handle_create(
         "CreateKey",
         &caller_str(ctx),
         AuditDecision::Allowed,
-        &format!("owner={owner_sub}; {}", chosen.how),
+        &format!(
+            "owner={owner_sub}; {}{}",
+            chosen.how,
+            if created_by_owner_approval { "; with the owner's create approval" } else { "" }
+        ),
     ) {
         return e;
     }
@@ -828,7 +1012,7 @@ fn handle_export(
     binding: Option<BindingV2Request>,
     ctx: &RequestContext,
 ) -> VaultResponse {
-    let mut record = match load_record(handle) {
+    let mut record = match load_for(handle, ctx) {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -891,7 +1075,7 @@ fn handle_delete(
     after: Option<crate::types::DeleteAfter>,
     ctx: &RequestContext,
 ) -> VaultResponse {
-    let mut record = match load_record(handle) {
+    let mut record = match load_for(handle, ctx) {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -934,39 +1118,73 @@ fn handle_delete(
         return VaultResponse::Error(e);
     }
 
-    match remove_record(&mut record, "DeleteKey", &caller, &detail) {
+    let (tomb_op, successor) = match &after {
+        Some(a) => ("delete_after", a.successor.as_str()),
+        None => ("delete", "-"),
+    };
+    match remove_record(&mut record, "DeleteKey", &caller, &detail, tomb_op, successor, ctx) {
         Ok(()) => VaultResponse::KeyDeleted,
         Err(e) => e,
     }
 }
 
-/// Delete a key's record after auditing it. The record itself disappears, so
-/// its audit chain dies too: deletion is final and auditors snapshot the log
-/// before it goes.
+/// Delete a key after auditing it, leaving a tombstone (formats §9.3): the
+/// tombstone is written first, then the record with its material. The audit
+/// log stays until the key's original expiry.
+#[allow(clippy::too_many_arguments)]
 fn remove_record(
     record: &mut KeyRecord,
     what: &str,
     caller: &str,
     detail: &str,
+    tomb_op: &str,
+    successor: &str,
+    ctx: &RequestContext,
 ) -> Result<(), VaultResponse> {
-    let handle = record.handle.clone();
-    let owner_sub = match owner_oidc_sub(&record.policy.principals.owner) {
-        Some(s) => s,
-        None => return Err(VaultResponse::Error("policy owner is not OIDC; cannot index".into())),
+    let Some(now) = now_secs() else {
+        return Err(VaultResponse::Error(NO_TRUSTED_TIME.into()));
     };
-    let _ = audit_and_save(record, what, caller, AuditDecision::Allowed, detail);
-
+    let final_pd = v2::stored_policy_digest(&record.policy).map_err(VaultResponse::Error)?;
+    audit_and_save(record, what, caller, AuditDecision::Allowed, detail)?;
+    let (approver, vault_op) = tomb_approver(&record.policy, tomb_op, ctx);
+    let t = crate::types::Tombstone {
+        handle: record.handle.clone(),
+        key_type: record.key_type,
+        final_policy: record.policy.clone(),
+        final_pd,
+        final_policy_version: record.policy_version,
+        op: tomb_op.to_string(),
+        approver,
+        vault_op,
+        successor: successor.to_string(),
+        deleted_at: now,
+        expires_at: record.expires_at,
+        audit_next_seq: record.audit_next_seq,
+    };
     let kv = kv()?;
-    let mut store = match kv.lock() {
-        Ok(s) => s,
-        Err(_) => return Err(VaultResponse::Error("kv store lock poisoned".into())),
-    };
-    if let Err(e) = store.delete(&record_key(&handle)) {
-        return Err(VaultResponse::Error(format!("kv delete failed: {e}")));
+    let mut store = kv
+        .lock()
+        .map_err(|_| VaultResponse::Error("kv store lock poisoned".into()))?;
+    tomb::delete_with_tombstone(&mut store, &t).map_err(VaultResponse::Error)
+}
+
+/// Who approved a deletion, and the binding that named it ("-" unless the
+/// vault checked a binding v2 for it).
+fn tomb_approver(policy: &KeyPolicy, tomb_op: &str, ctx: &RequestContext) -> (String, String) {
+    match ctx.oidc_claims.as_ref() {
+        Some(c) => {
+            let bound = tomb_op != "retire" && rule_takes_binding_v2(policy, Operation::DeleteKey);
+            let vault_op = match (&c.vault_op, bound) {
+                (Some(v), true) => v.clone(),
+                _ => "-".to_string(),
+            };
+            (format!("oidc:0:{}", c.sub), vault_op)
+        }
+        None => {
+            let id = threshold::caller_id(ctx);
+            (format!("tee:{}", id.trim_start_matches('|')), "-".to_string())
+        }
     }
-    let _ = store.delete(&threshold::previous_key(&handle));
-    let _ = remove_from_owner_index(&store, &owner_sub, &handle);
-    Ok(())
 }
 
 /// The old key of a migration or upgrade may go only once its successor has
@@ -976,7 +1194,12 @@ fn check_successor_succeeded(old: &KeyRecord, after: &crate::types::DeleteAfter)
     if after.successor == old.handle {
         return Err("a key cannot be the successor of itself".into());
     }
-    let succ = load_record(&after.successor).ok();
+    // A successor deleted here is not one "on another constellation".
+    let succ = match lookup(&after.successor).map_err(response_text)? {
+        tomb::Lookup::Live(r) => Some(r),
+        tomb::Lookup::Deleted(_) => return Err("the successor has been deleted".into()),
+        tomb::Lookup::Missing => None,
+    };
     successor_check(old, after, succ.as_ref(), now_secs())
 }
 
@@ -1024,10 +1247,19 @@ fn handle_retire(
     successor_members: &[String],
     ctx: &RequestContext,
 ) -> VaultResponse {
-    let mut record = match load_record(handle) {
-        Ok(r) => r,
-        Err(_) => return VaultResponse::KeyRetired { was_present: false },
+    // Idempotent: a key already gone was retired (or deleted) before.
+    let mut record = match lookup(handle) {
+        Ok(tomb::Lookup::Live(r)) => r,
+        Ok(tomb::Lookup::Deleted(t)) if !tomb::is_principal(&t, ctx) => {
+            return VaultResponse::Error(tomb::NOT_A_PRINCIPAL.into())
+        }
+        Ok(_) => return VaultResponse::KeyRetired { was_present: false },
+        Err(e) => return e,
     };
+    if resolve_caller(&record.policy, ctx).is_none() {
+        UNAUDITED_DENIALS.fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+        return VaultResponse::Error(tomb::NOT_A_PRINCIPAL.into());
+    }
     let caller = caller_str(ctx);
     let refuse = |record: &mut KeyRecord, e: String| {
         let _ = audit_denial(ctx, record, "RetireKey", &caller, AuditDecision::Denied, &e);
@@ -1072,7 +1304,7 @@ fn handle_retire(
             )
         }
     };
-    match remove_record(&mut record, "RetireKey", &caller, &detail) {
+    match remove_record(&mut record, "RetireKey", &caller, &detail, "retire", successor, ctx) {
         Ok(()) => VaultResponse::KeyRetired { was_present: true },
         Err(e) => e,
     }
@@ -1085,7 +1317,7 @@ fn handle_update_policy(
     binding: Option<BindingV2Request>,
     ctx: &RequestContext,
 ) -> VaultResponse {
-    let mut record = match load_record(handle) {
+    let mut record = match load_for(handle, ctx) {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -1210,7 +1442,7 @@ fn handle_update_policy(
 }
 
 fn handle_get_policy(handle: &str, ctx: &RequestContext) -> VaultResponse {
-    let record = match load_record(handle) {
+    let record = match load_for(handle, ctx) {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -1224,12 +1456,25 @@ fn handle_get_policy(handle: &str, ctx: &RequestContext) -> VaultResponse {
 }
 
 fn handle_get_info(handle: &str, ctx: &RequestContext) -> VaultResponse {
-    let record = match load_record(handle) {
+    // A deleted key's principals read its tombstone (formats §9.3).
+    if let Ok(tomb::Lookup::Deleted(t)) = lookup(handle) {
+        if tomb::is_principal(&t, ctx) {
+            return VaultResponse::KeyTombstone {
+                handle: t.handle,
+                key_type: t.key_type,
+                op: t.op,
+                deleted_at: t.deleted_at,
+                successor: t.successor,
+                expires_at: t.expires_at,
+            };
+        }
+    }
+    let record = match load_for(handle, ctx) {
         Ok(r) => r,
         Err(e) => return e,
     };
     if resolve_caller(&record.policy, ctx).is_none() {
-        return VaultResponse::Error("caller is not in policy.principals".into());
+        return VaultResponse::Error(tomb::NOT_A_PRINCIPAL.into());
     }
     let threshold = threshold::key_info(&record);
     VaultResponse::KeyInfo(KeyInfo {
@@ -1242,6 +1487,7 @@ fn handle_get_info(handle: &str, ctx: &RequestContext) -> VaultResponse {
         public_key: record.public_key,
         threshold,
         renewed_in_place_from: record.renewed_in_place_from,
+        created_by_owner_approval: record.created_by_owner_approval,
     })
 }
 
@@ -1267,15 +1513,16 @@ fn handle_list(ctx: &RequestContext) -> VaultResponse {
     };
 
     let mut keys = Vec::new();
+    let mut store = store;
+    let now = now_secs();
     for handle in &handles {
-        if let Ok(Some(bytes)) = store.get(&record_key(handle)) {
-            if let Ok(record) = serde_json::from_slice::<KeyRecord>(&bytes) {
-                keys.push(KeyListEntry {
-                    handle: record.handle,
-                    key_type: record.key_type,
-                    expires_at: record.expires_at,
-                });
-            }
+        // Live keys only: a lookup also finishes a cut-short deletion.
+        if let Ok(tomb::Lookup::Live(record)) = tomb::lookup(&mut store, handle, now) {
+            keys.push(KeyListEntry {
+                handle: record.handle,
+                key_type: record.key_type,
+                expires_at: record.expires_at,
+            });
         }
     }
     VaultResponse::KeyList { keys }
@@ -1294,7 +1541,7 @@ pub(crate) fn require_op(
     approvals: &[ApprovalToken],
     ctx: &RequestContext,
 ) -> Result<KeyRecord, VaultResponse> {
-    let mut record = load_record(handle)?;
+    let mut record = load_for(handle, ctx)?;
     if expired(&record) {
         let _ = audit_denial(ctx, 
             &mut record,
@@ -1324,6 +1571,8 @@ pub(crate) fn require_op(
         let _ = audit_denial(ctx, &mut record, op_name(op), &caller, AuditDecision::Denied, &e);
         return Err(VaultResponse::Error(e));
     }
+    // Having served, a pending threshold key can no longer be aborted.
+    record.pending_creation = None;
     if let Err(e) = audit_and_save(
         &mut record,
         op_name(op),
@@ -1507,7 +1756,7 @@ fn handle_issue_approval(
     ttl_seconds: u64,
     ctx: &RequestContext,
 ) -> VaultResponse {
-    let mut record = match load_record(handle) {
+    let mut record = match load_for(handle, ctx) {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -1610,13 +1859,20 @@ fn handle_read_audit(
     limit: u32,
     ctx: &RequestContext,
 ) -> VaultResponse {
-    let record = match load_record(handle) {
-        Ok(r) => r,
-        Err(e) => return e,
+    // A deleted key's log stays readable by its principals until the purge.
+    let next = match lookup(handle) {
+        Ok(tomb::Lookup::Deleted(t)) if tomb::is_principal(&t, ctx) => t.audit_next_seq,
+        _ => {
+            let record = match load_for(handle, ctx) {
+                Ok(r) => r,
+                Err(e) => return e,
+            };
+            if resolve_caller(&record.policy, ctx).is_none() {
+                return VaultResponse::Error(tomb::NOT_A_PRINCIPAL.into());
+            }
+            record.audit_next_seq
+        }
     };
-    if resolve_caller(&record.policy, ctx).is_none() {
-        return VaultResponse::Error("caller is not in policy.principals".into());
-    }
     let limit = if limit == 0 { 256 } else { limit.min(1024) };
 
     let kv = match kv() {
@@ -1628,7 +1884,7 @@ fn handle_read_audit(
         Err(_) => return VaultResponse::Error("kv store lock poisoned".into()),
     };
     let (entries, next_seq) =
-        match audit::read(&store, handle, record.audit_next_seq, since_seq, limit) {
+        match audit::read(&store, handle, next, since_seq, limit) {
             Ok(p) => p,
             Err(e) => return VaultResponse::Error(e),
         };
@@ -1725,7 +1981,7 @@ fn handle_stage_pending(
     source: PendingProfileSource,
     ctx: &RequestContext,
 ) -> VaultResponse {
-    let mut record = match load_record(handle) {
+    let mut record = match load_for(handle, ctx) {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -1876,7 +2132,7 @@ fn handle_stage_pending(
 }
 
 fn handle_list_pending(handle: &str, ctx: &RequestContext) -> VaultResponse {
-    let record = match load_record(handle) {
+    let record = match load_for(handle, ctx) {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -1895,7 +2151,7 @@ fn handle_promote_pending(
     binding: Option<BindingV2Request>,
     ctx: &RequestContext,
 ) -> VaultResponse {
-    let mut record = match load_record(handle) {
+    let mut record = match load_for(handle, ctx) {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -2005,7 +2261,7 @@ fn handle_promote_pending(
 }
 
 fn handle_revoke_pending(handle: &str, pending_id: u32, ctx: &RequestContext) -> VaultResponse {
-    let mut record = match load_record(handle) {
+    let mut record = match load_for(handle, ctx) {
         Ok(r) => r,
         Err(e) => return e,
     };
@@ -2055,7 +2311,7 @@ pub(crate) fn expired(record: &KeyRecord) -> bool {
     now_secs().map_or(true, |now| now > record.expires_at)
 }
 
-fn owner_oidc_sub(owner: &Principal) -> Option<String> {
+pub(crate) fn owner_oidc_sub(owner: &Principal) -> Option<String> {
     match owner {
         Principal::Oidc { sub, .. } => Some(sub.clone()),
         Principal::Tee(_) | Principal::Fido2 { .. } => None,
@@ -2135,6 +2391,8 @@ mod step1_tests {
             threshold_vaults: Vec::new(),
             key_check: None,
             renewed_in_place_from: renewed_in_place_from.map(String::from),
+            created_by_owner_approval: false,
+            pending_creation: None,
         }
     }
 
@@ -2174,5 +2432,335 @@ mod step1_tests {
         // The control plane's and Drive's generations stay ordinary creations.
         assert!(!is_generation_handle("apps.privasys.org/x/storage-kek/v2"));
         assert!(!is_generation_handle("users/s/data/o/mek/v7"));
+    }
+}
+
+#[cfg(test)]
+mod tombstone_tests {
+    //! Formats §9.3 and §9.3.1 against an in-memory host.
+    use super::*;
+    use enclave_os_common::modules::AppIdentity;
+    use enclave_os_common::ocall::{self, OcallVtable};
+    use enclave_os_common::rpc::KvBatchOp;
+    use std::collections::HashMap;
+    use std::sync::{Mutex, Once};
+
+    type Host = HashMap<(Vec<u8>, Vec<u8>), Vec<u8>>;
+    static HOST: Mutex<Option<Host>> = Mutex::new(None);
+    static INIT: Once = Once::new();
+    const NOW: u64 = 1_000_000;
+
+    fn put(t: &[u8], k: &[u8], v: &[u8]) -> Result<(), i32> {
+        HOST.lock().unwrap().get_or_insert_with(HashMap::new).insert((t.to_vec(), k.to_vec()), v.to_vec());
+        Ok(())
+    }
+    fn get(t: &[u8], k: &[u8]) -> Result<Option<Vec<u8>>, i32> {
+        Ok(HOST.lock().unwrap().as_ref().and_then(|m| m.get(&(t.to_vec(), k.to_vec())).cloned()))
+    }
+    fn del(t: &[u8], k: &[u8]) -> Result<bool, i32> {
+        Ok(HOST.lock().unwrap().as_mut().is_some_and(|m| m.remove(&(t.to_vec(), k.to_vec())).is_some()))
+    }
+    fn unused<T>() -> Result<T, i32> {
+        Err(-1)
+    }
+
+    /// One host and one vault store for the whole test binary; every test
+    /// uses its own handles.
+    fn init() {
+        INIT.call_once(|| {
+            ocall::register(OcallVtable {
+                net_tcp_listen: |_, _| unused(),
+                net_tcp_accept: |_| unused(),
+                net_tcp_connect: |_, _| unused(),
+                net_send: |_, _| unused(),
+                net_recv: |_, _| unused(),
+                net_close: |_| {},
+                net_udp_bind: |_, _| unused(),
+                net_udp_send_to: |_, _, _, _| unused(),
+                net_udp_recv_from: |_, _, _| unused(),
+                net_udp_close: |_| {},
+                kv_store_put: put,
+                kv_store_get: get,
+                kv_store_delete: del,
+                kv_store_list_keys: |_, _| unused(),
+                kv_store_write_batch: |_, _: &[KvBatchOp]| unused(),
+                kv_store_multi_get: |_, _| unused(),
+                kv_store_scan: |_, _, _, _| unused(),
+                get_current_time: || Ok(NOW),
+                get_current_time_ms: || Ok(NOW * 1000),
+                log: |_, _| {},
+                cert_store_register: |_: AppIdentity| {},
+                cert_store_unregister: |_| false,
+            });
+            let _ = enclave_os_kvstore::KvStoreModule::new([9u8; 32]).unwrap();
+        });
+    }
+
+    fn ctx(sub: &str) -> RequestContext {
+        RequestContext {
+            peer_cert_der: None,
+            peer_evidence: None,
+            attestation: "none".into(),
+            oidc_claims: Some(
+                serde_json::from_value(serde_json::json!({
+                    "sub": sub, "roles": [], "is_manager": false, "is_monitoring": false
+                }))
+                .unwrap(),
+            ),
+            fido2_user: None,
+            app_name: None,
+        }
+    }
+
+    fn alice_policy(ops: serde_json::Value) -> KeyPolicy {
+        serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "principals": {
+                "owner": {"Oidc": {"issuer": "https://privasys.id", "sub": "alice", "required_roles": []}},
+                "managers": [], "auditors": [], "tees": []
+            },
+            "operations": ops
+        }))
+        .unwrap()
+    }
+
+    /// A key alice owns and may delete and export with no approval.
+    fn put_key(handle: &str) {
+        init();
+        let policy = alice_policy(serde_json::json!([
+            {"ops": ["DeleteKey", "ExportKey"], "principals": ["Owner"], "requires": []}
+        ]));
+        let mut record = KeyRecord {
+            handle: handle.into(),
+            key_type: KeyType::RawShare,
+            exportable: true,
+            material: vec![42],
+            public_key: None,
+            policy,
+            policy_version: 1,
+            created_at: NOW - 10,
+            expires_at: NOW + 1000,
+            pending_profiles: Vec::new(),
+            audit_next_seq: 0,
+            next_pending_id: 0,
+            threshold_vaults: Vec::new(),
+            key_check: None,
+            renewed_in_place_from: None,
+            created_by_owner_approval: false,
+            pending_creation: None,
+        };
+        audit_and_save(&mut record, "CreateKey", "oidc:alice", AuditDecision::Allowed, "").unwrap();
+        let store = kv().unwrap().lock().unwrap();
+        add_to_owner_index(&store, "alice", handle).unwrap();
+    }
+
+    fn err(r: VaultResponse) -> String {
+        match r {
+            VaultResponse::Error(e) => e,
+            other => panic!("expected an error, got {}", serde_json::to_string(&other).unwrap()),
+        }
+    }
+
+    fn raw_record(handle: &str) -> Option<Vec<u8>> {
+        kv().unwrap().lock().unwrap().get(&record_key(handle)).unwrap()
+    }
+
+    fn deleted(h: &str) {
+        assert!(matches!(handle_delete(h, &[], None, None, &ctx("alice")), VaultResponse::KeyDeleted));
+    }
+
+    #[test]
+    fn a_delete_leaves_a_tombstone_and_no_material() {
+        let h = "users/alice/t1";
+        put_key(h);
+        deleted(h);
+        assert!(raw_record(h).is_none(), "the record and its material are gone");
+
+        // Its principals read the tombstone and the log.
+        match handle_get_info(h, &ctx("alice")) {
+            VaultResponse::KeyTombstone { op, successor, deleted_at, expires_at, .. } => {
+                assert_eq!(
+                    (op.as_str(), successor.as_str(), deleted_at, expires_at),
+                    ("delete", "-", NOW, NOW + 1000)
+                );
+            }
+            other => panic!("{}", serde_json::to_string(&other).unwrap()),
+        }
+        match handle_read_audit(h, 0, 0, &ctx("alice")) {
+            VaultResponse::AuditLog { entries, next_seq } => {
+                assert_eq!(next_seq, 2);
+                assert_eq!(entries.last().unwrap().op, "DeleteKey");
+            }
+            other => panic!("{}", serde_json::to_string(&other).unwrap()),
+        }
+        // Every other operation: "key deleted", distinct from "not found".
+        let e = err(handle_export(h, &[], None, &ctx("alice")));
+        assert!(e.starts_with("key deleted"), "{e}");
+        let e = err(handle_delete(h, &[], None, None, &ctx("alice")));
+        assert!(e.starts_with("key deleted"), "{e}");
+        // Not listed.
+        match handle_list(&ctx("alice")) {
+            VaultResponse::KeyList { keys } => assert!(keys.iter().all(|k| k.handle != h)),
+            _ => panic!("expected a key list"),
+        }
+        // Not creatable again, on any path (they all call this).
+        let e = check_handle_free(h).unwrap_err();
+        assert!(e.contains("reusable after"), "{e}");
+        assert_eq!(err(handle_get_info("users/alice/never", &ctx("alice"))), "key not found");
+    }
+
+    #[test]
+    fn a_successor_deleted_here_does_not_pass_for_one_elsewhere() {
+        let old = "users/alice/t6-old";
+        let succ = "users/alice/t6-new";
+        put_key(old);
+        put_key(succ);
+        deleted(succ);
+        let after = crate::types::DeleteAfter { successor: succ.into(), successor_target: "-".into() };
+        let e = err(handle_delete(old, &[], None, Some(after), &ctx("alice")));
+        assert!(e.contains("successor has been deleted"), "{e}");
+        assert!(raw_record(old).is_some());
+    }
+
+    #[test]
+    fn a_stranger_cannot_tell_a_deleted_key_from_a_live_one() {
+        let dead = "users/alice/t2-dead";
+        let live = "users/alice/t2-live";
+        put_key(dead);
+        put_key(live);
+        deleted(dead);
+        let bob = ctx("bob");
+        let members = vec!["m".to_string()];
+        let pairs: Vec<(String, String)> = vec![
+            (err(handle_get_info(dead, &bob)), err(handle_get_info(live, &bob))),
+            (err(handle_get_policy(dead, &bob)), err(handle_get_policy(live, &bob))),
+            (err(handle_export(dead, &[], None, &bob)), err(handle_export(live, &[], None, &bob))),
+            (err(handle_delete(dead, &[], None, None, &bob)), err(handle_delete(live, &[], None, None, &bob))),
+            (err(handle_read_audit(dead, 0, 0, &bob)), err(handle_read_audit(live, 0, 0, &bob))),
+            (err(handle_list_pending(dead, &bob)), err(handle_list_pending(live, &bob))),
+            (err(handle_retire(dead, "x", &members, &bob)), err(handle_retire(live, "x", &members, &bob))),
+        ];
+        for (d, l) in pairs {
+            assert_eq!(d, l);
+            assert_eq!(d, tomb::NOT_A_PRINCIPAL);
+        }
+    }
+
+    #[test]
+    fn a_cut_short_delete_is_finished_by_the_next_touch() {
+        let h = "users/alice/t3";
+        put_key(h);
+        let rec: KeyRecord = serde_json::from_slice(&raw_record(h).unwrap()).unwrap();
+        // The tombstone was written, then the vault stopped.
+        let mut t = tomb::tomb_for_tests(rec.policy.clone());
+        t.handle = h.into();
+        t.expires_at = NOW + 1000;
+        t.audit_next_seq = rec.audit_next_seq;
+        kv().unwrap()
+            .lock()
+            .unwrap()
+            .put(format!("tomb:{h}").as_bytes(), &serde_json::to_vec(&t).unwrap())
+            .unwrap();
+        assert!(raw_record(h).is_some());
+        // The next touch never serves the material, and finishes the delete.
+        let e = err(handle_export(h, &[], None, &ctx("alice")));
+        assert!(e.starts_with("key deleted"), "{e}");
+        assert!(raw_record(h).is_none());
+    }
+
+    #[test]
+    fn housekeeping_finishes_and_purges() {
+        let h = "users/alice/t4";
+        put_key(h);
+        deleted(h);
+        {
+            let mut store = kv().unwrap().lock().unwrap();
+            // Before the key's original expiry nothing is purged.
+            tomb::housekeep(&mut store, Some(NOW));
+            assert!(matches!(tomb::lookup(&mut store, h, Some(NOW)).unwrap(), tomb::Lookup::Deleted(_)));
+            // After it, the tombstone and the log go and the handle is free.
+            // (The housekeeping purges through the same lookup; a global pass
+            // at a later time would race the other tests' tombstones.)
+            assert!(matches!(tomb::lookup(&mut store, h, Some(NOW + 1001)).unwrap(), tomb::Lookup::Missing));
+            assert!(store.get(format!("tomb:{h}").as_bytes()).unwrap().is_none());
+            assert!(store.get(&audit::audit_key(h, 0)).unwrap().is_none());
+            assert!(store.get(&audit::audit_key(h, 1)).unwrap().is_none());
+            assert!(matches!(tomb::lookup(&mut store, h, Some(NOW + 1001)).unwrap(), tomb::Lookup::Missing));
+        }
+        // Without trusted time nothing is purged blind.
+        let h2 = "users/alice/t4b";
+        put_key(h2);
+        deleted(h2);
+        let mut store = kv().unwrap().lock().unwrap();
+        assert!(matches!(tomb::lookup(&mut store, h2, None).unwrap(), tomb::Lookup::Deleted(_)));
+    }
+
+    #[test]
+    fn name_rules() {
+        assert_eq!(name_rule("vaults/v/k"), NameRule::Plain);
+        assert_eq!(name_rule("vaults/v/k/new-2"), NameRule::ReCreated);
+        assert_eq!(name_rule("vaults/v/k/new-2/gen-3"), NameRule::BeneathReCreated);
+        assert_eq!(name_rule("vaults/v/k/new-x"), NameRule::Plain);
+        assert_eq!(name_rule("vaults/v/k/new-"), NameRule::Plain);
+        // Beneath new-<k>: only a renewal ending in gen-<m>.
+        assert!(check_name_rule("vaults/v/k/new-2/gen-3", true).is_ok());
+        assert!(check_name_rule("vaults/v/k/new-2/gen-3", false).is_err());
+        assert!(check_name_rule("vaults/v/k/new-2/v2", true).is_err());
+        assert!(check_name_rule("vaults/v/k/new-2/v2", false).is_err());
+        assert_eq!(check_name_rule("vaults/v/k/new-2", false).unwrap(), NameRule::ReCreated);
+    }
+
+    #[test]
+    fn a_re_created_name_needs_the_owners_bound_create_approval() {
+        init();
+        let policy = normalise_policy(alice_policy(serde_json::json!([])));
+        // Someone else's bearer, or the owner's without a step-up: refused.
+        let e = crate::policy::require_owner_create(&policy, "vaults/v/k/new-2", None, &ctx("mallory"))
+            .unwrap_err();
+        assert!(e.contains("only the key's owner"), "{e}");
+        let e = crate::policy::require_owner_create(&policy, "vaults/v/k/new-2", None, &ctx("alice"))
+            .unwrap_err();
+        assert!(e.contains("create approval"), "{e}");
+        // A policy not in stored form is refused before any approval.
+        let mut raw = policy.clone();
+        raw.lifecycle.ttl_seconds = 0;
+        assert!(check_stored_form(&raw).is_err());
+        assert!(check_stored_form(&policy).is_ok());
+    }
+
+    #[test]
+    fn a_pending_threshold_key_is_aborted_only_by_its_session() {
+        let h = "users/alice/t5";
+        put_key(h);
+        let set_pending = |p: Option<crate::types::PendingCreation>| {
+            let mut r: KeyRecord = serde_json::from_slice(&raw_record(h).unwrap()).unwrap();
+            r.pending_creation = p;
+            let store = kv().unwrap().lock().unwrap();
+            store.put(&record_key(h), &serde_json::to_vec(&r).unwrap()).unwrap();
+        };
+        let pending = || {
+            Some(crate::types::PendingCreation {
+                session: "s1".into(),
+                caller: "alice|".into(),
+                committed_at: NOW,
+            })
+        };
+        let abort = |session: &str, caller: &str, now: u64| {
+            threshold::abort_pending(false, session, Some(h), caller, now, &ctx("alice"), "dkg")
+        };
+        set_pending(pending());
+        assert!(abort("s2", "alice|", NOW).is_err(), "another session");
+        assert!(abort("s1", "bob|", NOW).is_err(), "another caller");
+        assert!(abort("s1", "alice|", NOW + 10_000).is_err(), "too late");
+        // Once it served something it is a key like any other.
+        set_pending(None);
+        assert!(abort("s1", "alice|", NOW).is_err(), "no longer pending");
+        set_pending(pending());
+        abort("s1", "alice|", NOW).unwrap();
+        // Gone, with no tombstone. The abort stays in the handle's log, which
+        // a re-creation continues.
+        assert!(matches!(lookup(h).unwrap(), tomb::Lookup::Missing));
+        let store = kv().unwrap().lock().unwrap();
+        assert_eq!(tomb::next_audit_seq(&store, h), 2);
     }
 }

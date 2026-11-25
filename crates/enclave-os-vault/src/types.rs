@@ -94,6 +94,11 @@ pub enum VaultRequest {
         carried_exportable: Option<bool>,
         #[serde(default)]
         carried_key_type: Option<KeyType>,
+        /// Binding v2 fields of the owner's `create` approval (formats
+        /// §9.3.1), required for a handle whose last segment is
+        /// `new-<digits>`. The approval itself is the bearer.
+        #[serde(default)]
+        binding: Option<BindingV2Request>,
     },
 
     /// Export the raw key material.
@@ -300,6 +305,10 @@ pub enum VaultRequest {
         index: u16,
         threshold: u16,
         vaults: Vec<String>,
+        /// The owner's `create` approval, for a `new-<digits>` handle (as
+        /// `CreateKey`).
+        #[serde(default)]
+        binding: Option<BindingV2Request>,
     },
     /// DKG round 2: every participant's round 1 message (by index).
     FrostDkgRound2 {
@@ -320,7 +329,14 @@ pub enum VaultRequest {
         handle: String,
         confirmations_b64: BTreeMap<u16, String>,
     },
-    FrostDkgAbort { session: String },
+    /// Abort a DKG. With `handle`, also remove the key this session
+    /// committed here while it is still pending (formats §9.3.1): same
+    /// session, same caller, never once it has served an operation.
+    FrostDkgAbort {
+        session: String,
+        #[serde(default)]
+        handle: Option<String>,
+    },
     /// Signing round 1: authorised like `Sign` (the key's policy, with
     /// `approvals`); returns this vault's commitment.
     FrostSignRound1 {
@@ -366,6 +382,10 @@ pub enum VaultRequest {
         vaults: Vec<String>,
         helpers: Vec<u16>,
         old_public_key_package_b64: String,
+        /// The owner's `create` approval, for a `new-<digits>` handle new
+        /// on this vault (as `CreateKey`).
+        #[serde(default)]
+        binding: Option<BindingV2Request>,
     },
     /// On each helper: deal this vault's share to the new participants, whose
     /// quotes must carry `target_mrenclave`. The bearer must be the key's
@@ -395,7 +415,12 @@ pub enum VaultRequest {
         handle: String,
         confirmations_b64: BTreeMap<u16, String>,
     },
-    FrostReshareAbort { session: String },
+    /// Abort a resharing; `handle` as for `FrostDkgAbort`.
+    FrostReshareAbort {
+        session: String,
+        #[serde(default)]
+        handle: Option<String>,
+    },
     /// Owner: drop the previous record kept by a renewal in place.
     FrostReshareFinalize { handle: String },
     /// Owner: put the previous record back (a renewal that did not commit on
@@ -424,6 +449,10 @@ pub enum VaultResponse {
         /// and a carried create keeps the source's exportable flag and type.
         /// A client trusts a generation link only from a build listing it.
         /// "update-policy-from-v1" = it accepts `update_policy_from` (§5.3).
+        /// "tombstones-v1" = a deleted key leaves a tombstone (§9.3), a
+        /// re-created name (`new-<k>`) needs its owner's bound create approval
+        /// and `GetKeyInfo` reports `created_by_owner_approval`, and a pending
+        /// threshold key is aborted through its session (§9.3.1).
         #[serde(default)]
         capabilities: Vec<String>,
     },
@@ -437,6 +466,16 @@ pub enum VaultResponse {
         expires_at: u64,
     },
     KeyDeleted,
+    /// `GetKeyInfo` on a deleted key, to the principals of its final policy
+    /// (formats §9.3).
+    KeyTombstone {
+        handle: String,
+        key_type: KeyType,
+        op: String,
+        deleted_at: u64,
+        successor: String,
+        expires_at: u64,
+    },
     /// `RetireKey`: whether the predecessor was still here to delete.
     KeyRetired {
         was_present: bool,
@@ -604,6 +643,14 @@ pub struct KeyInfo {
     /// generation n - 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub renewed_in_place_from: Option<String>,
+    /// Created with its owner's bound `create` approval (formats §9.3.1):
+    /// set by the vault, never from a request.
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub created_by_owner_approval: bool,
+}
+
+fn is_false(b: &bool) -> bool {
+    !*b
 }
 
 /// Entry returned by `VaultRequest::ListKeys`.
@@ -1182,4 +1229,43 @@ pub struct KeyRecord {
     /// request, so a carried create cannot claim to supersede a key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub renewed_in_place_from: Option<String>,
+    /// Created with its owner's bound `create` approval (formats §9.3.1).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub created_by_owner_approval: bool,
+    /// A threshold key committed by a DKG or resharing session and not yet
+    /// used: its session may still abort it (formats §9.3.1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pending_creation: Option<PendingCreation>,
+}
+
+/// Who may still abort a threshold key that has not served anything yet.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct PendingCreation {
+    pub session: String,
+    /// The threshold module's caller id of the session's opener.
+    pub caller: String,
+    pub committed_at: u64,
+}
+
+/// What a deleted key leaves behind (formats §9.3): never material.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Tombstone {
+    pub handle: String,
+    pub key_type: KeyType,
+    pub final_policy: KeyPolicy,
+    pub final_pd: String,
+    pub final_policy_version: u32,
+    /// "delete", "delete_after" or "retire".
+    pub op: String,
+    /// "oidc:0:<sub>" or "tee:<caller id>".
+    pub approver: String,
+    /// The binding's `vault_op`, or "-".
+    pub vault_op: String,
+    /// The successor's handle, or "-".
+    pub successor: String,
+    pub deleted_at: u64,
+    /// The key's original expiry: the tombstone and the audit log go then.
+    pub expires_at: u64,
+    /// Where the key's audit log ends.
+    pub audit_next_seq: u64,
 }

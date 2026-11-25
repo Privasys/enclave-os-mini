@@ -17,7 +17,7 @@ use enclave_os_kvstore::SealedKvStore;
 
 use crate::types::{AuditDecision, AuditEntry, KeyRecord};
 
-fn audit_key(handle: &str, seq: u64) -> Vec<u8> {
+pub(crate) fn audit_key(handle: &str, seq: u64) -> Vec<u8> {
     format!("audit:{}:{:020}", handle, seq).into_bytes()
 }
 
