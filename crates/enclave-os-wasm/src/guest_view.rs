@@ -29,11 +29,42 @@ pub fn is_platform_role(role: &str, extra: &[&str]) -> bool {
     }
 }
 
-/// The caller's roles as the guest sees them: the platform's roles removed.
-/// Bare role names (`admin`, `user-management`, ...) come from the app's own
-/// role store or the app's own identity provider and stay.
-pub fn guest_visible_roles(roles: Vec<String>, extra: &[&str]) -> Vec<String> {
-    roles.into_iter().filter(|r| !is_platform_role(r, extra)).collect()
+/// Whether `role` is the platform's role scoped to THIS app, exactly
+/// `<platform aud>:app:<this app id>:<role>`: it tells the app that the
+/// caller owns, administers or approves it, which is the app's business.
+pub fn is_this_apps_platform_role(role: &str, this_app_id: Option<&str>) -> bool {
+    let Some(id) = this_app_id.filter(|i| !i.is_empty()) else {
+        return false;
+    };
+    let mut parts = role.splitn(4, ':');
+    let (Some(ns), Some(kind), Some(app), Some(name)) = (parts.next(), parts.next(), parts.next(), parts.next())
+    else {
+        return false;
+    };
+    let platform = ns == "privasys-platform" || ns.starts_with("privasys-platform-");
+    platform && kind == "app" && app.eq_ignore_ascii_case(id) && !name.is_empty() && !name.contains(':')
+}
+
+/// The caller's roles as the guest sees them: the platform's roles removed,
+/// except those scoped to this app (`this_app_id`, lower-case hex). Bare
+/// role names (`admin`, `user-management`, ...) come from the app's own role
+/// store or the app's own identity provider and stay.
+pub fn guest_visible_roles(roles: Vec<String>, extra: &[&str], this_app_id: Option<&str>) -> Vec<String> {
+    roles
+        .into_iter()
+        .filter(|r| !is_platform_role(r, extra) || is_this_apps_platform_role(r, this_app_id))
+        .collect()
+}
+
+/// Lower-case hex of an app id, as it appears in its scoped roles.
+pub fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut s = String::with_capacity(bytes.len() * 2);
+    for b in bytes {
+        s.push(HEX[(b >> 4) as usize] as char);
+        s.push(HEX[(b & 0x0f) as usize] as char);
+    }
+    s
 }
 
 /// The value of parameter `name` from a call's named body: never the bearer,
@@ -69,11 +100,43 @@ mod tests {
         .iter()
         .map(|s| s.to_string())
         .collect();
-        let seen = guest_visible_roles(roles, &["custom-manager", ""]);
+        let seen = guest_visible_roles(roles, &["custom-manager", ""], None);
         assert_eq!(seen, vec!["admin", "user-management", "app:my-app:editor", "reader"]);
         // A look-alike namespace is the app's own.
         assert!(!is_platform_role("privasys-platformx:admin", &[]));
         assert!(!is_platform_role("privasys-platform", &[]));
+    }
+
+    #[test]
+    fn roles_scoped_to_this_app_stay_and_other_apps_go() {
+        let me = "0123456789abcdef0123456789abcdef";
+        let other = "fedcba9876543210fedcba9876543210";
+        let roles: Vec<String> = [
+            format!("privasys-platform:app:{me}:owner"),
+            format!("privasys-platform:app:{me}:admin"),
+            format!("privasys-platform-test:app:{me}:approver"),
+            format!("privasys-platform:app:{}:owner", me.to_uppercase()),
+            format!("privasys-platform:app:{other}:owner"),
+            format!("privasys-platform:app:{me}"),
+            format!("privasys-platform:app:{me}:"),
+            format!("privasys-platform:app:{me}:owner:extra"),
+            format!("privasys-platform:team:{me}:owner"),
+            "privasys-platform:manager".to_string(),
+        ]
+        .into_iter()
+        .collect();
+        let seen = guest_visible_roles(roles.clone(), &[], Some(me));
+        assert_eq!(
+            seen,
+            vec![
+                format!("privasys-platform:app:{me}:owner"),
+                format!("privasys-platform:app:{me}:admin"),
+                format!("privasys-platform-test:app:{me}:approver"),
+                format!("privasys-platform:app:{}:owner", me.to_uppercase()),
+            ]
+        );
+        // Without an app id, no platform role at all.
+        assert!(guest_visible_roles(roles, &[], None).is_empty());
     }
 
     #[test]

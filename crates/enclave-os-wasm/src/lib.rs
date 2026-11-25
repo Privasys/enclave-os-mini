@@ -547,9 +547,11 @@ impl WasmModule {
             let platform_roles: Vec<&str> = enclave_os_common::oidc::global_oidc_config()
                 .map(|c| vec![c.manager_role.as_str(), c.monitoring_role.as_str()])
                 .unwrap_or_default();
+            let this_app_id = registry.app_id(&call.app).map(|id| crate::guest_view::hex_lower(&id));
             let caller_roles = crate::guest_view::guest_visible_roles(
                 auth.map(|a| a.roles).unwrap_or_default(),
                 &platform_roles,
+                this_app_id.as_deref(),
             );
             registry.prepare_call(
                 &call.app,
