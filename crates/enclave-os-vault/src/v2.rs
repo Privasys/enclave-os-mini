@@ -379,6 +379,70 @@ pub fn stored_policy_digest(policy: &KeyPolicy) -> Result<String, String> {
     Ok(hex(&sha256(jcs(&parse_strict(&json)?).as_bytes())))
 }
 
+/// The start of the refusal of a policy that is not sent in stored form.
+pub const NOT_STORED_FORM: &str = "new_policy is not in the vault's stored form";
+
+/// A binding v2 policy update must send the new policy exactly as the vault
+/// will store and return it (every default written out, nothing the vault
+/// would drop or change), as `CanonicalisePolicy` returns it (Security, after
+/// the 2026-11-25 dev sitting). Then what the owner approves, what is stored
+/// and what the next `update_policy_from` names as replaced are one JSON, and
+/// a wallet compares like with like. Key order and whitespace do not matter
+/// (PD is over the RFC 8785 form). Call after `canonical_policy` succeeded.
+pub fn check_sent_in_stored_form(raw: &str) -> Result<(), String> {
+    let sent: serde_json::Value =
+        serde_json::from_str(raw).map_err(|e| format!("policy does not parse: {e}"))?;
+    let policy: KeyPolicy =
+        serde_json::from_str(raw).map_err(|e| format!("policy does not parse: {e}"))?;
+    let stored = serde_json::to_value(crate::normalise_policy(policy))
+        .map_err(|e| format!("serialise policy: {e}"))?;
+    match first_difference(&sent, &stored, "") {
+        None => Ok(()),
+        Some(path) => Err(format!(
+            "{NOT_STORED_FORM} (first difference at {}): send the policy exactly as \
+             CanonicalisePolicy returns it",
+            if path.is_empty() { "/" } else { path.as_str() }
+        )),
+    }
+}
+
+/// The JSON-pointer path of the first place two values differ, if any.
+fn first_difference(a: &serde_json::Value, b: &serde_json::Value, path: &str) -> Option<String> {
+    use serde_json::Value;
+    match (a, b) {
+        (Value::Object(x), Value::Object(y)) => {
+            let mut keys: Vec<&String> = x.keys().chain(y.keys()).collect();
+            keys.sort();
+            keys.dedup();
+            for k in keys {
+                let p = format!("{path}/{k}");
+                match (x.get(k), y.get(k)) {
+                    (Some(u), Some(v)) => {
+                        if let Some(d) = first_difference(u, v, &p) {
+                            return Some(d);
+                        }
+                    }
+                    _ => return Some(p),
+                }
+            }
+            None
+        }
+        (Value::Array(x), Value::Array(y)) => {
+            for (i, (u, v)) in x.iter().zip(y.iter()).enumerate() {
+                if let Some(d) = first_difference(u, v, &format!("{path}/{i}")) {
+                    return Some(d);
+                }
+            }
+            if x.len() != y.len() {
+                return Some(format!("{path}/{}", x.len().min(y.len())));
+            }
+            None
+        }
+        (u, v) if u == v => None,
+        _ => Some(path.to_string()),
+    }
+}
+
 /// Target of an `update_policy_from` (formats §5.3):
 /// hex H("privasys-update-policy-from-v1\n" PD(current) "\n" PD(new)).
 pub fn update_from_target(current_pd: &str, new_pd: &str) -> String {
@@ -711,6 +775,40 @@ mod tests {
         }
     }
 
+    // ---- A binding v2 update sends the policy in stored form ----
+
+    #[test]
+    fn a_v2_update_must_send_the_stored_form() {
+        // The control plane's typed form leaves defaults out.
+        let terse = r#"{"version":1,"principals":{"owner":{"Oidc":{"issuer":"https://privasys.id","sub":"o"}},"tees":[{"Tee":{"name":"app","measurements":[{"Mrenclave":"ab"}],"attestation_servers":[{"url":"https://as.privasys.org/verify"}]}}]},"operations":[{"ops":["ExportKey"],"principals":["AnyTee"]}],"lifecycle":{"ttl_seconds":7776000}}"#;
+        // canonical_policy accepts it (it is valid and normalised) ...
+        let c = canonical_policy(terse).unwrap();
+        // ... but it is not what the vault stores: refused, naming where.
+        let e = check_sent_in_stored_form(terse).unwrap_err();
+        assert!(e.starts_with(NOT_STORED_FORM), "{e}");
+        assert!(e.contains("first difference at /"), "{e}");
+        // What CanonicalisePolicy returns is accepted, in any key order.
+        let stored = serde_json::to_string(&c.policy).unwrap();
+        check_sent_in_stored_form(&stored).unwrap();
+        let reordered = jcs(&parse_strict(&stored).unwrap());
+        check_sent_in_stored_form(&reordered).unwrap();
+        // Then PD as sent is the stored PD: the next update_policy_from's
+        // replaced_pd is this one, with no re-canonicalising.
+        assert_eq!(canonical_policy(&stored).unwrap().pd, stored_policy_digest(&c.policy).unwrap());
+        assert_ne!(c.pd, stored_policy_digest(&c.policy).unwrap());
+        // "approval": null and "binding": 0 are written out only by a sender:
+        // the stored form omits them.
+        let mut v: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        v["approval"] = serde_json::Value::Null;
+        let e = check_sent_in_stored_form(&v.to_string()).unwrap_err();
+        assert!(e.contains("/approval"), "{e}");
+        // A missing default deep inside (a TEE's required_oids) is named.
+        let mut v: serde_json::Value = serde_json::from_str(&stored).unwrap();
+        v["principals"]["tees"][0]["Tee"].as_object_mut().unwrap().remove("required_oids");
+        let e = check_sent_in_stored_form(&v.to_string()).unwrap_err();
+        assert!(e.contains("/principals/tees/0/Tee/required_oids"), "{e}");
+    }
+
     // ---- Formats §4.1: an owner may add approvals to an existing key ----
 
     /// An existing app key as the control plane writes it: open person rules,
@@ -888,7 +986,15 @@ mod vectors {
             "AAECAwQFBgcICQoLDA0ODw",
             1764000600,
         );
+        let refusal = check_sent_in_stored_form(SAMPLE_POLICY).unwrap_err();
         serde_json::json!({
+            "stored_form_for_v2_updates": {
+                "sent_not_stored_form": SAMPLE_POLICY,
+                "refusal": refusal,
+                "stored_form_as_canonicalise_policy_returns_it": stored_json,
+                "pd_of_stored_form_as_sent": canonical_policy(&stored_json).unwrap().pd,
+                "stored_pd": current_pd,
+            },
             "binding_v2_update_policy_from": {
                 "current_policy_as_get_policy_returns_it": stored_json,
                 "current_pd": current_pd,

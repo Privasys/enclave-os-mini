@@ -1333,7 +1333,12 @@ fn handle_update_policy(
     let canonical = v2::canonical_policy(new_policy_raw.get());
     let new_policy = if takes_v2 {
         match &canonical {
-            Ok(c) => c.policy.clone(),
+            // Sent exactly as it will be stored (Security): the owner approves
+            // the JSON the vault keeps and returns.
+            Ok(c) => match v2::check_sent_in_stored_form(new_policy_raw.get()) {
+                Ok(()) => c.policy.clone(),
+                Err(e) => return VaultResponse::Error(e),
+            },
             Err(e) => return VaultResponse::Error(e.clone()),
         }
     } else {
