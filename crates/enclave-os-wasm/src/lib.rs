@@ -70,6 +70,7 @@ pub mod code_pool;
 pub mod enclave_sdk;
 pub mod engine;
 pub mod executor;
+pub mod guest_view;
 pub mod jwks_fetcher;
 pub mod kek_material;
 pub mod limits;
@@ -541,7 +542,15 @@ impl WasmModule {
                 }
             };
             let caller_id = auth.as_ref().and_then(|a| a.user_id.clone());
-            let caller_roles = auth.map(|a| a.roles).unwrap_or_default();
+            // The guest sees only roles scoped to the app: never the
+            // platform's own (Security, defence in depth).
+            let platform_roles: Vec<&str> = enclave_os_common::oidc::global_oidc_config()
+                .map(|c| vec![c.manager_role.as_str(), c.monitoring_role.as_str()])
+                .unwrap_or_default();
+            let caller_roles = crate::guest_view::guest_visible_roles(
+                auth.map(|a| a.roles).unwrap_or_default(),
+                &platform_roles,
+            );
             registry.prepare_call(
                 &call.app,
                 &call.function,
@@ -1394,9 +1403,8 @@ impl WasmModule {
         let body = call.body.as_object();
         let mut params = Vec::with_capacity(func.params.len());
         for ps in &func.params {
-            let val = body
-                .and_then(|o| o.get(&ps.name))
-                .unwrap_or(&serde_json::Value::Null);
+            // Never the caller's bearer, whatever the function declares.
+            let val = crate::guest_view::guest_param(body, &ps.name);
             params.push(json_to_wasm_param(val, &ps.ty, &ps.name)?);
         }
 
