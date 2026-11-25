@@ -1184,15 +1184,23 @@ fn handle_update_policy(
         return VaultResponse::Error(e);
     }
 
+    // A strict tightening (formats §4.1) is audited as its own decision.
+    let (what, detail) = match v2::tightening_rules(&record.policy, &new_policy) {
+        Ok(rules) if !rules.is_empty() => (
+            "TightenApprovals",
+            format!("bound step-up added to rules {rules:?}"),
+        ),
+        _ => ("UpdatePolicy", String::new()),
+    };
     record.policy = new_policy;
     record.policy_version = record.policy_version.saturating_add(1);
 
     if let Err(e) = audit_and_save(
         &mut record,
-        "UpdatePolicy",
+        what,
         &caller,
         AuditDecision::Allowed,
-        "",
+        &detail,
     ) {
         return e;
     }

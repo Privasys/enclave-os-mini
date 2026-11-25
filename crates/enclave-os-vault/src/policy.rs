@@ -33,7 +33,7 @@ use crate::quote::{dissect_peer_cert, parse_quote, TeeType};
 use crate::signing::verify_approval_token;
 use crate::types::{
     ApprovalToken, AttestationProfile, Condition, KeyPolicy, Measurement, Mutability, Operation,
-    OperationRule, Principal, PrincipalRef,
+    OperationRule, PolicyField, Principal, PrincipalRef,
 };
 
 /// Domain separator for the operation-binding hash. MUST match the IdP and
@@ -700,11 +700,25 @@ pub fn evaluate_policy_update(
     new: &KeyPolicy,
     role: CallerRole,
 ) -> Result<(), String> {
-    let changed = diff_policy_fields(old, new);
+    let mut changed = diff_policy_fields(old, new);
     if changed.is_empty() {
         return Ok(());
     }
     let m = &old.mutability;
+    // Formats §4.1: the owner may change the operation rules, even where
+    // `owner_can` does not list them, when the change is exactly a strict
+    // tightening (the canonical bound step-up added to all-person rules).
+    // A frozen (`immutable`) field stays frozen.
+    if role == CallerRole::Owner
+        && changed.contains(&PolicyField::Operations)
+        && !m.immutable.contains(&PolicyField::Operations)
+        && crate::v2::tightening_rules(old, new).is_ok_and(|t| !t.is_empty())
+    {
+        changed.retain(|f| *f != PolicyField::Operations);
+        if changed.is_empty() {
+            return Ok(());
+        }
+    }
     let allowed = match role {
         CallerRole::Owner => &m.owner_can,
         CallerRole::Manager => &m.manager_can,

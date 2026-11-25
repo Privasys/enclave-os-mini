@@ -507,6 +507,82 @@ pub fn is_wallet_approval(c: &Condition) -> bool {
     }
 }
 
+/// The one condition an owner may add to an existing key's rules (formats
+/// §4.1): a bound passkey step-up, in its canonical shape.
+pub fn canonical_step_up() -> Condition {
+    Condition::OidcStepUp {
+        required_amr: vec!["webauthn".into()],
+        operation_bound: true,
+        fresh_for_seconds: 300,
+        binding: 2,
+    }
+}
+
+/// Whether `new` differs from `old` only by a strict tightening (formats
+/// §4.1): some rules gain the canonical step-up as one extra condition at the
+/// end, and nothing else changes. Returns the indices of the rules tightened
+/// (empty if the operations are unchanged), or why it is not a tightening.
+pub fn tightening_rules(old: &KeyPolicy, new: &KeyPolicy) -> Result<Vec<usize>, String> {
+    use crate::types::PrincipalRef;
+
+    // Everything but the operations: identical, after canonicalisation.
+    let strip = |p: &KeyPolicy| -> Result<serde_json::Value, String> {
+        let mut v = serde_json::to_value(p).map_err(|e| format!("serialise policy: {e}"))?;
+        if let Some(o) = v.as_object_mut() {
+            o.remove("operations");
+        }
+        Ok(v)
+    };
+    if strip(old)? != strip(new)? {
+        return Err("only the operation rules may change in a tightening".into());
+    }
+    if old.operations.len() != new.operations.len() {
+        return Err("a tightening keeps every rule, in order".into());
+    }
+    let governing = [
+        Operation::PromoteProfile,
+        Operation::UpdatePolicy,
+        Operation::DeleteKey,
+        Operation::ExportKey,
+    ];
+    let canonical = canonical_step_up();
+    let mut tightened = Vec::new();
+    for (i, (o, n)) in old.operations.iter().zip(new.operations.iter()).enumerate() {
+        if o.ops != n.ops || o.principals != n.principals {
+            return Err(format!("rule {i}: a tightening keeps its operations and principals"));
+        }
+        if o.requires == n.requires {
+            continue;
+        }
+        // Exactly one condition appended: the canonical step-up.
+        let appended = n.requires.len() == o.requires.len() + 1
+            && n.requires[..o.requires.len()] == o.requires[..]
+            && n.requires[o.requires.len()] == canonical;
+        if !appended {
+            return Err(format!(
+                "rule {i}: a tightening may only append the canonical bound passkey step-up"
+            ));
+        }
+        let all_persons = !o.principals.is_empty()
+            && o.principals.iter().all(|p| {
+                matches!(p, PrincipalRef::Owner | PrincipalRef::Manager(_) | PrincipalRef::Auditor(_))
+            });
+        if !all_persons {
+            return Err(format!(
+                "rule {i} names an enclave: a step-up would lock it out; split the rule first"
+            ));
+        }
+        if !o.ops.iter().any(|op| governing.contains(op)) {
+            return Err(format!("rule {i} governs no promote, update, delete or export"));
+        }
+        if o.requires.iter().any(is_wallet_approval) {
+            return Err(format!("rule {i} already asks for an approval"));
+        }
+        tightened.push(i);
+    }
+    Ok(tightened)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -633,6 +709,136 @@ mod tests {
             let p = canonical_policy(&app_key_policy(weak)).unwrap().policy;
             assert!(check_approval_by_default(&p, true).is_err(), "{weak}");
         }
+    }
+
+    // ---- Formats §4.1: an owner may add approvals to an existing key ----
+
+    /// An existing app key as the control plane writes it: open person rules,
+    /// Operations not in owner_can, only the owner frozen.
+    fn open_app_key() -> serde_json::Value {
+        let mut v: serde_json::Value = serde_json::from_str(&app_key_policy("")).unwrap();
+        v["mutability"] = serde_json::json!({
+            "owner_can": ["Tees", "PendingProfiles", "Lifecycle"],
+            "manager_can": ["PendingProfiles"],
+            "immutable": ["Owner"]
+        });
+        v
+    }
+
+    fn step_up_json() -> serde_json::Value {
+        serde_json::to_value(canonical_step_up()).unwrap()
+    }
+
+    fn typed(v: &serde_json::Value) -> KeyPolicy {
+        serde_json::from_value(v.clone()).unwrap()
+    }
+
+    /// Rules 1..=3 are the person rules (owner export, promote, update/delete);
+    /// rule 0 is the app's own AnyTee export.
+    fn tightened(v: &serde_json::Value) -> serde_json::Value {
+        let mut t = v.clone();
+        for i in 1..=3 {
+            t["operations"][i]["requires"].as_array_mut().unwrap().push(step_up_json());
+        }
+        t
+    }
+
+    fn owner_update(old: &serde_json::Value, new: &serde_json::Value) -> Result<(), String> {
+        crate::policy::evaluate_policy_update(&typed(old), &typed(new), crate::policy::CallerRole::Owner)
+    }
+
+    #[test]
+    fn an_owner_may_add_the_bound_step_up_to_person_rules() {
+        let old = open_app_key();
+        let new = tightened(&old);
+        assert_eq!(tightening_rules(&typed(&old), &typed(&new)).unwrap(), vec![1, 2, 3]);
+        // Operations is not in owner_can, yet the tightening is allowed.
+        owner_update(&old, &new).unwrap();
+        // The result passes approval by default; the open key did not.
+        assert!(check_approval_by_default(&typed(&old), true).is_err());
+        assert!(check_approval_by_default(&typed(&new), true).is_ok());
+        // A partial tightening is still a tightening.
+        let mut partial = old.clone();
+        partial["operations"][2]["requires"].as_array_mut().unwrap().push(step_up_json());
+        assert_eq!(tightening_rules(&typed(&old), &typed(&partial)).unwrap(), vec![2]);
+    }
+
+    #[test]
+    fn anything_but_a_strict_tightening_is_refused() {
+        let old = open_app_key();
+        let base = tightened(&old);
+        let refused = |new: serde_json::Value, why: &str| {
+            assert!(tightening_rules(&typed(&old), &typed(&new)).is_err(), "{why}");
+            assert!(owner_update(&old, &new).is_err(), "{why}");
+        };
+
+        // Another principal.
+        let mut v = base.clone();
+        v["operations"][2]["principals"] = serde_json::json!(["Owner"]);
+        refused(v, "principal changed");
+        // Another op.
+        let mut v = base.clone();
+        v["operations"][1]["ops"] = serde_json::json!(["ExportKey", "Wrap"]);
+        refused(v, "op changed");
+        // Rules reordered.
+        let mut v = base.clone();
+        let ops = v["operations"].as_array_mut().unwrap();
+        ops.swap(1, 2);
+        refused(v, "rules reordered");
+        // Lifecycle, mutability or approval changed alongside.
+        let mut v = base.clone();
+        v["lifecycle"]["ttl_seconds"] = serde_json::json!(3600);
+        refused(v, "lifecycle changed");
+        let mut v = base.clone();
+        v["mutability"]["owner_can"] = serde_json::json!(["Tees", "Operations"]);
+        refused(v, "mutability changed");
+        let mut v = base.clone();
+        v["approval"] = serde_json::json!("none");
+        refused(v, "approval became none");
+        // An existing condition removed or altered.
+        let with_one: serde_json::Value = {
+            let mut w = old.clone();
+            w["operations"][2]["requires"] =
+                serde_json::json!([{"TimeWindow":{"not_before":0,"not_after":0}}]);
+            w
+        };
+        let mut v = with_one.clone();
+        v["operations"][2]["requires"] = serde_json::json!([step_up_json()]);
+        assert!(tightening_rules(&typed(&with_one), &typed(&v)).is_err(), "condition replaced");
+        // A condition added to the app's own AnyTee rule (would lock it out).
+        let mut v = old.clone();
+        v["operations"][0]["requires"].as_array_mut().unwrap().push(step_up_json());
+        refused(v, "AnyTee rule");
+        // A mixed rule [Owner, AnyTee].
+        let mut mixed = old.clone();
+        mixed["operations"][1]["principals"] = serde_json::json!(["Owner", "AnyTee"]);
+        let mut v = mixed.clone();
+        v["operations"][1]["requires"].as_array_mut().unwrap().push(step_up_json());
+        assert!(tightening_rules(&typed(&mixed), &typed(&v)).is_err(), "mixed rule");
+        // Anything but the canonical step-up (a lock-out by freshness).
+        let mut v = old.clone();
+        v["operations"][2]["requires"].as_array_mut().unwrap().push(serde_json::json!(
+            {"OidcStepUp":{"required_amr":["webauthn"],"operation_bound":true,"fresh_for_seconds":1,"binding":2}}
+        ));
+        refused(v, "non-canonical step-up");
+        let mut v = old.clone();
+        v["operations"][2]["requires"].as_array_mut().unwrap()
+            .push(serde_json::json!({"ManagerApproval":{"manager":0,"fresh_for_seconds":900}}));
+        refused(v, "co-sign added");
+
+        // Not the owner.
+        let new = tightened(&old);
+        assert!(crate::policy::evaluate_policy_update(
+            &typed(&old),
+            &typed(&new),
+            crate::policy::CallerRole::Manager
+        )
+        .is_err());
+        // Operations frozen.
+        let mut frozen = old.clone();
+        frozen["mutability"]["immutable"] = serde_json::json!(["Owner", "Operations"]);
+        let new = tightened(&frozen);
+        assert!(owner_update(&frozen, &new).is_err(), "frozen operations");
     }
 }
 
