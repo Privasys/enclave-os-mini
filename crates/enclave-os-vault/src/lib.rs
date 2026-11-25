@@ -368,7 +368,7 @@ fn housekeeping() {
     LAST_HOUSEKEEPING.store(now, core::sync::atomic::Ordering::Relaxed);
     let Ok(kv) = kv() else { return };
     if let Ok(mut store) = kv.lock() {
-        tomb::housekeep(&mut store, Some(now));
+        tomb::housekeep(&mut store, Some(now), tomb::HOUSEKEEPING_BATCH);
     }
 }
 
@@ -2493,6 +2493,12 @@ mod tombstone_tests {
                 cert_store_unregister: |_| false,
             });
             let _ = enclave_os_kvstore::KvStoreModule::new([9u8; 32]).unwrap();
+            enclave_os_common::oidc::set_global_oidc_config(
+                serde_json::from_value(serde_json::json!({
+                    "issuer": "https://privasys.id", "audience": "privasys-platform"
+                }))
+                .unwrap(),
+            );
         });
     }
 
@@ -2676,7 +2682,7 @@ mod tombstone_tests {
         {
             let mut store = kv().unwrap().lock().unwrap();
             // Before the key's original expiry nothing is purged.
-            tomb::housekeep(&mut store, Some(NOW));
+            tomb::housekeep(&mut store, Some(NOW), tomb::HOUSEKEEPING_BATCH);
             assert!(matches!(tomb::lookup(&mut store, h, Some(NOW)).unwrap(), tomb::Lookup::Deleted(_)));
             // After it, the tombstone and the log go and the handle is free.
             // (The housekeeping purges through the same lookup; a global pass
@@ -2721,6 +2727,39 @@ mod tombstone_tests {
         let e = crate::policy::require_owner_create(&policy, "vaults/v/k/new-2", None, &ctx("alice"))
             .unwrap_err();
         assert!(e.contains("create approval"), "{e}");
+        // The owner's bound step-up for exactly this creation: accepted, once.
+        let (_, me, _) = v2::own_identity().unwrap();
+        let handle = "vaults/v/k/new-2";
+        let step_up = |target_policy: &KeyPolicy, nonce: &str| {
+            let pd = v2::stored_policy_digest(target_policy).unwrap();
+            let exp = NOW + 300;
+            let text = v2::binding_v2_text(
+                &[me.clone()], "create", handle, &pd, 0, "oidc:0:alice", "-", nonce, exp,
+            );
+            let mut c = ctx("alice");
+            let claims = c.oidc_claims.as_mut().unwrap();
+            claims.amr = vec!["webauthn".into()];
+            claims.iat = NOW;
+            claims.exp = exp;
+            claims.nonce = Some(nonce.into());
+            claims.vault_op = Some(v2::vault_op_v2(&text));
+            c
+        };
+        let ok = step_up(&policy, "n-create-1");
+        crate::policy::require_owner_create(&policy, handle, Some(vec![me.clone()]), &ok).unwrap();
+        let e = crate::policy::require_owner_create(&policy, handle, Some(vec![me.clone()]), &ok)
+            .unwrap_err();
+        assert!(e.contains("already used"), "{e}");
+        // An approval of another policy, another handle, or with no members.
+        let mut other = policy.clone();
+        other.lifecycle.ttl_seconds = 3600;
+        let wrong = step_up(&other, "n-create-2");
+        assert!(crate::policy::require_owner_create(&policy, handle, Some(vec![me.clone()]), &wrong).is_err());
+        let fresh = step_up(&policy, "n-create-3");
+        assert!(crate::policy::require_owner_create(&policy, "vaults/v/k/new-3", Some(vec![me.clone()]), &fresh).is_err());
+        let fresh = step_up(&policy, "n-create-4");
+        assert!(crate::policy::require_owner_create(&policy, handle, None, &fresh).is_err());
+
         // A policy not in stored form is refused before any approval.
         let mut raw = policy.clone();
         raw.lifecycle.ttl_seconds = 0;

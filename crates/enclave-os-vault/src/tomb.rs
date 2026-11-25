@@ -141,10 +141,25 @@ pub fn delete_with_tombstone(store: &mut SealedKvStore, tomb: &Tombstone) -> Res
     finish_delete(store, &tomb.handle)
 }
 
-/// Finish cut-short deletions and purge expired tombstones, across the
-/// vault. Without trusted time only the deletions are finished.
-pub fn housekeep(store: &mut SealedKvStore, now: Option<u64>) {
-    for handle in read_index(store) {
+/// Most tombstones one housekeeping pass visits: it runs on the request
+/// path, so a long index is worked through over several passes (Security).
+pub const HOUSEKEEPING_BATCH: usize = 100;
+
+/// Where the next housekeeping pass starts in the index.
+static CURSOR: core::sync::atomic::AtomicUsize = core::sync::atomic::AtomicUsize::new(0);
+
+/// Finish cut-short deletions and purge expired tombstones, visiting at most
+/// `max` of them, carrying on from the last pass. Without trusted time only
+/// the deletions are finished.
+pub fn housekeep(store: &mut SealedKvStore, now: Option<u64>, max: usize) {
+    let index = read_index(store);
+    if index.is_empty() {
+        return;
+    }
+    let start = CURSOR.load(core::sync::atomic::Ordering::Relaxed) % index.len();
+    let batch: Vec<String> = index.iter().cycle().skip(start).take(max.min(index.len())).cloned().collect();
+    CURSOR.store(start.saturating_add(batch.len()), core::sync::atomic::Ordering::Relaxed);
+    for handle in batch {
         match get_tomb(store, &handle) {
             Ok(Some(_)) => {
                 let _ = lookup(store, &handle, now);
