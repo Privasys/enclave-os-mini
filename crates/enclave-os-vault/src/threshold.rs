@@ -581,7 +581,7 @@ fn check_creation(
 }
 
 /// A threshold key new on this vault under a re-created name needs the
-/// owner's bound create approval (formats §9.3.1); beneath one, only a
+/// owner's bound create approval (wire formats §9.3.1); beneath one, only a
 /// linked renewal. `renewal` is whether this is a resharing.
 fn check_threshold_name(
     handle: &str,
@@ -609,7 +609,7 @@ fn check_threshold_name(
 }
 
 /// Abort a key this session committed here and that has served nothing yet
-/// (formats §9.3.1). No tombstone: it never existed as a usable key. The
+/// (wire formats §9.3.1). No tombstone: it never existed as a usable key. The
 /// abort stays in the handle's audit log.
 pub(crate) fn abort_pending(
     session_was_open: bool,
@@ -682,6 +682,10 @@ fn dkg_round1(
     // Bound to the caller, as for CreateKey.
     let grant = crate::grant::verify_grant(grant_jwt, ctx, now)?;
     check_creation(handle, &grant, &vaults, threshold, index, false)?;
+    // A first creation, as for CreateKey: the grant's policy must ask for
+    // approvals, or opt out explicitly. A resharing renews an existing key
+    // and, like every renewal, is not checked again.
+    crate::v2::check_approval_by_default(&normalise_policy(grant.policy.clone()), false)?;
     let created_by_owner_approval = check_threshold_name(handle, &grant, false, binding, ctx)?;
     let n = vaults.len() as u16;
     let out = with_state(|st| {

@@ -52,7 +52,7 @@ pub struct OpBinding {
     /// operation-bound condition on them fails closed, as it always has, so
     /// that an export approval (same v1 slot) can never be spent on them.
     pub v1: bool,
-    /// What a binding v2 needs (formats §5), for a condition with
+    /// What a binding v2 needs (wire formats §5), for a condition with
     /// `binding: 2`. `None` where the handler has no v2 form.
     pub v2: Option<OpBindingV2>,
 }
@@ -62,7 +62,7 @@ pub struct OpBinding {
 pub struct OpBindingV2 {
     /// `promote`, `export`, `update_policy`, `delete`, ...
     pub op: &'static str,
-    /// The target as formats §5 defines it per op, or why it could not be
+    /// The target as wire formats §5 defines it per op, or why it could not be
     /// computed (for example a new policy that is not canonical).
     pub target: Result<String, String>,
     /// The request's sorted member ids, if it sent any.
@@ -538,7 +538,7 @@ fn evaluate_conditions(
                 // the handler supplied no binding (op has no target) or the token
                 // lacks the claims. See the vault promote-step-up design.
                 //
-                // Binding v2 (formats §5): the key's condition says which
+                // Binding v2 (wire formats §5): the key's condition says which
                 // version it takes, and it takes only that one.
                 match *binding_version {
                     0 => {}
@@ -621,7 +621,7 @@ pub(crate) fn require_owner_step_up(
 }
 
 
-/// Check a token's `vault_op` against binding v2 (formats §5): the request
+/// Check a token's `vault_op` against binding v2 (wire formats §5): the request
 /// names this vault among its members, and the text rebuilt from the
 /// operation, the key's state and the token's own fields hashes to it.
 fn check_binding_v2(
@@ -683,7 +683,7 @@ fn check_binding_v2(
     Ok(())
 }
 
-/// The owner's bound `create` approval of a new key (formats §9.3.1): the
+/// The owner's bound `create` approval of a new key (wire formats §9.3.1): the
 /// bearer is the policy owner, with a fresh passkey step-up whose binding v2
 /// names `create`, the handle, and `PD` of the policy as the vault will store
 /// it, at policy version 0.
@@ -904,7 +904,9 @@ fn diff_policy_fields(old: &KeyPolicy, new: &KeyPolicy) -> Vec<crate::types::Pol
     if !principal_vec_eq(&old.principals.tees, &new.principals.tees) {
         out.push(F::Tees);
     }
-    if !operations_eq(&old.operations, &new.operations) {
+    // `approval` decides whether the operation rules must ask for approvals,
+    // so changing it is a change to the operation rules.
+    if !operations_eq(&old.operations, &new.operations) || old.approval != new.approval {
         out.push(F::Operations);
     }
     if old.lifecycle != new.lifecycle {
@@ -986,6 +988,32 @@ mod oidc_match_tests {
         let p = oidc("", &[]);
         assert!(!oidc_matches(&p, &claims("user-1", &[])));
         assert!(!oidc_matches(&p, &claims("user-1", &["anything"])));
+    }
+}
+
+#[cfg(test)]
+mod approval_field_tests {
+    use super::*;
+
+    #[test]
+    fn changing_approval_is_a_change_to_the_operation_rules() {
+        let old: KeyPolicy = serde_json::from_value(serde_json::json!({
+            "version": 1,
+            "principals": {
+                "owner": {"Oidc": {"issuer": "https://privasys.id", "sub": "alice", "required_roles": []}},
+                "managers": [], "auditors": [], "tees": []
+            },
+            "operations": [],
+            "mutability": {"owner_can": [], "manager_can": ["Lifecycle"], "immutable": []}
+        }))
+        .unwrap();
+        let mut new = old.clone();
+        new.approval = Some("none".into());
+        assert_eq!(diff_policy_fields(&old, &new), vec![crate::types::PolicyField::Operations]);
+        // Neither a manager allowed only the lifecycle, nor an owner allowed
+        // nothing, may flip it.
+        assert!(evaluate_policy_update(&old, &new, CallerRole::Manager).is_err());
+        assert!(evaluate_policy_update(&old, &new, CallerRole::Owner).is_err());
     }
 }
 

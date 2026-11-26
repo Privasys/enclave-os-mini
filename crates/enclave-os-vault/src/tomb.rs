@@ -1,7 +1,7 @@
 // Copyright (c) Privasys. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
-//! Tombstones (formats §9.3).
+//! Tombstones (wire formats §9.3).
 //!
 //! A deleted key leaves `tomb:<handle>` (never material) until its original
 //! expiry. The sealed store has no multi-key transaction, so the tombstone is
@@ -20,11 +20,11 @@ use crate::policy::resolve_caller;
 use crate::types::{KeyRecord, Tombstone, VaultResponse};
 
 /// What a caller outside a key's policy is told, for a live key and a
-/// deleted one alike (no existence oracle, Security).
+/// deleted one alike (no existence oracle).
 pub const NOT_A_PRINCIPAL: &str = "caller is not in policy.principals";
 
 /// The capability a build publishes when it keeps tombstones, enforces the
-/// re-created name rules and aborts pending threshold keys (formats §9.3).
+/// re-created name rules and aborts pending threshold keys (wire formats §9.3).
 pub const CAPABILITY_TOMBSTONES: &str = "tombstones-v1";
 
 fn tomb_key(handle: &str) -> Vec<u8> {
@@ -46,8 +46,7 @@ pub enum Lookup {
 /// (and the handle stays deleted): purging is never done blind.
 pub fn lookup(store: &mut SealedKvStore, handle: &str, now: Option<u64>) -> Result<Lookup, String> {
     if let Some(t) = get_tomb(store, handle)? {
-        if now.is_some_and(|n| n > t.expires_at) {
-            purge(store, &t)?;
+        if now.is_some_and(|n| n > t.expires_at) && purge(store, &t)? {
             return Ok(Lookup::Missing);
         }
         finish_delete(store, handle)?;
@@ -98,19 +97,37 @@ fn finish_delete(store: &mut SealedKvStore, handle: &str) -> Result<(), String> 
     Ok(())
 }
 
-/// At the key's original expiry: the tombstone and the key's audit log go,
-/// and the handle is free again.
-fn purge(store: &mut SealedKvStore, t: &Tombstone) -> Result<(), String> {
+/// Most audit entries one purge deletes: purging runs on the request path,
+/// so a long log goes over several lookups or housekeeping passes.
+pub const PURGE_BATCH: u64 = 1000;
+
+/// At the key's original expiry: the key's audit log goes, newest first and
+/// at most [`PURGE_BATCH`] entries at a time, then the tombstone, and the
+/// handle is free again. Returns whether the purge is complete; until it is,
+/// the tombstone stays (counting the entries left) and the handle stays
+/// deleted.
+fn purge(store: &mut SealedKvStore, t: &Tombstone) -> Result<bool, String> {
     finish_delete(store, &t.handle)?;
-    for seq in 0..t.audit_next_seq {
+    let left = t.audit_next_seq.saturating_sub(PURGE_BATCH);
+    for seq in (left..t.audit_next_seq).rev() {
         let _ = store.delete(&crate::audit::audit_key(&t.handle, seq));
+    }
+    if left > 0 {
+        let mut rest = t.clone();
+        rest.audit_next_seq = left;
+        let bytes = serde_json::to_vec(&rest).map_err(|e| format!("serialise tombstone: {e}"))?;
+        store
+            .put(&tomb_key(&t.handle), &bytes)
+            .map_err(|e| format!("kv put failed: {e}"))?;
+        return Ok(false);
     }
     store
         .delete(&tomb_key(&t.handle))
         .map_err(|e| format!("kv delete failed: {e}"))?;
     let mut index = read_index(store);
     index.retain(|h| h != &t.handle);
-    write_index(store, &index)
+    write_index(store, &index)?;
+    Ok(true)
 }
 
 fn read_index(store: &SealedKvStore) -> Vec<String> {
@@ -142,7 +159,7 @@ pub fn delete_with_tombstone(store: &mut SealedKvStore, tomb: &Tombstone) -> Res
 }
 
 /// Most tombstones one housekeeping pass visits: it runs on the request
-/// path, so a long index is worked through over several passes (Security).
+/// path, so a long index is worked through over several passes.
 pub const HOUSEKEEPING_BATCH: usize = 100;
 
 /// Where the next housekeeping pass starts in the index.

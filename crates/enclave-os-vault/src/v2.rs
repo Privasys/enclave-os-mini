@@ -1,15 +1,15 @@
 // Copyright (c) Privasys. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
-//! Vault key ownership, step 1 (`wallet-signed-authority-wire-formats.md`).
+//! Vault key ownership (docs/vault-wire-formats.md).
 //!
-//! - The vault's member id and the identity call (formats §1).
+//! - The vault's member id and the identity call (wire formats §1).
 //! - The policy digest over the policy JSON exactly as a request carries it,
-//!   in RFC 8785 canonical form (formats §5.1).
+//!   in RFC 8785 canonical form (wire formats §5.1).
 //! - Binding v2: the approval text that names the constellation's members,
-//!   the operation, its target and the approver (formats §5).
+//!   the operation, its target and the approver (wire formats §5).
 //! - Approval by default: a new policy must ask for an approval on the
-//!   operations that govern a key (formats §4).
+//!   operations that govern a key (wire formats §4).
 
 use std::collections::BTreeMap;
 use std::fmt;
@@ -19,16 +19,16 @@ use serde::Deserialize;
 
 use crate::types::{Condition, KeyPolicy, Operation, PrincipalRef};
 
-/// Domain of the binding v2 text (formats §5).
+/// Domain of the binding v2 text (wire formats §5).
 pub const BINDING_V2_DOMAIN: &str = "privasys-vault-approval/v2";
-/// Domain of a member id (formats §1).
+/// Domain of a member id (wire formats §1).
 pub const MEMBER_DOMAIN: &str = "privasys-vault-member-v1\n";
-/// Domain of the identity quote's report data (formats §1).
+/// Domain of the identity quote's report data (wire formats §1).
 pub const IDENTITY_DOMAIN: &str = "privasys-vault-identity-v1\n";
-/// Domain of the step 1 interim billing id (formats §1; replaced in step 2).
+/// Domain of the implicit billing id (wire formats §1).
 pub const BILLING_IMPLICIT_DOMAIN: &str = "privasys-billing-implicit-v0\n";
 
-/// The largest integer a canonical policy may hold (formats §5.1).
+/// The largest integer a canonical policy may hold (wire formats §5.1).
 const MAX_SAFE_INTEGER: u64 = 1 << 53;
 
 fn sha256(data: &[u8]) -> [u8; 32] {
@@ -39,11 +39,7 @@ fn sha256(data: &[u8]) -> [u8; 32] {
 }
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
-    let mut s = String::with_capacity(bytes.len() * 2);
-    for b in bytes {
-        s.push_str(&format!("{b:02x}"));
-    }
-    s
+    enclave_os_common::hex::hex_encode(bytes)
 }
 
 fn b64u(bytes: &[u8]) -> String {
@@ -56,7 +52,7 @@ fn b64u(bytes: &[u8]) -> String {
 //  Strict JSON and RFC 8785
 // ---------------------------------------------------------------------------
 
-/// A JSON value parsed under the canonical restrictions of formats §5.1:
+/// A JSON value parsed under the canonical restrictions of wire formats §5.1:
 /// unique ASCII member names, integers within 2^53, no floats.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Strict {
@@ -198,14 +194,14 @@ fn write_jcs_string(s: &str, out: &mut String) {
 }
 
 /// A policy as a v2 request carries it: the typed policy, and its digest over
-/// the JSON exactly as received (formats §5.1).
+/// the JSON exactly as received (wire formats §5.1).
 pub struct CanonicalPolicy {
     pub policy: KeyPolicy,
     /// `PD(policy)`: hex SHA-256 of the RFC 8785 form of the JSON as sent.
     pub pd: String,
 }
 
-/// Check a policy's JSON against formats §5.1 and compute its digest:
+/// Check a policy's JSON against wire formats §5.1 and compute its digest:
 /// canonical input, no field the vault does not know, and nothing the vault's
 /// normalisation would change.
 pub fn canonical_policy(raw: &str) -> Result<CanonicalPolicy, String> {
@@ -242,7 +238,7 @@ pub fn canonical_policy(raw: &str) -> Result<CanonicalPolicy, String> {
 }
 
 /// The policy fields the vault's own serialisation leaves out at their
-/// default, with that default (Security: an exemption by name, not by value,
+/// default, with that default (an exemption by name, not by value,
 /// so an unknown name is always refused).
 fn is_known_default(name: &str, v: &serde_json::Value) -> bool {
     use serde_json::Value;
@@ -305,14 +301,14 @@ pub fn member_id(public_key_sec1: &[u8]) -> String {
     hex(&sha256(&buf))
 }
 
-/// The step 1 interim billing id: the vault's one issuer and audience
-/// (formats §1). Step 2 replaces it with the sealed billing configuration.
+/// The implicit billing id: the vault's one issuer and audience
+/// (wire formats §1).
 pub fn implicit_billing_id(issuer: &str, audience: &str) -> String {
     let s = format!("{BILLING_IMPLICIT_DOMAIN}{issuer}\n{audience}");
     hex(&sha256(s.as_bytes()))
 }
 
-/// Report data of the identity quote (formats §1), in its first 32 bytes.
+/// Report data of the identity quote (wire formats §1), in its first 32 bytes.
 pub fn identity_report_data(member_id: &str, billing_id: &str) -> [u8; 32] {
     sha256(format!("{IDENTITY_DOMAIN}{member_id}\n{billing_id}").as_bytes())
 }
@@ -334,7 +330,7 @@ pub fn own_identity() -> Result<(Vec<u8>, String, String), String> {
 //  Binding v2
 // ---------------------------------------------------------------------------
 
-/// The binding v2 text (formats §5). `members` must already be checked.
+/// The binding v2 text (wire formats §5). `members` must already be checked.
 #[allow(clippy::too_many_arguments)]
 pub fn binding_v2_text(
     members: &[String],
@@ -362,7 +358,7 @@ pub fn binding_v2_text(
     s
 }
 
-/// Target of a `delete_after` (formats §9.2):
+/// Target of a `delete_after` (wire formats §9.2):
 /// hex H("privasys-delete-after-v1\n" successor "\n" successor_target).
 pub fn delete_after_target(successor: &str, successor_target: &str) -> Result<String, String> {
     check_line("successor", successor)?;
@@ -373,7 +369,7 @@ pub fn delete_after_target(successor: &str, successor_target: &str) -> Result<St
 }
 
 /// `PD` of a policy as the vault stores and returns it (`GetPolicy`): its own
-/// serialisation, in RFC 8785 form (formats §5.3, "PD(current)").
+/// serialisation, in RFC 8785 form (wire formats §5.3, "PD(current)").
 pub fn stored_policy_digest(policy: &KeyPolicy) -> Result<String, String> {
     let json = serde_json::to_string(policy).map_err(|e| format!("serialise policy: {e}"))?;
     Ok(hex(&sha256(jcs(&parse_strict(&json)?).as_bytes())))
@@ -384,10 +380,9 @@ pub const NOT_STORED_FORM: &str = "new_policy is not in the vault's stored form"
 
 /// A binding v2 policy update must send the new policy exactly as the vault
 /// will store and return it (every default written out, nothing the vault
-/// would drop or change), as `CanonicalisePolicy` returns it (Security, after
-/// the 2026-11-25 dev sitting). Then what the owner approves, what is stored
-/// and what the next `update_policy_from` names as replaced are one JSON, and
-/// a wallet compares like with like. Key order and whitespace do not matter
+/// would drop or change), as `CanonicalisePolicy` returns it. Then what the
+/// owner approves, what is stored and what the next `update_policy_from`
+/// names as replaced are one JSON, and a wallet compares like with like. Key order and whitespace do not matter
 /// (PD is over the RFC 8785 form). Call after `canonical_policy` succeeded.
 pub fn check_sent_in_stored_form(raw: &str) -> Result<(), String> {
     let sent: serde_json::Value =
@@ -443,7 +438,7 @@ fn first_difference(a: &serde_json::Value, b: &serde_json::Value, path: &str) ->
     }
 }
 
-/// Target of an `update_policy_from` (formats §5.3):
+/// Target of an `update_policy_from` (wire formats §5.3):
 /// hex H("privasys-update-policy-from-v1\n" PD(current) "\n" PD(new)).
 pub fn update_from_target(current_pd: &str, new_pd: &str) -> String {
     hex(&sha256(
@@ -451,7 +446,7 @@ pub fn update_from_target(current_pd: &str, new_pd: &str) -> String {
     ))
 }
 
-/// How long a binding v2 may live for `op` (formats §5): 600 s, except a
+/// How long a binding v2 may live for `op` (wire formats §5): 600 s, except a
 /// `delete_after`, presented only once its migration has finished (24 h).
 pub fn max_lifetime(op: &str) -> u64 {
     if op == "delete_after" {
@@ -466,7 +461,7 @@ pub fn vault_op_v2(text: &str) -> String {
     b64u(&sha256(text.as_bytes()))
 }
 
-/// Spent bindings, kept until their expiry (formats §5). In enclave memory:
+/// Spent bindings, kept until their expiry (wire formats §5). In enclave memory:
 /// the guarantee is the short expiry and the policy version, this is an extra.
 static SPENT: std::sync::Mutex<BTreeMap<[u8; 32], u64>> = std::sync::Mutex::new(BTreeMap::new());
 const SPENT_MAX: usize = 8192;
@@ -513,11 +508,30 @@ pub fn check_line(name: &str, v: &str) -> Result<(), String> {
 }
 
 // ---------------------------------------------------------------------------
-//  Approval by default (formats §4)
+//  Approval by default (wire formats §4)
 // ---------------------------------------------------------------------------
 
 /// The value of `KeyPolicy::approval` that opts a key out of approvals.
 pub const APPROVAL_NONE: &str = "none";
+
+/// An update may not take away the approvals a key has. A key that asks for
+/// approvals on its own rules (no opt-out) keeps doing so: the new policy must
+/// pass on its own rules too, and may not add the `"approval": "none"` opt-out.
+/// A key without them (created before approval by default, or opted out at
+/// creation) may still be updated, and an update may add them.
+pub fn check_no_approval_downgrade(
+    old: &KeyPolicy,
+    new: &KeyPolicy,
+    exportable: bool,
+) -> Result<(), String> {
+    if old.approval.is_some() || check_approval_by_default(old, exportable).is_err() {
+        return Ok(());
+    }
+    if new.approval.is_some() {
+        return Err("an update may not opt a key out of the approvals it has".into());
+    }
+    check_approval_by_default(new, exportable)
+}
 
 /// Refuse a new policy that lets an operation governing the key happen
 /// without an approval, unless it says so explicitly (`"approval": "none"`).
@@ -534,7 +548,7 @@ pub fn check_approval_by_default(policy: &KeyPolicy, exportable: bool) -> Result
         ops.push(Operation::ExportKey);
     }
     for op in ops {
-        // Rules a person can use (Security): an app fetching its own key under
+        // Rules a person can use: an app fetching its own key under
         // a rule for its enclaves only (`Tee`, `AnyTee`) is not a governance act.
         let by_people = policy.operations.iter().filter(|r| {
             r.ops.contains(&op)
@@ -555,7 +569,7 @@ pub fn check_approval_by_default(policy: &KeyPolicy, exportable: bool) -> Result
     Ok(())
 }
 
-/// What counts as an approval for approval by default (Security; the
+/// What counts as an approval for approval by default (the
 /// portal's notice uses the same rule): a passkey step-up (`webauthn` in
 /// `required_amr`) bound to the operation (binding v2, or v1
 /// `operation_bound`). A fresh token alone, or a co-sign alone, is not.
@@ -653,7 +667,7 @@ mod tests {
 
     #[test]
     fn binding_v2_vector_matches_the_spec() {
-        // wallet-signed-authority-wire-formats.md §5.2
+        // docs/vault-wire-formats.md §5.2
         let members = vec!["1".repeat(64), "2".repeat(64)];
         let text = binding_v2_text(
             &members,
@@ -940,7 +954,7 @@ mod tests {
     }
 }
 
-/// Shared test vectors (formats §5.2): `testdata/v2_vectors.json`, which the
+/// Shared test vectors (wire formats §5.2): `testdata/v2_vectors.json`, which the
 /// Go client, privasys.id and the wallet check their own code against.
 /// `cargo test -- --ignored write_vectors` regenerates the file; the
 /// ordinary test asserts the code still produces exactly what it holds.
@@ -969,7 +983,7 @@ mod vectors {
             "AAECAwQFBgcICQoLDA0ODw",
             1764000600,
         );
-        // update_policy_from (formats §5.3): the current policy is the sample as
+        // update_policy_from (wire formats §5.3): the current policy is the sample as
         // the vault would store and return it; the new one is the sample as sent.
         let stored = canonical_policy(SAMPLE_POLICY).unwrap().policy;
         let stored_json = serde_json::to_string(&stored).unwrap();

@@ -62,12 +62,12 @@ pub enum VaultRequest {
         /// IdP-issued grant (JWT) carrying owner, scope, key_type, exportable
         /// and policy.
         grant: String,
-        /// Renewal in place (formats §9): the handle of the key this one
+        /// Renewal in place (wire formats §9): the handle of the key this one
         /// succeeds, on this vault. The vault copies its policy, version and
         /// key check value, and ignores the grant's policy.
         #[serde(default)]
         predecessor: Option<String>,
-        /// Renewal onto another constellation, or rotation (formats §9): the
+        /// Renewal onto another constellation, or rotation (wire formats §9): the
         /// key's current policy, read fresh from the source vault by the app
         /// and carried verbatim. Takes the place of the grant's policy.
         #[serde(default)]
@@ -75,21 +75,21 @@ pub enum VaultRequest {
         /// The carried policy's version at the source.
         #[serde(default)]
         policy_version: Option<u32>,
-        /// Holder records the carried policy names (step 3; refused if
-        /// non-empty before then).
+        /// Holder records the carried policy names: not accepted by this
+        /// vault, so a request carrying any is refused.
         #[serde(default)]
         holder_records: Vec<serde_json::Value>,
         /// The source vault's billing id: a carried policy is accepted only
         /// from a vault under this vault's billing configuration.
         #[serde(default)]
         source_billing_id: Option<String>,
-        /// The key check value of the whole key (formats §10.4), stored
+        /// The key check value of the whole key (wire formats §10.4), stored
         /// opaquely and never returned.
         #[serde(default)]
         key_check: Option<KeyCheck>,
         /// With a carried policy: the source key's `exportable` and
         /// `key_type` (from its `GetKeyInfo`). A carried create must keep
-        /// them; the vault refuses a grant that says otherwise (Security).
+        /// them; the vault refuses a grant that says otherwise.
         #[serde(default)]
         carried_exportable: Option<bool>,
         #[serde(default)]
@@ -122,7 +122,7 @@ pub enum VaultRequest {
         /// Binding v2 fields, for a key whose step-up takes `binding: 2`.
         #[serde(default)]
         binding: Option<BindingV2Request>,
-        /// The old key of a migration or upgrade (formats §9.2): the delete
+        /// The old key of a migration or upgrade (wire formats §9.2): the delete
         /// is bound to its successor and refused until the successor, where
         /// this vault can see it, has succeeded.
         #[serde(default)]
@@ -138,7 +138,7 @@ pub enum VaultRequest {
     },
 
     /// Replace the policy on an existing key. `new_policy` is kept as sent:
-    /// a v2 approval binds the digest of exactly this JSON (formats §5.1).
+    /// a v2 approval binds the digest of exactly this JSON (wire formats §5.1).
     UpdatePolicy {
         handle: String,
         new_policy: Box<serde_json::value::RawValue>,
@@ -149,11 +149,11 @@ pub enum VaultRequest {
         binding: Option<BindingV2Request>,
     },
 
-    /// This vault's identity (formats §1): member id, billing id and a quote
+    /// This vault's identity (wire formats §1): member id, billing id and a quote
     /// binding them. Unauthenticated.
     GetVaultIdentity,
 
-    /// Check a policy against formats §5.1 and return its digest, storing
+    /// Check a policy against wire formats §5.1 and return its digest, storing
     /// nothing. Unauthenticated.
     CanonicalisePolicy {
         policy: Box<serde_json::value::RawValue>,
@@ -330,7 +330,7 @@ pub enum VaultRequest {
         confirmations_b64: BTreeMap<u16, String>,
     },
     /// Abort a DKG. With `handle`, also remove the key this session
-    /// committed here while it is still pending (formats §9.3.1): same
+    /// committed here while it is still pending (wire formats §9.3.1): same
     /// session, same caller, never once it has served an operation.
     FrostDkgAbort {
         session: String,
@@ -435,7 +435,7 @@ pub enum VaultResponse {
         handle: String,
         expires_at: u64,
     },
-    /// This vault's identity (formats §1). The quote's report data is
+    /// This vault's identity (wire formats §1). The quote's report data is
     /// `H("privasys-vault-identity-v1\n" member_id "\n" billing_id)`.
     VaultIdentity {
         member_id: String,
@@ -443,7 +443,7 @@ pub enum VaultResponse {
         billing_id: String,
         mrenclave: String,
         quote_b64: String,
-        /// What this build enforces beyond step 1, by name (formats §9.1):
+        /// What this build enforces, by name (wire formats §9.1):
         /// "generations-v1" = `GetKeyInfo` reports `renewed_in_place_from`, a
         /// first creation of a generation handle (last segment `gen-<n>`) is refused,
         /// and a carried create keeps the source's exportable flag and type.
@@ -456,7 +456,7 @@ pub enum VaultResponse {
         #[serde(default)]
         capabilities: Vec<String>,
     },
-    /// A policy checked against formats §5.1, and its digest.
+    /// A policy checked against wire formats §5.1, and its digest.
     CanonicalPolicy {
         policy: KeyPolicy,
         pd: String,
@@ -467,7 +467,7 @@ pub enum VaultResponse {
     },
     KeyDeleted,
     /// `GetKeyInfo` on a deleted key, to the principals of its final policy
-    /// (formats §9.3).
+    /// (wire formats §9.3).
     KeyTombstone {
         handle: String,
         key_type: KeyType,
@@ -637,13 +637,13 @@ pub struct KeyInfo {
     /// Threshold keys: this vault's part (public).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub threshold: Option<ThresholdKeyInfo>,
-    /// The key this one renewed IN PLACE on this vault (formats §9.1),
+    /// The key this one renewed IN PLACE on this vault (wire formats §9.1),
     /// absent for a first creation or a carried move. A client that takes a
     /// name's newest generation accepts generation n > 1 only when it names
     /// generation n - 1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub renewed_in_place_from: Option<String>,
-    /// Created with its owner's bound `create` approval (formats §9.3.1):
+    /// Created with its owner's bound `create` approval (wire formats §9.3.1):
     /// set by the vault, never from a request.
     #[serde(default, skip_serializing_if = "is_false")]
     pub created_by_owner_approval: bool,
@@ -916,7 +916,7 @@ pub enum Condition {
         #[serde(default)]
         fresh_for_seconds: u64,
         /// Which binding the token's `vault_op` carries: absent or 0 for v1
-        /// (every key created before v2), 2 for binding v2 (formats §5). A
+        /// (every key created before v2), 2 for binding v2 (wire formats §5). A
         /// v2 condition is always operation-bound, and takes only v2.
         #[serde(default, skip_serializing_if = "is_zero_u8")]
         binding: u8,
@@ -927,19 +927,19 @@ fn is_zero_u8(v: &u8) -> bool {
     *v == 0
 }
 
-/// The request's part of a binding v2 (formats §5): the members it names,
+/// The request's part of a binding v2 (wire formats §5): the members it names,
 /// sorted. Every other field the vault takes from its own state, the
 /// operation, or the token.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct BindingV2Request {
     pub members: Vec<String>,
-    /// For `update_policy_from` (formats §5.3): `PD` of the policy being
+    /// For `update_policy_from` (wire formats §5.3): `PD` of the policy being
     /// replaced, as `GetPolicy` returns it. Absent: plain `update_policy`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub replaced_pd: Option<String>,
 }
 
-/// The successor a `delete_after` is bound to (formats §9.2).
+/// The successor a `delete_after` is bound to (wire formats §9.2).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct DeleteAfter {
     pub successor: String,
@@ -948,7 +948,7 @@ pub struct DeleteAfter {
     pub successor_target: String,
 }
 
-/// The key check value of a whole key (formats §10.4): an Argon2id digest
+/// The key check value of a whole key (wire formats §10.4): an Argon2id digest
 /// under a random salt. Stored opaquely and never returned.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct KeyCheck {
@@ -1099,7 +1099,7 @@ impl Default for Mutability {
 /// The full access policy attached to a key.
 ///
 /// **Serialisation is part of the protocol.** `PD(current)` in an
-/// `update_policy_from` approval (formats §5.3) and the FROST quote context
+/// `update_policy_from` approval (wire formats §5.3) and the FROST quote context
 /// hash this type as the vault serialises it. A NEW field on this type, or on
 /// any type it contains, must be `#[serde(default, skip_serializing_if = ...)]`
 /// at its default, so that an unchanged stored policy serialises exactly as
@@ -1115,7 +1115,7 @@ pub struct KeyPolicy {
     pub mutability: Mutability,
     #[serde(default)]
     pub lifecycle: Lifecycle,
-    /// `"none"` opts the key out of approval by default (formats §4): a new
+    /// `"none"` opts the key out of approval by default (wire formats §4): a new
     /// policy without approval rules on promote, update, delete and export
     /// is refused unless it says so. Absent on every key created before v2.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1220,20 +1220,20 @@ pub struct KeyRecord {
     /// `threshold_vaults[i - 1]`. Empty for other keys.
     #[serde(default)]
     pub threshold_vaults: Vec<String>,
-    /// The key check value of the whole key (formats §10.4), if the creator
+    /// The key check value of the whole key (wire formats §10.4), if the creator
     /// gave one. Never returned by any call.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub key_check: Option<KeyCheck>,
-    /// The key this one renewed IN PLACE (formats §9.1): set only when the
+    /// The key this one renewed IN PLACE (wire formats §9.1): set only when the
     /// policy was copied from a predecessor on this vault, never from a
     /// request, so a carried create cannot claim to supersede a key.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub renewed_in_place_from: Option<String>,
-    /// Created with its owner's bound `create` approval (formats §9.3.1).
+    /// Created with its owner's bound `create` approval (wire formats §9.3.1).
     #[serde(default, skip_serializing_if = "is_false")]
     pub created_by_owner_approval: bool,
     /// A threshold key committed by a DKG or resharing session and not yet
-    /// used: its session may still abort it (formats §9.3.1).
+    /// used: its session may still abort it (wire formats §9.3.1).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pending_creation: Option<PendingCreation>,
 }
@@ -1247,7 +1247,7 @@ pub struct PendingCreation {
     pub committed_at: u64,
 }
 
-/// What a deleted key leaves behind (formats §9.3): never material.
+/// What a deleted key leaves behind (wire formats §9.3): never material.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Tombstone {
     pub handle: String,

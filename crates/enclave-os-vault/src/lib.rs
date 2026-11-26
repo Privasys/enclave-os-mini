@@ -293,7 +293,7 @@ pub(crate) fn kv() -> Result<&'static std::sync::Mutex<SealedKvStore>, VaultResp
 }
 
 /// Find a handle as it stands, finishing a cut-short deletion or purging an
-/// expired tombstone on the way (formats §9.3).
+/// expired tombstone on the way (wire formats §9.3).
 pub(crate) fn lookup(handle: &str) -> Result<tomb::Lookup, VaultResponse> {
     let kv = kv()?;
     let mut store = kv
@@ -320,7 +320,7 @@ fn may_see(policy: &KeyPolicy, ctx: &RequestContext) -> bool {
 
 /// A key's record for a request by `ctx`. Anyone outside the key's policy
 /// gets the same answer for a live key and a deleted one (no existence
-/// oracle, Security); the key's principals learn that it was deleted.
+/// oracle); the key's principals learn that it was deleted.
 pub(crate) fn load_for(handle: &str, ctx: &RequestContext) -> Result<KeyRecord, VaultResponse> {
     match lookup(handle)? {
         tomb::Lookup::Live(r) if may_see(&r.policy, ctx) => Ok(r),
@@ -337,7 +337,7 @@ pub(crate) fn load_for(handle: &str, ctx: &RequestContext) -> Result<KeyRecord, 
 }
 
 /// Refuse to create `handle` while it has a tombstone or a key. Every
-/// creation path calls this (Security).
+/// creation path calls this.
 pub(crate) fn check_handle_free(handle: &str) -> Result<(), String> {
     match lookup(handle).map_err(response_text)? {
         tomb::Lookup::Missing => Ok(()),
@@ -523,7 +523,7 @@ pub(crate) fn check_grant_for_handle(
     Ok(())
 }
 
-/// What a `CreateKey` may carry beyond the grant (formats §9, §10.4).
+/// What a `CreateKey` may carry beyond the grant (wire formats §9, §10.4).
 struct CreateExtras {
     predecessor: Option<String>,
     policy: Option<Box<serde_json::value::RawValue>>,
@@ -537,15 +537,15 @@ struct CreateExtras {
 }
 
 /// The capability this build publishes in `GetVaultIdentity` for generation
-/// links (formats §9.1).
+/// links (wire formats §9.1).
 pub const CAPABILITY_GENERATIONS: &str = "generations-v1";
 
 /// The capability a build publishes when it accepts `update_policy_from`
-/// (formats §5.3).
+/// (wire formats §5.3).
 pub const CAPABILITY_UPDATE_FROM: &str = "update-policy-from-v1";
 
 /// Whether a handle's last segment is a generation marker "gen-<digits>"
-/// (formats §9.1): the suffix user-secret generations use, and nothing else.
+/// (wire formats §9.1): the suffix user-secret generations use, and nothing else.
 pub(crate) fn is_generation_handle(handle: &str) -> bool {
     let last = handle.rsplit('/').next().unwrap_or(handle);
     match last.strip_prefix("gen-") {
@@ -554,7 +554,7 @@ pub(crate) fn is_generation_handle(handle: &str) -> bool {
     }
 }
 
-/// What the handle's name allows (formats §9.3.1).
+/// What the handle's name allows (wire formats §9.3.1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum NameRule {
     /// No `new-<digits>` segment.
@@ -602,7 +602,7 @@ pub(crate) fn check_name_rule(handle: &str, renewal: bool) -> Result<NameRule, S
 }
 
 /// A re-created name's policy is approved as the vault will store it: the
-/// policy must already be in stored form (formats §9.3.1).
+/// policy must already be in stored form (wire formats §9.3.1).
 pub(crate) fn check_stored_form(policy: &KeyPolicy) -> Result<(), String> {
     let a = serde_json::to_value(policy).map_err(|e| format!("serialise policy: {e}"))?;
     let b = serde_json::to_value(normalise_policy(policy.clone()))
@@ -648,7 +648,7 @@ fn check_renewal_caller(policy: &KeyPolicy, ctx: &RequestContext) -> Result<(), 
     }
 }
 
-/// Decide the new key's policy (formats §9): copied from a predecessor on
+/// Decide the new key's policy (wire formats §9): copied from a predecessor on
 /// this vault, carried by the app from another constellation, or the grant's
 /// for a first creation.
 fn new_key_policy(
@@ -657,7 +657,7 @@ fn new_key_policy(
     ctx: &RequestContext,
 ) -> Result<NewKeyPolicy, String> {
     if !extras.holder_records.is_empty() {
-        return Err("holder records are not accepted before step 3".into());
+        return Err("holder records are not accepted by this vault".into());
     }
     if let Some(kc) = &extras.key_check {
         check_key_check(kc)?;
@@ -713,9 +713,14 @@ fn new_key_policy(
             }
             None => return Err("a carried policy needs source_billing_id".into()),
         }
+        // The key stays its owner's: a grant creates keys for its subject
+        // only, carried or not, so the caller cannot name another owner.
+        if owner_oidc_sub(&policy.principals.owner).as_deref() != Some(grant.sub.as_str()) {
+            return Err("a carried policy must name the grant's subject as its owner".into());
+        }
         check_renewal_caller(&policy, ctx)?;
         // The source key's exportable flag and type travel with its policy;
-        // a grant may not change them on the way (Security).
+        // a grant may not change them on the way.
         let carried_exportable = extras
             .carried_exportable
             .ok_or_else(|| "a carried policy needs the source's carried_exportable".to_string())?;
@@ -737,7 +742,7 @@ fn new_key_policy(
                 Some(p) => format!("carried from {p}"),
                 None => "carried (rotation)".into(),
             },
-            // A carried create never supersedes anything here (Security).
+            // A carried create never supersedes anything here.
             in_place_from: None,
         });
     }
@@ -757,7 +762,7 @@ fn new_key_policy(
 
 /// A renewal in place keeps the key's value. For every key type but a Shamir
 /// share (whose share is fresh by design, the value being whole only across
-/// the vaults), the vault holds the whole value and compares it (Security).
+/// the vaults), the vault holds the whole value and compares it.
 fn check_same_value(key_type: KeyType, old: &[u8], new: &[u8]) -> Result<(), String> {
     if key_type == KeyType::RawShare {
         return Ok(());
@@ -772,7 +777,7 @@ fn check_same_value(key_type: KeyType, old: &[u8], new: &[u8]) -> Result<(), Str
 }
 
 /// Whether `succ` is a live renewal of `handle` made on this vault: the only
-/// kind of successor that lets `RetireKey` delete `handle` (Security).
+/// kind of successor that lets `RetireKey` delete `handle`.
 fn superseded_in_place(handle: &str, succ: &KeyRecord) -> bool {
     superseded_in_place_at(handle, succ, now_secs())
 }
@@ -856,7 +861,7 @@ fn handle_create(
     if extras.predecessor.as_deref() == Some(handle) {
         return VaultResponse::Error("a key cannot succeed itself".into());
     }
-    // A generation ("<name>/gen-<n>") exists only through a renewal (Security):
+    // A generation ("<name>/gen-<n>") exists only through a renewal:
     // whoever mints grants must not be able to plant a newer generation with
     // a value of its choosing as a first creation. The marker is used by
     // nothing else, so first creations at ".../v<n>" are untouched.
@@ -872,7 +877,7 @@ fn handle_create(
         Ok(r) => r,
         Err(e) => return VaultResponse::Error(e),
     };
-    // Every creation path stops at a tombstone (formats §9.3).
+    // Every creation path stops at a tombstone (wire formats §9.3).
     if let Err(e) = check_handle_free(handle) {
         return VaultResponse::Error(e);
     }
@@ -900,7 +905,7 @@ fn handle_create(
         Err(e) => return VaultResponse::Error(e),
     };
     // The owner's bound create approval, checked against exactly the policy
-    // stored (Security): never a grant alone.
+    // stored: never a grant alone.
     let created_by_owner_approval = rule == NameRule::ReCreated;
     if created_by_owner_approval {
         if let Err(e) = crate::policy::require_owner_create(
@@ -1081,7 +1086,7 @@ fn handle_delete(
     };
     let caller = caller_str(ctx);
     // The old key of a migration or upgrade: refused until its successor has
-    // succeeded, checked before the approval is spent (formats §9.2).
+    // succeeded, checked before the approval is spent (wire formats §9.2).
     let (op, target, detail) = match &after {
         Some(a) => {
             if let Err(e) = check_successor_succeeded(&record, a) {
@@ -1128,7 +1133,7 @@ fn handle_delete(
     }
 }
 
-/// Delete a key after auditing it, leaving a tombstone (formats §9.3): the
+/// Delete a key after auditing it, leaving a tombstone (wire formats §9.3): the
 /// tombstone is written first, then the record with its material. The audit
 /// log stays until the key's original expiry.
 #[allow(clippy::too_many_arguments)]
@@ -1188,7 +1193,7 @@ fn tomb_approver(policy: &KeyPolicy, tomb_op: &str, ctx: &RequestContext) -> (St
 }
 
 /// The old key of a migration or upgrade may go only once its successor has
-/// succeeded, where this vault can see it (formats §9.2).
+/// succeeded, where this vault can see it (wire formats §9.2).
 fn check_successor_succeeded(old: &KeyRecord, after: &crate::types::DeleteAfter) -> Result<(), String> {
     // Promote K then "delete K after K" would delete the key just promoted.
     if after.successor == old.handle {
@@ -1203,7 +1208,7 @@ fn check_successor_succeeded(old: &KeyRecord, after: &crate::types::DeleteAfter)
     successor_check(old, after, succ.as_ref(), now_secs())
 }
 
-/// The successor checks of formats §9.2, given the successor's record when it
+/// The successor checks of wire formats §9.2, given the successor's record when it
 /// is on this vault.
 fn successor_check(
     old: &KeyRecord,
@@ -1223,7 +1228,7 @@ fn successor_check(
         return Err("the successor has expired".into());
     }
     // Any live key here would otherwise pass for a created successor
-    // (Security): it must belong to the same owner and be newer.
+    //: it must belong to the same owner and be newer.
     if succ.policy.principals.owner != old.policy.principals.owner {
         return Err("the successor belongs to another owner".into());
     }
@@ -1285,7 +1290,7 @@ fn handle_retire(
     }
     // Only a generation this vault KNOWS is superseded may be retired: its
     // successor is here, unexpired, and records it as its predecessor. The
-    // live generation is never reachable, whatever the caller claims (Security).
+    // live generation is never reachable, whatever the caller claims.
     // A key that moved to another constellation is not retired this way.
     if !successor_members.iter().any(|m| m == &own) {
         return refuse(
@@ -1327,13 +1332,13 @@ fn handle_update_policy(
     let caller = caller_str(ctx);
 
     // A key whose update rule takes binding v2 approves exactly the JSON sent
-    // (formats §5.1): it must be canonical, and it is stored as sent. Other
+    // (wire formats §5.1): it must be canonical, and it is stored as sent. Other
     // keys take the policy as before, normalised.
     let takes_v2 = rule_takes_binding_v2(&record.policy, Operation::UpdatePolicy);
     let canonical = v2::canonical_policy(new_policy_raw.get());
     let new_policy = if takes_v2 {
         match &canonical {
-            // Sent exactly as it will be stored (Security): the owner approves
+            // Sent exactly as it will be stored: the owner approves
             // the JSON the vault keeps and returns.
             Ok(c) => match v2::check_sent_in_stored_form(new_policy_raw.get()) {
                 Ok(()) => c.policy.clone(),
@@ -1347,7 +1352,7 @@ fn handle_update_policy(
             Err(e) => return VaultResponse::Error(format!("new_policy does not parse: {e}")),
         }
     };
-    // update_policy_from (formats §5.3): the approval also names the policy it
+    // update_policy_from (wire formats §5.3): the approval also names the policy it
     // replaces; it must be the one this vault holds now.
     let replaced_pd = binding.as_ref().and_then(|b| b.replaced_pd.clone());
     let (op, target) = match replaced_pd {
@@ -1379,6 +1384,27 @@ fn handle_update_policy(
         }),
     };
 
+    // The change itself is checked first, so a change the vault refuses never
+    // spends the single-use approval that came with it.
+    let role = match resolve_caller(&record.policy, ctx) {
+        Some((_pref, role)) => role,
+        None => return VaultResponse::Error("caller is not in policy.principals".into()),
+    };
+    if let Err(e) = v2::check_no_approval_downgrade(&record.policy, &new_policy, record.exportable)
+    {
+        let _ = audit_denial(ctx, &mut record, "UpdatePolicy", &caller, AuditDecision::Denied, &e);
+        return VaultResponse::Error(e);
+    }
+    if let Err(e) = evaluate_policy_update(&record.policy, &new_policy, role) {
+        let _ = audit_denial(ctx,
+            &mut record,
+            "UpdatePolicy",
+            &caller,
+            AuditDecision::Denied,
+            &e,
+        );
+        return VaultResponse::Error(e);
+    }
     if let Err(e) = evaluate_op(
         &record.policy,
         record.policy_version,
@@ -1388,30 +1414,7 @@ fn handle_update_policy(
         ctx,
         Some(&op_binding),
     ) {
-        let _ = audit_denial(ctx, 
-            &mut record,
-            "UpdatePolicy",
-            &caller,
-            AuditDecision::Denied,
-            &e,
-        );
-        return VaultResponse::Error(e);
-    }
-    let role = match resolve_caller(&record.policy, ctx) {
-        Some((_pref, role)) => role,
-        None => return VaultResponse::Error("caller is not in policy.principals".into()),
-    };
-    // Approval by default (formats §4): an update may not take away the
-    // approvals a key has. A key that never had them (created before v2) may
-    // still be updated, and an update may add them.
-    if v2::check_approval_by_default(&record.policy, record.exportable).is_ok() {
-        if let Err(e) = v2::check_approval_by_default(&new_policy, record.exportable) {
-            let _ = audit_denial(ctx, &mut record, "UpdatePolicy", &caller, AuditDecision::Denied, &e);
-            return VaultResponse::Error(e);
-        }
-    }
-    if let Err(e) = evaluate_policy_update(&record.policy, &new_policy, role) {
-        let _ = audit_denial(ctx, 
+        let _ = audit_denial(ctx,
             &mut record,
             "UpdatePolicy",
             &caller,
@@ -1421,7 +1424,7 @@ fn handle_update_policy(
         return VaultResponse::Error(e);
     }
 
-    // A strict tightening (formats §4.1) is audited as its own decision.
+    // A strict tightening (wire formats §4.1) is audited as its own decision.
     let (what, detail) = match v2::tightening_rules(&record.policy, &new_policy) {
         Ok(rules) if !rules.is_empty() => (
             "TightenApprovals",
@@ -1431,6 +1434,9 @@ fn handle_update_policy(
     };
     record.policy = new_policy;
     record.policy_version = record.policy_version.saturating_add(1);
+    // Governed by its owner now: a pending threshold key can no longer be
+    // aborted.
+    record.pending_creation = None;
 
     if let Err(e) = audit_and_save(
         &mut record,
@@ -1461,7 +1467,7 @@ fn handle_get_policy(handle: &str, ctx: &RequestContext) -> VaultResponse {
 }
 
 fn handle_get_info(handle: &str, ctx: &RequestContext) -> VaultResponse {
-    // A deleted key's principals read its tombstone (formats §9.3).
+    // A deleted key's principals read its tombstone (wire formats §9.3).
     if let Ok(tomb::Lookup::Deleted(t)) = lookup(handle) {
         if tomb::is_principal(&t, ctx) {
             return VaultResponse::KeyTombstone {
@@ -2249,6 +2255,9 @@ fn handle_promote_pending(
         .tees
         .push(Principal::Tee(pending.profile));
     record.policy_version = record.policy_version.saturating_add(1);
+    // Governed by its owner now: a pending threshold key can no longer be
+    // aborted.
+    record.pending_creation = None;
     let new_tee_idx = record.policy.principals.tees.len() - 1;
 
     if let Err(e) = audit_and_save(
@@ -2339,7 +2348,7 @@ mod step1_tests {
         assert!(e.contains("successor of itself"), "{e}");
     }
 
-    /// Security: a created successor ("-") on this vault must be the same
+    /// A created successor ("-") on this vault must be the same
     /// owner's and newer, or any live key would pass.
     #[test]
     fn delete_after_needs_a_newer_successor_of_the_same_owner() {
@@ -2401,7 +2410,7 @@ mod step1_tests {
         }
     }
 
-    /// Security's forged-link case: an enclave named by K's policy creates X
+    /// The forged-link case: an enclave named by K's policy creates X
     /// on K's vaults with a carried policy naming K as predecessor, then asks
     /// to retire K. A carried create records no in-place link, so X never
     /// supersedes K, and only a live in-place renewal of K does.
@@ -2770,6 +2779,153 @@ mod tombstone_tests {
         raw.lifecycle.ttl_seconds = 0;
         assert!(check_stored_form(&raw).is_err());
         assert!(check_stored_form(&policy).is_ok());
+    }
+
+    #[test]
+    fn a_rule_change_never_drops_approvals_and_a_refused_one_spends_nothing() {
+        init();
+        let h = "users/alice/t7";
+        let rules = |requires: serde_json::Value| {
+            serde_json::json!([
+                {"ops": ["PromoteProfile", "UpdatePolicy", "DeleteKey"], "principals": ["Owner"], "requires": requires}
+            ])
+        };
+        let step_up = serde_json::json!([{"OidcStepUp": {
+            "required_amr": ["webauthn"], "operation_bound": true, "fresh_for_seconds": 300, "binding": 2
+        }}]);
+        let mut policy = alice_policy(rules(step_up.clone()));
+        policy.mutability.owner_can =
+            vec![crate::types::PolicyField::Operations, crate::types::PolicyField::Lifecycle];
+        let policy = normalise_policy(policy);
+        assert!(v2::check_approval_by_default(&policy, false).is_ok());
+        let mut record = KeyRecord {
+            handle: h.into(),
+            key_type: KeyType::Aes256GcmKey,
+            exportable: false,
+            material: vec![42; 32],
+            public_key: None,
+            policy: policy.clone(),
+            policy_version: 1,
+            created_at: NOW - 10,
+            expires_at: NOW + 1000,
+            pending_profiles: Vec::new(),
+            audit_next_seq: 0,
+            next_pending_id: 0,
+            threshold_vaults: Vec::new(),
+            key_check: None,
+            renewed_in_place_from: None,
+            created_by_owner_approval: false,
+            pending_creation: None,
+        };
+        audit_and_save(&mut record, "CreateKey", "oidc:alice", AuditDecision::Allowed, "").unwrap();
+        let send = |p: &KeyPolicy| {
+            let raw = serde_json::to_string(&normalise_policy(p.clone())).unwrap();
+            let raw = serde_json::value::RawValue::from_string(raw).unwrap();
+            handle_update_policy(h, &raw, &[], None, &ctx("alice"))
+        };
+        // Opting out, in the same change that drops the approvals: refused,
+        // and refused before any approval is asked for.
+        let mut opt_out = policy.clone();
+        opt_out.operations = alice_policy(rules(serde_json::json!([]))).operations;
+        opt_out.approval = Some(v2::APPROVAL_NONE.into());
+        let e = err(send(&opt_out));
+        assert!(e.contains("may not opt a key out"), "{e}");
+        // Opting out alone: refused too.
+        let mut only_opt_out = policy.clone();
+        only_opt_out.approval = Some(v2::APPROVAL_NONE.into());
+        let e = err(send(&only_opt_out));
+        assert!(e.contains("may not opt a key out"), "{e}");
+        // Dropping the approvals without the opt-out: refused.
+        let mut dropped = policy.clone();
+        dropped.approval = None;
+        dropped.operations = opt_out.operations.clone();
+        let e = err(send(&dropped));
+        assert!(e.contains("without an approval"), "{e}");
+        // A change the vault accepts still needs the owner's approval.
+        let mut longer = policy.clone();
+        longer.lifecycle.ttl_seconds = 3600;
+        let e = err(send(&longer));
+        assert!(!e.contains("may not opt") && !e.contains("without an approval"), "{e}");
+        // Nothing changed.
+        let r: KeyRecord = serde_json::from_slice(&raw_record(h).unwrap()).unwrap();
+        assert_eq!(r.policy_version, 1);
+    }
+
+    #[test]
+    fn a_carried_policy_keeps_the_grants_subject_as_owner() {
+        init();
+        let (_, _, billing) = v2::own_identity().unwrap();
+        let grant_policy = alice_policy(serde_json::json!([]));
+        let grant = crate::grant::KeyCreationGrant {
+            iss: "https://privasys.id".into(),
+            aud: "privasys-platform".into(),
+            sub: "alice".into(),
+            scope: "users/alice".into(),
+            key_type: KeyType::Aes256GcmKey,
+            exportable: false,
+            policy: grant_policy,
+            exp: NOW + 300,
+            cnf: None,
+        };
+        let carried = |owner: &str| {
+            let mut p = alice_policy(serde_json::json!([
+                {"ops": ["ExportKey"], "principals": ["Owner"], "requires": []}
+            ]));
+            p.principals.owner = serde_json::from_value(serde_json::json!(
+                {"Oidc": {"issuer": "https://privasys.id", "sub": owner, "required_roles": []}}
+            ))
+            .unwrap();
+            p.approval = Some(v2::APPROVAL_NONE.into());
+            CreateExtras {
+                predecessor: None,
+                policy: Some(
+                    serde_json::value::RawValue::from_string(serde_json::to_string(&p).unwrap()).unwrap(),
+                ),
+                policy_version: Some(4),
+                holder_records: Vec::new(),
+                source_billing_id: Some(billing.clone()),
+                key_check: None,
+                carried_exportable: Some(false),
+                carried_key_type: Some(KeyType::Aes256GcmKey),
+                binding: None,
+            }
+        };
+        // A caller naming itself the owner of a key in alice's scope: refused,
+        // even though it would pass as that policy's owner.
+        let e = new_key_policy(&grant, carried("mallory"), &ctx("mallory")).err().unwrap();
+        assert!(e.contains("grant's subject"), "{e}");
+        // Alice's own key, carried: accepted as it is.
+        let ok = new_key_policy(&grant, carried("alice"), &ctx("alice")).ok().unwrap();
+        assert_eq!(ok.policy_version, 4);
+    }
+
+    #[test]
+    fn an_expired_tombstone_with_a_long_log_is_purged_in_batches() {
+        let h = "users/alice/t8";
+        put_key(h);
+        deleted(h);
+        let mut store = kv().unwrap().lock().unwrap();
+        // A log longer than one purge batch.
+        let mut t = match tomb::lookup(&mut store, h, Some(NOW)).unwrap() {
+            tomb::Lookup::Deleted(t) => t,
+            _ => panic!("expected a tombstone"),
+        };
+        let total = tomb::PURGE_BATCH * 2 + 5;
+        for seq in t.audit_next_seq..total {
+            store.put(&audit::audit_key(h, seq), b"{}").unwrap();
+        }
+        t.audit_next_seq = total;
+        store.put(format!("tomb:{h}").as_bytes(), &serde_json::to_vec(&t).unwrap()).unwrap();
+        let later = Some(NOW + 1001);
+        // Two lookups each delete one batch, newest first; the handle stays deleted.
+        assert!(matches!(tomb::lookup(&mut store, h, later).unwrap(), tomb::Lookup::Deleted(_)));
+        assert!(store.get(&audit::audit_key(h, total - 1)).unwrap().is_none());
+        assert!(store.get(&audit::audit_key(h, 0)).unwrap().is_some());
+        assert!(matches!(tomb::lookup(&mut store, h, later).unwrap(), tomb::Lookup::Deleted(_)));
+        // The third finishes it.
+        assert!(matches!(tomb::lookup(&mut store, h, later).unwrap(), tomb::Lookup::Missing));
+        assert!(store.get(&audit::audit_key(h, 0)).unwrap().is_none());
+        assert!(store.get(format!("tomb:{h}").as_bytes()).unwrap().is_none());
     }
 
     #[test]
