@@ -9,7 +9,7 @@
 //! | `get-seal-key()` | The calling app's CURRENT sealing key S_N and the code hash it is bound to. |
 //!
 //! S_N is derived from the MRENCLAVE-sealed runtime root and the calling
-//! app's own code hash (OID 3.2), so a new wasm build receives a
+//! app's own code hash (OID 4.2), so a new wasm build receives a
 //! DIFFERENT key. An app keeps each data owner's wallet-delivered key
 //! element W wrapped under S_N: after an upgrade the wrap is unreadable
 //! until the owner's wallet re-delivers W — an app upgrade is a consent

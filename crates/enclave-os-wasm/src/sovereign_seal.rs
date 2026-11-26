@@ -15,7 +15,7 @@
 //!
 //! The runtime master key is MRENCLAVE-sealed (`SealedConfig::master_key`),
 //! so S_N inherits hardware version binding at the RUNTIME level, and the
-//! `code_hash` input (the app's own measurement, OID 3.2) binds it at the
+//! `code_hash` input (the app's own measurement, OID 4.2) binds it at the
 //! APP level: a new wasm build receives a different S_N, so the kept W is
 //! unreadable to upgraded code until the data owner's wallet re-delivers
 //! it — an app upgrade is a consent boundary. The enclave installs only
@@ -64,7 +64,7 @@ pub fn derive_sovereign_root(master: &[u8; 32]) -> [u8; 32] {
 
 /// Derive an app's current version-bound sealing key S_N from the
 /// sovereign root and the app's code hash (SHA-256 of its module,
-/// attested at OID 3.2).
+/// attested at OID 4.2).
 pub fn derive_seal_key(root: &[u8; 32], code_hash: &[u8; 32]) -> [u8; 32] {
     let prk = hkdf_extract(SOVEREIGN_SEAL_INFO, root);
     let mut info = [0u8; 4 + 32];

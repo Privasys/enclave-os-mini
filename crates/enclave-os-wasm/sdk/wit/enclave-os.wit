@@ -324,7 +324,7 @@ interface auth {
 ///      traffic flows again.
 interface attestation {
     /// Install (or replace) a non-critical X.509 extension on the
-    /// per-app RA-TLS leaf at OID `1.3.6.1.4.1.65230.3.5.{arc-suffix}`.
+    /// per-app RA-TLS leaf at OID `1.3.6.1.4.1.65230.5.4.{arc-suffix}` (arc-suffix from 1, at most 16 per app).
     ///
     /// The value is persisted to the sealed KV store so it survives
     /// enclave restarts. Capped at 4096 bytes to keep the leaf
@@ -365,7 +365,7 @@ interface ledger {
 /// An app flags data as user-owned and keeps each data owner's
 /// wallet-delivered key element wrapped under S_N, a sealing key bound
 /// to the RUNTIME's MRENCLAVE-sealed root AND this app's own code hash
-/// (OID 3.2). A new build of the app receives a DIFFERENT key, so the
+/// (OID 4.2). A new build of the app receives a DIFFERENT key, so the
 /// wrap is unreadable to upgraded code until the data owner's wallet
 /// re-delivers the element: an app upgrade is a consent boundary.
 interface sealing {

@@ -178,7 +178,7 @@
 //
 //   interface sealing {
 //       /// The calling app's CURRENT sealing key S_N (32 bytes) and the
-//       /// code hash (32 bytes, OID 3.2) it is bound to. A new build of
+//       /// code hash (32 bytes, OID 4.2) it is bound to. A new build of
 //       /// the app receives a DIFFERENT key: an app upgrade is a consent
 //       /// boundary for user-owned data. Errors during ledger replay.
 //       get-seal-key: func() -> result<tuple<list<u8>, list<u8>>, string>;

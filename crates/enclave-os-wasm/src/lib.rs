@@ -70,6 +70,7 @@ pub mod code_pool;
 pub mod enclave_sdk;
 pub mod engine;
 pub mod executor;
+pub mod extensions;
 pub mod guest_view;
 pub mod jwks_fetcher;
 pub mod kek_material;
@@ -241,7 +242,7 @@ impl WasmModule {
     /// If `permissions` is `Some`, per-function access control is
     /// enforced on `wasm_call` using the app developer's own OIDC
     /// provider. The SHA-256 hash of the configuration is included
-    /// in the per-app RA-TLS certificate as OID 3.5.
+    /// in the per-app RA-TLS certificate as OID 1.3.6.1.4.1.65230.5.2.
     pub fn load_app(
         &self,
         name: &str,
@@ -325,7 +326,8 @@ impl WasmModule {
     }
 
     /// Install (or replace) an app-defined attestation extension at
-    /// arc `1.3.6.1.4.1.65230.3.5.{arc_suffix}`. Persists the new
+    /// `1.3.6.1.4.1.65230.5.4.{arc_suffix}` (at most
+    /// [`extensions::MAX_APP_EXTENSIONS`] per app, arcs from 1). Persists the new
     /// extension set to KV (so it survives restarts) and re-registers
     /// the per-app identity with the global CertStore so the next
     /// RA-TLS handshake serves a leaf that includes the extension.
@@ -343,8 +345,7 @@ impl WasmModule {
                 .registry
                 .lock()
                 .map_err(|_| String::from("registry lock poisoned"))?;
-            reg.set_extension(name, arc_suffix, value)
-                .ok_or_else(|| format!("unknown app: '{}'", name))?
+            reg.set_extension(name, arc_suffix, value)?
         };
         // Persist updated metadata to KV so extensions survive restart.
         // We do not need the wasm bytes here \u2014 only the meta entry
@@ -356,7 +357,7 @@ impl WasmModule {
     }
 
     /// Set (or clear) an app's attested cross-enclave dependency set. Persists the
-    /// canonical OID 6.1 encoding to KV and re-registers the per-app identity so
+    /// canonical OID 7.1 encoding to KV and re-registers the per-app identity so
     /// the next RA-TLS handshake serves a leaf carrying the updated dependency
     /// set. Runtime-owned: reached only via the `wasm_set_dependencies` management
     /// command, never by the app.
@@ -394,7 +395,7 @@ impl WasmModule {
         Ok(())
     }
 
-    /// The code hash (SHA-256 of the module, attested at OID 3.2) of a
+    /// The code hash (SHA-256 of the module, attested at OID 4.2) of a
     /// known app. Used by the `sealing.get-seal-key` host function to
     /// bind the sovereign sealing key S_N to the calling app's current
     /// code — see [`crate::sovereign_seal`].
@@ -1848,7 +1849,7 @@ impl EnclaveModule for WasmModule {
                         )));
                     }
                 };
-                // The handle is namespaced by the app-id (OID 3.6, the undashed
+                // The handle is namespaced by the app-id (OID 4.1, the undashed
                 // hex of the 16 id bytes) so it falls under the grant scope
                 // `apps.privasys.org/<app-id>`; this must match the platform's
                 // minted grant exactly. The owner-bound policy is carried in the
@@ -2295,7 +2296,7 @@ impl EnclaveModule for WasmModule {
 
 /// Build an [`AppIdentity`] from persisted metadata for CertStore registration.
 /// Parse a UUID string (with or without hyphens) into its raw 16 bytes for the
-/// OID 3.6 app-id extension. Returns `None` for empty or malformed input, which
+/// OID 4.1 app-id extension. Returns `None` for empty or malformed input, which
 /// leaves the app in MR_ENCLAVE shape (the back-compat default before the
 /// platform starts sending `app_id`). See the MR_APP / promote-step-up design.
 fn parse_app_id(s: Option<&str>) -> Option<[u8; 16]> {
@@ -2348,7 +2349,7 @@ fn build_app_identity(meta: &AppMeta) -> AppIdentity {
             oid: Some(enclave_os_common::oids::APP_CONFIGURATION_HASH_OID),
         });
     }
-    // MR_APP: bind this app's leaf to its platform-assigned app-id (OID 3.6).
+    // MR_APP: bind this app's leaf to its platform-assigned app-id (OID 4.1).
     // Omitted (MR_ENCLAVE) when the platform did not supply one.
     if let Some(ref id) = meta.app_id {
         config.push(ConfigEntry {
@@ -2357,7 +2358,7 @@ fn build_app_identity(meta: &AppMeta) -> AppIdentity {
             oid: Some(enclave_os_common::oids::APP_ID_OID),
         });
     }
-    // Attested cross-enclave dependency set (OID 6.1). Runtime-owned: the value
+    // Attested cross-enclave dependency set (OID 7.1). Runtime-owned: the value
     // comes from the platform (wasm_load / wasm_set_dependencies), never from the
     // app, so the advertised set and the enforced set are one object.
     if let Some(ref deps) = meta.dependencies {
@@ -2367,22 +2368,14 @@ fn build_app_identity(meta: &AppMeta) -> AppIdentity {
             oid: Some(enclave_os_common::oids::ATTESTED_DEPENDENCY_SET_OID),
         });
     }
-    // App-defined extensions live under sub-OIDs of
-    // APP_CONFIGURATION_HASH_OID (1.3.6.1.4.1.65230.3.5.{arc_suffix}).
-    // The parent OID carries the WIT-derived configuration hash; the
-    // sub-arc carries opaque values installed at runtime by the app.
+    // App-defined extensions, at `1.3.6.1.4.1.65230.5.4.{arc}` (the registry's
+    // app-defined arc, never under a runtime-owned OID). The OID for each arc
+    // is interned once: identities are rebuilt on every load and change.
     for (arc_suffix, value) in &meta.extensions {
-        let mut full_oid: Vec<u64> = enclave_os_common::oids::APP_CONFIGURATION_HASH_OID.to_vec();
-        full_oid.push(*arc_suffix as u64);
-        // Leak to obtain a 'static slice. Acceptable: extensions are
-        // monotonically added and the registry lives for the
-        // process lifetime; the leaked memory is bounded by the
-        // number of distinct (app, arc) pairs ever installed.
-        let leaked: &'static [u64] = Box::leak(full_oid.into_boxed_slice());
         config.push(ConfigEntry {
             key: format!("wasm.{}.extension.{}", meta.name, arc_suffix),
             value: value.clone(),
-            oid: Some(leaked),
+            oid: Some(extensions::extension_oid(*arc_suffix)),
         });
     }
     AppIdentity {

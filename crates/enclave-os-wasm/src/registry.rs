@@ -549,7 +549,7 @@ pub struct AppMeta {
     /// SDK `set-attestation-extension(arc_suffix, value)` call. Each
     /// entry is embedded in the per-app RA-TLS leaf certificate as a
     /// non-critical extension under OID
-    /// `1.3.6.1.4.1.65230.3.5.{arc_suffix}`. Persisted so the
+    /// `1.3.6.1.4.1.65230.5.4.{arc_suffix}`. Persisted so the
     /// extensions survive enclave restarts; the cert is replayed
     /// before traffic is unblocked.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
@@ -569,7 +569,7 @@ pub struct AppMeta {
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub owners: Vec<String>,
     /// Platform-assigned app identity (apps.id, raw 16-byte UUID). Stamped at
-    /// OID 3.6 on the per-app leaf so a vault key can be bound to THIS app
+    /// OID 4.1 on the per-app leaf so a vault key can be bound to THIS app
     /// (MR_APP). `None` for apps loaded before app-id support (and for app-less
     /// callers), which keeps the MR_ENCLAVE behaviour. See the MR_APP / promote-step-up design.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -612,7 +612,7 @@ pub struct AppMeta {
     /// Attested cross-enclave dependency set — the canonical OID
     /// `1.3.6.1.4.1.65230.6.1` encoding of the enclaves this app is pinned to.
     /// Owned by the runtime: supplied by the platform via `wasm_load` /
-    /// `wasm_set_dependencies`, never writable by the app (unlike the `3.5.{n}`
+    /// `wasm_set_dependencies`, never writable by the app (unlike the `5.4.{n}`
     /// extensions). Sealed so it survives restarts and stamped on the per-app leaf
     /// so verifiers and the wallet can read what this app depends on. `None` =
     /// no declared dependencies.
@@ -1361,7 +1361,8 @@ impl AppRegistry {
     }
 
     /// Install (or replace) an app-defined attestation extension at
-    /// arc `1.3.6.1.4.1.65230.3.5.{arc_suffix}`. Returns the updated
+    /// `1.3.6.1.4.1.65230.5.4.{arc_suffix}`: arcs from 1, at most
+    /// [`crate::extensions::MAX_APP_EXTENSIONS`] per app. Returns the updated
     /// metadata so the caller can re-register the app identity with
     /// the global CertStore. Persistence to KV is the caller's job.
     pub fn set_extension(
@@ -1369,14 +1370,18 @@ impl AppRegistry {
         name: &str,
         arc_suffix: u32,
         value: Vec<u8>,
-    ) -> Option<AppMeta> {
-        let meta = self.known.get_mut(name)?;
+    ) -> Result<AppMeta, String> {
+        let meta = self
+            .known
+            .get_mut(name)
+            .ok_or_else(|| format!("unknown app: '{}'", name))?;
+        crate::extensions::check_new_extension(&meta.extensions, arc_suffix)?;
         meta.extensions.insert(arc_suffix, value);
-        Some(meta.clone())
+        Ok(meta.clone())
     }
 
     /// Set (or clear, when `dependencies` is `None`) an app's attested
-    /// cross-enclave dependency set (the canonical OID 6.1 encoding). Returns the
+    /// cross-enclave dependency set (the canonical OID 7.1 encoding). Returns the
     /// updated meta so the caller can persist it and re-register the identity.
     pub fn set_dependencies(&mut self, name: &str, dependencies: Option<Vec<u8>>) -> Option<AppMeta> {
         let meta = self.known.get_mut(name)?;
@@ -1443,7 +1448,7 @@ impl AppRegistry {
             .collect()
     }
 
-    /// Get the configuration hash for a known app (for OID 3.5 attestation).
+    /// Get the configuration hash for a known app (for OID 5.2 attestation).
     pub fn app_configuration_hash(&self, name: &str) -> Option<&[u8; 32]> {
         self.known
             .get(name)
@@ -1468,7 +1473,7 @@ impl AppRegistry {
 
     /// Platform-assigned app identity (apps.id, raw 16 bytes) from the
     /// load payload, or `None` for pre-MR_APP loads. Hex-encoded it is
-    /// the OID 3.6 value and the app-id segment of the per-app config
+    /// the OID 4.1 value and the app-id segment of the per-app config
     /// role (`<audience>:app:<hex>:owner|admin`) the configure-authz
     /// gate checks.
     pub fn app_id(&self, name: &str) -> Option<[u8; 16]> {

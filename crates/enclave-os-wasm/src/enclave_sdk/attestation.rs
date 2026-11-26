@@ -7,7 +7,7 @@
 //!
 //! | Function | Purpose |
 //! |----------|---------|
-//! | `set-attestation-extension(arc-suffix: u32, value: list<u8>)` | Install (or replace) a non-critical X.509 extension on the per-app RA-TLS leaf at OID `1.3.6.1.4.1.65230.3.5.{arc_suffix}`. Persisted across enclave restarts. |
+//! | `set-attestation-extension(arc-suffix: u32, value: list<u8>)` | Install (or replace) a non-critical X.509 extension on the per-app RA-TLS leaf at OID `1.3.6.1.4.1.65230.5.4.{arc_suffix}` (arcs from 1, at most 16 per app). Persisted across enclave restarts. |
 //! | `set-config-complete()` | Lift the freeze gate so the app's other exports become callable. Must be called from the configure function (the function declared as `config_api` at load time). |
 //!
 //! ## Configure-then-freeze flow

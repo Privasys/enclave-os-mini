@@ -122,7 +122,7 @@ pub struct WasmEnvelope {
     pub wasm_rotate_key: Option<WasmRotateKey>,
 
     /// Set (or clear) an app's attested cross-enclave dependency set, re-minting
-    /// its per-app certificate so OID 6.1 reflects the new set on the next
+    /// its per-app certificate so OID 7.1 reflects the new set on the next
     /// handshake. Runtime-owned; the app cannot issue this. Requires the
     /// **manager** role.
     #[serde(default)]
@@ -135,7 +135,7 @@ pub struct WasmEnvelope {
 /// { "wasm_set_dependencies": { "name": "my-app", "dependencies": "<base64 canonical>" } }
 /// ```
 ///
-/// `dependencies` is the canonical OID 6.1 encoding (standard base64). The
+/// `dependencies` is the canonical OID 7.1 encoding (standard base64). The
 /// runtime validates it (decode + re-encode canonical), seals it, and re-mints
 /// the per-app leaf. Absent/empty clears the set.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -323,7 +323,7 @@ pub struct WasmLoad {
     /// When present, the enclave enforces per-function access control on
     /// `wasm_call` requests using the app developer's own OIDC provider.
     /// The SHA-256 hash of the serialised permissions JSON is embedded in
-    /// the per-app RA-TLS certificate as OID `1.3.6.1.4.1.65230.3.5`.
+    /// the per-app RA-TLS certificate as OID `1.3.6.1.4.1.65230.5.2`.
     ///
     /// When absent, all exported functions are callable without
     /// authentication.
@@ -391,7 +391,7 @@ pub struct WasmLoad {
     pub owners: Vec<String>,
 
     /// Platform-assigned app identity (apps.id, a UUID string). When present,
-    /// the enclave stamps it (raw 16 bytes) at OID 3.6 on the per-app leaf so a
+    /// the enclave stamps it (raw 16 bytes) at OID 4.1 on the per-app leaf so a
     /// vault key can be sealed to THIS app (MR_APP) and a same-cwasm peer with a
     /// different app-id cannot unseal it. Absent keeps the MR_ENCLAVE behaviour.
     /// See the MR_APP / promote-step-up design.
@@ -436,7 +436,7 @@ pub struct WasmLoad {
     /// `vault_backed` is true.
     #[serde(default)]
     pub key_handle: Option<String>,
-    /// Attested cross-enclave dependency set, as the canonical OID 6.1 encoding in
+    /// Attested cross-enclave dependency set, as the canonical OID 7.1 encoding in
     /// standard base64. Runtime-owned (the app cannot set it). Validated and
     /// re-canonicalised by the enclave, sealed, and stamped on the per-app leaf.
     /// Absent means the app declares no dependencies.
@@ -866,7 +866,7 @@ pub struct ExportedFunc {
 /// `wasm_call` time.
 ///
 /// The SHA-256 hash of the canonical JSON serialisation is included in
-/// the per-app RA-TLS certificate (OID `1.3.6.1.4.1.65230.3.5`).
+/// the per-app RA-TLS certificate (OID `1.3.6.1.4.1.65230.5.2`).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AppPermissions {
     /// Schema version (must be `1`).
