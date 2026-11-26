@@ -13,7 +13,7 @@ single SGX enclave.
 | **HTTPS Egress** | Outbound HTTPS from inside the enclave (TLS terminated in enclave, sockets owned by the host). A request waiting on the network suspends and the enclave keeps serving the others |
 | **Sealed Key-Value Store** | Encrypted KV database — keys HMAC'd, values AES-256-GCM'd — master key sealed to MRENCLAVE |
 | **WASM Runtime** | Execute WebAssembly apps inside SGX with WASI and Enclave OS SDK interfaces |
-| **OIDC-Authenticated Vault** | Store and retrieve secrets gated by OIDC RBAC with dual-path GetSecret (OIDC owner + RA-TLS TEE) |
+| **Vault** | Policy-gated key store (vHSM): typed keys, threshold Ed25519, owner-approved operations |
 | **Sealed Config** | All persistent state stored as a single MRENCLAVE-bound blob |
 | **Config Attestation** | Merkle root + per-module OIDs over all config inputs in every RA-TLS certificate |
 | **Trusted Time** | The host's clock is never taken on trust: every time read is checked against a sealed floor, the platform clock monitor's signed polls and NTS servers (RFC 8915), and verification decisions fail closed without it. See [docs/trusted-time.md](docs/trusted-time.md) |

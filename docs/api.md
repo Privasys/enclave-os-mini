@@ -59,13 +59,20 @@ its connection 60 s after it opened (see
 
 ### Vault
 
-| Operation | Auth | Role | Description |
-|-----------|------|------|-------------|
-| `StoreSecret` | Bearer | Secret Owner | Store a named secret |
-| `GetSecret` | Bearer **or** mutual RA-TLS | — | Retrieve a secret (dual-path) |
-| `DeleteSecret` | Bearer | Secret Owner | Delete a secret |
-| `UpdateSecretPolicy` | Bearer | Secret Owner | Update a secret's access policy |
-| `ListSecrets` | Bearer | Secret Owner | List caller's secrets (metadata only) |
+| Operation | Auth | Description |
+|-----------|------|-------------|
+| `CreateKey` | Key-creation grant bound to the caller | Create a typed key (also renewals and re-created names) |
+| `ExportKey` | Key policy | Export raw material of an `exportable` key |
+| `DeleteKey` | Key policy | Delete a key, leaving a tombstone (also `delete_after`) |
+| `RetireKey` | An enclave the key's policy names | Delete the previous generation after a renewal in place |
+| `UpdatePolicy` | Key policy + `Mutability` | Replace a key's policy |
+| `GetPolicy` / `GetKeyInfo` / `ListKeys` | Bearer (key principals) | Read a key's policy, metadata or the caller's handles |
+| `Wrap` / `Unwrap` / `Sign` / `Mac` | Key policy (bearer or mutual RA-TLS) | In-enclave crypto |
+| `IssueApprovalToken` | Bearer (a key manager) | Mint a manager approval token |
+| `ReadAuditLog` | Bearer (owner or auditor) | Read a key's audit log |
+| `StagePendingProfile` / `ListPendingProfiles` / `PromotePendingProfile` / `RevokePendingProfile` | Key policy | Enclave-upgrade lifecycle |
+| `FrostDkg*` / `FrostSign*` / `FrostAggregate` / `FrostReshare*` | Grant or key policy | Threshold Ed25519 keys (FROST) |
+| `GetVaultIdentity` / `CanonicalisePolicy` | None | Vault identity; a policy's stored form and digest |
 
 "Monitoring+" means the `privasys-platform:monitoring` role or any higher
 role (manager implies monitoring).
@@ -93,9 +100,6 @@ to the module.
 |------|------------|-------|
 | Manager | `privasys-platform:manager` | WASM load/unload |
 | Monitoring | `privasys-platform:monitoring` | Readyz, Status, Metrics, WASM list |
-| Vault Owner | `vault:owner` | Vault create/delete/update/list/export own keys |
-| Vault Manager | `vault:manager` | Issue ApprovalTokens for policy-gated vault operations |
-| Vault Auditor | `vault:auditor` | Read vault metadata and audit log |
 
 Role claims are extracted from (checked in order):
 1. `roles` (string array — standard RFC 9068)
@@ -769,198 +773,55 @@ which configuration is active — without trusting the host.
 
 ## Vault Operations
 
-Vault operations are carried inside `Data` frames.  The JSON payload is a
-`VaultRequest` enum variant.  See [vault.md](vault.md) for the full access
-policy model and dual-path authentication details.
+Vault operations are carried inside `Data` frames. The JSON payload is a `VaultRequest` enum variant, with the OIDC bearer, when there is one, in the `"auth"` field. The vault answers with a `VaultResponse` variant, or `{"Error": "<message>"}`. [vault.md](vault.md) documents every request, the key policy model and approvals; [vault-wire-formats.md](vault-wire-formats.md) gives the exact formats of approvals, policy digests, renewals and tombstones.
 
-### StoreSecret
-
-Store a named secret with an access policy.  Requires **Secret Owner**
-role.
-
-**Request**
+**Example: wrap with an AES key**
 
 ```json
 {
   "auth": "<token>",
-  "StoreSecret": {
-    "name": "customer-123-dek",
-    "secret": "base64url-encoded-bytes",
-    "policy": {
-      "allowed_mrenclave": ["abcd1234..."],
-      "allowed_mrtd": [],
-      "manager_sub": "manager-oidc-subject",
-      "required_oids": [],
-      "ttl_seconds": 604800
-    }
+  "Wrap": {
+    "handle": "tenant42/master-kek",
+    "plaintext_b64": "base64url-encoded-bytes"
   }
 }
 ```
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `name` | string | yes | Human-readable secret name |
-| `secret` | string | yes | Base64url-encoded secret bytes |
-| `policy` | SecretPolicy | yes | Access policy (see below) |
-
-**SecretPolicy fields**
-
-| Field | Type | Default | Description |
-|-------|------|---------|-------------|
-| `allowed_mrenclave` | string[] | `[]` | SGX MRENCLAVE values (hex) permitted to retrieve |
-| `allowed_mrtd` | string[] | `[]` | TDX MRTD values (hex) permitted to retrieve |
-| `manager_sub` | string? | `null` | OIDC `sub` of the secret manager (defence-in-depth) |
-| `required_oids` | OidRequirement[] | `[]` | OID/value pairs the caller's RA-TLS cert must contain |
-| `ttl_seconds` | u64 | 30 days | Time-to-live (capped at 90 days) |
-
-**Response**
-
 ```json
-{ "SecretStored": { "name": "customer-123-dek", "expires_at": 1741564800 } }
+{ "Wrapped": { "ciphertext": [12, 34, ...], "iv": [56, 78, ...] } }
 ```
 
----
-
-### GetSecret
-
-Retrieve a secret.  Supports two authentication paths:
-
-**Path 1 — OIDC owner**: the caller's OIDC `sub` matches the stored
-`owner_sub`.  No RA-TLS required.
-
-**Path 2 — Mutual RA-TLS TEE**: the caller presents an RA-TLS client
-certificate.  The vault extracts attestation from the peer cert and
-evaluates it against the secret's policy.  Optionally requires a bearer
-token from the secret manager.
-
-**Request** (OIDC owner path)
+**Example: delete a key under the owner's wallet approval (binding v2)**
 
 ```json
 {
-  "auth": "<owner-oidc-token>",
-  "GetSecret": { "name": "customer-123-dek" }
-}
-```
-
-**Request** (RA-TLS TEE path, with manager bearer token)
-
-```json
-{
-  "GetSecret": {
-    "name": "customer-123-dek",
-    "bearer_token": [101, 121, 74, ...]
+  "auth": "<owner step-up token>",
+  "DeleteKey": {
+    "handle": "tenant42/master-kek",
+    "binding": { "members": ["<member_id>", "<member_id>"] }
   }
 }
 ```
 
-| Field | Type | Required | Description |
-|-------|------|----------|-------------|
-| `name` | string | yes | Secret name |
-| `bearer_token` | byte[] | no | OIDC bearer token from the secret manager (required if policy has `manager_sub`) |
+```json
+"KeyDeleted"
+```
 
-**Response**
+**Example: read this vault's identity**
+
+```json
+"GetVaultIdentity"
+```
 
 ```json
 {
-  "SecretValue": {
-    "secret": [72, 101, 108, 108, 111],
-    "expires_at": 1741564800
-  }
-}
-```
-
-**Error responses**
-
-| Condition | Error message |
-|-----------|---------------|
-| No auth provided | `"authentication required: provide OIDC token or mutual RA-TLS client certificate"` |
-| Secret not found | `"secret not found"` |
-| Secret expired | `"secret has expired"` |
-| Measurement mismatch | `"measurement not permitted by policy"` |
-| Missing bearer token | `"bearer token required (manager_sub set in policy)"` |
-| Bearer sub mismatch | `"bearer token sub '...' != policy manager_sub"` |
-| OID not satisfied | `"required OID ... not satisfied"` |
-
----
-
-### DeleteSecret
-
-Delete a secret.  Only the original OIDC owner can delete.  Requires
-**Secret Owner** role.
-
-**Request**
-
-```json
-{
-  "auth": "<token>",
-  "DeleteSecret": { "name": "customer-123-dek" }
-}
-```
-
-**Response**
-
-```json
-"SecretDeleted"
-```
-
----
-
-### UpdateSecretPolicy
-
-Update the access policy for an existing secret.  Only the original OIDC
-owner can update.  Requires **Secret Owner** role.
-
-**Request**
-
-```json
-{
-  "auth": "<token>",
-  "UpdateSecretPolicy": {
-    "name": "customer-123-dek",
-    "policy": {
-      "allowed_mrenclave": ["abcd1234...", "ef567890..."],
-      "allowed_mrtd": [],
-      "manager_sub": null,
-      "required_oids": [
-        { "oid": "1.3.6.1.4.1.65230.2.1", "value": "a1b2c3..." }
-      ],
-      "ttl_seconds": 2592000
-    }
-  }
-}
-```
-
-**Response**
-
-```json
-"PolicyUpdated"
-```
-
----
-
-### ListSecrets
-
-List all secrets owned by the caller (metadata only, never the secret
-values).  Requires **Secret Owner** role.
-
-**Request**
-
-```json
-{
-  "auth": "<token>",
-  "ListSecrets": null
-}
-```
-
-**Response**
-
-```json
-{
-  "SecretList": {
-    "secrets": [
-      { "name": "customer-123-dek", "expires_at": 1741564800 },
-      { "name": "signing-key", "expires_at": 1742169600 }
-    ]
+  "VaultIdentity": {
+    "member_id": "<hex>",
+    "member_public_key": "<hex>",
+    "billing_id": "<hex>",
+    "mrenclave": "<hex>",
+    "quote_b64": "<base64url>",
+    "capabilities": ["generations-v1", "update-policy-from-v1", "tombstones-v1"]
   }
 }
 ```

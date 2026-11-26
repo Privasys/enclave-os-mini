@@ -117,7 +117,7 @@ OS returns an error to the client.
 | **kvstore** | `crates/enclave-os-kvstore` | Sealed AES-256-GCM key-value store |
 | **merkle** | `crates/enclave-os-merkle` | Authenticated KV store — versioned sparse Merkle tree with an encryption-independent root (see [merkle-store.md](merkle-store.md)) |
 | **wasm** | `crates/enclave-os-wasm` | Wasmtime WASM runtime with WASI + SDK |
-| **vault** | `crates/enclave-os-vault` | JWT-authenticated (ES256) secret store |
+| **vault** | `crates/enclave-os-vault` | Policy-gated key store (vHSM): typed keys, threshold Ed25519, owner-approved operations (see [vault.md](vault.md)) |
 
 ### Composition Crates
 
