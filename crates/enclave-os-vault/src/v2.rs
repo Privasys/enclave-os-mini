@@ -17,6 +17,7 @@ use std::fmt;
 use serde::de::{self, Deserializer, MapAccess, SeqAccess, Visitor};
 use serde::Deserialize;
 
+use crate::sha256;
 use crate::types::{Condition, KeyPolicy, Operation, PrincipalRef};
 
 /// Domain of the binding v2 text (wire formats §5).
@@ -30,13 +31,6 @@ pub const BILLING_IMPLICIT_DOMAIN: &str = "privasys-billing-implicit-v0\n";
 
 /// The largest integer a canonical policy may hold (wire formats §5.1).
 const MAX_SAFE_INTEGER: u64 = 1 << 53;
-
-fn sha256(data: &[u8]) -> [u8; 32] {
-    let d = ring::digest::digest(&ring::digest::SHA256, data);
-    let mut out = [0u8; 32];
-    out.copy_from_slice(d.as_ref());
-    out
-}
 
 pub(crate) fn hex(bytes: &[u8]) -> String {
     enclave_os_common::hex::hex_encode(bytes)

@@ -15,7 +15,6 @@
 //! this connection.
 
 use std::string::String;
-use std::vec::Vec;
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine;
@@ -25,6 +24,7 @@ use enclave_os_common::modules::RequestContext;
 use enclave_os_common::oids::APP_ID_OID_STR;
 
 use crate::policy::tee_matches;
+use crate::sha256;
 use crate::types::{KeyPolicy, KeyType, Principal};
 
 /// Dedicated audience: distinguishes a key-creation grant from an access token.
@@ -169,10 +169,4 @@ fn bind_caller(grant: &KeyCreationGrant, ctx: &RequestContext) -> Result<(), Str
 /// The app-id segment of an `apps.privasys.org/<app-id>` scope, or `None`.
 fn scope_app_id(scope: &str) -> Option<&str> {
     scope.strip_prefix("apps.privasys.org/")
-}
-
-fn sha256(data: &[u8]) -> Vec<u8> {
-    ring::digest::digest(&ring::digest::SHA256, data)
-        .as_ref()
-        .to_vec()
 }
