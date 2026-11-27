@@ -37,7 +37,7 @@ expiry look far away):
 - EncAuth vouchers and the browser session relay;
 - JWT `exp`/`nbf` (platform and app tokens), FIDO2 ceremonies and session
   tokens;
-- vault key expiry, `TimeWindow`, approval and step-up freshness, audit
+- vault key expiry, approval and step-up freshness, audit
   stamps;
 - the egress JWKS cache, the raft replay clock;
 - the WASI `wall-clock` and `monotonic-clock`: the call **traps** (1 ms

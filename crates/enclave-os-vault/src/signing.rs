@@ -1,39 +1,26 @@
 // Copyright (c) Privasys. All rights reserved.
 // Licensed under the GNU Affero General Public License v3.0. See LICENSE file for details.
 
-//! Vault signing key + approval-token issuance / verification.
+//! The vault's member key.
 //!
-//! The vault owns a single ECDSA-P256 key pair, generated lazily on
-//! first use and stored sealed in the KV store under
-//! [`SIGNING_KEY_KV`]. It is used to sign [`ApprovalToken`]s issued
-//! via [`VaultRequest::IssueApprovalToken`](crate::types::VaultRequest)
-//! and to verify those same tokens when they show up inside other
-//! requests (gating [`Condition::ManagerApproval`](crate::types::Condition)).
+//! The vault owns a single ECDSA-P256 key pair, generated lazily on first use
+//! and stored sealed in the KV store under [`SIGNING_KEY_KV`]. Its public key
+//! is the vault's identity: the member id is its hash (wire formats §3).
 //!
-//! The signing key never leaves the enclave.
+//! The key never leaves the enclave.
 
 use std::string::String;
 use std::vec::Vec;
 
-use enclave_os_common::jwt::{decode_payload_unverified, encode_jwt, JwtVerifier};
 use enclave_os_kvstore::SealedKvStore;
 use ring::rand::SystemRandom;
 use ring::signature::{EcdsaKeyPair, KeyPair, ECDSA_P256_SHA256_FIXED_SIGNING};
 
-use crate::types::{ApprovalClaims, ApprovalToken, Operation};
-
 /// Sealed-KV key holding the vault's PKCS#8 ECDSA-P256 private key.
 const SIGNING_KEY_KV: &[u8] = b"__vault_signing_key_pkcs8__";
 
-/// Issuer claim placed in every approval token.
-pub(crate) const ISSUER: &str = "enclave-os-vault";
-
-// ---------------------------------------------------------------------------
-//  Lazy-init keypair
-// ---------------------------------------------------------------------------
-
-/// Return the vault's signing key, generating + persisting it on the
-/// first call.
+/// Return the vault's member key, generating and persisting it on the first
+/// call.
 ///
 /// Caller must already hold the KV mutex.
 pub(crate) fn load_or_init_keypair(store: &mut SealedKvStore) -> Result<EcdsaKeyPair, String> {
@@ -62,156 +49,4 @@ pub(crate) fn load_or_init_keypair(store: &mut SealedKvStore) -> Result<EcdsaKey
 /// Caller must already hold the KV mutex.
 pub(crate) fn load_or_init_public_key(store: &mut SealedKvStore) -> Result<Vec<u8>, String> {
     Ok(load_or_init_keypair(store)?.public_key().as_ref().to_vec())
-}
-
-// ---------------------------------------------------------------------------
-//  Issue
-// ---------------------------------------------------------------------------
-
-/// Sign an [`ApprovalToken`] for the given (handle, op, manager) triple.
-///
-/// `approver_sub` is the OIDC `sub` of the manager who authenticated to
-/// request the token; it is recorded in the claims so a subject-bound
-/// [`Condition::ManagerApproval`] can check it is that manager and a
-/// role-based one can enforce separation of duties. `policy_version` is the
-/// key's policy version now: the token is accepted only while it is current.
-pub(crate) fn issue_approval_token(
-    store: &mut SealedKvStore,
-    handle: &str,
-    op: Operation,
-    manager: u32,
-    approver_sub: &str,
-    policy_version: u32,
-    iat: u64,
-    ttl_seconds: u64,
-) -> Result<ApprovalToken, String> {
-    let kp = load_or_init_keypair(store)?;
-    let claims = ApprovalClaims {
-        iss: ISSUER.to_string(),
-        handle: handle.to_string(),
-        op,
-        manager,
-        approver_sub: approver_sub.to_string(),
-        policy_version: Some(policy_version),
-        iat,
-        exp: iat.saturating_add(ttl_seconds),
-    };
-    let rng = SystemRandom::new();
-    let jwt_bytes = encode_jwt(&claims, &kp, &rng, None)?;
-    let jwt = String::from_utf8(jwt_bytes).map_err(|e| format!("jwt utf8: {e}"))?;
-    Ok(ApprovalToken { jwt })
-}
-
-// ---------------------------------------------------------------------------
-//  Verify
-// ---------------------------------------------------------------------------
-
-/// Verify an approval token against the expected (handle, op, manager).
-///
-/// Performs (in order):
-///   1. ES256 signature verification against the vault's signing key,
-///   2. `iss == ISSUER`,
-///   3. `handle` / `op` / `manager` claims match,
-///   4. the manager *index* is pinned (a token can only be issued by the
-///      vault for a manager who has authenticated, so the policy lookup
-///      catches reshuffles),
-///   5. if `expected_approver` is `Some(sub)` (a subject-bound manager), the
-///      token's `approver_sub` must be that manager's current `sub`; in all
-///      cases the token must carry the key's current `policy_version`,
-///   6. if `distinct_from` is `Some(proposer_sub)` (role-based co-sign /
-///      separation of duties), the token's `approver_sub` must be present
-///      and different from the proposer's sub,
-///   7. `now <= exp`,
-///   8. `now - iat <= fresh_for_seconds`.
-pub(crate) fn verify_approval_token(
-    token: &ApprovalToken,
-    handle: &str,
-    op: Operation,
-    manager: u32,
-    expected_approver: Option<&str>,
-    policy_version: u32,
-    distinct_from: Option<&str>,
-    fresh_for_seconds: u64,
-    now: u64,
-) -> Result<(), String> {
-    // 1. Look up our own public key from the sealed KV.
-    let public_key = {
-        let kv =
-            enclave_os_kvstore::kv_store().ok_or_else(|| "kv store not initialised".to_string())?;
-        let mut store = kv
-            .lock()
-            .map_err(|_| "kv store lock poisoned".to_string())?;
-        load_or_init_public_key(&mut store)?
-    };
-    let verifier = JwtVerifier::from_public_key_bytes(&public_key)?;
-
-    // 2. Verify signature + decode claims.
-    let claims: ApprovalClaims = verifier.verify_and_decode(token.jwt.as_bytes())?;
-
-    if claims.iss != ISSUER {
-        return Err(format!("issuer mismatch (got '{}')", claims.iss));
-    }
-    if claims.handle != handle {
-        return Err(format!(
-            "handle mismatch (token={}, request={})",
-            claims.handle, handle
-        ));
-    }
-    if claims.op != op {
-        return Err(format!(
-            "op mismatch (token={:?}, request={:?})",
-            claims.op, op
-        ));
-    }
-    if claims.manager != manager {
-        return Err(format!(
-            "manager mismatch (token={}, expected={})",
-            claims.manager, manager
-        ));
-    }
-    // The index alone is not the manager: the slot may have been given to
-    // someone else since the token was issued.
-    if let Some(sub) = expected_approver {
-        if claims.approver_sub != sub {
-            return Err(format!(
-                "approver mismatch (token approver_sub '{}' is not the manager at index {})",
-                claims.approver_sub, manager
-            ));
-        }
-    }
-    // Approval is for the policy as it was when given.
-    if claims.policy_version != Some(policy_version) {
-        return Err(format!(
-            "policy changed since approval (token policy_version {:?}, key {})",
-            claims.policy_version, policy_version
-        ));
-    }
-    if let Some(proposer_sub) = distinct_from {
-        if claims.approver_sub.is_empty() {
-            return Err("co-sign required but token carries no approver_sub".into());
-        }
-        if claims.approver_sub == proposer_sub {
-            return Err(format!(
-                "co-sign requires a second approver (approver_sub '{}' == proposer)",
-                claims.approver_sub
-            ));
-        }
-    }
-    if now > claims.exp {
-        return Err(format!("expired (now={}, exp={})", now, claims.exp));
-    }
-    if fresh_for_seconds > 0 && now.saturating_sub(claims.iat) > fresh_for_seconds {
-        return Err(format!(
-            "stale (iat={}, now={}, fresh_for={}s)",
-            claims.iat, now, fresh_for_seconds
-        ));
-    }
-    Ok(())
-}
-
-/// Best-effort decode of an approval token without verification, for
-/// returning useful errors before the full check.
-#[allow(dead_code)]
-pub(crate) fn peek_claims(token: &ApprovalToken) -> Result<ApprovalClaims, String> {
-    decode_payload_unverified::<ApprovalClaims>(token.jwt.as_bytes())
 }

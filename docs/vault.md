@@ -66,10 +66,10 @@ Any caller that is not a principal of a key gets the same answer, `caller is not
 | RPC | Auth | Description |
 |---|---|---|
 | `CreateKey { handle, material_b64, grant, predecessor?, policy?, policy_version?, source_billing_id?, key_check?, carried_exportable?, carried_key_type?, binding? }` | IdP-issued grant bound to the caller (see below) | Create a key in a single call. The grant carries the owner, scope, key type, exportable flag and full policy; the caller supplies the material. The optional fields create a renewal (section 7) or a re-created name (section 8.3). Returns `KeyCreated { handle, expires_at }`. |
-| `ExportKey { handle, approvals?, binding? }` | per-key `ExportKey` rule | Returns raw material. Requires `exportable == true`. |
-| `DeleteKey { handle, approvals?, binding?, after? }` | per-key `DeleteKey` rule | Deletes the key's material and record and leaves a tombstone (section 8). With `after`, the delete is bound to a successor (`delete_after`, section 7.3). |
+| `ExportKey { handle, binding? }` | per-key `ExportKey` rule | Returns raw material. Requires `exportable == true`. |
+| `DeleteKey { handle, binding?, after? }` | per-key `DeleteKey` rule | Deletes the key's material and record and leaves a tombstone (section 8). With `after`, the delete is bound to a successor (`delete_after`, section 7.3). |
 | `RetireKey { handle, successor, successor_members }` | an enclave the key's policy names | Deletes the previous generation after a renewal in place, with no approval (section 7.2). Returns `KeyRetired { was_present }`. |
-| `UpdatePolicy { handle, new_policy, approvals?, binding? }` | per-key `UpdatePolicy` rule and per-field `Mutability` (section 3.4) | Replace the policy. `new_policy` is kept as sent; a binding v2 approval covers the digest of exactly this JSON (section 5). |
+| `UpdatePolicy { handle, new_policy, binding? }` | per-key `UpdatePolicy` rule and per-field `Mutability` (section 3.4) | Replace the policy. `new_policy` is kept as sent; a binding v2 approval covers the digest of exactly this JSON (section 5). |
 | `GetPolicy { handle }` | key principals | Returns the current policy, in the vault's stored form, and `policy_version`. |
 | `GetKeyInfo { handle }` | key principals | Metadata only; never material. Reports `threshold`, `renewed_in_place_from` and `created_by_owner_approval` where set. On a deleted key, returns its tombstone (section 8). |
 | `ListKeys` | OIDC | Lists live handles whose owner is the caller. |
@@ -82,16 +82,12 @@ Any caller that is not a principal of a key gets the same answer, `caller is not
 
 | RPC | Key type | Output |
 |---|---|---|
-| `Wrap { handle, plaintext_b64, aad_b64?, approvals? }` | `Aes256GcmKey` | `{ ciphertext, iv }` (the vault generates the 12-byte IV; a request carrying `iv_b64` is refused, so a nonce is never reused) |
-| `Unwrap { handle, ciphertext_b64, iv_b64, aad_b64?, approvals? }` | `Aes256GcmKey` | `{ plaintext }` |
-| `Sign { handle, message_b64, prehashed?, approvals? }` | `P256SigningKey` | `{ signature, alg: "ECDSA-P256-SHA256" }`; with `prehashed`, `message_b64` is a 32-byte SHA-256 digest signed directly |
-| `Mac { handle, message_b64, approvals? }` | `HmacSha256Key` | `{ mac, alg: "HMAC-SHA-256" }` |
+| `Wrap { handle, plaintext_b64, aad_b64? }` | `Aes256GcmKey` | `{ ciphertext, iv }` (the vault generates the 12-byte IV; a request carrying `iv_b64` is refused, so a nonce is never reused) |
+| `Unwrap { handle, ciphertext_b64, iv_b64, aad_b64? }` | `Aes256GcmKey` | `{ plaintext }` |
+| `Sign { handle, message_b64, prehashed? }` | `P256SigningKey` | `{ signature, alg: "ECDSA-P256-SHA256" }`; with `prehashed`, `message_b64` is a 32-byte SHA-256 digest signed directly |
+| `Mac { handle, message_b64 }` | `HmacSha256Key` | `{ mac, alg: "HMAC-SHA-256" }` |
 
-### 2.3 Manager approval tokens
-
-| RPC | Description |
-|---|---|
-| `IssueApprovalToken { handle, op, ttl_seconds }` | Caller must match one of `policy.principals.managers`. Returns a short-lived ES256 JWT signed by the vault. The token can be carried inside subsequent requests to satisfy `Condition::ManagerApproval`. TTL capped at one hour; default 5 minutes. |
+### 2.3 Owner approvals
 
 Owner approvals from a wallet are passkey step-ups, carried in the bearer itself (section 5); they need no RPC of their own.
 
@@ -107,9 +103,9 @@ Audit entries are stored under `audit:<handle>:<020d-seq>` in the sealed KV. Eve
 
 | RPC | Description |
 |---|---|
-| `StagePendingProfile { handle, profile, source }` | Owner; or manager iff `mutability.manager_can` includes `PendingProfiles`; or the platform's manager-role bearer, unless `PendingProfiles` is immutable on the key. Stages a new `AttestationProfile` for later promotion. Staging authorises nothing. |
+| `StagePendingProfile { handle, profile }` | Owner; or manager iff `mutability.manager_can` includes `PendingProfiles`; or the platform's manager-role bearer, unless `PendingProfiles` is immutable on the key. Stages a new `AttestationProfile` for later promotion. Staging authorises nothing. |
 | `ListPendingProfiles { handle }` | Key principals. |
-| `PromotePendingProfile { handle, pending_id, approvals?, binding? }` | Subject to the key's `PromoteProfile` rule and to `Mutability` for `PolicyField::Tees`. Promotes the profile into `policy.principals.tees`. |
+| `PromotePendingProfile { handle, pending_id, binding? }` | Subject to the key's `PromoteProfile` rule and to `Mutability` for `PolicyField::Tees`. Promotes the profile into `policy.principals.tees`. |
 | `RevokePendingProfile { handle, pending_id }` | Owner / managers. Drops without promoting. |
 
 ### 2.6 Threshold Ed25519 keys (FROST)
@@ -160,7 +156,6 @@ PrincipalSet {
 |---|---|---|
 | `Oidc { issuer, sub, required_roles }` | Caller's verified `OidcClaims.sub` matches AND every required role is present. An empty `sub` makes the principal role-only: it matches any subject holding all `required_roles` (which must then be non-empty). | Owner / manager / auditor identities (humans, CI, service accounts), or a team named by role. |
 | `Tee(AttestationProfile)` | RA-TLS peer cert satisfies the profile (measurement + OIDs + bidirectional challenge). | Runtime callers: the running app TEE doing `Wrap` / `Unwrap` / `Sign` / `ExportKey` on its own key or share. |
-| `Fido2 { rp_id, credential_id_b64 }` | Declared in the schema; no caller resolves to it. | Hardware-bound human approvals are expressed with `OidcStepUp` (section 3.3), a passkey step-up through the IdP. |
 
 Bidirectional RA-TLS challenge-response is **always** required for `Principal::Tee`; there is no opt-out flag.
 
@@ -175,10 +170,7 @@ OperationRule {
 }
 
 Condition {
-    AttestationMatches(AttestationProfile)
-  | ManagerApproval { manager: u32, fresh_for_seconds: u64 }
-  | TimeWindow { not_before: u64, not_after: u64 }
-  | OidcStepUp { required_amr: Vec<String>, operation_bound: bool,
+    OidcStepUp { required_amr: Vec<String>, operation_bound: bool,
                  fresh_for_seconds: u64, binding: u8 }
 }
 ```
@@ -234,7 +226,7 @@ With `auto_migrate_to_next_attestation_profile`, a profile staged by the platfor
 A new key's policy asks for the owner's wallet approval on the operations that govern the key. At a first creation (`CreateKey` without `predecessor` or a carried `policy`, and `FrostDkgRound1`), the vault refuses a policy in which a rule that a person can use lets `PromoteProfile`, `UpdatePolicy` or `DeleteKey` happen without an approval, or `ExportKey` too when the key is exportable.
 
 - **Rules a person can use** are rules naming `Owner`, a `Manager` or an `Auditor`. A rule for the app's own enclaves only (`Tee`, `AnyTee`), such as an app fetching its own key, is exempt.
-- **An approval** is an `OidcStepUp` with `webauthn` in `required_amr` that is bound to the operation: `"binding": 2`, or `operation_bound: true` (binding v1). A fresh token alone, or a `ManagerApproval` co-sign alone, does not count.
+- **An approval** is an `OidcStepUp` with `webauthn` in `required_amr` that is bound to the operation: `"binding": 2`, or `operation_bound: true` (binding v1). A fresh token alone does not count.
 - **Opting out** is explicit: `"approval": "none"` in the policy. Any other value is refused.
 - **Updates** keep what a key has: when the current policy passes these rules and does not opt out, the new policy must pass them too and may not add `"approval": "none"`. A key created before approval by default may still be updated, and an update may add approvals.
 - **Renewals** (section 7) copy or carry the key's existing policy, so the check does not apply to them.
@@ -313,27 +305,6 @@ For a key whose `UpdatePolicy` rule takes binding 2, `new_policy` must be sent e
 ### 5.4 Binding v1
 
 Keys created before binding v2 carry `OidcStepUp` conditions without `binding`. With `operation_bound: true`, such a condition takes a binding v1: `vault_op = base64url(SHA-256("privasys-vault-approval/v1\n" handle "\n" measurement_hex "\n" policy_version "\n" nonce "\n" exp))`, where the measurement slot is the staged profile's `profile_binding_digest` for a promote and empty for an export. Binding v1 has no form for update or delete, so an operation-bound v1 condition on those operations is never satisfied. Resharing a threshold key uses binding v1 with the resharing context in the measurement slot (section 2.6).
-
-### 5.5 Manager approval tokens
-
-`IssueApprovalToken { handle, op, ttl_seconds }` returns an `ApprovalToken { jwt }`. The JWT is ES256, signed by a vault-resident P-256 key created on first use and sealed under `__vault_signing_key_pkcs8__`.
-
-```text
-ApprovalClaims {
-    iss:     "enclave-os-vault",
-    handle:  String,
-    op:      Operation,
-    manager: u32,                          // index into principals.managers
-    approver_sub:   String,                // the approver's OIDC sub
-    policy_version: u32,                   // the key's policy_version at issuance
-    iat:     u64,
-    exp:     u64,
-}
-```
-
-Approval tokens are vault-local: the vault that verifies a token is the vault that issued it.
-
-`Condition::ManagerApproval { manager, fresh_for_seconds }` succeeds iff the request carries an `ApprovalToken` whose claims match `(handle, op, manager)` and whose age is within `fresh_for_seconds` at verification time. For a subject-bound manager, the token's `approver_sub` must be the `sub` of the manager now at that index; for a role-based manager, the approver must be a different person from the caller. The token is accepted only while the key's `policy_version` equals the one it carries.
 
 ---
 
@@ -440,7 +411,7 @@ OperationRule {
 
 with `principals.tees[0] = Principal::Tee(profile_v_n)`. The enclave rule needs no approval; the owner's rule carries the canonical step-up, so the policy passes approval by default.
 
-### 9.2 "Manager may add a new TEE for an enclave upgrade, with a co-signer"
+### 9.2 "A manager may promote a new build, with their own approval"
 
 `Mutability::manager_can = [PolicyField::PendingProfiles, PolicyField::Tees]` with:
 
@@ -448,13 +419,12 @@ with `principals.tees[0] = Principal::Tee(profile_v_n)`. The enclave rule needs 
 OperationRule {
   ops:        [PromoteProfile],
   principals: [Manager(0)],
-  requires:   [ManagerApproval { manager: 1, fresh_for_seconds: 3600 },
-               OidcStepUp { required_amr: ["webauthn"], operation_bound: true,
+  requires:   [OidcStepUp { required_amr: ["webauthn"], operation_bound: true,
                             fresh_for_seconds: 300, binding: 2 }],
 }
 ```
 
-so promoting requires manager #0's own bound passkey step-up and a fresh token from manager #1.
+so manager #0 promotes with their own bound passkey step-up.
 
 ### 9.3 "Auditor reads the audit log, nothing else"
 
@@ -470,7 +440,7 @@ The vault enforces a strict separation: a platform-driven enclave upgrade **neve
 [v(N) running]
    |  developer builds v(N+1); MRENCLAVE captured
    v
-[v(N+1) staged]   StagePendingProfile{ handle, profile=v(N+1), source }
+[v(N+1) staged]   StagePendingProfile{ handle, profile=v(N+1) }
    |              -> vault appends to KeyRecord.pending_profiles
    |              -> the owner approves the promote in their wallet
    v
@@ -496,7 +466,7 @@ The fan-out across the constellation lives entirely in `enclave-vaults-client`. 
 | `tomb:<handle>` | sealed `Tombstone` | What a deleted key leaves, until its original expiry (section 8). |
 | `__tombs` | JSON `Vec<String>` | Handles that have a tombstone, for the housekeeping. |
 | `prev:<handle>` | sealed `KeyRecord` | A threshold key's previous share during a renewal in place, until finalize or rollback. |
-| `__vault_signing_key_pkcs8__` | sealed P-256 PKCS#8 | The vault's member key: signs manager approval tokens and defines the member id. |
+| `__vault_signing_key_pkcs8__` | sealed P-256 PKCS#8 | The vault's member key: defines the member id. |
 
 KV keys are HMAC-SHA-256-encrypted on disk by `enclave-os-kvstore`, so the host sees opaque blobs only: no prefix scans, no enumeration. Handles starting with `__` are reserved.
 
@@ -507,7 +477,7 @@ KV keys are HMAC-SHA-256-encrypted on disk by `enclave-os-kvstore`, so the host 
 | Caller | Transport | Identifies as | Typical operations |
 |---|---|---|---|
 | Service / TEE | mutual RA-TLS | `Principal::Tee` | `Wrap` / `Unwrap` / `Sign` / `Mac` / `ExportKey`, renewals, `RetireKey`. |
-| Operator (CI, CLI, human) | OIDC bearer over RA-TLS | `Principal::Oidc` | `GetPolicy`, `GetKeyInfo`, `ListKeys`, `ReadAuditLog`, `IssueApprovalToken`, pending-profile staging. |
+| Operator (CI, CLI, human) | OIDC bearer over RA-TLS | `Principal::Oidc` | `GetPolicy`, `GetKeyInfo`, `ListKeys`, `ReadAuditLog`, pending-profile staging. |
 | Owner approving in their wallet | OIDC bearer with a passkey step-up | `Principal::Oidc` + `OidcStepUp` | Promote, update, delete, export, re-creating a name. |
 
 The vault matches OIDC callers against the subjects and `required_roles` its key policies name; it gives no built-in meaning to any role name. A role-only principal (empty `sub`) names a set of callers by role, for example an app's team. Adopters can point `oidc_issuer_url` at any OIDC provider and name its issuer in `Principal::Oidc`.
@@ -521,6 +491,6 @@ The previous wire protocol (`StoreSecret` / `GetSecret` / etc.) is gone. Adopter
 1. Replace `StoreSecret` with `CreateKey` under a grant for `key_type: RawShare` (or a typed key).
 2. Replace `GetSecret` (OIDC owner path) with `ExportKey`.
 3. Replace `GetSecret` (RA-TLS path) with `ExportKey` carrying appropriate `principals.tees` + `OperationRule { ops: [ExportKey], principals: [AnyTee] }`.
-4. Replace `manager_sub` with `principals.managers[i]` plus a `Condition::ManagerApproval` on the relevant operation rule (and use `IssueApprovalToken` to mint approvals at the call site), or with the owner's `OidcStepUp`.
+4. Replace `manager_sub` with `principals.managers[i]`, named in the operation rules it may use, with an `OidcStepUp` where its approval is needed.
 
 There is no compatibility shim: keeping the TCB minimal comes first.

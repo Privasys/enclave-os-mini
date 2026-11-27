@@ -6,10 +6,10 @@
 //! Callers manipulate **keys** (handle + type + material + policy).
 //! Access is gated by [`KeyPolicy`] which lists named principals
 //! ([`PrincipalSet`]) and the operations each is allowed to perform
-//! ([`OperationRule`]). Operations may also carry [`Condition`]s
-//! (`AttestationMatches` / `ManagerApproval` / `TimeWindow`) that
-//! tighten the grant. Remote TEE callers authenticate via mutual
-//! RA-TLS with bidirectional challenge-response (always on).
+//! ([`OperationRule`]). Operations may also carry [`Condition`]s (an
+//! operation-bound wallet approval) that tighten the grant. Remote TEE
+//! callers authenticate via mutual RA-TLS with bidirectional
+//! challenge-response (always on).
 //!
 //! See `docs/vault.md` for the full design and `Cargo.toml` for
 //! dependencies.
@@ -38,10 +38,9 @@ use enclave_os_kvstore::SealedKvStore;
 use crate::policy::{evaluate_op, evaluate_policy_update, resolve_caller, CallerRole};
 
 use crate::types::{
-    ApprovalToken, AttestationProfile, AuditDecision, BindingV2Request, KeyInfo, KeyListEntry, KeyPolicy, KeyRecord,
-    KeyType, Operation, PendingProfile, PendingProfileSource, PolicyField, Principal, VaultRequest,
-    VaultResponse, DEFAULT_APPROVAL_TOKEN_TTL_SECONDS, DEFAULT_KEY_TTL_SECONDS,
-    MAX_APPROVAL_TOKEN_TTL_SECONDS, MAX_KEY_TTL_SECONDS,
+    AttestationProfile, AuditDecision, BindingV2Request, KeyInfo, KeyListEntry, KeyPolicy, KeyRecord,
+    KeyType, Operation, PendingProfile, PolicyField, Principal, VaultRequest,
+    VaultResponse, DEFAULT_KEY_TTL_SECONDS, MAX_KEY_TTL_SECONDS,
 };
 
 // ---------------------------------------------------------------------------
@@ -91,7 +90,6 @@ impl EnclaveModule for VaultModule {
                 predecessor,
                 policy,
                 policy_version,
-                holder_records,
                 source_billing_id,
                 key_check,
                 carried_exportable,
@@ -105,7 +103,6 @@ impl EnclaveModule for VaultModule {
                     predecessor,
                     policy,
                     policy_version,
-                    holder_records,
                     source_billing_id,
                     key_check,
                     carried_exportable,
@@ -116,15 +113,13 @@ impl EnclaveModule for VaultModule {
             ),
             VaultRequest::ExportKey {
                 handle,
-                approvals,
                 binding,
-            } => handle_export(&handle, &approvals, binding, ctx),
+            } => handle_export(&handle, binding, ctx),
             VaultRequest::DeleteKey {
                 handle,
-                approvals,
                 binding,
                 after,
-            } => handle_delete(&handle, &approvals, binding, after, ctx),
+            } => handle_delete(&handle, binding, after, ctx),
             VaultRequest::RetireKey {
                 handle,
                 successor,
@@ -133,9 +128,8 @@ impl EnclaveModule for VaultModule {
             VaultRequest::UpdatePolicy {
                 handle,
                 new_policy,
-                approvals,
                 binding,
-            } => handle_update_policy(&handle, &new_policy, &approvals, binding, ctx),
+            } => handle_update_policy(&handle, &new_policy, binding, ctx),
             VaultRequest::GetVaultIdentity => handle_identity(),
             VaultRequest::CanonicalisePolicy { policy } => match v2::canonical_policy(policy.get()) {
                 Ok(c) => VaultResponse::CanonicalPolicy {
@@ -153,13 +147,11 @@ impl EnclaveModule for VaultModule {
                 plaintext_b64,
                 aad_b64,
                 iv_b64,
-                approvals,
             } => handle_wrap(
                 &handle,
                 &plaintext_b64,
                 aad_b64.as_deref(),
                 iv_b64.as_deref(),
-                &approvals,
                 ctx,
             ),
             VaultRequest::Unwrap {
@@ -167,32 +159,22 @@ impl EnclaveModule for VaultModule {
                 ciphertext_b64,
                 iv_b64,
                 aad_b64,
-                approvals,
             } => handle_unwrap(
                 &handle,
                 &ciphertext_b64,
                 &iv_b64,
                 aad_b64.as_deref(),
-                &approvals,
                 ctx,
             ),
             VaultRequest::Sign {
                 handle,
                 message_b64,
                 prehashed,
-                approvals,
-            } => handle_sign(&handle, &message_b64, prehashed, &approvals, ctx),
+            } => handle_sign(&handle, &message_b64, prehashed, ctx),
             VaultRequest::Mac {
                 handle,
                 message_b64,
-                approvals,
-            } => handle_mac(&handle, &message_b64, &approvals, ctx),
-
-            VaultRequest::IssueApprovalToken {
-                handle,
-                op,
-                ttl_seconds,
-            } => handle_issue_approval(&handle, op, ttl_seconds, ctx),
+            } => handle_mac(&handle, &message_b64, ctx),
 
             VaultRequest::ReadAuditLog {
                 handle,
@@ -203,15 +185,13 @@ impl EnclaveModule for VaultModule {
             VaultRequest::StagePendingProfile {
                 handle,
                 profile,
-                source,
-            } => handle_stage_pending(&handle, profile, source, ctx),
+            } => handle_stage_pending(&handle, profile, ctx),
             VaultRequest::ListPendingProfiles { handle } => handle_list_pending(&handle, ctx),
             VaultRequest::PromotePendingProfile {
                 handle,
                 pending_id,
-                approvals,
                 binding,
-            } => handle_promote_pending(&handle, pending_id, &approvals, binding, ctx),
+            } => handle_promote_pending(&handle, pending_id, binding, ctx),
             VaultRequest::RevokePendingProfile { handle, pending_id } => {
                 handle_revoke_pending(&handle, pending_id, ctx)
             }
@@ -528,7 +508,6 @@ struct CreateExtras {
     predecessor: Option<String>,
     policy: Option<Box<serde_json::value::RawValue>>,
     policy_version: Option<u32>,
-    holder_records: Vec<serde_json::Value>,
     source_billing_id: Option<String>,
     key_check: Option<crate::types::KeyCheck>,
     carried_exportable: Option<bool>,
@@ -656,9 +635,6 @@ fn new_key_policy(
     extras: CreateExtras,
     ctx: &RequestContext,
 ) -> Result<NewKeyPolicy, String> {
-    if !extras.holder_records.is_empty() {
-        return Err("holder records are not accepted by this vault".into());
-    }
     if let Some(kc) = &extras.key_check {
         check_key_check(kc)?;
     }
@@ -1013,7 +989,6 @@ fn handle_create(
 
 fn handle_export(
     handle: &str,
-    approvals: &[ApprovalToken],
     binding: Option<BindingV2Request>,
     ctx: &RequestContext,
 ) -> VaultResponse {
@@ -1046,10 +1021,8 @@ fn handle_export(
     };
     match evaluate_op(
         &record.policy,
-        record.policy_version,
         Operation::ExportKey,
         handle,
-        approvals,
         ctx,
         Some(&op_binding),
     ) {
@@ -1075,7 +1048,6 @@ fn handle_export(
 
 fn handle_delete(
     handle: &str,
-    approvals: &[ApprovalToken],
     binding: Option<BindingV2Request>,
     after: Option<crate::types::DeleteAfter>,
     ctx: &RequestContext,
@@ -1112,10 +1084,8 @@ fn handle_delete(
     };
     if let Err(e) = evaluate_op(
         &record.policy,
-        record.policy_version,
         Operation::DeleteKey,
         handle,
-        approvals,
         ctx,
         Some(&op_binding),
     ) {
@@ -1318,7 +1288,6 @@ fn handle_retire(
 fn handle_update_policy(
     handle: &str,
     new_policy_raw: &serde_json::value::RawValue,
-    approvals: &[ApprovalToken],
     binding: Option<BindingV2Request>,
     ctx: &RequestContext,
 ) -> VaultResponse {
@@ -1407,10 +1376,8 @@ fn handle_update_policy(
     }
     if let Err(e) = evaluate_op(
         &record.policy,
-        record.policy_version,
         Operation::UpdatePolicy,
         handle,
-        approvals,
         ctx,
         Some(&op_binding),
     ) {
@@ -1549,7 +1516,6 @@ pub(crate) fn require_op(
     handle: &str,
     op: Operation,
     expect_type: KeyType,
-    approvals: &[ApprovalToken],
     ctx: &RequestContext,
 ) -> Result<KeyRecord, VaultResponse> {
     let mut record = load_for(handle, ctx)?;
@@ -1578,7 +1544,7 @@ pub(crate) fn require_op(
         return Err(VaultResponse::Error(msg));
     }
     let caller = caller_str(ctx);
-    if let Err(e) = evaluate_op(&record.policy, record.policy_version, op, handle, approvals, ctx, None) {
+    if let Err(e) = evaluate_op(&record.policy, op, handle, ctx, None) {
         let _ = audit_denial(ctx, &mut record, op_name(op), &caller, AuditDecision::Denied, &e);
         return Err(VaultResponse::Error(e));
     }
@@ -1614,14 +1580,12 @@ fn handle_wrap(
     plaintext_b64: &str,
     aad_b64: Option<&str>,
     iv_b64: Option<&str>,
-    approvals: &[ApprovalToken],
     ctx: &RequestContext,
 ) -> VaultResponse {
     let record = match require_op(
         handle,
         Operation::Wrap,
         KeyType::Aes256GcmKey,
-        approvals,
         ctx,
     ) {
         Ok(r) => r,
@@ -1659,14 +1623,12 @@ fn handle_unwrap(
     ciphertext_b64: &str,
     iv_b64: &str,
     aad_b64: Option<&str>,
-    approvals: &[ApprovalToken],
     ctx: &RequestContext,
 ) -> VaultResponse {
     let record = match require_op(
         handle,
         Operation::Unwrap,
         KeyType::Aes256GcmKey,
-        approvals,
         ctx,
     ) {
         Ok(r) => r,
@@ -1697,14 +1659,12 @@ fn handle_sign(
     handle: &str,
     message_b64: &str,
     prehashed: bool,
-    approvals: &[ApprovalToken],
     ctx: &RequestContext,
 ) -> VaultResponse {
     let record = match require_op(
         handle,
         Operation::Sign,
         KeyType::P256SigningKey,
-        approvals,
         ctx,
     ) {
         Ok(r) => r,
@@ -1733,14 +1693,12 @@ fn handle_sign(
 fn handle_mac(
     handle: &str,
     message_b64: &str,
-    approvals: &[ApprovalToken],
     ctx: &RequestContext,
 ) -> VaultResponse {
     let record = match require_op(
         handle,
         Operation::Mac,
         KeyType::HmacSha256Key,
-        approvals,
         ctx,
     ) {
         Ok(r) => r,
@@ -1755,109 +1713,6 @@ fn handle_mac(
         mac,
         alg: "HMAC-SHA-256",
     }
-}
-
-// ---------------------------------------------------------------------------
-//  Handlers — approval tokens
-// ---------------------------------------------------------------------------
-
-fn handle_issue_approval(
-    handle: &str,
-    op: Operation,
-    ttl_seconds: u64,
-    ctx: &RequestContext,
-) -> VaultResponse {
-    let mut record = match load_for(handle, ctx) {
-        Ok(r) => r,
-        Err(e) => return e,
-    };
-
-    // Caller must be an OIDC manager of this key.
-    let claims = match ctx.oidc_claims.as_ref() {
-        Some(c) => c,
-        None => {
-            let _ = audit_denial(ctx, 
-                &mut record,
-                "IssueApprovalToken",
-                "anonymous",
-                AuditDecision::Denied,
-                "no OIDC claims",
-            );
-            return VaultResponse::Error(
-                "OIDC authentication required to issue approval tokens".into(),
-            );
-        }
-    };
-    // Match the caller to a manager principal the same way op evaluation does:
-    // a subject-bound manager by exact sub, a role-based manager by role. This
-    // lets a role-holder issue an approval token for a role-based (co-sign)
-    // manager even though no manager pins their sub.
-    let mgr_idx = match record
-        .policy
-        .principals
-        .managers
-        .iter()
-        .position(|p| policy::oidc_matches(p, claims))
-    {
-        Some(i) => i as u32,
-        None => {
-            let msg = "caller is not an OIDC manager of this key".to_string();
-            let _ = audit_denial(ctx, 
-                &mut record,
-                "IssueApprovalToken",
-                &format!("oidc:{}", claims.sub),
-                AuditDecision::Denied,
-                &msg,
-            );
-            return VaultResponse::Error(msg);
-        }
-    };
-
-    let ttl = if ttl_seconds == 0 {
-        DEFAULT_APPROVAL_TOKEN_TTL_SECONDS
-    } else if ttl_seconds > MAX_APPROVAL_TOKEN_TTL_SECONDS {
-        MAX_APPROVAL_TOKEN_TTL_SECONDS
-    } else {
-        ttl_seconds
-    };
-    let Some(now) = now_secs() else {
-        return VaultResponse::Error(NO_TRUSTED_TIME.into());
-    };
-
-    let token = {
-        let kv = match kv() {
-            Ok(k) => k,
-            Err(e) => return e,
-        };
-        let mut store = match kv.lock() {
-            Ok(s) => s,
-            Err(_) => return VaultResponse::Error("kv store lock poisoned".into()),
-        };
-        match signing::issue_approval_token(
-            &mut store,
-            handle,
-            op,
-            mgr_idx,
-            &claims.sub,
-            record.policy_version,
-            now,
-            ttl,
-        )
-        {
-            Ok(t) => t,
-            Err(e) => return VaultResponse::Error(e),
-        }
-    };
-
-    let _ = audit_and_save(
-        &mut record,
-        "IssueApprovalToken",
-        &format!("oidc:{}", claims.sub),
-        AuditDecision::Allowed,
-        &format!("op={:?} ttl={}s", op, ttl),
-    );
-
-    VaultResponse::ApprovalTokenIssued(token)
 }
 
 // ---------------------------------------------------------------------------
@@ -1942,7 +1797,7 @@ fn check_pending_mutability(
 /// Who is staging a pending profile.
 enum StagerIdentity {
     /// A key principal (owner, or a manager the Mutability rules permit).
-    Principal(CallerRole),
+    Principal,
     /// The PLATFORM: a verified manager-role bearer that matches no key
     /// principal. This is the staging-only capability from the
     /// enclave-upgrade design (item 2): after a runtime roll the platform
@@ -1963,7 +1818,7 @@ fn check_stage_authority(
     ctx: &RequestContext,
 ) -> Result<StagerIdentity, String> {
     if resolve_caller(&record.policy, ctx).is_some() {
-        return check_pending_mutability(record, ctx).map(StagerIdentity::Principal);
+        return check_pending_mutability(record, ctx).map(|_| StagerIdentity::Principal);
     }
     let is_platform = ctx
         .oidc_claims
@@ -1989,7 +1844,6 @@ fn check_stage_authority(
 fn handle_stage_pending(
     handle: &str,
     mut profile: AttestationProfile,
-    source: PendingProfileSource,
     ctx: &RequestContext,
 ) -> VaultResponse {
     let mut record = match load_for(handle, ctx) {
@@ -2043,8 +1897,8 @@ fn handle_stage_pending(
 
     let staged_by_platform = matches!(stager, StagerIdentity::Platform);
     // Auto-migrate acceptance (see `Lifecycle`): only for the PLATFORM
-    // stager — `source` is caller-supplied and never trusted — and only a
-    // runtime-only delta of a profile the owner already accepted. The
+    // stager, and only a runtime-only delta of a profile the owner already
+    // accepted. The
     // promote-time OID append/strengthen invariant is re-checked out of
     // defence in depth (equality of required_oids implies it).
     if staged_by_platform
@@ -2113,13 +1967,6 @@ fn handle_stage_pending(
     record.pending_profiles.push(PendingProfile {
         id: pending_id,
         profile,
-        // The platform's stage is always a platform build proposal,
-        // whatever the caller claimed.
-        source: if staged_by_platform {
-            PendingProfileSource::PlatformBuild
-        } else {
-            source
-        },
         staged_at,
         staged_by_sub,
         staged_by_platform,
@@ -2158,7 +2005,6 @@ fn handle_list_pending(handle: &str, ctx: &RequestContext) -> VaultResponse {
 fn handle_promote_pending(
     handle: &str,
     pending_id: u32,
-    approvals: &[ApprovalToken],
     binding: Option<BindingV2Request>,
     ctx: &RequestContext,
 ) -> VaultResponse {
@@ -2193,10 +2039,8 @@ fn handle_promote_pending(
 
     if let Err(e) = evaluate_op(
         &record.policy,
-        record.policy_version,
         Operation::PromoteProfile,
         handle,
-        approvals,
         ctx,
         op_binding.as_ref(),
     ) {
@@ -2328,7 +2172,7 @@ pub(crate) fn expired(record: &KeyRecord) -> bool {
 pub(crate) fn owner_oidc_sub(owner: &Principal) -> Option<String> {
     match owner {
         Principal::Oidc { sub, .. } => Some(sub.clone()),
-        Principal::Tee(_) | Principal::Fido2 { .. } => None,
+        Principal::Tee(_) => None,
     }
 }
 
@@ -2586,7 +2430,7 @@ mod tombstone_tests {
     }
 
     fn deleted(h: &str) {
-        assert!(matches!(handle_delete(h, &[], None, None, &ctx("alice")), VaultResponse::KeyDeleted));
+        assert!(matches!(handle_delete(h, None, None, &ctx("alice")), VaultResponse::KeyDeleted));
     }
 
     #[test]
@@ -2614,9 +2458,9 @@ mod tombstone_tests {
             other => panic!("{}", serde_json::to_string(&other).unwrap()),
         }
         // Every other operation: "key deleted", distinct from "not found".
-        let e = err(handle_export(h, &[], None, &ctx("alice")));
+        let e = err(handle_export(h, None, &ctx("alice")));
         assert!(e.starts_with("key deleted"), "{e}");
-        let e = err(handle_delete(h, &[], None, None, &ctx("alice")));
+        let e = err(handle_delete(h, None, None, &ctx("alice")));
         assert!(e.starts_with("key deleted"), "{e}");
         // Not listed.
         match handle_list(&ctx("alice")) {
@@ -2637,7 +2481,7 @@ mod tombstone_tests {
         put_key(succ);
         deleted(succ);
         let after = crate::types::DeleteAfter { successor: succ.into(), successor_target: "-".into() };
-        let e = err(handle_delete(old, &[], None, Some(after), &ctx("alice")));
+        let e = err(handle_delete(old, None, Some(after), &ctx("alice")));
         assert!(e.contains("successor has been deleted"), "{e}");
         assert!(raw_record(old).is_some());
     }
@@ -2654,8 +2498,8 @@ mod tombstone_tests {
         let pairs: Vec<(String, String)> = vec![
             (err(handle_get_info(dead, &bob)), err(handle_get_info(live, &bob))),
             (err(handle_get_policy(dead, &bob)), err(handle_get_policy(live, &bob))),
-            (err(handle_export(dead, &[], None, &bob)), err(handle_export(live, &[], None, &bob))),
-            (err(handle_delete(dead, &[], None, None, &bob)), err(handle_delete(live, &[], None, None, &bob))),
+            (err(handle_export(dead, None, &bob)), err(handle_export(live, None, &bob))),
+            (err(handle_delete(dead, None, None, &bob)), err(handle_delete(live, None, None, &bob))),
             (err(handle_read_audit(dead, 0, 0, &bob)), err(handle_read_audit(live, 0, 0, &bob))),
             (err(handle_list_pending(dead, &bob)), err(handle_list_pending(live, &bob))),
             (err(handle_retire(dead, "x", &members, &bob)), err(handle_retire(live, "x", &members, &bob))),
@@ -2683,7 +2527,7 @@ mod tombstone_tests {
             .unwrap();
         assert!(raw_record(h).is_some());
         // The next touch never serves the material, and finishes the delete.
-        let e = err(handle_export(h, &[], None, &ctx("alice")));
+        let e = err(handle_export(h, None, &ctx("alice")));
         assert!(e.starts_with("key deleted"), "{e}");
         assert!(raw_record(h).is_none());
     }
@@ -2821,7 +2665,7 @@ mod tombstone_tests {
         let send = |p: &KeyPolicy| {
             let raw = serde_json::to_string(&normalise_policy(p.clone())).unwrap();
             let raw = serde_json::value::RawValue::from_string(raw).unwrap();
-            handle_update_policy(h, &raw, &[], None, &ctx("alice"))
+            handle_update_policy(h, &raw, None, &ctx("alice"))
         };
         // Opting out, in the same change that drops the approvals: refused,
         // and refused before any approval is asked for.
@@ -2882,7 +2726,6 @@ mod tombstone_tests {
                     serde_json::value::RawValue::from_string(serde_json::to_string(&p).unwrap()).unwrap(),
                 ),
                 policy_version: Some(4),
-                holder_records: Vec::new(),
                 source_billing_id: Some(billing.clone()),
                 key_check: None,
                 carried_exportable: Some(false),

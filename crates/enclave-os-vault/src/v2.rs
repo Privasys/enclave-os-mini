@@ -572,17 +572,15 @@ pub fn check_approval_by_default(policy: &KeyPolicy, exportable: bool) -> Result
 /// What counts as an approval for approval by default (the
 /// portal's notice uses the same rule): a passkey step-up (`webauthn` in
 /// `required_amr`) bound to the operation (binding v2, or v1
-/// `operation_bound`). A fresh token alone, or a co-sign alone, is not.
+/// `operation_bound`). A fresh token alone is not.
 pub fn is_wallet_approval(c: &Condition) -> bool {
-    match c {
-        Condition::OidcStepUp {
-            required_amr,
-            operation_bound,
-            binding,
-            ..
-        } => required_amr.iter().any(|a| a == "webauthn") && (*binding == 2 || *operation_bound),
-        _ => false,
-    }
+    let Condition::OidcStepUp {
+        required_amr,
+        operation_bound,
+        binding,
+        ..
+    } = c;
+    required_amr.iter().any(|a| a == "webauthn") && (*binding == 2 || *operation_bound)
 }
 
 /// The one condition an owner may add to an existing key's rules (formats
@@ -778,11 +776,10 @@ mod tests {
         assert!(check_approval_by_default(&p, true).is_ok());
 
         // A fresh token alone (no webauthn), or webauthn without a binding, is
-        // not an approval; nor is a co-sign alone.
+        // not an approval.
         for weak in [
             r#"{"OidcStepUp":{"required_amr":[],"operation_bound":false,"fresh_for_seconds":300}}"#,
             r#"{"OidcStepUp":{"required_amr":["webauthn"],"operation_bound":false,"fresh_for_seconds":300}}"#,
-            r#"{"ManagerApproval":{"manager":0,"fresh_for_seconds":900}}"#,
         ] {
             let p = canonical_policy(&app_key_policy(weak)).unwrap().policy;
             assert!(check_approval_by_default(&p, true).is_err(), "{weak}");
@@ -911,7 +908,7 @@ mod tests {
         let with_one: serde_json::Value = {
             let mut w = old.clone();
             w["operations"][2]["requires"] =
-                serde_json::json!([{"TimeWindow":{"not_before":0,"not_after":0}}]);
+                serde_json::json!([{"OidcStepUp":{"required_amr":["webauthn"],"operation_bound":false,"fresh_for_seconds":300}}]);
             w
         };
         let mut v = with_one.clone();
@@ -935,8 +932,8 @@ mod tests {
         refused(v, "non-canonical step-up");
         let mut v = old.clone();
         v["operations"][2]["requires"].as_array_mut().unwrap()
-            .push(serde_json::json!({"ManagerApproval":{"manager":0,"fresh_for_seconds":900}}));
-        refused(v, "co-sign added");
+            .push(serde_json::json!({"OidcStepUp":{"required_amr":["webauthn"],"operation_bound":false,"fresh_for_seconds":300}}));
+        refused(v, "unbound step-up added");
 
         // Not the owner.
         let new = tightened(&old);

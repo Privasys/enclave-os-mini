@@ -68,7 +68,6 @@ its connection 60 s after it opened (see
 | `UpdatePolicy` | Key policy + `Mutability` | Replace a key's policy |
 | `GetPolicy` / `GetKeyInfo` / `ListKeys` | Bearer (key principals) | Read a key's policy, metadata or the caller's handles |
 | `Wrap` / `Unwrap` / `Sign` / `Mac` | Key policy (bearer or mutual RA-TLS) | In-enclave crypto |
-| `IssueApprovalToken` | Bearer (a key manager) | Mint a manager approval token |
 | `ReadAuditLog` | Bearer (owner or auditor) | Read a key's audit log |
 | `StagePendingProfile` / `ListPendingProfiles` / `PromotePendingProfile` / `RevokePendingProfile` | Key policy | Enclave-upgrade lifecycle |
 | `FrostDkg*` / `FrostSign*` / `FrostAggregate` / `FrostReshare*` | Grant or key policy | Threshold Ed25519 keys (FROST) |

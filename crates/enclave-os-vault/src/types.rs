@@ -24,13 +24,6 @@ pub const MAX_KEY_TTL_SECONDS: u64 = 90 * 24 * 60 * 60;
 /// Default key TTL: 1 month (30 days).
 pub const DEFAULT_KEY_TTL_SECONDS: u64 = 30 * 24 * 60 * 60;
 
-/// Maximum lifetime of an [`ApprovalToken`] (1 hour).
-pub const MAX_APPROVAL_TOKEN_TTL_SECONDS: u64 = 60 * 60;
-
-/// Default lifetime of an [`ApprovalToken`] when caller asks for the
-/// default (5 minutes).
-pub const DEFAULT_APPROVAL_TOKEN_TTL_SECONDS: u64 = 5 * 60;
-
 // ---------------------------------------------------------------------------
 //  Wire protocol
 // ---------------------------------------------------------------------------
@@ -75,10 +68,6 @@ pub enum VaultRequest {
         /// The carried policy's version at the source.
         #[serde(default)]
         policy_version: Option<u32>,
-        /// Holder records the carried policy names: not accepted by this
-        /// vault, so a request carrying any is refused.
-        #[serde(default)]
-        holder_records: Vec<serde_json::Value>,
         /// The source vault's billing id: a carried policy is accepted only
         /// from a vault under this vault's billing configuration.
         #[serde(default)]
@@ -107,8 +96,6 @@ pub enum VaultRequest {
     /// the caller [`Operation::ExportKey`].
     ExportKey {
         handle: String,
-        #[serde(default)]
-        approvals: Vec<ApprovalToken>,
         /// Binding v2 fields, for a key whose step-up takes `binding: 2`.
         #[serde(default)]
         binding: Option<BindingV2Request>,
@@ -117,8 +104,6 @@ pub enum VaultRequest {
     /// Delete a key and its policy.
     DeleteKey {
         handle: String,
-        #[serde(default)]
-        approvals: Vec<ApprovalToken>,
         /// Binding v2 fields, for a key whose step-up takes `binding: 2`.
         #[serde(default)]
         binding: Option<BindingV2Request>,
@@ -142,8 +127,6 @@ pub enum VaultRequest {
     UpdatePolicy {
         handle: String,
         new_policy: Box<serde_json::value::RawValue>,
-        #[serde(default)]
-        approvals: Vec<ApprovalToken>,
         /// Binding v2 fields, for a key whose step-up takes `binding: 2`.
         #[serde(default)]
         binding: Option<BindingV2Request>,
@@ -188,8 +171,6 @@ pub enum VaultRequest {
         aad_b64: Option<String>,
         #[serde(default)]
         iv_b64: Option<String>,
-        #[serde(default)]
-        approvals: Vec<ApprovalToken>,
     },
 
     /// AES-256-GCM decrypt with a `KeyType::Aes256GcmKey`.
@@ -199,8 +180,6 @@ pub enum VaultRequest {
         iv_b64: String,
         #[serde(default)]
         aad_b64: Option<String>,
-        #[serde(default)]
-        approvals: Vec<ApprovalToken>,
     },
 
     /// ECDSA-P256 sign with a `KeyType::P256SigningKey`. Returns an IEEE-P1363
@@ -213,31 +192,12 @@ pub enum VaultRequest {
         message_b64: String,
         #[serde(default)]
         prehashed: bool,
-        #[serde(default)]
-        approvals: Vec<ApprovalToken>,
     },
 
     /// HMAC-SHA-256 with a `KeyType::HmacSha256Key`.
     Mac {
         handle: String,
         message_b64: String,
-        #[serde(default)]
-        approvals: Vec<ApprovalToken>,
-    },
-
-    // --- Approvals --------------------------------------------------------
-    /// Issue an [`ApprovalToken`] from the caller (must be one of
-    /// `policy.principals.managers`) for a specific operation. The token
-    /// can then be carried inside subsequent requests to satisfy
-    /// [`Condition::ManagerApproval`].
-    IssueApprovalToken {
-        handle: String,
-        op: Operation,
-        /// Requested TTL in seconds; capped at
-        /// [`MAX_APPROVAL_TOKEN_TTL_SECONDS`]. Zero means default
-        /// ([`DEFAULT_APPROVAL_TOKEN_TTL_SECONDS`]).
-        #[serde(default)]
-        ttl_seconds: u64,
     },
 
     // --- Audit ------------------------------------------------------------
@@ -265,7 +225,6 @@ pub enum VaultRequest {
     StagePendingProfile {
         handle: String,
         profile: AttestationProfile,
-        source: PendingProfileSource,
     },
 
     /// List currently-pending attestation profiles for a key.
@@ -277,8 +236,6 @@ pub enum VaultRequest {
     PromotePendingProfile {
         handle: String,
         pending_id: u32,
-        #[serde(default)]
-        approvals: Vec<ApprovalToken>,
         /// Binding v2 fields, for a key whose step-up takes `binding: 2`.
         #[serde(default)]
         binding: Option<BindingV2Request>,
@@ -343,8 +300,6 @@ pub enum VaultRequest {
         session: String,
         handle: String,
         message_b64: String,
-        #[serde(default)]
-        approvals: Vec<ApprovalToken>,
     },
     /// Signing round 2: every signer's round 1 commitment (by index); returns
     /// this vault's signature share for the message round 1 was given.
@@ -507,8 +462,6 @@ pub enum VaultResponse {
         mac: Vec<u8>,
         alg: &'static str,
     },
-
-    ApprovalTokenIssued(ApprovalToken),
 
     AuditLog {
         entries: Vec<AuditEntry>,
@@ -692,9 +645,8 @@ pub enum KeyType {
 
 /// Per-key operations that can be granted by an [`OperationRule`].
 ///
-/// Namespace operations (`CreateKey`, `ListKeys`, `IssueApprovalToken`,
-/// `ReadAuditLog`, `StagePendingProfile`, `ListPendingProfiles`,
-/// `RevokePendingProfile`) are not policy-gated and have no variant
+/// Namespace operations (`CreateKey`, `ListKeys`, `ReadAuditLog`,
+/// `StagePendingProfile`, `ListPendingProfiles`, `RevokePendingProfile`) are not policy-gated and have no variant
 /// here — they have their own auth rules baked in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum Operation {
@@ -731,17 +683,6 @@ pub enum Principal {
         sub: String,
         #[serde(default)]
         required_roles: Vec<String>,
-    },
-
-    /// A FIDO2 credential previously registered via `enclave-os-fido2`.
-    ///
-    /// **Phase 3 status:** the variant is part of the schema and
-    /// [`evaluate_op`](crate::policy::evaluate_op) will reject calls
-    /// that try to authenticate as one until the wallet relay path is
-    /// wired up. Policies may already be authored against it.
-    Fido2 {
-        rp_id: String,
-        credential_id_b64: String,
     },
 
     /// A remote TEE that authenticates via mutual RA-TLS.
@@ -871,29 +812,6 @@ pub struct OperationRule {
 /// All conditions in a rule's `requires` list are AND-ed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Condition {
-    /// The caller's RA-TLS peer certificate must satisfy the named
-    /// attestation profile (in addition to whatever principal match
-    /// already happened).
-    AttestationMatches(AttestationProfile),
-
-    /// The request must carry a valid [`ApprovalToken`] issued for
-    /// `manager` (an index into `principals.managers`) for this op.
-    /// `fresh_for_seconds` bounds the maximum age of the token at
-    /// verification time.
-    ManagerApproval {
-        manager: u32,
-        fresh_for_seconds: u64,
-    },
-
-    /// The current time must lie inside `[not_before, not_after]`. Use
-    /// 0 for an unbounded side.
-    TimeWindow {
-        #[serde(default)]
-        not_before: u64,
-        #[serde(default)]
-        not_after: u64,
-    },
-
     /// The caller's OIDC bearer must prove a fresh step-up: its `amr` claim
     /// contains every method in `required_amr` (e.g. `["webauthn"]`) and its
     /// `iat` is within `fresh_for_seconds`. This is the IdP-verified promote
@@ -954,52 +872,6 @@ pub struct DeleteAfter {
 pub struct KeyCheck {
     pub salt_b64: String,
     pub digest_hex: String,
-}
-
-// ---------------------------------------------------------------------------
-//  Approval tokens
-// ---------------------------------------------------------------------------
-
-/// A signed approval blob issued by [`VaultRequest::IssueApprovalToken`].
-///
-/// On the wire this is just the JWT string. The vault that verifies it
-/// is the same vault that issued it (single-vault deployment) or is
-/// configured with the same vault signing key (constellation).
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-pub struct ApprovalToken {
-    pub jwt: String,
-}
-
-/// Claims inside an approval-token JWT (ES256, signed by the vault).
-///
-/// Public for tests / out-of-process verifiers.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct ApprovalClaims {
-    /// Issuer fixed to `"enclave-os-vault"`.
-    pub iss: String,
-    /// Key handle this approval applies to.
-    pub handle: String,
-    /// Operation the approval is for.
-    pub op: Operation,
-    /// Index into `principals.managers` of the issuing manager.
-    pub manager: u32,
-    /// OIDC `sub` of the human/manager who authenticated to issue this
-    /// token. For a subject-bound manager this equals that manager's
-    /// pinned `sub`; for a role-based manager (empty `sub`, matched by
-    /// role) it is whichever role-holder authenticated. Used to enforce
-    /// separation-of-duties co-sign: a role-based [`Condition::ManagerApproval`]
-    /// requires `approver_sub != proposer_sub`.
-    #[serde(default)]
-    pub approver_sub: String,
-    /// The key's `policy_version` when the approval was given. A token is
-    /// accepted only while the policy is unchanged; tokens without it are
-    /// refused.
-    #[serde(default)]
-    pub policy_version: Option<u32>,
-    /// Issued at (unix seconds).
-    pub iat: u64,
-    /// Expires at (unix seconds).
-    pub exp: u64,
 }
 
 // ---------------------------------------------------------------------------
@@ -1126,30 +998,17 @@ pub struct KeyPolicy {
 //  Pending attestation profiles (enclave upgrade flow)
 // ---------------------------------------------------------------------------
 
-/// How a [`PendingProfile`] entered the vault.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub enum PendingProfileSource {
-    /// Staged by the platform's build pipeline (e.g. management-service
-    /// after a successful WASM/enclave build that produced a new
-    /// MRENCLAVE).
-    PlatformBuild,
-    /// Staged by a human operator from a CLI / portal manual import.
-    ManualImport,
-}
-
 /// An attestation profile staged for a key but not yet promoted into
 /// `policy.principals.tees`.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PendingProfile {
     pub id: u32,
     pub profile: AttestationProfile,
-    pub source: PendingProfileSource,
     pub staged_at: u64,
     pub staged_by_sub: String,
     /// True when the stager was the PLATFORM (manager-role bearer via the
     /// staging-only capability), not a key principal. Set by the vault from
-    /// the resolved identity — never from caller input (`source` is
-    /// caller-supplied and advisory only).
+    /// the resolved identity, never from caller input.
     #[serde(default)]
     pub staged_by_platform: bool,
 }

@@ -13,7 +13,7 @@ The exact formats the vault (`crates/enclave-os-vault`) computes and checks for 
 
 ## 1. What a vault fixes at first boot
 
-- **The member key.** The vault's own P-256 key, generated in the enclave on first use and sealed under `__vault_signing_key_pkcs8__` (`signing.rs`). It also signs manager approval tokens.
+- **The member key.** The vault's own P-256 key, generated in the enclave on first use and sealed under `__vault_signing_key_pkcs8__` (`signing.rs`).
 - `member_id` = hex `H("privasys-vault-member-v1\n" || P)`, with `P` the SEC1 uncompressed public key of the member key. Stable across restarts, new with every vault. Different vaults have different member ids, and every approval names the members it is for (§5), which is what keeps one constellation's approvals from being spent on another.
 - `billing_id` = hex `H("privasys-billing-implicit-v0\n" issuer "\n" audience)`, from the vault's OIDC issuer and audience, which are fixed in its sealed configuration.
 - **`GetVaultIdentity`** (unauthenticated) returns `VaultIdentity { member_id, member_public_key, billing_id, mrenclave, quote_b64, capabilities }`. `member_public_key` is hex; `quote_b64` is an SGX quote (b64u) whose report data starts with `H("privasys-vault-identity-v1\n" member_id "\n" billing_id)`. `capabilities` lists what the build enforces: `generations-v1` (§9), `update-policy-from-v1` (§5.3) and `tombstones-v1` (§9.3, §9.3.1).
@@ -25,7 +25,7 @@ The exact formats the vault (`crates/enclave-os-vault`) computes and checks for 
 
 - only rules a person can use count: rules naming `Owner`, a `Manager` or an `Auditor`. A rule for the app's own enclaves only (`Tee`, `AnyTee`), such as an app fetching its key, needs no approval;
 - the operations checked are `PromoteProfile`, `UpdatePolicy` and `DeleteKey`, and `ExportKey` when the key is exportable;
-- an approval is an `OidcStepUp` with `webauthn` in `required_amr`, bound to the operation (`binding: 2`, or v1 `operation_bound`). A fresh token alone, or a `ManagerApproval` co-sign alone, is not;
+- an approval is an `OidcStepUp` with `webauthn` in `required_amr`, bound to the operation (`binding: 2`, or v1 `operation_bound`). A fresh token alone is not;
 - checked at first creation (`CreateKey` without a predecessor or carried policy, and `FrostDkgRound1`), and at update only against a downgrade: when the current policy passes and does not opt out, the new one must pass and may not add `"approval": "none"`. A key without approvals may still be updated, and an update may add them. Renewals are exempt: their policy is copied or carried, not written (§9).
 
 ### 4.1 Adding approvals to an existing key
@@ -99,10 +99,10 @@ privasys-vault-approval/v2
 - **A binding v2 policy update sends the stored form.** For a key whose `UpdatePolicy` rule takes binding 2, every policy update (`update_policy`, `update_policy_from`, and the §4.1 tightening) must send `new_policy` exactly in the vault's stored form, as `CanonicalisePolicy` returns it (key order and whitespace free). Otherwise it is refused before any approval is evaluated or spent, with `new_policy is not in the vault's stored form (first difference at <json-pointer>): send the policy exactly as CanonicalisePolicy returns it`. Then `PD(new as sent)` is the stored `PD`, and the next `update_policy_from` names it as `replaced_pd`. A re-created name's policy (§9.3.1) is likewise sent in stored form.
 - **The stored form, field by field:**
   - policy: `version`, `principals`, `operations`, `mutability` (absent means the default: `owner_can` `[Managers, Auditors, Tees, Operations, Lifecycle, PendingProfiles]`, `manager_can` `[]`, `immutable` `[Owner, Mutability]`; a partial object gets `[]` for each list it leaves out), `lifecycle` (`ttl_seconds`, default 2592000, 0 means the default, capped at 7776000; `auto_migrate_to_next_attestation_profile`, default false). `approval` is omitted when absent, never `null`.
-  - principals: `owner`, `managers`, `auditors`, `tees` (each `[]` when empty). `Oidc`: `issuer`, `sub`, `required_roles` (`[]`). `Fido2`: `rp_id`, `credential_id_b64`.
-  - TEE profile (`Tee`, and inside `AttestationMatches`): `name`, `measurements` (`{"Mrenclave": hex}` or `{"Tdx": {"mrtd", "rtmr1", "rtmr2"}}`), `attestation_servers` (each `url` and `pinned_spki_sha256_hex`, `null` when absent), `required_oids` (`[]`), `acceptable_tcb_statuses` (`null` when absent). Hex is lower-case.
+  - principals: `owner`, `managers`, `auditors`, `tees` (each `[]` when empty). `Oidc`: `issuer`, `sub`, `required_roles` (`[]`).
+  - TEE profile (`Tee`): `name`, `measurements` (`{"Mrenclave": hex}` or `{"Tdx": {"mrtd", "rtmr1", "rtmr2"}}`), `attestation_servers` (each `url` and `pinned_spki_sha256_hex`, `null` when absent), `required_oids` (`[]`), `acceptable_tcb_statuses` (`null` when absent). Hex is lower-case.
   - operation rule: `ops`, `principals`, `requires` (`[]`).
-  - conditions: `OidcStepUp` writes `required_amr`, `operation_bound`, `fresh_for_seconds`, and `binding` only when non-zero; `TimeWindow` writes `not_before` and `not_after`; `ManagerApproval` writes `manager` and `fresh_for_seconds`.
+  - conditions: `OidcStepUp` writes `required_amr`, `operation_bound`, `fresh_for_seconds`, and `binding` only when non-zero.
 
 ### 5.2 Test vector, binding v2
 

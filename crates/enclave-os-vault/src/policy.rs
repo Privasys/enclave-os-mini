@@ -30,9 +30,8 @@ use enclave_os_common::modules::RequestContext;
 use enclave_os_common::oidc::OidcClaims;
 
 use crate::quote::{dissect_peer_cert, parse_quote, TeeType};
-use crate::signing::verify_approval_token;
 use crate::types::{
-    ApprovalToken, AttestationProfile, Condition, KeyPolicy, Measurement, Mutability, Operation,
+    AttestationProfile, Condition, KeyPolicy, Measurement, Mutability, Operation,
     OperationRule, PolicyField, Principal, PrincipalRef,
 };
 
@@ -189,7 +188,7 @@ pub(crate) fn oidc_matches(principal: &Principal, claims: &OidcClaims) -> bool {
             }
             sub == &claims.sub && has_required_roles(claims, required_roles)
         }
-        Principal::Tee(_) | Principal::Fido2 { .. } => false,
+        Principal::Tee(_) => false,
     }
 }
 
@@ -314,15 +313,11 @@ fn measurement_matches(identity: &crate::quote::QuoteIdentity, allowed: &[Measur
 // ---------------------------------------------------------------------------
 
 /// Verify the caller is allowed to perform `op` on the key whose policy
-/// is `policy` (at `policy_version`). The `handle`, `policy_version` and
-/// `approvals` parameters are needed to evaluate
-/// [`Condition::ManagerApproval`].
+/// is `policy`.
 pub fn evaluate_op(
     policy: &KeyPolicy,
-    policy_version: u32,
     op: Operation,
     handle: &str,
-    approvals: &[ApprovalToken],
     ctx: &RequestContext,
     op_binding: Option<&OpBinding>,
 ) -> Result<(), String> {
@@ -341,11 +336,7 @@ pub fn evaluate_op(
         }
         match evaluate_conditions(
             &rule.requires,
-            policy,
-            policy_version,
-            op,
             handle,
-            approvals,
             ctx,
             op_binding,
         ) {
@@ -383,11 +374,7 @@ fn rule_grants_to(rule: &OperationRule, caller: PrincipalRef) -> bool {
 
 fn evaluate_conditions(
     conditions: &[Condition],
-    policy: &KeyPolicy,
-    policy_version: u32,
-    op: Operation,
     handle: &str,
-    approvals: &[ApprovalToken],
     ctx: &RequestContext,
     op_binding: Option<&OpBinding>,
 ) -> Result<(), String> {
@@ -399,105 +386,6 @@ fn evaluate_conditions(
     };
     for cond in conditions {
         match cond {
-            Condition::TimeWindow {
-                not_before,
-                not_after,
-            } => {
-                let now = now()?;
-                if *not_before != 0 && now < *not_before {
-                    return Err(format!(
-                        "TimeWindow: now={} before not_before={}",
-                        now, not_before
-                    ));
-                }
-                if *not_after != 0 && now > *not_after {
-                    return Err(format!(
-                        "TimeWindow: now={} after not_after={}",
-                        now, not_after
-                    ));
-                }
-            }
-            Condition::AttestationMatches(profile) => {
-                let peer = ctx.peer_cert_der.as_deref().ok_or_else(|| {
-                    "AttestationMatches: no peer RA-TLS cert in request".to_string()
-                })?;
-                if !tee_matches(profile, peer, ctx.peer_evidence.as_ref()) {
-                    return Err(format!(
-                        "AttestationMatches: peer does not match profile '{}'",
-                        profile.name
-                    ));
-                }
-            }
-            Condition::ManagerApproval {
-                manager,
-                fresh_for_seconds,
-            } => {
-                let mgr_idx = *manager;
-                let mgr = policy
-                    .principals
-                    .managers
-                    .get(mgr_idx as usize)
-                    .ok_or_else(|| {
-                        format!("ManagerApproval: manager index {} out of range", mgr_idx)
-                    })?;
-                let mgr_sub = match mgr {
-                    Principal::Oidc { sub, .. } => sub.as_str(),
-                    Principal::Tee(_) | Principal::Fido2 { .. } => {
-                        return Err(
-                            "ManagerApproval: only OIDC managers can issue approval tokens"
-                                .to_string(),
-                        )
-                    }
-                };
-                // A role-based manager (empty sub, matched by role) names a *set*
-                // of approvers, so the approval must come from a DIFFERENT person
-                // than whoever is driving this operation: separation-of-duties
-                // co-sign. We pass the proposer's sub so the token's approver_sub
-                // is checked to differ. A subject-bound manager is distinct by
-                // construction, so no co-sign check applies (distinct_from = None).
-                let distinct_from: Option<&str> = if mgr_sub.is_empty() {
-                    match ctx.oidc_claims.as_ref() {
-                        Some(c) => Some(c.sub.as_str()),
-                        None => {
-                            return Err("ManagerApproval: role-based co-sign requires an \
-                                 authenticated OIDC proposer"
-                                .to_string())
-                        }
-                    }
-                } else {
-                    None
-                };
-                let now = now()?;
-                let mut accepted = false;
-                let mut last_err: Option<String> = None;
-                for token in approvals {
-                    match verify_approval_token(
-                        token,
-                        handle,
-                        op,
-                        mgr_idx,
-                        // A subject-bound manager's approval must come from
-                        // that subject; a role-based one names no subject.
-                        if mgr_sub.is_empty() { None } else { Some(mgr_sub) },
-                        policy_version,
-                        distinct_from,
-                        *fresh_for_seconds,
-                        now,
-                    ) {
-                        Ok(()) => {
-                            accepted = true;
-                            break;
-                        }
-                        Err(e) => last_err = Some(e),
-                    }
-                }
-                if !accepted {
-                    return Err(match last_err {
-                        Some(e) => format!("ManagerApproval: no token accepted ({})", e),
-                        None => "ManagerApproval: no approval token supplied".into(),
-                    });
-                }
-            }
             Condition::OidcStepUp {
                 required_amr,
                 operation_bound,
@@ -610,11 +498,7 @@ pub(crate) fn require_owner_step_up(
     };
     evaluate_conditions(
         &step_up,
-        policy,
-        policy_version,
-        Operation::UpdatePolicy,
         handle,
-        &[],
         ctx,
         Some(&binding),
     )
@@ -715,11 +599,7 @@ pub(crate) fn require_owner_create(
     };
     evaluate_conditions(
         &[crate::v2::canonical_step_up()],
-        policy,
-        0,
-        Operation::UpdatePolicy,
         handle,
-        &[],
         ctx,
         Some(&binding),
     )

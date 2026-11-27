@@ -38,7 +38,7 @@ use frost::{Round1Msg, StoredShare};
 use crate::grant::KeyCreationGrant;
 use crate::policy::{resolve_caller, CallerRole};
 use crate::types::{
-    ApprovalToken, AuditDecision, FrostTargetMessage, KeyRecord, KeyType, Operation,
+    AuditDecision, FrostTargetMessage, KeyRecord, KeyType, Operation,
     ThresholdKeyInfo, VaultRequest, VaultResponse,
 };
 use crate::{
@@ -284,8 +284,7 @@ fn run(req: VaultRequest, ctx: &RequestContext) -> Result<VaultResponse, String>
             session,
             handle,
             message_b64,
-            approvals,
-        } => sign_round1(&session, &handle, &message_b64, &approvals, &caller, ctx),
+        } => sign_round1(&session, &handle, &message_b64, &caller, ctx),
 
         VaultRequest::FrostSignRound2 {
             session,
@@ -793,12 +792,11 @@ fn sign_round1(
     session: &str,
     handle: &str,
     message_b64: &str,
-    approvals: &[ApprovalToken],
     caller: &str,
     ctx: &RequestContext,
 ) -> Result<VaultResponse, String> {
     // Authorised and audited exactly like Sign on this vault.
-    let record = require_op(handle, Operation::Sign, KeyType::FrostEd25519, approvals, ctx)
+    let record = require_op(handle, Operation::Sign, KeyType::FrostEd25519, ctx)
         .map_err(response_error)?;
     let share = StoredShare::from_bytes(&record.material)?;
     let message = unb64(message_b64, "message")?;
