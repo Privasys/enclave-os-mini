@@ -50,6 +50,11 @@ pub const CAPABILITY_GENERATIONS: &str = "generations-v1";
 /// (wire formats §5.3).
 pub const CAPABILITY_UPDATE_FROM: &str = "update-policy-from-v1";
 
+/// The capability a build publishes when it reads every step-up as binding v2
+/// and has no binding v1 (wire formats §5): a client asks for a v2 approval
+/// on every key, whatever its rules say.
+pub const CAPABILITY_BINDING_V2_ALWAYS: &str = "binding-v2-always-v1";
+
 /// Whether a handle's last segment is a generation marker "gen-<digits>"
 /// (wire formats §9.1): the suffix user-secret generations use, and nothing else.
 pub(crate) fn is_generation_handle(handle: &str) -> bool {

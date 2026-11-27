@@ -32,7 +32,7 @@ mod pending;
 mod read;
 mod rules;
 
-pub use create::{CAPABILITY_GENERATIONS, CAPABILITY_UPDATE_FROM};
+pub use create::{CAPABILITY_BINDING_V2_ALWAYS, CAPABILITY_GENERATIONS, CAPABILITY_UPDATE_FROM};
 use create::*;
 use delete::*;
 use ops::*;

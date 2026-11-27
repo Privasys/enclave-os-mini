@@ -26,6 +26,7 @@ pub(crate) fn handle_identity() -> VaultResponse {
         capabilities: vec![
             CAPABILITY_GENERATIONS.to_string(),
             CAPABILITY_UPDATE_FROM.to_string(),
+            CAPABILITY_BINDING_V2_ALWAYS.to_string(),
             tomb::CAPABILITY_TOMBSTONES.to_string(),
         ],
     }

@@ -81,7 +81,7 @@ privasys-vault-approval/v2
 - **Members.** 64 lower-case hex digits each, sorted ascending and unique. The vault refuses unless its own `member_id` is in the set.
 - **Expiry and nonce.** `now <= exp <= now + 600` on the vault's trusted clock, refused when the clock is not trusted. The one exception is `delete_after`, which may live up to 24 hours (`now + 86400`), because it is presented only once a migration or upgrade has finished (§9.2). Each vault keeps `H(text)` until `exp` and refuses a second use; the real guarantee is the short expiry plus `policy_version`.
 - **Freshness.** The condition's `fresh_for_seconds` bounds the token's age by its `iat` (300 s in the canonical step-up).
-- **Every step-up is binding v2.** Keys written before v2 carry `OidcStepUp` without `binding` (and `operation_bound` true or false); the vault keeps those bytes, so their `PD` never changes, and checks every step-up as binding v2. `binding` other than absent or `2` is refused. A rule checks its binding once.
+- **Every step-up is binding v2.** Keys written before v2 carry `OidcStepUp` without `binding` (and `operation_bound` true or false); the vault keeps those bytes, so their `PD` never changes, and checks every step-up as binding v2. `binding` other than absent or `2` is refused. A rule checks its binding once. A build without binding v1 lists capability `binding-v2-always-v1` in `GetVaultIdentity`, so a client asks for a v2 approval on every key it holds.
 - `profile_binding_digest` is the hex `H` of the profile's measurements and required OIDs rendered as lower-case `kind:value` lines (`mrenclave:`, `mrtd:`, `rtmr1:`, `rtmr2:`, `oid:<oid>=<value>`), sorted and joined by `\n`.
 
 ### 5.1 The policy digest, exactly
