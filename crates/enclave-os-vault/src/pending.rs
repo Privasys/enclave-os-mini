@@ -270,9 +270,7 @@ pub(crate) fn handle_promote_pending(
     let op_binding = pos_opt.map(|p| {
         let digest = crate::policy::profile_binding_digest(&record.pending_profiles[p].profile);
         crate::policy::OpBinding {
-            measurement_digest_hex: digest.clone(),
             policy_version: record.policy_version,
-            v1: true,
             v2: Some(crate::policy::OpBindingV2 {
                 op: "promote",
                 target: Ok(digest),

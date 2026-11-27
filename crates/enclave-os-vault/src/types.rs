@@ -354,6 +354,9 @@ pub enum VaultRequest {
         vaults: Vec<String>,
         target_mrenclave: String,
         targets: BTreeMap<u16, FrostTargetMessage>,
+        /// Binding v2 members of the owner's `reshare` approval (formats §5).
+        #[serde(default)]
+        binding: Option<BindingV2Request>,
     },
     /// Round 2 on each new participant: every new participant's first message
     /// and every helper's deal for this vault.
@@ -812,20 +815,15 @@ pub struct OperationRule {
 /// All conditions in a rule's `requires` list are AND-ed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum Condition {
-    /// The caller's OIDC bearer must prove a fresh step-up: its `amr` claim
-    /// contains every method in `required_amr` (e.g. `["webauthn"]`) and its
-    /// `iat` is within `fresh_for_seconds`. This is the IdP-verified promote
-    /// step-up (see the vault promote-step-up design): the attested IdP issues a short-lived,
-    /// high-`acr` token after a wallet/passkey WebAuthn assertion.
+    /// The caller's OIDC bearer must prove a fresh step-up bound to this
+    /// operation: its `amr` claim contains every method in `required_amr`
+    /// (e.g. `["webauthn"]`), its `iat` is within `fresh_for_seconds`, and its
+    /// `vault_op` is the binding v2 of this operation (wire formats §5). One
+    /// rule checks the binding once.
     ///
-    /// `operation_bound` requires the token to also be bound to THIS operation
-    /// (a `vault_op` claim over `H(handle ‖ measurement ‖ policy_version ‖ nonce
-    /// ‖ exp)`). That binding needs per-operation context not yet threaded into
-    /// condition evaluation, so while `operation_bound = true` is accepted in the
-    /// schema it currently evaluates **fail-closed** (the condition cannot be
-    /// satisfied). Authoring it into a live policy would therefore strand the op
-    /// until the binding path lands — do not author it yet. `operation_bound =
-    /// false` enforces only the `amr` + freshness step-up.
+    /// `operation_bound` and `binding` are kept as stored, so a policy's bytes
+    /// and digest never change; the vault reads every step-up as binding v2
+    /// whatever they say. Keys written before v2 carry `binding: 0`.
     OidcStepUp {
         #[serde(default)]
         required_amr: Vec<String>,
@@ -833,9 +831,8 @@ pub enum Condition {
         operation_bound: bool,
         #[serde(default)]
         fresh_for_seconds: u64,
-        /// Which binding the token's `vault_op` carries: absent or 0 for v1
-        /// (every key created before v2), 2 for binding v2 (wire formats §5). A
-        /// v2 condition is always operation-bound, and takes only v2.
+        /// 2 on keys written since binding v2, absent (0) before. Read as v2
+        /// either way; any other value is refused.
         #[serde(default, skip_serializing_if = "is_zero_u8")]
         binding: u8,
     },

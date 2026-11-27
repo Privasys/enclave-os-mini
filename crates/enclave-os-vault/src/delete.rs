@@ -29,12 +29,9 @@ pub(crate) fn handle_delete(
         }
         None => ("delete", Ok("-".into()), String::new()),
     };
-    // A v1 condition has no binding for delete (an operation-bound one fails
-    // closed, as before); binding v2 binds the handle and policy version.
+    // Binding v2 binds the handle and the policy version (wire formats §5).
     let op_binding = crate::policy::OpBinding {
-        measurement_digest_hex: String::new(),
         policy_version: record.policy_version,
-        v1: false,
         v2: Some(crate::policy::OpBindingV2 {
             op,
             target,
@@ -107,7 +104,7 @@ pub(crate) fn remove_record(
 pub(crate) fn tomb_approver(policy: &KeyPolicy, tomb_op: &str, ctx: &RequestContext) -> (String, String) {
     match ctx.oidc_claims.as_ref() {
         Some(c) => {
-            let bound = tomb_op != "retire" && rule_takes_binding_v2(policy, Operation::DeleteKey);
+            let bound = tomb_op != "retire" && rule_asks_approval(policy, Operation::DeleteKey);
             let vault_op = match (&c.vault_op, bound) {
                 (Some(v), true) => v.clone(),
                 _ => "-".to_string(),

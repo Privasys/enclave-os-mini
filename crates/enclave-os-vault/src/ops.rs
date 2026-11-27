@@ -21,16 +21,10 @@ pub(crate) fn handle_export(
         return VaultResponse::Error("key is not exportable".into());
     }
     let caller = caller_str(ctx);
-    // Export has no canonical target measurement (unlike promote), so an
-    // `OidcStepUp { operation_bound }` condition binds the empty measurement
-    // slot: (handle, "", policy_version, nonce, exp). The empty measurement can
-    // never collide with a promote binding (which always carries a non-empty
-    // profile digest), so a captured promote approval cannot be replayed to
-    // export the same handle, and vice versa.
+    // Binding v2 op `export`, target `-` (wire formats §5): it names the
+    // operation, so no other approval can be spent on it.
     let op_binding = crate::policy::OpBinding {
-        measurement_digest_hex: String::new(),
         policy_version: record.policy_version,
-        v1: true,
         v2: Some(crate::policy::OpBindingV2 {
             op: "export",
             target: Ok("-".into()),

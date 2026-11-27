@@ -118,7 +118,7 @@ The client drives every round across the constellation, calling each vault direc
 |---|---|
 | `FrostDkgRound1` / `FrostDkgRound2` / `FrostDkgRound3` / `FrostDkgCommit` | Distributed key generation under a key-creation grant (`key_type = FrostEd25519`, `exportable = false`), bound to the caller as for `CreateKey`: round 1 packages plus an X25519 key, round 2 packages sealed (AES-GCM) to each peer, round 3 HMAC confirmations, then commit. The context binds the participant list and the threshold. Round 1 takes `binding` for a re-created name (section 8.3). |
 | `FrostSignRound1` / `FrostSignRound2` / `FrostAggregate` | Signing: commitments (the policy's `Sign` rule is checked and audited here), signature shares over the message the vault kept, aggregation into one EdDSA signature verified under the group key (key principals only). |
-| `FrostReshareTarget1` / `FrostReshareDeal` / `FrostReshareTarget2` / `FrostReshareCommit` | Resharing (renewal or move to other vaults, same handle and same public key; the threshold may change): the target vaults quote their key and the policy, each helper deals λᵢ·sᵢ with a Feldman VSS sealed to the target, the targets verify and sum, then confirm. A helper deals only to the key's owner, under a passkey step-up fresh within 300 s and bound (binding v1, section 5.4) to the resharing context in the measurement slot: handle, group key, helpers, threshold, target vaults and target MRENCLAVE. |
+| `FrostReshareTarget1` / `FrostReshareDeal` / `FrostReshareTarget2` / `FrostReshareCommit` | Resharing (renewal or move to other vaults, same handle and same public key; the threshold may change): the target vaults quote their key and the policy, each helper deals λᵢ·sᵢ with a Feldman VSS sealed to the target, the targets verify and sum, then confirm. A helper deals only to the key's owner, under a passkey step-up fresh within 300 s and bound by binding v2 (op `reshare`, section 5) to the resharing context: handle, group key, helpers, threshold, target vaults and target MRENCLAVE. `FrostReshareDeal` carries the approval's `binding` members. |
 | `FrostReshareFinalize` / `FrostReshareRollback` | Owner. A renewal in place keeps the previous share as `prev:<handle>` until finalize; rollback restores it. A new resharing of the key waits until the previous one is finalized or rolled back. |
 | `FrostDkgAbort { session, handle? }` / `FrostReshareAbort { session, handle? }` / `FrostSignAbort { session }` | End a session. With `handle`, also remove the key that session committed on this vault while it is still pending (see below). |
 
@@ -177,7 +177,7 @@ Condition {
 
 A request is allowed iff there is at least one rule whose `ops` contains the requested op AND whose `principals` contains the caller's resolved principal AND every condition in `requires` evaluates true.
 
-`OidcStepUp` asks the caller's own bearer to prove a fresh step-up: its `amr` claim contains every method in `required_amr`, and its `iat` is within `fresh_for_seconds`. With `"binding": 2` the token must also carry a binding v2 of this exact operation (section 5); with `binding` absent and `operation_bound: true`, a binding v1 (section 5.4). A condition takes only the binding version it names. The canonical owner approval, which the vault's approval-by-default and tightening rules recognise, is:
+`OidcStepUp` asks the caller's own bearer to prove a fresh step-up: its `amr` claim contains every method in `required_amr`, and its `iat` is within `fresh_for_seconds`. The token must also carry a binding v2 of this exact operation (section 5), whatever the condition's `operation_bound` and `binding` say: keys written before binding v2 keep those fields as stored, and the vault reads them as v2. A rule checks its binding once. The canonical owner approval, which the vault's approval-by-default and tightening rules recognise, is:
 
 ```json
 {"OidcStepUp":{"required_amr":["webauthn"],"operation_bound":true,"fresh_for_seconds":300,"binding":2}}
@@ -226,7 +226,7 @@ With `auto_migrate_to_next_attestation_profile`, a profile staged by the platfor
 A new key's policy asks for the owner's wallet approval on the operations that govern the key. At a first creation (`CreateKey` without `predecessor` or a carried `policy`, and `FrostDkgRound1`), the vault refuses a policy in which a rule that a person can use lets `PromoteProfile`, `UpdatePolicy` or `DeleteKey` happen without an approval, or `ExportKey` too when the key is exportable.
 
 - **Rules a person can use** are rules naming `Owner`, a `Manager` or an `Auditor`. A rule for the app's own enclaves only (`Tee`, `AnyTee`), such as an app fetching its own key, is exempt.
-- **An approval** is an `OidcStepUp` with `webauthn` in `required_amr` that is bound to the operation: `"binding": 2`, or `operation_bound: true` (binding v1). A fresh token alone does not count.
+- **An approval** is an `OidcStepUp` with `webauthn` in `required_amr`, which the vault always checks bound to the operation. A step-up that asks for no passkey does not count.
 - **Opting out** is explicit: `"approval": "none"` in the policy. Any other value is refused.
 - **Updates** keep what a key has: when the current policy passes these rules and does not opt out, the new policy must pass them too and may not add `"approval": "none"`. A key created before approval by default may still be updated, and an update may add approvals.
 - **Renewals** (section 7) copy or carry the key's existing policy, so the check does not apply to them.
@@ -271,7 +271,6 @@ privasys-vault-approval/v2
 | `create` | the new handle | `PD` of the new key's policy in the vault's stored form | `0` |
 | `promote` | key | `profile_binding_digest` of the staged profile | current |
 | `export` | key | `-` | current |
-| `update_policy` | key | `PD(new_policy as sent)` | current (the version replaced) |
 | `update_policy_from` | key | hex `SHA-256("privasys-update-policy-from-v1\n" PD(current) "\n" PD(new))` | current |
 | `delete` | key | `-` | current |
 | `delete_after` | the old key | hex `SHA-256("privasys-delete-after-v1\n" successor "\n" successor_target)` | current |
@@ -296,15 +295,11 @@ privasys-vault-approval/v2
 
 For a key whose `UpdatePolicy` rule takes binding 2, `new_policy` must be sent exactly in the vault's stored form, as `CanonicalisePolicy` returns it (key order and whitespace are free). The vault checks this before evaluating or spending any approval, and otherwise answers `new_policy is not in the vault's stored form (first difference at <json-pointer>): send the policy exactly as CanonicalisePolicy returns it`. The owner then approves the JSON the vault stores and returns, and the next update can name it as replaced with no re-canonicalising.
 
-**`update_policy_from`.** A request may also bind the policy it replaces: `"binding": { "members": [...], "replaced_pd": "<hex PD(current)>" }`. The vault refuses unless `replaced_pd` equals the digest of its own current policy, and the approval's target covers both digests. A wallet can then show the owner a before-and-after diff that the vault itself checks. A vault that supports it lists `update-policy-from-v1` among its capabilities; a request without `replaced_pd` is a plain `update_policy`.
+**`update_policy_from`.** Every policy update binds the policy it replaces: `"binding": { "members": [...], "replaced_pd": "<hex PD(current)>" }`. The vault refuses a request without `replaced_pd`, and refuses unless it equals the digest of its own current policy; the approval's target covers both digests. A wallet can then show the owner a before-and-after diff that the vault itself checks.
 
 ### 5.3 Test vectors
 
-[`crates/enclave-os-vault/testdata/v2_vectors.json`](../crates/enclave-os-vault/testdata/v2_vectors.json) holds vectors produced by the vault's own code: a policy digest (with its JCS form), a member id, a billing id, the identity report data, a binding v2 `update_policy`, a binding v2 `update_policy_from`, and the stored-form refusal. A crate test asserts that the code still produces exactly that file, so client implementations can check their own code against it.
-
-### 5.4 Binding v1
-
-Keys created before binding v2 carry `OidcStepUp` conditions without `binding`. With `operation_bound: true`, such a condition takes a binding v1: `vault_op = base64url(SHA-256("privasys-vault-approval/v1\n" handle "\n" measurement_hex "\n" policy_version "\n" nonce "\n" exp))`, where the measurement slot is the staged profile's `profile_binding_digest` for a promote and empty for an export. Binding v1 has no form for update or delete, so an operation-bound v1 condition on those operations is never satisfied. Resharing a threshold key uses binding v1 with the resharing context in the measurement slot (section 2.6).
+[`crates/enclave-os-vault/testdata/v2_vectors.json`](../crates/enclave-os-vault/testdata/v2_vectors.json) holds vectors produced by the vault's own code: a policy digest (with its JCS form), a member id, a billing id, the identity report data, a binding v2 `update_policy` (the vectors keep it; vaults no longer take it), a binding v2 `update_policy_from`, and the stored-form refusal. A crate test asserts that the code still produces exactly that file, so client implementations can check their own code against it.
 
 ---
 

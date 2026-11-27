@@ -25,7 +25,7 @@ The exact formats the vault (`crates/enclave-os-vault`) computes and checks for 
 
 - only rules a person can use count: rules naming `Owner`, a `Manager` or an `Auditor`. A rule for the app's own enclaves only (`Tee`, `AnyTee`), such as an app fetching its key, needs no approval;
 - the operations checked are `PromoteProfile`, `UpdatePolicy` and `DeleteKey`, and `ExportKey` when the key is exportable;
-- an approval is an `OidcStepUp` with `webauthn` in `required_amr`, bound to the operation (`binding: 2`, or v1 `operation_bound`). A fresh token alone is not;
+- an approval is an `OidcStepUp` with `webauthn` in `required_amr`, which the vault always checks bound to the operation (§5). A step-up without a passkey is not;
 - checked at first creation (`CreateKey` without a predecessor or carried policy, and `FrostDkgRound1`), and at update only against a downgrade: when the current policy passes and does not opt out, the new one must pass and may not add `"approval": "none"`. A key without approvals may still be updated, and an update may add them. Renewals are exempt: their policy is copied or carried, not written (§9).
 
 ### 4.1 Adding approvals to an existing key
@@ -71,18 +71,17 @@ privasys-vault-approval/v2
 | `op` | `handle` | `target` (computed by the vault) | `policy_version` |
 | --- | --- | --- | --- |
 | `create` | the new handle | `PD(policy of the new key)`, in the vault's stored form | `0` |
-| `promote` | key | `profile_binding_digest` of the staged profile (as v1) | current |
+| `promote` | key | `profile_binding_digest` of the staged profile | current |
 | `export` | key | `-` | current |
-| `update_policy` | key | `PD(new policy)` | current (the version replaced) |
 | `update_policy_from` | key | hex `H("privasys-update-policy-from-v1\n" PD(current policy) "\n" PD(new policy))` (§5.3) | current (the version replaced) |
 | `delete` | key | `-` | current |
 | `delete_after` | the old key | hex `H("privasys-delete-after-v1\n" successor_handle "\n" successor_target)` (§9.2) | current |
+| `reshare` | key | the hex resharing context of the threshold key (§9) | current |
 
 - **Members.** 64 lower-case hex digits each, sorted ascending and unique. The vault refuses unless its own `member_id` is in the set.
 - **Expiry and nonce.** `now <= exp <= now + 600` on the vault's trusted clock, refused when the clock is not trusted. The one exception is `delete_after`, which may live up to 24 hours (`now + 86400`), because it is presented only once a migration or upgrade has finished (§9.2). Each vault keeps `H(text)` until `exp` and refuses a second use; the real guarantee is the short expiry plus `policy_version`.
 - **Freshness.** The condition's `fresh_for_seconds` bounds the token's age by its `iat` (300 s in the canonical step-up).
-- **Which version a key takes** is in its policy: an `OidcStepUp` condition with `"binding": 2` takes v2, and only v2; without the field, v1 and only v1. A client reads it with `GetPolicy`.
-- **v1** stays verifiable on keys whose policies predate v2: `vault_op = b64u(H("privasys-vault-approval/v1\n" handle "\n" measurement_hex "\n" policy_version "\n" nonce "\n" exp))`, the measurement slot being the profile digest for a promote and empty for an export. Resharing a threshold key uses v1 with the hex resharing context in the measurement slot.
+- **Every step-up is binding v2.** Keys written before v2 carry `OidcStepUp` without `binding` (and `operation_bound` true or false); the vault keeps those bytes, so their `PD` never changes, and checks every step-up as binding v2. `binding` other than absent or `2` is refused. A rule checks its binding once.
 - `profile_binding_digest` is the hex `H` of the profile's measurements and required OIDs rendered as lower-case `kind:value` lines (`mrenclave:`, `mrtd:`, `rtmr1:`, `rtmr2:`, `oid:<oid>=<value>`), sorted and joined by `\n`.
 
 ### 5.1 The policy digest, exactly
@@ -96,7 +95,7 @@ privasys-vault-approval/v2
 - **Omitted fields** take their defaults, and the digest covers the omission.
 - `GetPolicy` returns the vault's own serialisation (the stored form). `PD(current)` is the digest of that.
 - **`CanonicalisePolicy { policy }`** (unauthenticated, stores nothing): returns `{ policy, pd }`, the policy in the vault's stored form and the digest of the JSON as sent.
-- **A binding v2 policy update sends the stored form.** For a key whose `UpdatePolicy` rule takes binding 2, every policy update (`update_policy`, `update_policy_from`, and the §4.1 tightening) must send `new_policy` exactly in the vault's stored form, as `CanonicalisePolicy` returns it (key order and whitespace free). Otherwise it is refused before any approval is evaluated or spent, with `new_policy is not in the vault's stored form (first difference at <json-pointer>): send the policy exactly as CanonicalisePolicy returns it`. Then `PD(new as sent)` is the stored `PD`, and the next `update_policy_from` names it as `replaced_pd`. A re-created name's policy (§9.3.1) is likewise sent in stored form.
+- **A policy update sends the stored form.** Every policy update (`update_policy_from`, including the §4.1 tightening) must send `new_policy` exactly in the vault's stored form, as `CanonicalisePolicy` returns it (key order and whitespace free). Otherwise it is refused before any approval is evaluated or spent, with `new_policy is not in the vault's stored form (first difference at <json-pointer>): send the policy exactly as CanonicalisePolicy returns it`. Then `PD(new as sent)` is the stored `PD`, and the next `update_policy_from` names it as `replaced_pd`. A re-created name's policy (§9.3.1) is likewise sent in stored form.
 - **The stored form, field by field:**
   - policy: `version`, `principals`, `operations`, `mutability` (absent means the default: `owner_can` `[Managers, Auditors, Tees, Operations, Lifecycle, PendingProfiles]`, `manager_can` `[]`, `immutable` `[Owner, Mutability]`; a partial object gets `[]` for each list it leaves out), `lifecycle` (`ttl_seconds`, default 2592000, 0 means the default, capped at 7776000; `auto_migrate_to_next_attestation_profile`, default false). `approval` is omitted when absent, never `null`.
   - principals: `owner`, `managers`, `auditors`, `tees` (each `[]` when empty). `Oidc`: `issuer`, `sub`, `required_roles` (`[]`).
@@ -136,7 +135,7 @@ An approval of a policy update may also bind the digest of the policy it replace
 - **The binding** keeps the §5 layout. Only the op and its target differ: `op` = `update_policy_from`, `target` = hex `H("privasys-update-policy-from-v1\n" || PD(current) || "\n" || PD(new))`, `policy_version` = the current version.
 - **`PD(current)`** is the digest of the key's current policy as `GetPolicy` returns it (the stored form, §5.1).
 - **The request** carries `"binding": { "members": [...], "replaced_pd": "<hex PD(current)>" }` on `UpdatePolicy`. The vault refuses unless `replaced_pd` equals its own `PD(current)`. Like `policy_version`, that stops an approval made against one "before" being spent on another.
-- **Coexistence.** A request without `replaced_pd` is `update_policy`. A vault that implements §5.3 lists capability `update-policy-from-v1` in `GetVaultIdentity` and accepts both forms; a client uses `update_policy_from` when every member of the key's constellation lists it.
+- **Required.** A request without `replaced_pd` is refused. The vault still lists capability `update-policy-from-v1` in `GetVaultIdentity` for older clients; nothing needs to read it.
 
 ## 9. Renewals and moves
 

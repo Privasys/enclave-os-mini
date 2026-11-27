@@ -501,13 +501,14 @@ pub(crate) fn sha256(data: &[u8]) -> [u8; 32] {
     out
 }
 
-/// Whether any rule granting `op` asks for a binding v2 step-up.
-fn rule_takes_binding_v2(policy: &KeyPolicy, op: Operation) -> bool {
-    policy.operations.iter().filter(|r| r.ops.contains(&op)).any(|r| {
-        r.requires
-            .iter()
-            .any(|c| matches!(c, crate::types::Condition::OidcStepUp { binding: 2, .. }))
-    })
+/// Whether any rule granting `op` asks for an approval (a step-up, which the
+/// vault checks as binding v2).
+fn rule_asks_approval(policy: &KeyPolicy, op: Operation) -> bool {
+    policy
+        .operations
+        .iter()
+        .filter(|r| r.ops.contains(&op))
+        .any(|r| !r.requires.is_empty())
 }
 
 /// Whether the key has expired. Without trusted time a key counts as
@@ -1012,7 +1013,11 @@ mod tombstone_tests {
         let send = |p: &KeyPolicy| {
             let raw = serde_json::to_string(&normalise_policy(p.clone())).unwrap();
             let raw = serde_json::value::RawValue::from_string(raw).unwrap();
-            handle_update_policy(h, &raw, None, &ctx("alice"))
+            let binding = crate::types::BindingV2Request {
+                members: Vec::new(),
+                replaced_pd: Some(v2::stored_policy_digest(&policy).unwrap()),
+            };
+            handle_update_policy(h, &raw, Some(binding), &ctx("alice"))
         };
         // Opting out, in the same change that drops the approvals: refused,
         // and refused before any approval is asked for.

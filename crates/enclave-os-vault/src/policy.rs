@@ -22,8 +22,6 @@
 use std::string::String;
 use std::vec::Vec;
 
-use base64::engine::general_purpose::URL_SAFE_NO_PAD;
-use base64::Engine;
 use enclave_os_common::digest;
 use enclave_os_common::hex::hex_encode;
 use enclave_os_common::modules::RequestContext;
@@ -35,24 +33,12 @@ use crate::types::{
     OperationRule, PolicyField, Principal, PrincipalRef,
 };
 
-/// Domain separator for the operation-binding hash. MUST match the IdP and
-/// client implementations (the vault promote-step-up design).
-const VAULT_APPROVAL_DOMAIN: &str = "privasys-vault-approval/v1";
-
-/// Per-operation binding data for `Condition::OidcStepUp { operation_bound }`.
-/// Supplied by the handler that knows the operation's target (e.g. promote),
-/// `None` for ops that have no canonical target measurement.
+/// Per-operation binding data for `Condition::OidcStepUp` (binding v2, wire
+/// formats §5), supplied by the handler that knows the operation and its target.
 pub struct OpBinding {
-    /// Hex SHA-256 of the canonical promoted profile ([`profile_binding_digest`]).
-    pub measurement_digest_hex: String,
     /// The key's `policy_version` at the time of the operation.
     pub policy_version: u32,
-    /// Whether this operation has a v1 form. Update and delete do not: a v1
-    /// operation-bound condition on them fails closed, as it always has, so
-    /// that an export approval (same v1 slot) can never be spent on them.
-    pub v1: bool,
-    /// What a binding v2 needs (wire formats §5), for a condition with
-    /// `binding: 2`. `None` where the handler has no v2 form.
+    /// What a binding v2 needs. `None` where the operation has no binding form.
     pub v2: Option<OpBindingV2>,
 }
 
@@ -90,24 +76,6 @@ pub fn profile_binding_digest(profile: &AttestationProfile) -> String {
     parts.sort();
     let joined = parts.join("\n");
     hex_encode(digest::digest(&digest::SHA256, joined.as_bytes()).as_ref())
-}
-
-/// The operation-binding value the IdP stamps into `vault_op` and the vault
-/// recomputes: `base64url(SHA-256(domain \n handle \n measurement_hex \n
-/// policy_version \n nonce \n exp))`. All inputs are rendered as UTF-8 strings
-/// joined by `\n` so the hash is trivially identical across Rust/Go/TS.
-pub fn vault_op_binding(
-    handle: &str,
-    measurement_digest_hex: &str,
-    policy_version: u32,
-    nonce: &str,
-    exp: u64,
-) -> String {
-    let input = format!(
-        "{}\n{}\n{}\n{}\n{}\n{}",
-        VAULT_APPROVAL_DOMAIN, handle, measurement_digest_hex, policy_version, nonce, exp
-    );
-    URL_SAFE_NO_PAD.encode(digest::digest(&digest::SHA256, input.as_bytes()).as_ref())
 }
 
 // ---------------------------------------------------------------------------
@@ -384,13 +352,16 @@ fn evaluate_conditions(
         enclave_os_common::ocall::get_current_time()
             .map_err(|_| "no trusted time to evaluate a time-bound condition".to_string())
     };
+    // A rule's approval is checked once: a second step-up on the same rule
+    // would otherwise spend the same single-use approval twice.
+    let mut bound = false;
     for cond in conditions {
         match cond {
             Condition::OidcStepUp {
                 required_amr,
-                operation_bound,
                 fresh_for_seconds,
                 binding: binding_version,
+                ..
             } => {
                 let claims = ctx
                     .oidc_claims
@@ -417,50 +388,18 @@ fn evaluate_conditions(
                         ));
                     }
                 }
-                // Operation binding: the token's `vault_op` must equal the value
-                // recomputed from THIS operation's (handle, measurement,
-                // policy_version) plus the token's own (nonce, exp). This proves
-                // the WebAuthn step-up the IdP attests (`amr`) was performed for
-                // exactly this promote, so a stolen bearer + a captured approval
-                // cannot promote a different/forged measurement. Fail closed when
-                // the handler supplied no binding (op has no target) or the token
-                // lacks the claims. See the vault promote-step-up design.
-                //
-                // Binding v2 (wire formats §5): the key's condition says which
-                // version it takes, and it takes only that one.
-                match *binding_version {
-                    0 => {}
-                    2 => {
-                        check_binding_v2(claims, handle, op_binding, now()?)?;
-                        continue;
-                    }
-                    v => return Err(format!("OidcStepUp: unknown binding version {v}")),
+                // Every step-up is bound to its operation by binding v2 (wire
+                // formats §5). Keys written before v2 carry `binding: 0` and
+                // `operation_bound`; both are kept as stored and read as v2.
+                if *binding_version != 0 && *binding_version != 2 {
+                    return Err(format!("OidcStepUp: unknown binding version {binding_version}"));
                 }
-                if *operation_bound {
-                    let binding = op_binding.filter(|b| b.v1).ok_or_else(|| {
-                        "OidcStepUp: operation_bound required but this operation \
-                         carries no binding context"
-                            .to_string()
-                    })?;
-                    let vault_op = claims.vault_op.as_deref().ok_or_else(|| {
-                        "OidcStepUp: token has no vault_op binding claim".to_string()
-                    })?;
-                    let nonce = claims
-                        .nonce
-                        .as_deref()
-                        .ok_or_else(|| "OidcStepUp: token has no nonce claim".to_string())?;
-                    let expected = vault_op_binding(
-                        handle,
-                        &binding.measurement_digest_hex,
-                        binding.policy_version,
-                        nonce,
-                        claims.exp,
-                    );
-                    if vault_op != expected {
-                        return Err("OidcStepUp: vault_op does not bind this operation \
-                             (handle/measurement/policy_version/nonce/exp mismatch)"
-                            .to_string());
+                if !bound {
+                    if op_binding.and_then(|b| b.v2.as_ref()).is_none() {
+                        return Err("OidcStepUp: binding v2 required but this operation carries no binding".into());
                     }
+                    check_binding_v2(claims, handle, op_binding, now()?)?;
+                    bound = true;
                 }
             }
         }
@@ -471,13 +410,14 @@ fn evaluate_conditions(
 /// The owner, with a fresh WebAuthn step-up bound to this operation: what
 /// resharing a threshold key requires, as exporting a secret does. Whatever
 /// the key's policy says, only its owner moves it, and only with a wallet
-/// approval naming exactly where it goes (`binding_hex`, carried in the
-/// step-up's measurement slot).
+/// approval naming exactly where it goes: binding v2 op `reshare`, target the
+/// hex resharing context (wire formats §5).
 pub(crate) fn require_owner_step_up(
     policy: &KeyPolicy,
     policy_version: u32,
     handle: &str,
-    binding_hex: &str,
+    context_hex: &str,
+    members: Option<Vec<String>>,
     ctx: &RequestContext,
 ) -> Result<(), String> {
     match resolve_caller(policy, ctx) {
@@ -488,13 +428,15 @@ pub(crate) fn require_owner_step_up(
         required_amr: vec!["webauthn".into()],
         operation_bound: true,
         fresh_for_seconds: RESHARE_STEP_UP_FRESH_SECONDS,
-        binding: 0,
+        binding: 2,
     }];
     let binding = OpBinding {
-        measurement_digest_hex: binding_hex.to_string(),
         policy_version,
-        v1: true,
-        v2: None,
+        v2: Some(OpBindingV2 {
+            op: "reshare",
+            target: Ok(context_hex.to_string()),
+            members,
+        }),
     };
     evaluate_conditions(
         &step_up,
@@ -588,9 +530,7 @@ pub(crate) fn require_owner_create(
     }
     let pd = crate::v2::stored_policy_digest(policy)?;
     let binding = OpBinding {
-        measurement_digest_hex: String::new(),
         policy_version: 0,
-        v1: false,
         v2: Some(OpBindingV2 {
             op: "create",
             target: Ok(pd),

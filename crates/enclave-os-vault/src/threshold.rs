@@ -379,7 +379,8 @@ fn run(req: VaultRequest, ctx: &RequestContext) -> Result<VaultResponse, String>
             vaults,
             target_mrenclave,
             targets,
-        } => reshare_deal(&session, &handle, &helpers, threshold, &vaults, &target_mrenclave, &targets, ctx),
+            binding,
+        } => reshare_deal(&session, &handle, &helpers, threshold, &vaults, &target_mrenclave, &targets, binding, ctx),
         VaultRequest::FrostReshareTarget2 {
             session,
             handle,
@@ -1001,6 +1002,7 @@ fn reshare_deal(
     vaults: &[String],
     target_mrenclave: &str,
     targets: &BTreeMap<u16, FrostTargetMessage>,
+    binding: Option<crate::types::BindingV2Request>,
     ctx: &RequestContext,
 ) -> Result<VaultResponse, String> {
     let mut record = threshold_record(handle)?;
@@ -1017,6 +1019,7 @@ fn reshare_deal(
         record.policy_version,
         handle,
         &crate::quote::hex_encode(&context),
+        binding.map(|b| b.members),
         ctx,
     ) {
         let _ = crate::audit_denial(ctx, &mut record, "ReshareDeal", &caller, AuditDecision::Denied, &e);

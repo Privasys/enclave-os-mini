@@ -20,52 +20,36 @@ pub(crate) fn handle_update_policy(
     }
     let caller = caller_str(ctx);
 
-    // A key whose update rule takes binding v2 approves exactly the JSON sent
-    // (wire formats §5.1): it must be canonical, and it is stored as sent. Other
-    // keys take the policy as before, normalised.
-    let takes_v2 = rule_takes_binding_v2(&record.policy, Operation::UpdatePolicy);
-    let canonical = v2::canonical_policy(new_policy_raw.get());
-    let new_policy = if takes_v2 {
-        match &canonical {
-            // Sent exactly as it will be stored: the owner approves
-            // the JSON the vault keeps and returns.
-            Ok(c) => match v2::check_sent_in_stored_form(new_policy_raw.get()) {
-                Ok(()) => c.policy.clone(),
-                Err(e) => return VaultResponse::Error(e),
-            },
-            Err(e) => return VaultResponse::Error(e.clone()),
-        }
-    } else {
-        match serde_json::from_str::<KeyPolicy>(new_policy_raw.get()) {
-            Ok(p) => normalise_policy(p),
-            Err(e) => return VaultResponse::Error(format!("new_policy does not parse: {e}")),
-        }
+    // The new policy is sent exactly as it will be stored (wire formats §5.1):
+    // canonical, and in stored form, so the owner approves the JSON the vault
+    // keeps and returns.
+    let canonical = match v2::canonical_policy(new_policy_raw.get()) {
+        Ok(c) => c,
+        Err(e) => return VaultResponse::Error(e),
     };
-    // update_policy_from (wire formats §5.3): the approval also names the policy it
-    // replaces; it must be the one this vault holds now.
-    let replaced_pd = binding.as_ref().and_then(|b| b.replaced_pd.clone());
-    let (op, target) = match replaced_pd {
-        None => ("update_policy", canonical.map(|c| c.pd)),
-        Some(replaced) => {
-            let current = match v2::stored_policy_digest(&record.policy) {
-                Ok(pd) => pd,
-                Err(e) => return VaultResponse::Error(e),
-            };
-            if replaced != current {
-                let e = "replaced_pd is not this key's current policy: the policy changed since the approval was asked for".to_string();
-                let _ = audit_denial(ctx, &mut record, "UpdatePolicy", &caller, AuditDecision::Denied, &e);
-                return VaultResponse::Error(e);
-            }
-            (
-                "update_policy_from",
-                canonical.map(|c| v2::update_from_target(&current, &c.pd)),
-            )
-        }
+    if let Err(e) = v2::check_sent_in_stored_form(new_policy_raw.get()) {
+        return VaultResponse::Error(e);
+    }
+    let new_policy = canonical.policy;
+    // update_policy_from (wire formats §5.3): the request names the policy it
+    // replaces, which must be the one this vault holds now.
+    let Some(replaced) = binding.as_ref().and_then(|b| b.replaced_pd.clone()) else {
+        return VaultResponse::Error(
+            "an update names the policy it replaces (binding.replaced_pd, update_policy_from)".into(),
+        );
     };
+    let current = match v2::stored_policy_digest(&record.policy) {
+        Ok(pd) => pd,
+        Err(e) => return VaultResponse::Error(e),
+    };
+    if replaced != current {
+        let e = "replaced_pd is not this key's current policy: the policy changed since the approval was asked for".to_string();
+        let _ = audit_denial(ctx, &mut record, "UpdatePolicy", &caller, AuditDecision::Denied, &e);
+        return VaultResponse::Error(e);
+    }
+    let (op, target) = ("update_policy_from", Ok(v2::update_from_target(&current, &canonical.pd)));
     let op_binding = crate::policy::OpBinding {
-        measurement_digest_hex: String::new(),
         policy_version: record.policy_version,
-        v1: false,
         v2: Some(crate::policy::OpBindingV2 {
             op,
             target,

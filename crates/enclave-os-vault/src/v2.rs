@@ -565,16 +565,11 @@ pub fn check_approval_by_default(policy: &KeyPolicy, exportable: bool) -> Result
 
 /// What counts as an approval for approval by default (the
 /// portal's notice uses the same rule): a passkey step-up (`webauthn` in
-/// `required_amr`) bound to the operation (binding v2, or v1
-/// `operation_bound`). A fresh token alone is not.
+/// `required_amr`), which the vault always checks bound to the operation
+/// (binding v2). A step-up that asks for no passkey is not.
 pub fn is_wallet_approval(c: &Condition) -> bool {
-    let Condition::OidcStepUp {
-        required_amr,
-        operation_bound,
-        binding,
-        ..
-    } = c;
-    required_amr.iter().any(|a| a == "webauthn") && (*binding == 2 || *operation_bound)
+    let Condition::OidcStepUp { required_amr, .. } = c;
+    required_amr.iter().any(|a| a == "webauthn")
 }
 
 /// The one condition an owner may add to an existing key's rules (formats
@@ -764,20 +759,20 @@ mod tests {
         let ok = canonical_policy(&app_key_policy(STEP_UP)).unwrap().policy;
         assert!(check_approval_by_default(&ok, true).is_ok());
 
-        // A v1 bound passkey step-up counts too.
-        let v1 = r#"{"OidcStepUp":{"required_amr":["webauthn"],"operation_bound":true,"fresh_for_seconds":300}}"#;
-        let p = canonical_policy(&app_key_policy(v1)).unwrap().policy;
-        assert!(check_approval_by_default(&p, true).is_ok());
-
-        // A fresh token alone (no webauthn), or webauthn without a binding, is
-        // not an approval.
-        for weak in [
-            r#"{"OidcStepUp":{"required_amr":[],"operation_bound":false,"fresh_for_seconds":300}}"#,
+        // A passkey step-up written before binding v2 counts too: the vault
+        // reads every step-up as binding v2.
+        for older in [
+            r#"{"OidcStepUp":{"required_amr":["webauthn"],"operation_bound":true,"fresh_for_seconds":300}}"#,
             r#"{"OidcStepUp":{"required_amr":["webauthn"],"operation_bound":false,"fresh_for_seconds":300}}"#,
         ] {
-            let p = canonical_policy(&app_key_policy(weak)).unwrap().policy;
-            assert!(check_approval_by_default(&p, true).is_err(), "{weak}");
+            let p = canonical_policy(&app_key_policy(older)).unwrap().policy;
+            assert!(check_approval_by_default(&p, true).is_ok(), "{older}");
         }
+
+        // A fresh token alone (no passkey) is not an approval.
+        let weak = r#"{"OidcStepUp":{"required_amr":[],"operation_bound":false,"fresh_for_seconds":300}}"#;
+        let p = canonical_policy(&app_key_policy(weak)).unwrap().policy;
+        assert!(check_approval_by_default(&p, true).is_err(), "{weak}");
     }
 
     // ---- A binding v2 update sends the policy in stored form ----
